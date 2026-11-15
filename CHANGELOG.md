@@ -10,6 +10,18 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
+## [0.4.5] - 2026-11-15
+
+### Fixed
+- **Your profile updates everywhere at once:** after you save a new picture, colour or name, it shows straight away in the member list, on your messages (old and new), in voice and in the user panel. No restart needed.
+- **Saving your profile is clearer:** changes only show in the preview until you press Save. Then you see "Profile saved", and others in your servers see the change within a few minutes.
+- **Profile updates reach every server:** if a server refused your profile update, MVS now tries again for that server only.
+- **"Join chat" and relay-only:** turning "Relay only" on or off now updates the "Join chat" entry straight away, even when no voice room is open.
+
+### Known
+- **Voice calls are officially supported only when everyone is on the same network** (for example the same Wi-Fi). Calls across networks are on the way.
+- **Everyone needs 0.4.4 or later for voice rooms.**
+
 ## [0.4.4] - 2026-11-11
 
 ### New

@@ -62,14 +62,18 @@ const KV_BACKUP_KNOWN: &str = "backup-known";
 /// G-21: per channel, `read/<channel hex>` = the last message read, as
 /// JSON `[ts, "<record id hex>"]`. Local only (phase 3 syncs it).
 const KV_READ_PREFIX: &str = "read/";
-/// #354: a profile change waits to be published (coalesced), and when the
-/// last profile post went out (u64le ms).
+/// #354: a profile change waits to be published (coalesced).
 const KV_PROFILE_PENDING: &str = "profile-pending";
-const KV_PROFILE_POSTED_AT: &str = "profile-posted-at";
+/// Profile save (#378): the post limit's next-allowed time (GCRA's
+/// theoretical arrival time, u64le ms). Replaces `profile-posted-at`.
+const KV_PROFILE_POST_TAT: &str = "profile-post-tat";
 /// #359 follow-up: servers whose profile post was refused (JSON hex list).
 const KV_PROFILE_RETRY: &str = "profile-retry";
-/// #354: at most one profile post per server per 10 minutes.
+/// Profile posts (Tech Lead, #378): a burst of [`PROFILE_POST_BURST`] at
+/// once, so an explicit save goes out right away, then one per this long
+/// (later changes coalesce: the latest values go).
 pub const PROFILE_POST_EVERY_MS: u64 = 10 * 60_000;
+pub const PROFILE_POST_BURST: u64 = 3;
 /// Restore servers: a restore still has servers to rejoin from the backup.
 const KV_BACKUP_PENDING: &str = "backup-pending";
 /// Restore servers: a fingerprint of the server set last backed up, and
@@ -889,12 +893,37 @@ impl Core {
             let key = *me.identity.storage_key().expose_secret();
             inner.db.save_profile(&key, &serde_json::to_vec(&profile).expect("plain struct"))?;
             // A change goes to every server I'm still in, as a new profile
-            // post (the latest wins), at most once per PROFILE_POST_EVERY_MS
-            // (coalesced; the pending one survives a restart). The bio and
-            // the large picture stay on this device.
+            // post (the latest wins): at once while the burst lasts, then once
+            // per PROFILE_POST_EVERY_MS (coalesced; the pending one survives a
+            // restart). The bio and the large picture stay on this device.
             if changed {
                 inner.db.set(KV_PROFILE_PENDING, b"1")?;
                 inner.flush_profile(ports)?;
+                // Profile save (#378, acceptance 7): my row in every server
+                // I'm a member of, so each place that shows me updates now.
+                // The profile is saved already: a server that fails here is
+                // logged, not an error.
+                let key = inner.me.as_ref().expect("checked above").key();
+                for server in inner.db.servers()? {
+                    let row = (|| -> CoreResult<Option<Event>> {
+                        if inner.db.closed_at(server)?.is_some() {
+                            return Ok(None);
+                        }
+                        inner.load(server)?;
+                        let view = inner.view(server)?;
+                        if view.state.closed.is_some() || !view.state.is_member(key) {
+                            return Ok(None);
+                        }
+                        Ok(Some(Event::MembersChanged {
+                            server_id: model::hex_id(server.as_bytes()),
+                            members: inner.members_json(&view)?,
+                        }))
+                    })();
+                    match row {
+                        Ok(event) => events.extend(event),
+                        Err(e) => eprintln!("mvs-core: members.changed after a profile save: {:?}", e.code),
+                    }
+                }
             }
             let identity = inner.identity_json(inner.me.as_ref().expect("checked above"))?;
             events.push(Event::IdentityChanged(identity.clone()));
@@ -3362,9 +3391,10 @@ impl Inner {
         })
     }
 
-    /// #354: a pending profile change goes out once the last profile post is
-    /// [`PROFILE_POST_EVERY_MS`] old (coalesced: the latest values). Called on
-    /// a change and every sync round; the pending flag is stored.
+    /// #354, #378: a pending profile change goes out at once while the burst
+    /// lasts ([`PROFILE_POST_BURST`]), then once per [`PROFILE_POST_EVERY_MS`]
+    /// (coalesced: the latest values). Called on a change and every sync
+    /// round; the pending flag is stored.
     fn flush_profile(&mut self, ports: &Ports) -> CoreResult<()> {
         let pending = self.db.get(KV_PROFILE_PENDING)?.is_some();
         // Servers whose last profile post was refused (Tech Lead on #359):
@@ -3381,20 +3411,23 @@ impl Inner {
         if !pending && retry.is_empty() {
             return Ok(());
         }
+        // GCRA (#378): each post moves `tat` on by the interval; one may go
+        // while `tat` is at most BURST − 1 intervals ahead of now.
         let now = ports.clock.now_ms();
-        let last = self
+        let tat = self
             .db
-            .get(KV_PROFILE_POSTED_AT)?
+            .get(KV_PROFILE_POST_TAT)?
             .and_then(|v| v.try_into().ok())
-            .map(u64::from_le_bytes);
-        if last.is_some_and(|last| now.saturating_sub(last) < PROFILE_POST_EVERY_MS) {
+            .map_or(0, u64::from_le_bytes);
+        if tat > now.saturating_add((PROFILE_POST_BURST - 1) * PROFILE_POST_EVERY_MS) {
             return Ok(());
         }
         let (sent, failed) = self.post_profile_everywhere(ports, (!pending).then_some(&retry))?;
-        // The 10 minutes start once a post was made or tried (sign-up sets a
-        // name before I'm in any server: nothing either way).
+        // Counted once a post was made or tried (sign-up sets a name before
+        // I'm in any server: nothing either way).
         if sent > 0 || !failed.is_empty() {
-            self.db.set(KV_PROFILE_POSTED_AT, &now.to_le_bytes())?;
+            let tat = tat.max(now).saturating_add(PROFILE_POST_EVERY_MS);
+            self.db.set(KV_PROFILE_POST_TAT, &tat.to_le_bytes())?;
         }
         let failed: Vec<String> = failed.iter().map(|s| model::hex_id(s.as_bytes())).collect();
         self.db.set(KV_PROFILE_RETRY, &serde_json::to_vec(&failed).expect("plain list"))?;
@@ -3715,8 +3748,21 @@ impl Inner {
         let server_id = model::hex_id(view.id.as_bytes());
         let mut out = Vec::new();
         let looks = view.looks();
-        for member in view.members() {
-            let (avatar, color) = looks.get(&member.key).cloned().unwrap_or_default();
+        // Profile save (#378): my own row shows my saved profile at once,
+        // not what my last profile post said (it may still be waiting).
+        let mine = self.me.as_ref().map(|me| {
+            let set = |v: &Option<String>| v.clone().filter(|v| !v.is_empty());
+            let p = &me.profile;
+            (p.display_name.clone(), set(&p.avatar_small), set(&p.color))
+        });
+        for mut member in view.members() {
+            let (mut avatar, mut color) = looks.get(&member.key).cloned().unwrap_or_default();
+            if let (Some((name, my_avatar, my_color)), true) = (&mine, Some(member.key) == me) {
+                if !name.is_empty() {
+                    member.display_name = name.clone();
+                }
+                (avatar, color) = (my_avatar.clone(), my_color.clone());
+            }
             let blocked = self.db.is_blocked(&member.key)?;
             out.push(Member {
                 id: model::hex_id(member.key.as_bytes()),

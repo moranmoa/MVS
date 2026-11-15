@@ -3362,12 +3362,6 @@ impl Inner {
         })
     }
 
-    /// Signs `action` on our heads in loaded `server`, dry-runs it on the
-    /// live resolver, then stores and publishes it. Its deps are our heads,
-    /// so it joins at once; if `authority` doesn't accept it, it was never
-    /// stored or sent (`not-allowed`), and the log is rebuilt from the store
-    /// so it leaves no trace.
-    // TODO(records B4): `Resolver::would_accept` instead.
     /// #354: a pending profile change goes out once the last profile post is
     /// [`PROFILE_POST_EVERY_MS`] old (coalesced: the latest values). Called on
     /// a change and every sync round; the pending flag is stored.
@@ -3396,7 +3390,7 @@ impl Inner {
         if last.is_some_and(|last| now.saturating_sub(last) < PROFILE_POST_EVERY_MS) {
             return Ok(());
         }
-        let (sent, failed) = self.post_profile_everywhere(ports, (!pending).then_some(&retry));
+        let (sent, failed) = self.post_profile_everywhere(ports, (!pending).then_some(&retry))?;
         // The 10 minutes start once a post was made or tried (sign-up sets a
         // name before I'm in any server: nothing either way).
         if sent > 0 || !failed.is_empty() {
@@ -3410,17 +3404,18 @@ impl Inner {
     /// My profile (name, small picture, colour) as one profile post per
     /// server I'm still a member of (not closed, not kicked, not left), or
     /// only to `only`. A server that refuses it is logged. Returns how many
-    /// went out and the servers that refused.
+    /// went out and the servers that refused. A database error is returned
+    /// (Tech Lead on #361), so the pending change stays for the next round.
     fn post_profile_everywhere(
         &mut self,
         ports: &Ports,
         only: Option<&BTreeSet<ServerId>>,
-    ) -> (usize, Vec<ServerId>) {
-        let Ok(mut servers) = self.db.servers() else { return (0, Vec::new()) };
+    ) -> CoreResult<(usize, Vec<ServerId>)> {
+        let mut servers = self.db.servers()?;
         if let Some(only) = only {
             servers.retain(|s| only.contains(s));
         }
-        let Some(me) = self.me.as_ref() else { return (0, Vec::new()) };
+        let Some(me) = self.me.as_ref() else { return Ok((0, Vec::new())) };
         let (mut sent, mut failed) = (0, Vec::new());
         let key = me.key();
         let p = &me.profile;
@@ -3447,9 +3442,15 @@ impl Inner {
                 }
             }
         }
-        (sent, failed)
+        Ok((sent, failed))
     }
 
+    /// Signs `action` on our heads in loaded `server`, dry-runs it on the
+    /// live resolver, then stores and publishes it. Its deps are our heads,
+    /// so it joins at once; if `authority` doesn't accept it, it was never
+    /// stored or sent (`not-allowed`), and the log is rebuilt from the store
+    /// so it leaves no trace.
+    // TODO(records B4): `Resolver::would_accept` instead.
     fn publish_control(
         &mut self,
         ports: &Ports,

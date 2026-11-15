@@ -909,13 +909,8 @@ impl Core {
         let mut out = Vec::new();
         for id in inner.db.servers()? {
             inner.load(id)?;
-            let mut summary = inner.summary(id)?;
             // G-21 and G-24: the server rail's unread dot and mention badge.
-            let me = inner.me.as_ref().map(Me::key);
-            let mut channels = inner.view(id)?.channels(me);
-            inner.fill_unread(&*self.ports.cipher, id, &mut channels)?;
-            summary.unread = channels.iter().any(|c| c.unread);
-            summary.mentions = channels.iter().map(|c| c.mentions).fold(0, u32::saturating_add);
+            let summary = inner.counted_summary(&*self.ports.cipher, id)?;
             out.push(summary);
         }
         Ok(out)
@@ -1227,7 +1222,7 @@ impl Core {
             inner.lifecycle_role(server, authority::Role::Admin)?;
             inner.lifecycle_gate(server)?;
             inner.publish_control(ports, server, &Action::ServerEdit { name: name.to_owned() })?;
-            let summary = inner.summary(server)?;
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
             events.push(Event::ServerUpdated(summary.clone()));
             Ok(summary)
         })
@@ -1529,7 +1524,8 @@ impl Core {
 
     /// G-21 `markRead(channelId)`: everything in the channel now counts as
     /// read (the marker moves to its last message), and `channel.updated`
-    /// carries the reset `unreadCount` and no `firstUnreadIndex`. Local only.
+    /// carries the reset `unreadCount` and no `firstUnreadIndex`, then
+    /// `server.updated` with the server's recounted dot and badge. Local only.
     pub fn mark_read(&self, channel_id: &str) -> CoreResult<()> {
         let (server, channel) = {
             let mut inner = self.lock();
@@ -1544,6 +1540,9 @@ impl Core {
         };
         let json = self.channel_json(server, channel)?;
         self.ports.events.emit(&Event::ChannelUpdated(json));
+        // The server rail too: its dot and badge come from all its channels.
+        let summary = self.lock().counted_summary(&*self.ports.cipher, server)?;
+        self.ports.events.emit(&Event::ServerUpdated(summary));
         Ok(())
     }
 
@@ -1603,7 +1602,7 @@ impl Core {
             let record = inner.publish_control(ports, server, &action)?;
             if matches!(action, Action::Invite { .. } | Action::RevokeInvite { .. }) {
                 // The server's link may name another invite now.
-                events.push(Event::ServerUpdated(inner.summary(server)?));
+                events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 return Ok(record.id());
             }
             let after = inner.view(server)?;
@@ -1638,15 +1637,16 @@ impl Core {
         self.lock().calls.in_call()
     }
 
-    /// `joinCall(roomId)`: leaves any other call first. Calls happen only in
-    /// a server's voice room: a text channel answers `not-allowed`.
+    /// `joinCall(roomId)`: a live voice room of one of my servers; leaves
+    /// any other call first. A text channel answers `not-allowed`, an
+    /// unknown or gone room `not-found`.
     pub fn join_call(&self, room_id: &str) -> CoreResult<CallState> {
         let room =
             model::parse_hex32(room_id).map(ChannelId::from_bytes).ok_or(ErrorCode::NotFound)?;
         self.voice(|calls, ctx, inner| {
-            let server = match inner.room_server(room)? {
-                Some(server) => server,
-                None => {
+            let server = match calls.room_server(room) {
+                Some(server) if inner.db.has_server(server)? => server,
+                _ => {
                     inner.channel_server(room)?;
                     return Err(ErrorCode::NotAllowed.into());
                 }
@@ -1655,21 +1655,42 @@ impl Core {
         })
     }
 
-    /// `getVoiceRoom`: who is in the server's voice room. `not-found` for a
-    /// server I don't have, `not-allowed` if I'm not a member (or kicked).
-    pub fn get_voice_room(&self, server_id: &str) -> CoreResult<VoiceRoom> {
+    /// `createVoiceRoom(serverId)`: a new room with me as its master, and
+    /// me in it (leaving any other call first). `room-cap` at 10 live rooms.
+    pub fn create_voice_room(&self, server_id: &str) -> CoreResult<CallState> {
         let server = parse_server(server_id)?;
         self.voice(|calls, ctx, inner| {
             if !inner.db.has_server(server)? {
                 return Err(ErrorCode::NotFound.into());
             }
-            let me = ctx.key.verifying_key().to_bytes();
-            let room = voice::room_id(server);
-            if !voice::Members::may_call(inner, PublicKey::from_bytes(me), server, room) {
+            calls.create(ctx, inner, server)
+        })
+    }
+
+    /// `listVoiceRooms(serverId)`: the server's live rooms, oldest first.
+    /// `not-found` for a server I don't have, `not-allowed` if I'm not a
+    /// member (or kicked).
+    pub fn list_voice_rooms(&self, server_id: &str) -> CoreResult<Vec<VoiceRoom>> {
+        let server = parse_server(server_id)?;
+        self.voice(|calls, ctx, inner| {
+            if !inner.db.has_server(server)? {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let me = PublicKey::from_bytes(ctx.key.verifying_key().to_bytes());
+            if !voice::Members::may_call(inner, me, server) {
                 return Err(ErrorCode::NotAllowed.into());
             }
-            Ok(calls.voice_room(ctx, inner, server))
+            Ok(calls.list(ctx, inner, server))
         })
+    }
+
+    /// `editVoiceRoom(roomId, name?, limit?)`: by the room's master (applied
+    /// now) or the server owner (sent to the master). `name: ""` restores
+    /// the default.
+    pub fn edit_voice_room(&self, room_id: &str, name: Option<String>, limit: Option<u8>) -> CoreResult<()> {
+        let room =
+            model::parse_hex32(room_id).map(ChannelId::from_bytes).ok_or(ErrorCode::NotFound)?;
+        self.voice(|calls, ctx, inner| calls.edit(ctx, inner, room, name, limit))
     }
 
     /// `leaveCall`: idempotent.
@@ -2066,7 +2087,7 @@ impl Core {
                     continue;
                 }
                 if inner.view(server)?.state.server_name != name_before {
-                    events.push(Event::ServerUpdated(inner.summary(server)?));
+                    events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
@@ -2188,7 +2209,7 @@ impl Core {
 
     /// `setRelayOnly(on)` (GAP-6r): stored, then applied to the network. On
     /// ends my call first (its media would go direct) and refuses calls
-    /// until it's off. Each of my servers gets a `voice.room` with the new
+    /// until it's off. Each of my servers gets a `voice.rooms` with the new
     /// `relayOnly` at the next tick. Needs no identity.
     pub fn set_relay_only(&self, on: bool) -> CoreResult<()> {
         if on {
@@ -2314,19 +2335,20 @@ fn update_event(e: UpdateEvent) -> Event {
 }
 
 impl voice::Members for Inner {
-    /// Room-only: the server's voice room, a server of mine whose genesis
-    /// is accepted (its ID checked against it), a member, not kicked. No
-    /// 18+ gate: the room isn't a channel record.
-    fn may_call(&mut self, who: PublicKey, server: ServerId, channel: ChannelId) -> bool {
-        if channel != voice::room_id(server) {
-            return false;
-        }
+    /// A server of mine whose genesis is accepted (its ID checked against
+    /// it), a member, not kicked. No 18+ gate: rooms aren't channel records.
+    /// (The room's ID derives from the server: `voice` checks that.)
+    fn may_call(&mut self, who: PublicKey, server: ServerId) -> bool {
         let mine = self.db.servers().is_ok_and(|servers| servers.contains(&server));
         if !mine || self.load(server).is_err() || self.view(server).is_err() {
             return false;
         }
         let state = self.logs[&server].resolver.state();
         state.members.contains(&who) && !state.kicked.contains(&who)
+    }
+
+    fn is_owner(&mut self, who: PublicKey, server: ServerId) -> bool {
+        self.load(server).is_ok() && self.view(server).is_ok_and(|view| view.owner == who)
     }
 
     fn audience(&mut self, server: ServerId) -> Vec<PublicKey> {
@@ -2744,12 +2766,27 @@ impl Inner {
     ) -> CoreResult<()> {
         let me = self.me.as_ref().map(Me::key);
         let members = self.view(server)?.state.members.clone();
+        // Channels with a new message from someone else: their unread
+        // counts changed (owner bug, v0.4.1: without these events the UI's
+        // dots drifted from the read marker and stuck).
+        let mut fresh = Vec::new();
         for channel in self.known(server)? {
             let shown = self.shown(cipher, server, channel)?;
             let seen = self.announced.entry(server).or_default();
             for (index, s) in shown.iter().enumerate() {
                 let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
                 let event = match seen.insert(s.record.id(), state) {
+                    None if Some(s.record.author()) != me && !fresh.contains(&channel) => {
+                        fresh.push(channel);
+                        Event::MessageAdded(message_json(
+                            s,
+                            index,
+                            channel,
+                            me,
+                            &Status { net: &*self.net, db: &self.db },
+                            &members,
+                        ))
+                    }
                     None => Event::MessageAdded(message_json(
                         s,
                         index,
@@ -2771,7 +2808,29 @@ impl Inner {
                 events.push(event);
             }
         }
+        if !fresh.is_empty() {
+            let mut channels: Vec<Channel> = self.view(server)?.channels(me);
+            channels.retain(|c| {
+                model::parse_hex32(&c.id).is_some_and(|id| fresh.contains(&ChannelId::from_bytes(id)))
+            });
+            self.fill_unread(cipher, server, &mut channels)?;
+            events.extend(channels.into_iter().map(Event::ChannelUpdated));
+            events.push(Event::ServerUpdated(self.counted_summary(cipher, server)?));
+        }
         Ok(())
+    }
+
+    /// The server's summary with its unread dot and mention badge (G-21,
+    /// G-24): what `listServers` returns and `server.updated` carries after
+    /// new messages or `markRead`.
+    fn counted_summary(&mut self, cipher: &dyn GroupCipher, server: ServerId) -> CoreResult<ServerSummary> {
+        let mut summary = self.summary(server)?;
+        let me = self.me.as_ref().map(Me::key);
+        let mut channels = self.view(server)?.channels(me);
+        self.fill_unread(cipher, server, &mut channels)?;
+        summary.unread = channels.iter().any(|c| c.unread);
+        summary.mentions = channels.iter().map(|c| c.mentions).fold(0, u32::saturating_add);
+        Ok(summary)
     }
 
     /// Seals `text` for `channel`'s members. If no key is usable yet, a
@@ -3135,11 +3194,6 @@ impl Inner {
     /// other. Loads the server.
     /// The server a channel of mine is in, 18+ ones included (whether I may
     /// use it is the caller's check).
-    /// The server of mine whose voice room is `room`, if any.
-    fn room_server(&self, room: ChannelId) -> CoreResult<Option<ServerId>> {
-        Ok(self.db.servers()?.into_iter().find(|server| voice::room_id(*server) == room))
-    }
-
     fn channel_server(&mut self, channel: ChannelId) -> CoreResult<ServerId> {
         for server in self.db.servers()? {
             self.load(server)?;
@@ -3862,15 +3916,16 @@ impl ServerView<'_> {
 
     /// G-11: every live channel in order. Placed ones first, by key (then
     /// ID, for keys two admins happened to pick alike); the rest after, in
-    /// today's order.
+    /// the order they were made (`creation_order`, #323).
     fn ordered_channels(&self) -> Vec<ChannelId> {
         let positions = self.channel_positions();
+        let created = self.creation_order();
         let mut ids: Vec<ChannelId> = self.state.channels.keys().copied().collect();
         ids.sort_by(|a, b| match (positions.get(a), positions.get(b)) {
             (Some(x), Some(y)) => x.cmp(y).then(a.cmp(b)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
+            (None, None) => created.get(a).cmp(&created.get(b)),
         });
         ids
     }

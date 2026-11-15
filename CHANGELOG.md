@@ -10,6 +10,48 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
+## [0.4.4] - 2026-11-11
+
+### New
+- **Voice rooms:** click "Join chat" in a server to open a new voice room. Live rooms show in the channel list with who is in them and who hosts. The room's owner can rename it and set how many people may join (2 to 5). A server can have up to 10 rooms at once, and you can be in one room at a time.
+- **Backup on the relay (groundwork):** the relay can now keep an encrypted backup of your servers, the first step towards restoring them on a new device. The relay can't read it. It starts working once the relay is updated.
+- **Faster update notices:** MVS now checks for updates every hour (was every 6 hours), so a new version shows up sooner.
+
+### Known
+- **Everyone needs 0.4.4 for voice.** Voice rooms use a new call format, so people on 0.4.3 or older can't join calls with people on 0.4.4. Please update.
+- **Voice calls are officially supported only when everyone is on the same network** (for example the same Wi-Fi). Calls across networks are on the way.
+- On first run, Windows may ask whether to allow MVS on the network. Please allow it (also on private networks); otherwise voice calls won't connect.
+
+## [0.4.3] - 2026-11-11
+
+This version replaces 0.4.2, which was never published. It includes everything in 0.4.2 plus the fixes below.
+
+### Fixed
+- **Closing the app during a call:** the app now always closes when you quit, when Windows shuts down or restarts for an update, or if the window stops responding during a call. The call ends cleanly.
+- **Channel order:** moving a channel for the first time now always lands it in the right place. Channels that were never moved keep the order they were created in.
+- **Fewer network requests** when you create or open many servers at once.
+- **Language and colour pickers:** their layout is back to normal.
+
+### Known
+- **Voice calls are officially supported only when everyone is on the same network** (for example the same Wi-Fi). Calls across networks are on the way.
+- On first run, Windows may ask whether to allow MVS on the network. Please allow it (also on private networks); otherwise voice calls won't connect.
+
+## [0.4.2] - 2026-11-11
+
+### New
+- **Your picture and colour everywhere:** your profile picture now shows next to your messages, in the member list and in voice, for everyone in your servers. Without a picture, your initial shows on your colour. Pick your colour in Settings → Account.
+- **New window and logo:** MVS has its own title bar and its new logo on the window, taskbar and installer. Minimising goes to the taskbar.
+- **Cleaner server header:** the age tag and the invite button moved out of the header. The invite link is in server settings and the server's right-click menu.
+- **Language list:** a 🌐 icon next to the language picker.
+
+### Fixed
+- **Who's online:** members connected to the server no longer show as offline, and the "Nobody from the server is online" banner no longer appears by mistake.
+- **Unread dots that stayed:** the unread dot and count on channels and servers now clear when you read them.
+
+### Known
+- **Voice calls are officially supported only when everyone is on the same network** (for example the same Wi-Fi). Calls across networks are on the way.
+- On first run, Windows may ask whether to allow MVS on the network. Please allow it (also on private networks); otherwise voice calls won't connect.
+
 ## [0.4.1] - 2026-11-11
 
 ### New

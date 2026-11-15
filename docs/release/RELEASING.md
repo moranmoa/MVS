@@ -109,7 +109,7 @@ domain, so it lives in a **repository variable**, never in git:
 Or with `gh` (PowerShell):
 
 ```powershell
-gh variable set MVS_RELAY_ADDR --repo moranmoa/MVP --body "/dns4/<relay-domain>/tcp/443/wss/p2p/<relay peer id>"
+gh variable set MVS_RELAY_ADDR --repo moranmoa/MVS --body "/dns4/<relay-domain>/tcp/443/wss/p2p/<relay peer id>"
 ```
 
 `mvs-core` dials wss through libp2p's `websocket` transport in `core/sync`
@@ -150,10 +150,10 @@ Or in one command (PowerShell, logged in to `gh` as the owner):
  "conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},
  "rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}],
  "bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}
-'@ | gh api repos/moranmoa/MVP/rulesets --method POST --input -
+'@ | gh api repos/moranmoa/MVS/rulesets --method POST --input -
 ```
 
-Check: `gh api repos/moranmoa/MVP/rulesets` lists `release tags`.
+Check: `gh api repos/moranmoa/MVS/rulesets` lists `release tags`.
 
 What this does and doesn't cover:
 
@@ -248,7 +248,7 @@ PowerShell on your normal (online) PC, in the repo:
    **Download and check** the draft's files:
 
    ```powershell
-   gh release download v0.1.0 --repo moranmoa/MVP --dir release-v0.1.0
+   gh release download v0.1.0 --repo moranmoa/MVS --dir release-v0.1.0
    cd release-v0.1.0
    Get-Content SHA256SUMS | ForEach-Object {
      $sum, $file = $_ -split '\s+', 2
@@ -292,11 +292,11 @@ PowerShell on your normal (online) PC, in the repo:
    what makes the update reach installed apps:
 
    ```powershell
-   gh release edit v0.1.0 --draft=false --repo moranmoa/MVP
+   gh release edit v0.1.0 --draft=false --repo moranmoa/MVS
    ```
 
 6. **Publish the update** to the channel releases the app polls
-   (`https://github.com/moranmoa/MVP/releases/download/update-<channel>/manifest.json`).
+   (`https://github.com/moranmoa/MVS/releases/download/update-<channel>/manifest.json`).
    The script first runs `updater verify` (signature, root chain, expiry;
    build `updater` from a reviewed commit, or pass `-Updater <path>`). It then checks that the signed body's channel and version match, and
    that the update zip in the release matches its hash and size. It then
@@ -335,6 +335,11 @@ The Windows binaries link the C runtime statically (`+crt-static` in
 Microsoft's CRT security fixes reach users **only through our rebuilds**,
 not through Windows Update. When Microsoft ships a CRT security fix, rebuild
 with the updated MSVC toolchain and release promptly.
+
+Electron updates that fix image decoders (for example libwebp) are security
+updates: ship them promptly. The app decodes avatars sent by other members,
+so a decoder bug is reachable by anyone in a shared server (Security Lead,
+A4). Follow [ELECTRON-UPGRADE.md](ELECTRON-UPGRADE.md) as usual.
 
 A manifest expires (at most 30 days, 14 by default). Clients refuse it after
 that, which stops an attacker freezing users on an old release. Before it

@@ -18,6 +18,8 @@ export interface Identity {
   /** CSS colour for the generated avatar; real avatars come later. */
   avatarColor: string;
   avatarDataUrl?: string;
+  /** #359: my chosen colour (#rrggbb), shown to others; falls back to avatarColor. */
+  color?: string;
   bio?: string;
   country: string;
   birthDate: BirthDate;
@@ -41,6 +43,10 @@ export interface ProfileInput {
   displayName: string;
   bio?: string;
   avatarDataUrl?: string;
+  /** #359: a 48×48 WebP/PNG (≤ 2,560 bytes) that others see. Absent = unchanged, '' = removed. */
+  avatarSmall?: string;
+  /** #359: #rrggbb. Absent = unchanged, '' = cleared. */
+  color?: string;
 }
 
 export type AgeRestriction = 'none' | '16+' | '18+';
@@ -102,6 +108,10 @@ export interface Member {
   /** Blocked by me: their messages are collapsed on this device only. */
   blocked?: boolean;
   bio?: string;
+  /** #359: the member's small picture (data:image/webp|png), from their profile post. */
+  avatarDataUrl?: string;
+  /** #359: the member's chosen colour (#rrggbb). */
+  color?: string;
 }
 
 /** `keyring`: the OS keychain is missing or unusable (QA-20; core code `keyring-unavailable`). */
@@ -141,6 +151,8 @@ export interface CoreError {
     | 'relay-only'
     /** #294: my own identity is already in this room from another computer (clears ~30 s after it stops). */
     | 'in-call-elsewhere'
+    /** Voice rooms (0.4.3): this server already has 10 live rooms. */
+    | 'room-cap'
     // In-app update (core/api CONFORMANCE "Updates")
     | 'offline'
     | 'invalid-update'
@@ -267,21 +279,30 @@ export interface CallState {
   relayOnly?: boolean;
 }
 
-/** Someone in a server's voice room. `userId` is a member id. */
-export interface VoiceParticipant {
+/** Someone in a voice room. `userId` is a member id; `joinedAt` (ms) orders the hand-off. */
+export interface VoiceRoomMember {
   userId: Id;
   muted: boolean;
+  joinedAt: number;
 }
 
 /**
- * The voice room of a server (voice v1 amendment): one per server, open to every
- * member. `roomId` is what joinCall takes. At most 5 people, me included when in.
+ * A live voice room (voice rooms, 0.4.3: "Join to create"). Soft state: it lives
+ * while someone is in it. `roomId` is what joinCall takes. The core computes
+ * `masterId` (the room's host); the UI never derives it. No `name` = the
+ * default "{master}'s room".
  */
 export interface VoiceRoom {
   serverId: Id;
   roomId: Id;
-  participants: VoiceParticipant[];
-  /** Relay-only is on here (#272): "Join" is off before trying. */
+  creatorId: Id;
+  createdAt: number;
+  name?: string;
+  /** 2–5 (the mesh maximum). */
+  limit: number;
+  masterId: Id;
+  members: VoiceRoomMember[];
+  /** Relay-only is on here (#272): joining and creating are off before trying. */
   relayOnly?: boolean;
 }
 

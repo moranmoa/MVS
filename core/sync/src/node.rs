@@ -100,6 +100,11 @@ const MAX_ANSWERING: usize = 8;
 /// budget (`SERVED_BYTES_BURST`) for each pull until the answer goes out, so
 /// 3 stay under it: a burst of pulls is never refused for the budget.
 const MAX_PULLS_IN_FLIGHT: usize = 3;
+/// T24: outgoing pulls per peer: a burst, then a steady rate, under the
+/// answering side's (`PULL_BURST` 30, `PULL_RATE` 10/s), so its limit never
+/// refuses ours (a refused pull fails, isn't an empty answer, and is re-asked).
+const OUT_PULL_BURST: u32 = 20;
+const OUT_PULL_RATE: u32 = 8;
 /// Most pulls `pull_all` sends one peer in one anti-entropy round: under the
 /// answering side's burst (`PULL_BURST`) and what its rate (`PULL_RATE`)
 /// refills between rounds, so a peer that holds none of our servers' logs
@@ -114,6 +119,9 @@ const FIRST_CONTACT_PULLS: usize = 5;
 /// probed for a server we already have a bound member of. Each such pull
 /// carries our binding to a peer that isn't known to be a member.
 const UNBOUND_REPROBE: Duration = Duration::from_secs(600);
+/// Most entries `empty_from` and `probed` each keep (security lead): peer IDs
+/// are free, so churned peers can't grow them; the oldest goes first.
+const MAX_T23_ENTRIES: usize = 10_000;
 /// How a control log's name ends (`log_name`): queued first.
 const CONTROL_SUFFIX: &str = "/control";
 /// Per-peer pull buckets remembered (also after disconnecting).
@@ -342,6 +350,8 @@ enum Command {
     InboundPulls { reply: oneshot::Sender<usize> },
     #[cfg(test)]
     Dial { addr: Multiaddr },
+    #[cfg(test)]
+    Disconnect { peer: PeerId },
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
@@ -607,6 +617,7 @@ impl Node {
             pending: Pending::new(MAX_PENDING, MAX_PENDING_BYTES),
             refused: Refused::new(MAX_REFUSED),
             inbound_pulls: RateLimiter::new(PULL_BURST, PULL_RATE, MAX_TRACKED_PEERS),
+            outbound_pulls: RateLimiter::new(OUT_PULL_BURST, OUT_PULL_RATE, MAX_TRACKED_PEERS),
             all_inbound_pulls: RateLimiter::new(GLOBAL_PULL_BURST, GLOBAL_PULL_RATE, 1),
             served_bytes: RateLimiter::new(SERVED_BYTES_BURST, SERVED_BYTES_RATE, MAX_TRACKED_PEERS),
             all_served_bytes: RateLimiter::new(ALL_SERVED_BYTES_BURST, ALL_SERVED_BYTES_RATE, 1),
@@ -761,6 +772,12 @@ impl Node {
     #[cfg(test)]
     fn test_dial(&self, addr: Multiaddr) {
         self.send(Command::Dial { addr }).unwrap();
+    }
+
+    /// Tests: close every connection to `peer` (as a relay circuit reset does).
+    #[cfg(test)]
+    fn test_disconnect(&self, peer: PeerId) {
+        self.send(Command::Disconnect { peer }).unwrap();
     }
 
     /// Tests: how many inbound pulls this node refused (any of the three limits).
@@ -1111,6 +1128,8 @@ struct Task {
     /// Channel records refused by the authorizer (or built only on refused ones).
     refused: Refused,
     inbound_pulls: RateLimiter<PeerId>,
+    /// T24: our pulls per peer (`OUT_PULL_BURST`, `OUT_PULL_RATE`).
+    outbound_pulls: RateLimiter<PeerId>,
     all_inbound_pulls: RateLimiter<()>,
     /// Byte budgets for served pages (tokens are bytes).
     served_bytes: RateLimiter<PeerId>,
@@ -1297,6 +1316,13 @@ impl Task {
                 Some(answer) = answers.recv() => self.send_answer(answer),
                 Some((key, records, more, acked)) = decoded.recv() => self.on_decoded(key, records, more, acked),
                 _ = soon.tick() => {
+                    // T24: send what the outgoing rate held back.
+                    let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
+                    for peer in waiting {
+                        for _ in 0..MAX_PULLS_IN_FLIGHT {
+                            self.pull_next(peer);
+                        }
+                    }
                     self.pull_soon();
                     self.direct_fallback();
                     self.recheck_punch();
@@ -1393,6 +1419,10 @@ impl Task {
             #[cfg(test)]
             Command::Dial { addr } => {
                 let _ = self.swarm.dial(addr);
+            }
+            #[cfg(test)]
+            Command::Disconnect { peer } => {
+                let _ = self.swarm.disconnect_peer_id(peer);
             }
             Command::VoiceSend { to, bytes, reply } => {
                 let _ = reply.send(self.voice_send(to, bytes));
@@ -2102,6 +2132,7 @@ impl Task {
             for log in &probes {
                 if let Some(server) = self.sealing.get(log).map(|s| s.server) {
                     if self.bound.keys().any(|(_, s)| *s == server) {
+                        cap_oldest(&mut self.probed, &(peer, server), |at| *at);
                         self.probed.insert((peer, server), now);
                     }
                 }
@@ -2127,7 +2158,12 @@ impl Task {
         }
         // At most MAX_PULLS_IN_FLIGHT out to one peer; the rest wait their
         // turn (`pull_next`) instead of being refused for its byte budget.
-        if self.inflight.values().filter(|(p, _)| *p == peer).count() >= MAX_PULLS_IN_FLIGHT {
+        // T24: and no faster than the answering side's rate, so a burst
+        // (opening many servers, quick answers freeing slots) never runs past
+        // its limit; the queue drains on the 1 s tick.
+        if self.inflight.values().filter(|(p, _)| *p == peer).count() >= MAX_PULLS_IN_FLIGHT
+            || !self.outbound_pulls.allow(peer, Instant::now())
+        {
             self.queued_pulls.entry(peer).or_default().insert(key.1);
             return;
         }
@@ -2269,6 +2305,12 @@ impl Task {
                     info!(%peer_id, "peer connected");
                     self.reached = true;
                     self.emit(NodeEvent::PeerConnected(peer_id));
+                    // A new connection is a new chance to bind: drop the
+                    // re-probe wait for this peer (a member whose link reset
+                    // would otherwise stay unbound, so offline, for up to
+                    // UNBOUND_REPROBE). Empty answers still count
+                    // (`empty_from`), so a reset doesn't re-probe what it lacks.
+                    self.probed.retain(|(p, _), _| *p != peer_id);
                     self.pull_shared(peer_id, "connect", FIRST_CONTACT_PULLS);
                 }
             }
@@ -2764,6 +2806,7 @@ impl Task {
         if response.records.is_empty() && !response.more {
             if let Some(server) = self.sealing.get(&key.1).map(|s| s.server) {
                 if key.1.ends_with(CONTROL_SUFFIX) && !self.bound.contains_key(&(key.0, server)) {
+                    cap_oldest(&mut self.empty_from, &key, |until| *until);
                     self.empty_from.insert(key.clone(), Instant::now() + UNBOUND_REPROBE);
                 }
             }
@@ -3354,6 +3397,18 @@ fn answer_with_ids(store: &Store, log: &str, have: &[ByteBuf], max_bytes: usize)
 /// Whether to ask for the next page right away. A peer that keeps saying
 /// "more" without sending anything new is not followed; the anti-entropy
 /// timer tries again later.
+/// Before an insert into a T23 map: at [`MAX_T23_ENTRIES`], drop the entry
+/// whose time (`at`) is earliest, so the map never grows past the cap.
+fn cap_oldest<K: Clone + Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>, key: &K, at: impl Fn(&V) -> Instant) {
+    // An overwrite doesn't grow the map (tech lead): nothing to drop.
+    if map.len() < MAX_T23_ENTRIES || map.contains_key(key) {
+        return;
+    }
+    if let Some(oldest) = map.iter().min_by_key(|(_, v)| at(v)).map(|(k, _)| k.clone()) {
+        map.remove(&oldest);
+    }
+}
+
 fn follow_up(more: bool, added_any: bool) -> bool {
     more && added_any
 }
@@ -4047,6 +4102,117 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         for node in [a, b, c, d] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn t23_maps_stay_under_the_cap_dropping_the_oldest() {
+        let mut map: HashMap<u32, Instant> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..(MAX_T23_ENTRIES as u32 + 50) {
+            cap_oldest(&mut map, &i, |at| *at);
+            map.insert(i, start + Duration::from_millis(u64::from(i)));
+        }
+        assert_eq!(map.len(), MAX_T23_ENTRIES);
+        assert!(!map.contains_key(&0) && !map.contains_key(&49), "the oldest stayed");
+        assert!(map.contains_key(&(MAX_T23_ENTRIES as u32 + 49)), "the newest went");
+        // At the cap, overwriting a key drops nothing.
+        let key = MAX_T23_ENTRIES as u32 + 49;
+        cap_oldest(&mut map, &key, |at| *at);
+        map.insert(key, start);
+        assert_eq!(map.len(), MAX_T23_ENTRIES);
+        assert!(map.contains_key(&50), "an overwrite evicted the oldest");
+    }
+
+    /// 0.4.1 presence bug: three members in a triangle (each has another bound
+    /// member). One link resets and comes back: both ends must see each other
+    /// online again soon, not after T23's 10-minute re-probe wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn members_see_each_other_online_again_after_a_link_reset() {
+        use crate::testutil::test_key;
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let secret = ServerSecret::from_bytes([14; 32]);
+        async fn online(node: &Node, want: PublicKey) -> bool {
+            node.presence(server()).await.unwrap().online.contains(&want)
+        }
+        let id = |n: u8| test_key(n).identity();
+        let addr = |port: u16| -> Multiaddr { format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap() };
+        // C first; B meets C, then A meets C: A and B each already have a
+        // bound member when they meet, so their first probes are recorded.
+        let (c, _) = test_node_events("tri-c", None, None, access(2)).await;
+        c.open_server(server(), secret.clone()).unwrap();
+        let b = test_node("tri-b", None, Some(port_of(&c).await), access(1)).await;
+        b.open_server(server(), secret.clone()).unwrap();
+        let a = test_node("tri-a", None, Some(port_of(&c).await), access(0)).await;
+        a.open_server(server(), secret).unwrap();
+        // Generous: the Windows runner is slow to set up connections.
+        let wait = |what: &'static str| (what, Instant::now() + Duration::from_secs(60));
+        let (what, until) = wait("B and A bound to C");
+        while !(online(&b, id(2)).await && online(&a, id(2)).await) {
+            assert!(Instant::now() < until, "{what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        a.test_dial(addr(port_of(&b).await));
+        let (what, until) = wait("A and B bound");
+        while !(online(&a, id(1)).await && online(&b, id(0)).await) {
+            assert!(Instant::now() < until, "{what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The A–B link resets (a relay circuit reset), then A dials B again.
+        a.test_disconnect(b.peer_id());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Redial until linked again, over TCP and QUIC: on Windows a TCP
+        // redial from the reused listen port to the same peer can sit in
+        // TIME_WAIT for minutes (a real device would come back through the
+        // relay). Only the link is retried; the claim stays the same.
+        let port_b = port_of(&b).await;
+        let quic_b: Multiaddr = format!("/ip4/127.0.0.1/udp/{port_b}/quic-v1").parse().unwrap();
+        let (what, until) = wait("A and B online again after the reset");
+        let mut redial = Instant::now() - Duration::from_secs(10);
+        while !(online(&a, id(1)).await && online(&b, id(0)).await) {
+            assert!(Instant::now() < until, "{what}");
+            if redial.elapsed() >= Duration::from_secs(3) && !a.peers().await.unwrap().contains(&b.peer_id()) {
+                a.test_dial(addr(port_b));
+                a.test_dial(quic_b.clone());
+                redial = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for node in [a, b, c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// T24: T23 under `open` plus
+    /// the queue. Opening 40 servers back to back while an unbound peer is
+    /// connected sends ~40 control pulls within a second, past the peer's
+    /// burst (30); refused pulls aren't recorded as empty and are re-asked
+    /// (51 pulls for 40 logs). Fix: pace outgoing pulls per peer (e.g. burst
+    /// 20, 8/s) and drain the queue on a 1 s tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_opened_while_a_peer_is_connected_are_probed_once_each() {
+        use crate::testutil::test_key;
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let (opener, _events) = test_node_events("t23-opener", None, None, access(1)).await;
+        let peer = test_node("t23-peer", None, Some(port_of(&opener).await), access(0)).await;
+        peer.open_server(ServerId::from_bytes([99; 32]), ServerSecret::from_bytes([98; 32])).unwrap();
+        let start = Instant::now();
+        while opener.peers().await.unwrap().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never connected");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let before = peer.pulls_received().await;
+        for i in 0..40u8 {
+            opener.open_server(ServerId::from_bytes([20 + i; 32]), ServerSecret::from_bytes([120 + i; 32])).unwrap();
+        }
+        tokio::time::sleep(ANTI_ENTROPY * 3 + Duration::from_secs(1)).await;
+        let asked = peer.pulls_received().await - before;
+        assert!(asked <= 44, "{asked} pulls for 40 control logs (at most one each, plus a few)");
+        assert!(asked >= 40, "only {asked}: the opened servers weren't probed");
+        for node in [opener, peer] {
             node.shutdown().await.unwrap();
         }
     }

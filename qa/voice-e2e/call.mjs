@@ -272,7 +272,11 @@ function checkFileLog() {
 
 // ---- UI --------------------------------------------------------------------
 
-const entry = () => page.locator('.voice-room-entry');
+// Voice rooms (0.4.3): the pinned "Join chat" row opens a new room; a room's row joins it.
+const entry = () => page.locator('.voice-root');
+const roomRow = () => page.locator('.voice-room-row').first();
+/** The first live room in the server, through the bridge. */
+const firstRoom = async () => (await invoke('listVoiceRooms', serverId))[0];
 const roster = () => page.locator('ul.voice-room-people > li');
 const rosterNames = () => roster().locator('.call-person').allInnerTexts();
 async function rosterHas(names) {
@@ -312,9 +316,14 @@ async function openServer() {
   await entry().waitFor({ timeout: 30_000 });
 }
 
+/** A opens the room (it takes turns: A is in first), B joins A's room from its row. */
 async function joinViaUi() {
   await watchPeerConnections();
-  await entry().click();
+  if (ROLE === 'a') await entry().click();
+  else {
+    await roomRow().waitFor({ timeout: 30_000 });
+    await roomRow().click();
+  }
   // First call on this computer: the IP notice (#225) comes before any join.
   const notice = page.locator('.ip-notice');
   await check('V6.1', 'the IP notice shows before the first join, and no call starts until OK', async () => {
@@ -411,7 +420,7 @@ try {
   await openServer();
   log('server open in the UI');
 
-  await check('V1.1', 'one "Join chat" entry with the speaker icon in the sidebar', async () => {
+  await check('V1.1', 'one pinned "Join chat" row with the speaker icon in the sidebar', async () => {
     const n = await entry().count();
     if (n !== 1) throw new Error(`${n} entries`);
     if (!(await entry().locator('svg').count())) throw new Error('no icon');
@@ -440,6 +449,31 @@ try {
     await page.locator('.call-bar .call-mute').waitFor({ timeout: 5000 });
     await page.locator('.call-bar .call-leave').waitFor({ timeout: 5000 });
   });
+
+  // Voice rooms (0.4.4): the owner renames the room and sets its limit, both sides see it,
+  // and a member who is neither the host nor the owner can't edit it.
+  const rowShows = async () => {
+    const t = await roomRow().innerText().catch(() => '');
+    return /QA room/.test(t) && /2\/2/.test(t) ? t.replace(/\s+/g, ' ') : null;
+  };
+  if (ROLE === 'a') {
+    await check('VR.1', 'the owner renames the room and sets its limit to 2', async () => {
+      await invoke('editVoiceRoom', (await firstRoom()).roomId, 'QA room', 2);
+      return until('edit shown', rowShows, 15_000);
+    });
+    put('edited');
+  } else {
+    await take('edited');
+    await check('VR.2', 'B sees the new name and 2/2', () => until('edit seen', rowShows, 15_000));
+    await check('VR.3', 'a member (not host, not owner) can\'t edit the room', async () => {
+      const res = await invoke('editVoiceRoom', (await firstRoom()).roomId, 'B was here', 3).then(
+        () => 'accepted',
+        (e) => `refused: ${e?.code ?? e?.message ?? e}`,
+      );
+      if (res === 'accepted') throw new Error('editVoiceRoom accepted from a member');
+      return res;
+    });
+  }
 
   const connected = await check('V2.2', 'the WebRTC connection to the other side reaches "connected"', async () => {
     const c = await until('connected', async () => (await live()).find((x) => x.state === 'connected'), 45_000, 500);
@@ -577,6 +611,9 @@ try {
       await until('roster empty', async () => (await roster().count()) === 0, 15_000);
       return `${((Date.now() - at) / 1000).toFixed(1)} s`;
     });
+    await check('VR.4', 'B sees the room end when everyone has left (no row)', () =>
+      until('no room row', async () => (await page.locator('.voice-room-row').count()) === 0, 15_000),
+    );
     put('saw-empty');
   } else {
     const { at } = await take('left');
@@ -592,6 +629,13 @@ try {
       await page.locator('.call-bar').waitFor({ state: 'detached', timeout: 10_000 });
       await until('roster empty', async () => (await roster().count()) === 0, 10_000);
     });
+    await check('VR.4', 'the room ends when everyone has left (no room in the core, no row)', () =>
+      until(
+        'no rooms',
+        async () => (await invoke('listVoiceRooms', serverId)).length === 0 && (await page.locator('.voice-room-row').count()) === 0,
+        15_000,
+      ),
+    );
     put('left');
     // Rejoining (V6.4) before B has seen the empty roster would race its check.
     await take('saw-empty');
@@ -615,9 +659,8 @@ try {
       const reason = await page.locator('.voice-room-reason').innerText({ timeout: 5000 });
       return reason;
     });
-    await check('V3.2', 'relay-only: the core refuses joinCall', async () => {
-      const room = await invoke('getVoiceRoom', serverId);
-      const res = await invoke('joinCall', room.roomId).then(
+    await check('V3.2', 'relay-only: the core refuses to open a room', async () => {
+      const res = await invoke('createVoiceRoom', serverId).then(
         () => 'joined',
         (e) => e.message,
       );
@@ -650,11 +693,19 @@ try {
     await take('v3-done');
   }
 
-  // V4: both back in the room, then the owner kicks B.
-  await entry().click();
-  await page.locator('.call-bar').waitFor({ timeout: 15_000 });
+  // V4: both back in one room (A opens it, B joins it), then the owner kicks B.
+  if (ROLE === 'a') {
+    await entry().click();
+    await page.locator('.call-bar').waitFor({ timeout: 15_000 });
+    put('v4-room');
+  } else {
+    await take('v4-room');
+    await roomRow().waitFor({ timeout: 30_000 });
+    await roomRow().click();
+    await page.locator('.call-bar').waitFor({ timeout: 15_000 });
+  }
   await until('both in roster', () => rosterHas([NAME.a, NAME.b]), 30_000).catch(() => {});
-  const room = await invoke('getVoiceRoom', serverId);
+  const room = await firstRoom();
   put('in-for-kick');
   await take('in-for-kick');
   if (ROLE === 'a') {
@@ -676,8 +727,8 @@ try {
     );
     await check('V4.4', 'the owner is still in the call, alone', async () => {
       if (!(await page.locator('.call-bar').count())) throw new Error('the owner\'s call ended');
-      const r = await invoke('getVoiceRoom', serverId);
-      if (r.participants.length !== 1) throw new Error(JSON.stringify(r.participants));
+      const r = await firstRoom();
+      if (r?.members.length !== 1) throw new Error(JSON.stringify(r?.members));
     });
     await take('kick-checked');
   } else {
@@ -699,7 +750,7 @@ try {
       throw new Error(`${what} was allowed`);
     };
     await check('V4.2', 'the kicked member can\'t read the room or join the call again', async () => {
-      const r1 = await until('getVoiceRoom refused', () => refused('getVoiceRoom', () => invoke('getVoiceRoom', serverId)), 15_000);
+      const r1 = await until('listVoiceRooms refused', () => refused('listVoiceRooms', () => invoke('listVoiceRooms', serverId)), 15_000);
       const r2 = await refused('joinCall', () => invoke('joinCall', room.roomId));
       return `${r1}; ${r2}`;
     });

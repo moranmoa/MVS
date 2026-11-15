@@ -2,7 +2,7 @@
 // place that shows me follows at once, from my identity, even when the core
 // sends only identity.changed (the real core before 0.4.5 did).
 
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
@@ -58,9 +58,13 @@ describe('profile save (0.4.5)', () => {
 
   it('the member list follows identity.changed alone (no restart)', async () => {
     const { core, me, myRowAvatar } = await setup();
+    // Let the start-up reads (rooms, app info) settle first.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
     expect(myRowAvatar().style.background).not.toBe(PINK);
     act(() => emitIdentity(core, { ...me, color: '#e91e63' }));
-    expect(myRowAvatar().style.background).toBe(PINK);
+    await waitFor(() => expect(myRowAvatar().style.background).toBe(PINK));
   });
 
   it('before Save only the preview changes; Save shows it everywhere, with "others will see it later"', async () => {

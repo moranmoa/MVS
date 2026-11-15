@@ -3612,6 +3612,67 @@ fn a_new_name_reaches_every_server_i_am_in() {
     assert_eq!(name_seen_by(&bob, &one.id, &owner_id), "MoA");
 }
 
+/// Profile save (#378, acceptance 7): `updateProfile` emits `members.changed`
+/// with my new row for each server I'm a member of (not one I was kicked
+/// from), and my own row shows my saved profile even while the post waits
+/// (past the burst).
+#[test]
+fn a_profile_save_updates_my_member_row_everywhere_at_once() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let bob = world.peer();
+    let bob_id = sign_up(&bob, "Bob").id;
+    let one = owner.core.create_server("One", AgeRestriction::None).unwrap();
+    let two = owner.core.create_server("Two", AgeRestriction::None).unwrap();
+    let gone = owner.core.create_server("Gone", AgeRestriction::None).unwrap();
+    for server in [&one, &two, &gone] {
+        bob.core.join_server(&server.invite_link).unwrap();
+    }
+    owner.core.sync_now().unwrap();
+    owner.core.kick_member(&gone.id, &bob_id).unwrap();
+    bob.core.sync_now().unwrap();
+
+    let save = |color: &str| {
+        bob.core
+            .update_profile(ProfileInput {
+                display_name: "Bob".into(),
+                bio: None,
+                avatar_data_url: None,
+                avatar_small: None,
+                color: Some(color.into()),
+            })
+            .unwrap();
+    };
+    let my_rows = |events: Vec<Event>| -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::MembersChanged { server_id, members } => {
+                    let me = members.into_iter().find(|m| m.id == bob_id).unwrap();
+                    Some((server_id, me.color))
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    // Three saves use the burst; the fourth's post waits, but my rows don't.
+    for (i, color) in ["#000001", "#000002", "#000003", "#000004"].iter().enumerate() {
+        bob.events.take();
+        save(color);
+        let mut expected = vec![(one.id.clone(), Some(color.to_string())), (two.id.clone(), Some(color.to_string()))];
+        expected.sort();
+        assert_eq!(my_rows(bob.events.take()), expected, "save {i}");
+    }
+    let row = bob.core.list_members(&one.id).unwrap().into_iter().find(|m| m.id == bob_id).unwrap();
+    assert_eq!(row.color.as_deref(), Some("#000004"), "my row, before the post goes out");
+    owner.core.sync_now().unwrap();
+    let seen = owner.core.list_members(&one.id).unwrap().into_iter().find(|m| m.id == bob_id).unwrap();
+    assert_eq!(seen.color.as_deref(), Some("#000003"), "others: the last post, until the next one");
+}
+
 /// A keychain whose deletes can be made to fail (a locked keychain):
 /// `deletes_fail` all of them, `check_delete_fails` only the
 /// recovery-check marker's.
@@ -4627,20 +4688,19 @@ fn profile_picture_and_colour_reach_other_members() {
     // a colour) fits one post and is published (the 4 KiB check guards it).
     let mut largest = profile(Some(&small_webp(48, 2_512)), Some("#ffffff"));
     largest.display_name = "🙂".repeat(128);
-    bob.core.update_profile(largest).unwrap();
+    // #378: an explicit save posts at once, up to a burst of three.
     let before = posts();
-    advance(&world, api::PROFILE_POST_EVERY_MS);
-    bob.core.sync_now().unwrap();
-    assert_eq!(posts(), before + 1, "the largest profile wasn't published");
-    advance(&world, api::PROFILE_POST_EVERY_MS);
+    bob.core.update_profile(largest).unwrap();
+    assert_eq!(posts(), before + 1, "the largest profile wasn't published at once");
     bob.core.update_profile(profile(Some(&pic), Some("#3b82f6"))).unwrap();
+    assert_eq!(posts(), before + 2, "the third save of the burst");
 
-    // Coalesced: two changes within 10 minutes, one post when they're up.
+    // Past the burst: two more changes coalesce into one post, 10 minutes on.
     let before = posts();
     bob.core.update_profile(profile(None, Some("#ff0000"))).unwrap();
     bob.core.update_profile(profile(None, Some("#00ff00"))).unwrap();
     bob.core.sync_now().unwrap();
-    assert_eq!(posts(), before, "posted within 10 minutes of the last");
+    assert_eq!(posts(), before, "posted past the burst");
     advance(&world, api::PROFILE_POST_EVERY_MS);
     bob.core.sync_now().unwrap();
     assert_eq!(posts(), before + 1);

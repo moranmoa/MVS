@@ -71,6 +71,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::CallState(_) => "call.state",
             Event::CallSignal { .. } => "call.signal",
             Event::VoiceRooms { .. } => "voice.rooms",
+            Event::MemberRelayChanged(_) => "memberRelay.changed",
         })
         .collect()
 }
@@ -4791,4 +4792,155 @@ fn unplaced_channels_keep_creation_order_and_the_first_move_lands() {
         member.core.sync_now().unwrap();
         assert_eq!(channel_names(&member.core.list_channels(&server.id).unwrap()), after);
     }
+}
+
+fn relay_of(peer: &Peer) -> MemberRelay {
+    peer.core.get_member_relay().unwrap()
+}
+
+/// The `memberRelay.changed` payloads since the last take.
+fn relay_events(peer: &Peer) -> Vec<MemberRelay> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::MemberRelayChanged(m) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Member relays, slice 1 (#368): `auto` is on for an owner or admin and off
+/// for a plain member; a demotion turns it off and a promotion back on (read
+/// from the log); relay-only forces it off and turning it off restores it;
+/// `memberRelay.changed` fires once per change and never without one.
+#[test]
+fn member_relay_follows_my_role_and_is_forced_off() {
+    use MemberRelaySetting::{Auto, Off};
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let bob = world.peer();
+    let bob_id = sign_up(&bob, "Bob").id;
+
+    // No server yet: auto, off, no role, the defaults.
+    let r = relay_of(&owner);
+    assert_eq!((r.setting, r.effective, r.role, r.reason, r.disclosure_seen), (Auto, false, false, None, false));
+    assert_eq!(r.daily_cap_mb, api::MEMBER_RELAY_CAP_DEFAULT_MB);
+    owner.events.take();
+
+    // An owner under auto: the role, but not relaying until the one-time
+    // disclosure is acknowledged (PO on #387); then on. One event each.
+    let server = owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(!ev[0].effective && ev[0].role && !ev[0].disclosure_seen);
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].disclosure_seen);
+
+    // A plain member: off, and joining as one changes nothing.
+    bob.events.take();
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(!relay_of(&bob).effective && !relay_of(&bob).role);
+    assert!(relay_events(&bob).is_empty(), "nothing changed for a plain member");
+    // Bob acknowledges the disclosure now (the toggle's first use).
+    bob.core.mark_member_relay_disclosure_seen().unwrap();
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // Promoted to admin (read from the log): on. Nothing new: no event.
+    owner.core.grant_role(&server.id, &bob_id, Role::Admin).unwrap();
+    bob.core.sync_now().unwrap();
+    let ev = relay_events(&bob);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].role);
+    bob.core.sync_now().unwrap();
+    assert!(relay_events(&bob).is_empty(), "no change, no event");
+
+    // Demoted: off under auto. Promoted again: back on.
+    owner.core.revoke_role(&server.id, &bob_id).unwrap();
+    bob.core.sync_now().unwrap();
+    let ev = relay_events(&bob);
+    assert_eq!(ev.len(), 1);
+    assert!(!ev[0].effective && !ev[0].role);
+    owner.core.grant_role(&server.id, &bob_id, Role::Admin).unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(relay_of(&bob).effective);
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // The setting: off wins over the role; the same setting again is no change.
+    let r = bob.core.set_member_relay(Off).unwrap();
+    assert!(!r.effective && r.role && r.reason.is_none());
+    assert_eq!(relay_events(&bob).len(), 1);
+    bob.core.set_member_relay(Off).unwrap();
+    assert!(relay_events(&bob).is_empty(), "the same setting again");
+    bob.core.set_member_relay(Auto).unwrap();
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // Relay-only forces it off, with the reason; off again restores it.
+    bob.core.set_relay_only(true).unwrap();
+    let r = relay_of(&bob);
+    assert_eq!((r.effective, r.reason), (false, Some(MemberRelayReason::RelayOnly)));
+    assert_eq!(relay_events(&bob).len(), 1);
+    bob.core.set_relay_only(false).unwrap();
+    assert!(relay_of(&bob).effective && relay_of(&bob).reason.is_none());
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // Leaving my only server: off under auto.
+    bob.core.leave_server(&server.id).unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(!relay_of(&bob).effective && !relay_of(&bob).role);
+    assert_eq!(relay_events(&bob).len(), 1);
+}
+
+/// Member relays: a minor (no trusted adult birth date) stays off even with
+/// "on", and even as an owner.
+#[test]
+fn member_relay_is_off_for_a_minor() {
+    let world = World::new();
+    let kid = world.peer();
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "2015-05-01".into() };
+    let created = kid.core.create_identity(input).unwrap();
+    assert!(answer(&kid, &created.words, &[]).1.unwrap().ok);
+    kid.core.create_server("Mine", AgeRestriction::None).unwrap();
+    let r = kid.core.set_member_relay(MemberRelaySetting::On).unwrap();
+    assert_eq!((r.effective, r.role, r.reason), (false, true, Some(MemberRelayReason::Minor)));
+}
+
+/// Member relays: the daily cap is 2,048 MB by default and 256..=51,200
+/// MB, else `bad-request`; it, the setting and the disclosure survive a
+/// restart.
+#[test]
+fn member_relay_cap_and_setting_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-relay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("core.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let secrets = Arc::new(MemoryStore::new());
+    let world = World::new();
+    {
+        let peer = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
+        sign_up(&peer, "Kept");
+        assert_eq!(relay_of(&peer).daily_cap_mb, 2_048);
+        for bad in [0, 255, 51_201] {
+            assert_eq!(peer.core.set_member_relay_cap(bad).unwrap_err().code, ErrorCode::BadRequest, "{bad}");
+        }
+        assert_eq!(peer.core.set_member_relay_cap(256).unwrap().daily_cap_mb, 256);
+        peer.events.take();
+        assert_eq!(peer.core.set_member_relay_cap(51_200).unwrap().daily_cap_mb, 51_200);
+        assert_eq!(relay_events(&peer).len(), 1, "a new cap is announced");
+        // An explicit "on" waits for the disclosure too (PO on #387).
+        assert!(!peer.core.set_member_relay(MemberRelaySetting::On).unwrap().effective);
+        peer.core.mark_member_relay_disclosure_seen().unwrap();
+        assert!(relay_of(&peer).effective);
+    }
+    let peer = world.peer_with(secrets, Some(db), Arc::new(PendingGroupKeys));
+    let r = relay_of(&peer);
+    assert_eq!((r.setting, r.daily_cap_mb, r.disclosure_seen), (MemberRelaySetting::On, 51_200, true));
+    assert!(r.effective, "on, for an adult with no server");
+    drop(peer);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

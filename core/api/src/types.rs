@@ -498,6 +498,9 @@ pub enum Event {
     /// while I'm a member. A hint: `listVoiceRooms` re-reads it.
     #[serde(rename = "voice.rooms", rename_all = "camelCase")]
     VoiceRooms { server_id: Id, rooms: Vec<VoiceRoom> },
+    /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
+    #[serde(rename = "memberRelay.changed")]
+    MemberRelayChanged(MemberRelay),
     /// Once, after `markHealthy` commits a new version. Text only.
     #[serde(rename = "update.installed")]
     UpdateInstalled { version: String, notes: Option<String> },
@@ -642,4 +645,46 @@ pub enum SignalKind {
 pub enum Connection {
     Direct,
     Relay,
+}
+
+/// Member relays (#368, slice 1): `setMemberRelay`'s setting. `Auto`: on
+/// while I'm owner or admin in a server I'm still a member of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRelaySetting {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Why relaying is off whatever the setting (the first that applies).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemberRelayReason {
+    /// The signed manifest's flag. Reserved: slice 3.
+    GlobalOff,
+    /// No trusted adult birth date (the age claim's rule).
+    Minor,
+    /// Relay-only is on.
+    RelayOnly,
+    /// A metered network. Reserved: slice 3.
+    Metered,
+}
+
+/// `getMemberRelay`'s answer, and `memberRelay.changed`'s payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRelay {
+    pub setting: MemberRelaySetting,
+    /// Relaying for my members now (slice 2's relay reads this). False
+    /// until the one-time disclosure was acknowledged (PO on #387).
+    pub effective: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<MemberRelayReason>,
+    /// `Auto` would turn it on: I'm owner or admin somewhere.
+    pub role: bool,
+    pub disclosure_seen: bool,
+    /// The daily byte cap, 256..=51,200 MB (default 2,048).
+    pub daily_cap_mb: u32,
 }

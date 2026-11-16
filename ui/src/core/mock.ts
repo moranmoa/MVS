@@ -9,6 +9,8 @@ import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
 import type {
   CallState,
   VoiceRoom,
+  MemberRelay,
+  MemberRelaySetting,
   VoiceRoomMember,
   AgeRestriction,
   AppInfo,
@@ -76,6 +78,10 @@ export interface MockOptions {
   roomFull?: boolean;
   /** Voice rooms (0.4.3): how many live rooms each demo server starts with (default 1; 0 = none; up to 10). */
   voiceRooms?: number;
+  /** Member relays: forced off for this reason (under 18, metered, turned off for everyone). */
+  memberRelayReason?: 'minor' | 'metered' | 'global-off';
+  /** Member relays: the one-time disclosure not seen yet (shows at start for an owner). */
+  memberRelayUnseen?: boolean;
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -1402,6 +1408,61 @@ export class MockCore implements CoreApi {
       if (here) here.room.members = here.room.members.filter((p) => p.userId !== this.identity?.id);
     }
     for (const id of this.servers.keys()) this.emitRooms(id);
+    this.emitMemberRelay();
+  }
+
+  // ---- member relays, slice 1 (#368) -------------------------------------------
+
+  private memberRelaySetting: MemberRelaySetting = 'auto';
+  private memberRelaySeen: boolean | null = null;
+  private memberRelayCap = 2048;
+
+  private memberRelay(): MemberRelay {
+    const me = this.identity?.id;
+    // auto: on for an owner (the core: or an admin) of a server I'm in.
+    const role = [...this.servers.values()].some((s) => !s.summary.closed && s.summary.ownerId === me);
+    const reason = this.options.memberRelayReason ?? (this.relayOnly ? 'relay-only' : undefined);
+    const wanted = this.memberRelaySetting === 'auto' ? role : this.memberRelaySetting === 'on';
+    const seen = this.memberRelaySeen ?? !this.options.memberRelayUnseen;
+    return {
+      setting: this.memberRelaySetting,
+      // As the core: nothing relays before the disclosure was acknowledged (PO).
+      effective: !reason && wanted && seen,
+      ...(reason ? { reason } : {}),
+      role,
+      disclosureSeen: seen,
+      dailyCapMb: this.memberRelayCap,
+    };
+  }
+
+  private emitMemberRelay(): void {
+    this.emit('memberRelay.changed', this.memberRelay());
+  }
+
+  async getMemberRelay(): Promise<MemberRelay> {
+    return this.memberRelay();
+  }
+
+  async setMemberRelay(setting: MemberRelaySetting): Promise<MemberRelay> {
+    await this.wait(100);
+    if (setting !== 'auto' && setting !== 'on' && setting !== 'off') throw err({ code: 'bad-request' });
+    this.memberRelaySetting = setting;
+    this.emitMemberRelay();
+    return this.memberRelay();
+  }
+
+  async setMemberRelayCap(mb: number): Promise<MemberRelay> {
+    await this.wait(100);
+    if (!Number.isInteger(mb) || mb < 256 || mb > 51200) throw err({ code: 'bad-request' });
+    this.memberRelayCap = mb;
+    this.emitMemberRelay();
+    return this.memberRelay();
+  }
+
+  async markMemberRelayDisclosureSeen(): Promise<null> {
+    this.memberRelaySeen = true;
+    this.emitMemberRelay();
+    return null;
   }
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {

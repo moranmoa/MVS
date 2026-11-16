@@ -11,6 +11,7 @@ import { textDir, useUiDir } from '../../app/textDir';
 import { ProfileEditor, type ProfileEditorHandle } from './ProfileEditor';
 import { SignOutButton } from './SignOut';
 import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/notify';
+import { MemberRelaySetting } from './MemberRelay';
 
 type Section = 'account' | 'privacy' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
 const SECTIONS: Section[] = ['account', 'privacy', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
@@ -525,6 +526,7 @@ function PrivacySection({ focus }: { focus?: number }) {
           <FormattedMessage id="invite.failed" />
         </p>
       )}
+      <MemberRelaySetting />
     </div>
   );
 }

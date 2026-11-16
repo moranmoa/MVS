@@ -237,6 +237,31 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `CallState.relayOnly`.
   - After a change, one `voice.rooms` per server at the next sync round carries the new value.
 - `CoreError.code`, voice: `'call-full' | 'relay-only' | 'in-call-elsewhere' | 'room-cap'`.
+- Member relays (#368, slice 1). The setting only: the relay itself is slice 2.
+  - `MemberRelay { setting: 'auto' | 'on' | 'off', effective: boolean, reason?: 'global-off' | 'minor' | 'relay-only' | 'metered', role: boolean, disclosureSeen: boolean, dailyCapMb: number }`.
+    - `setting` is stored in the core database, per device, and defaults to `'auto'`.
+    - `role` is true when I'm owner or admin in at least one server where I'm still a member (not closed, kicked or left), by the log as read so far.
+    - `'auto'` means `role`.
+    - `effective` is false until the one-time disclosure is acknowledged with `markMemberRelayDisclosureSeen` (PO on #387), whatever the setting. It's the one value slice 2's relay reads, so it fails closed. The UI shows the disclosure when relaying would be on but `disclosureSeen` is false: no `reason`, and the setting is `'on'`, or `'auto'` with `role`.
+    - `reason` forces `effective` off, whatever the setting. The first that applies wins:
+      1. `global-off`: the signed manifest's flag. Reserved; slice 3, never set yet.
+      2. `minor`: no trusted adult birth date (the age claim's rule: a restored date counts only once it agrees or its 30 days are up).
+      3. `relay-only`: relay-only is on.
+      4. `metered`: reserved; slice 3, never set yet.
+    - Without an identity, `effective` is false.
+    - `dailyCapMb` defaults to 2048.
+  - `getMemberRelay()` returns `MemberRelay`.
+  - `setMemberRelay(setting)` returns `MemberRelay`. A setting other than those three is `bad-request`.
+  - `setMemberRelayCap(mb: number)` returns `MemberRelay`. Values from 256 to 51200 are accepted; anything else is `bad-request`.
+  - `markMemberRelayDisclosureSeen()` returns `null`.
+  - Event `memberRelay.changed`, with a `MemberRelay` payload. It fires once whenever any field differs from the last value announced, and never otherwise. That covers:
+    - a role read from the log (promote, demote, ownership);
+    - a join or leave;
+    - relay-only toggled;
+    - the birth date changing, or its 30 days ending;
+    - the setting, the cap or the disclosure changing.
+    The core checks after every command and every sync round.
+  - `core.status.memberRelay.effective` is the desktop shell's to add (it builds `core.status`). It can follow `memberRelay.changed`.
 - Invites (#208), all moderator and up (`not-allowed` below that):
   - `createInvite(serverId, input?: { expiresMs?: number, maxUses?: number })`
     returns `{ id, link, expiresAt?, maxUses? }`. `expiresMs` is the last time a

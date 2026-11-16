@@ -26,6 +26,8 @@ export * from './types';
  *   ?pendingDob=1    a birth-date correction waits its 30 days (B7, #306)
  *   ?signOutKeyring=1 signOut fails with keyring-unavailable (#304)
  *   ?profileError=1  updateProfile fails (B11e)
+ *   ?memberRelay=minor|metered|global-off  member relaying is forced off for that reason
+ *   ?memberRelayUnseen=1  the member-relay disclosure is not seen yet (shows at start)
  *   ?roomFull=1      the first demo voice room already has 5 people
  *   ?voiceRooms=<n>  each demo server starts with n live voice rooms (default 1, 0–10)
  *   ?stun=<url>      the desktop shell's STUN URL for voice (stun:host:port)
@@ -62,6 +64,8 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     pendingDob: params.has('pendingDob'),
     keyPending: (params.get('keyPending') as MockOptions['keyPending']) ?? undefined,
     relayOnly: params.has('relayOnly'),
+    memberRelayReason: (['minor', 'metered', 'global-off'] as const).find((r) => r === params.get('memberRelay')),
+    memberRelayUnseen: params.has('memberRelayUnseen'),
     outdatedMembers: params.has('outdated'),
     closedServer: params.has('closed'),
     stunUrl: params.get('stun') ?? undefined,

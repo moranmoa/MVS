@@ -231,6 +231,16 @@ struct ChannelArg {
 }
 
 #[derive(Deserialize)]
+struct MemberRelayArg {
+    setting: MemberRelaySetting,
+}
+
+#[derive(Deserialize)]
+struct MemberRelayCapArg {
+    mb: u32,
+}
+
+#[derive(Deserialize)]
 struct RelayOnlyArg {
     on: bool,
 }
@@ -369,6 +379,10 @@ impl Core {
             "getAppInfo" => ok(self.get_app_info()),
             "setUpdateChannel" => ok(self.set_update_channel(args::<ChannelArg>(raw)?.channel)),
             "setRelayOnly" => ok(self.set_relay_only(args::<RelayOnlyArg>(raw)?.on)),
+            "getMemberRelay" => ok(self.get_member_relay()),
+            "setMemberRelay" => ok(self.set_member_relay(args::<MemberRelayArg>(raw)?.setting)),
+            "setMemberRelayCap" => ok(self.set_member_relay_cap(args::<MemberRelayCapArg>(raw)?.mb)),
+            "markMemberRelayDisclosureSeen" => ok(self.mark_member_relay_disclosure_seen()),
             // The shell restarts; nothing for the core to do.
             "restartToUpdate" => Ok(Value::Null),
 

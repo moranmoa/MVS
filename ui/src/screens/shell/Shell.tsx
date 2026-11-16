@@ -11,6 +11,7 @@ import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
 import { SettingsScreen } from '../settings/SettingsScreen';
+import { MemberRelayFirstRun } from '../settings/MemberRelay';
 import { ChannelDialog, type ChannelDialogMode } from './ChannelDialog';
 import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
@@ -343,6 +344,8 @@ export function Shell() {
           <RecoveryCheck onChecked={closeCheck} onShowAgain={() => setShowWords(true)} />
         )}
       </Dialog>
+      {/* Member relays (#368): the one-time disclosure, the first time relaying is on. */}
+      <MemberRelayFirstRun />
       <SettingsScreen
         open={settingsOpen}
         request={settingsRequest}

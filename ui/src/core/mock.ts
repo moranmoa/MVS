@@ -1423,12 +1423,14 @@ export class MockCore implements CoreApi {
     const role = [...this.servers.values()].some((s) => !s.summary.closed && s.summary.ownerId === me);
     const reason = this.options.memberRelayReason ?? (this.relayOnly ? 'relay-only' : undefined);
     const wanted = this.memberRelaySetting === 'auto' ? role : this.memberRelaySetting === 'on';
+    const seen = this.memberRelaySeen ?? !this.options.memberRelayUnseen;
     return {
       setting: this.memberRelaySetting,
-      effective: !reason && wanted,
+      // As the core: nothing relays before the disclosure was acknowledged (PO).
+      effective: !reason && wanted && seen,
       ...(reason ? { reason } : {}),
       role,
-      disclosureSeen: this.memberRelaySeen ?? !this.options.memberRelayUnseen,
+      disclosureSeen: seen,
       dailyCapMb: this.memberRelayCap,
     };
   }

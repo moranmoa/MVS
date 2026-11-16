@@ -75,7 +75,8 @@ describe('member relays, slice 1', () => {
   it('PO gate: a default-on owner sees the disclosure at start, and OK sends the acknowledgement to the core', async () => {
     const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, memberRelayUnseen: true });
     // Default-on for an owner: the setting is auto, the role turns it on, not seen yet.
-    expect(await core.getMemberRelay()).toMatchObject({ setting: 'auto', role: true, disclosureSeen: false });
+    // Not relaying until the acknowledgement (the core gates effective on it).
+    expect(await core.getMemberRelay()).toMatchObject({ setting: 'auto', role: true, disclosureSeen: false, effective: false });
     const ack = vi.spyOn(core, 'markMemberRelayDisclosureSeen');
     render(<App core={core} initialSettings={en} />);
     await screen.findByRole('textbox', { name: /^Message / });

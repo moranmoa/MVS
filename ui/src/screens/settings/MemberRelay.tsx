@@ -68,9 +68,9 @@ export function MemberRelayDisclosure({ open, onClose }: { open: boolean; onClos
 
 /**
  * PO: relaying must not start before the disclosure was shown once, so the
- * core may keep `effective` false until it is acknowledged. The disclosure
- * therefore follows what the setting would do: no reason, and "on", or
- * "auto" for an owner or admin.
+ * core keeps `effective` false until it is acknowledged (any setting). The
+ * toggle, the daily limit and the disclosure follow what the setting would
+ * do: no reason, and "on", or "auto" for an owner or admin.
  */
 export function wouldRelay(r: MemberRelay): boolean {
   return r.effective || (!r.reason && (r.setting === 'on' || (r.setting === 'auto' && r.role)));
@@ -115,7 +115,7 @@ export function MemberRelaySetting() {
           type="checkbox"
           role="switch"
           className="switch"
-          checked={relay.effective}
+          checked={wouldRelay(relay)}
           disabled={busy || blocked}
           aria-describedby={`member-relay-hint${blocked ? ' member-relay-reason' : ''}`}
           onChange={(e) => void set(e.target.checked ? 'on' : 'off')}
@@ -140,7 +140,7 @@ export function MemberRelaySetting() {
           <FormattedMessage id="memberRelay.disclosure.show" />
         </button>
       </p>
-      {relay.effective && <DailyCap relay={relay} />}
+      {wouldRelay(relay) && <DailyCap relay={relay} />}
       {relay.setting !== 'auto' && !blocked && (
         <button type="button" className="link small member-relay-default" disabled={busy} onClick={() => void set('auto')}>
           <FormattedMessage id="memberRelay.backToDefault" />

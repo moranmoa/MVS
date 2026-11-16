@@ -29,6 +29,8 @@ import type {
   CallState,
   CallSignal,
   VoiceRoom,
+  MemberRelay,
+  MemberRelaySetting,
 } from './types';
 
 export interface CoreCommands {
@@ -172,6 +174,11 @@ export interface CoreCommands {
    * Shown up front as `AppInfo.relayOnly` and `VoiceRoom.relayOnly`.
    */
   setRelayOnly(on: boolean): Promise<void>;
+  /** Member relays (slice 1, #368): the setting, what it is now, and why it's off. */
+  getMemberRelay(): Promise<MemberRelay>;
+  setMemberRelay(setting: MemberRelaySetting): Promise<MemberRelay>;
+  /** The one-time disclosure was acknowledged ("OK"). */
+  markMemberRelayDisclosureSeen(): Promise<null>;
   restartToUpdate(): Promise<void>;
 }
 
@@ -218,6 +225,8 @@ export interface CoreEvents {
   'call.signal': CallSignal;
   /** A server's rooms changed (create, join, leave, mute, edit, timeout), mine or not. Coalesced; a hint: re-read with listVoiceRooms. */
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
+  /** Member relays: anything in it changed (role, servers, relay-only, birth date, setting). */
+  'memberRelay.changed': MemberRelay;
 }
 
 export type CoreEventName = keyof CoreEvents;

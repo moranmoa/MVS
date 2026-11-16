@@ -306,6 +306,21 @@ export interface VoiceRoom {
   relayOnly?: boolean;
 }
 
+/** Member relays, slice 1 (design #368): relaying for my servers' members. */
+export type MemberRelaySetting = 'auto' | 'on' | 'off';
+/** Why it is off whatever the setting (first match). */
+export type MemberRelayReason = 'global-off' | 'minor' | 'relay-only' | 'metered';
+export interface MemberRelay {
+  setting: MemberRelaySetting;
+  /** Relaying now. */
+  effective: boolean;
+  reason?: MemberRelayReason;
+  /** `auto` would turn it on: I'm an owner or admin in a server I'm in. */
+  role: boolean;
+  /** The one-time disclosure was acknowledged. */
+  disclosureSeen: boolean;
+}
+
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */
 export interface CallSignal {
   from: Id;

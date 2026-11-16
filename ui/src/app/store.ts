@@ -5,7 +5,7 @@
 
 import { useSyncExternalStore } from 'react';
 import type { CoreApi } from '../core/api';
-import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom } from '../core/types';
+import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom, MemberRelay } from '../core/types';
 import { liveMutes, loadMutes, MUTE_DURATIONS, MUTE_FOREVER, nextExpiry, saveMutes, type MuteDuration, type MuteKey, type Mutes } from './mute';
 
 const PAGE = 100;
@@ -130,6 +130,8 @@ export interface StoreState {
    * voice room, and also learned from a call ended or a join refused for it.
    */
   relayOnly: boolean;
+  /** Member relays (slice 1, #368); null until read. */
+  memberRelay: MemberRelay | null;
   /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
   settingsRequest: { section: string; at: number } | null;
   /** A short confirmation toast (an i18n id), e.g. "Copied" after a menu copy. */
@@ -151,6 +153,7 @@ export class Store {
     callError: null,
     voiceRooms: {},
     relayOnly: false,
+    memberRelay: null,
     flash: null,
     settingsRequest: null,
     serverGone: null,
@@ -230,6 +233,7 @@ export class Store {
         });
       }),
       on('voice.rooms', (p) => this.setRooms(p.serverId, p.rooms)),
+      on('memberRelay.changed', (r) => this.setMemberRelay(r)),
       on('update.rolledBack', (u) => this.set({ updateNote: { kind: 'rolledBack', ...u } })),
       // rekey-waiting: the failed message's own line says why; no toast (UX, #289).
       on('notice', (n) => n.kind !== 'rekey-waiting' && this.set({ notice: { ...n, kind: n.kind, at: Date.now() } })),
@@ -246,6 +250,8 @@ export class Store {
     // Relay-only is per device and needs no identity (#272).
     const info = await this.core.getAppInfo().catch(() => null);
     if (info) this.set({ relayOnly: info.relayOnly === true });
+    const relay = await this.core.getMemberRelay().catch(() => null);
+    if (relay) this.set({ memberRelay: relay });
     if (identity) await this.loadServers();
   }
 
@@ -414,6 +420,10 @@ export class Store {
   }
 
   /** Settings → Privacy (#272). The core ends a call in progress when it goes on. */
+  setMemberRelay(memberRelay: MemberRelay): void {
+    this.set({ memberRelay });
+  }
+
   async setRelayOnly(on: boolean): Promise<void> {
     await this.core.setRelayOnly(on);
     this.set({ relayOnly: on, ...(on ? {} : { callError: this.state.callError === 'relay-only' ? null : this.state.callError }) });

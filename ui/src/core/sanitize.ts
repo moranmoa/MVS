@@ -21,6 +21,7 @@ import type {
   ServerSummary,
   CallState,
   VoiceRoom,
+  MemberRelay,
   Id,
 } from './types';
 
@@ -423,6 +424,26 @@ export function cleanVoiceRooms(serverId: unknown, rooms: unknown): VoiceRoom[] 
   return out.sort((a, b) => a.createdAt - b.createdAt);
 }
 
+/** Member relays (slice 1): the whole object, or null to drop it (anything unknown or mistyped). */
+export function cleanMemberRelay(r: unknown): MemberRelay | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['setting', 'effective', 'reason', 'role', 'disclosureSeen'])) return null;
+  const { setting, effective, reason, role, disclosureSeen } = r as Record<string, unknown>;
+  if (setting !== 'auto' && setting !== 'on' && setting !== 'off') return null;
+  if (typeof effective !== 'boolean' || typeof role !== 'boolean' || typeof disclosureSeen !== 'boolean') return null;
+  const REASONS = ['global-off', 'minor', 'relay-only', 'metered'] as const;
+  const why = REASONS.find((x) => x === reason);
+  if (reason !== undefined && reason !== null && !why) return null;
+  // A reason means off, whatever the setting.
+  if (why && effective) return null;
+  return { setting, effective, ...(why ? { reason: why } : {}), role, disclosureSeen };
+}
+
+const mustRelay = (r: unknown): MemberRelay => {
+  const clean = cleanMemberRelay(r);
+  if (!clean) throw { code: 'internal' };
+  return clean;
+};
+
 /** A cleaner may return null to drop the event altogether. */
 const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[E] | null } = {
   'identity.changed': cleanIdentity,
@@ -447,6 +468,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'window.closeRequest': () => ({}),
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
   'call.state': (c) => cleanCall(c),
+  'memberRelay.changed': (r) => cleanMemberRelay(r),
   'voice.rooms': (p) => {
     const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
     return rooms ? { serverId: p.serverId, rooms } : null;
@@ -511,6 +533,8 @@ export function guardCore(core: CoreApi): CoreApi {
         return rooms;
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
+    getMemberRelay: () => core.getMemberRelay().then(mustRelay),
+    setMemberRelay: (setting) => core.setMemberRelay(setting).then(mustRelay),
     getMessages: wrap(core.getMessages, cleanRange),
     sendMessage: wrap(core.sendMessage, cleanMessage),
     on: <E extends CoreEventName>(event: E, handler: (p: CoreEvents[E]) => void) => {

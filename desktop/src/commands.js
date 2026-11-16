@@ -64,6 +64,10 @@ const COMMANDS = Object.freeze({
   getAppInfo: [],
   setUpdateChannel: ['channel'],
   setRelayOnly: ['on'],
+  // Member relays, slice 1 (#368)
+  getMemberRelay: [],
+  setMemberRelay: ['setting'],
+  markMemberRelayDisclosureSeen: [],
   restartToUpdate: [],
 });
 

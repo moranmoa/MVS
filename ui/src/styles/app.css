@@ -3411,8 +3411,9 @@ input.switch:disabled {
   }
 }
 
-/* Profile save (0.4.5): "others will see it later" under "Profile saved". */
-.saved-later {
-  display: block;
-  flex-basis: 100%;
+/* Profile save (0.4.5): "Profile saved", then "others will see it later" on its own line (UX on #381). */
+.profile-actions .success {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
 }

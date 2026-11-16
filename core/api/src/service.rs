@@ -2873,7 +2873,10 @@ impl Inner {
             }
             let Ok(view) = self.view(server) else { continue };
             let state = &view.state;
-            if state.closed.is_none() && state.is_member(key) && state.role(key) >= authority::Role::Admin {
+            // Kicked is checked on its own too (Security Lead on #389), not
+            // only through membership.
+            let current = state.is_member(key) && !state.kicked.contains(&key);
+            if state.closed.is_none() && current && state.role(key) >= authority::Role::Admin {
                 return Ok(true);
             }
         }

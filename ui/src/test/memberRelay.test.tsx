@@ -37,7 +37,7 @@ describe('member relays, slice 1', () => {
     expect(toggle.checked).toBe(true);
     expect(toggle.disabled).toBe(false);
     expect(screen.queryByRole('button', { name: 'Back to default' })).toBeNull();
-    expect(document.getElementById('member-relay-hint')?.textContent).toContain('because you run a server');
+    expect(document.getElementById('member-relay-hint')?.textContent).toContain('because this account runs a server');
     await click(toggle);
     expect(toggle.checked).toBe(false);
     expect((await core.getMemberRelay()).setting).toBe('off');
@@ -72,8 +72,13 @@ describe('member relays, slice 1', () => {
     expect(toggle.checked).toBe(true);
   });
 
-  it('the disclosure shows once at start when on and not seen; OK marks it seen', async () => {
-    const { core } = await setup({ memberRelayUnseen: true });
+  it('PO gate: a default-on owner sees the disclosure at start, and OK sends the acknowledgement to the core', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, memberRelayUnseen: true });
+    // Default-on for an owner: the setting is auto, the role turns it on, not seen yet.
+    expect(await core.getMemberRelay()).toMatchObject({ setting: 'auto', role: true, disclosureSeen: false });
+    const ack = vi.spyOn(core, 'markMemberRelayDisclosureSeen');
+    render(<App core={core} initialSettings={en} />);
+    await screen.findByRole('textbox', { name: /^Message / });
     const dialog = await screen.findByRole('dialog', { name: 'Relay for your members is on' });
     expect(document.getElementById(dialog.getAttribute('aria-describedby')!)?.textContent).toContain('This uses up to');
     expect(document.activeElement?.textContent).toBe('OK');
@@ -81,6 +86,7 @@ describe('member relays, slice 1', () => {
     expect(screen.queryByRole('dialog', { name: 'Relay for your members is on' })).toBeNull();
     const relay = await core.getMemberRelay();
     expect(relay).toMatchObject({ disclosureSeen: true, setting: 'auto', effective: true });
+    expect(ack).toHaveBeenCalledTimes(1);
   });
 
   it('"Turn off" in the disclosure sets off; it is also reachable from Settings', async () => {
@@ -91,6 +97,15 @@ describe('member relays, slice 1', () => {
     await openPrivacy();
     await click(screen.getByRole('button', { name: 'What this means' }));
     expect(screen.getAllByRole('dialog', { name: 'Relay for your members is on' })).toHaveLength(1);
+  });
+
+  it('the disclosure also shows when the core holds effective off until it is acknowledged', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, memberRelayUnseen: true });
+    const real = core.getMemberRelay.bind(core);
+    // As a gating core may report it: would be on, but not relaying yet.
+    vi.spyOn(core, 'getMemberRelay').mockImplementation(async () => ({ ...(await real()), effective: false }));
+    render(<App core={core} initialSettings={en} />);
+    expect(await screen.findByRole('dialog', { name: 'Relay for your members is on' })).toBeTruthy();
   });
 
   it('no disclosure when it was seen, or when relaying is off', async () => {

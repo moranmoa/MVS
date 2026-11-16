@@ -66,10 +66,20 @@ export function MemberRelayDisclosure({ open, onClose }: { open: boolean; onClos
   );
 }
 
-/** At start or on a change: the disclosure, once, the first time relaying is on. */
+/**
+ * PO: relaying must not start before the disclosure was shown once, so the
+ * core may keep `effective` false until it is acknowledged. The disclosure
+ * therefore follows what the setting would do: no reason, and "on", or
+ * "auto" for an owner or admin.
+ */
+export function wouldRelay(r: MemberRelay): boolean {
+  return r.effective || (!r.reason && (r.setting === 'on' || (r.setting === 'auto' && r.role)));
+}
+
+/** At start or on a change: the disclosure, once, the first time relaying is (or would be) on. */
 export function MemberRelayFirstRun() {
   const store = useAppStore();
-  const due = useStore(store, (s) => !!s.memberRelay?.effective && !s.memberRelay.disclosureSeen);
+  const due = useStore(store, (s) => !!s.memberRelay && wouldRelay(s.memberRelay) && !s.memberRelay.disclosureSeen);
   const [dismissed, setDismissed] = useState(false);
   return <MemberRelayDisclosure open={due && !dismissed} onClose={() => setDismissed(true)} />;
 }

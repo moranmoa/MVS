@@ -379,7 +379,7 @@
   "privacy.relayOnly.turnOn": "Turn on",
   "memberRelay.label": "Relay for your members",
   "memberRelay.hint": "Members of your servers can connect through this computer when they can't reach each other directly. By default it's on only for server owners and admins.",
-  "memberRelay.hintRole": "On by default, because you run a server. Members of your servers can connect through this computer when they can't reach each other directly.",
+  "memberRelay.hintRole": "On by default, because this account runs a server. Members of your servers can connect through this computer when they can't reach each other directly.",
   "memberRelay.backToDefault": "Back to default",
   "memberRelay.cap": "Daily limit",
   "memberRelay.capDefault": "\u2068{size}\u2069 (default)",

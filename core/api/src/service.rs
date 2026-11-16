@@ -437,15 +437,7 @@ impl Core {
             Err(e) => return Err(vault_error(e)),
         };
         if state == Some(VaultState::Ready) {
-            let phrase = inner.vault.open().map_err(vault_error)?;
-            inner.me = Some(inner.load_me(phrase)?);
-            unlock_cipher(&ports, inner.me.as_ref());
-            // GAP-4: every server opened for sync before any command can
-            // publish to it (the sync loop also reopens them each round).
-            for server in inner.db.servers()? {
-                inner.load(server)?;
-                inner.open_sync(&ports, server)?;
-            }
+            inner.open_stored(&ports)?;
         }
         Ok(Core {
             inner: Mutex::new(inner),
@@ -585,15 +577,14 @@ impl Core {
     // ---- identity -------------------------------------------------------
 
     pub fn get_identity(&self) -> CoreResult<Option<Identity>> {
-        let inner = self.lock();
-        if inner.keyring_unavailable {
-            return Err(ErrorCode::KeyringUnavailable.into());
-        }
+        let mut inner = self.lock();
+        inner.recheck_keyring(&self.ports)?;
         inner.me.as_ref().map(|me| inner.identity_json(me)).transpose()
     }
 
     pub fn create_identity(&self, input: NewIdentityInput) -> CoreResult<CreatedIdentity> {
         self.run(|inner, ports, events| {
+            inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());
             }
@@ -719,6 +710,7 @@ impl Core {
         input: Option<NewIdentityInput>,
     ) -> CoreResult<Identity> {
         let identity = self.run(|inner, ports, _| {
+            inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());
             }
@@ -2747,6 +2739,36 @@ impl Inner {
         let me = self.me.as_ref().map(Me::key);
         let secret = self.secret(server)?;
         Ok(self.view(server)?.summary(me, secret.as_deref()))
+    }
+
+    /// The stored identity, opened, and every server opened for sync before
+    /// any command can publish to it (GAP-4; the sync loop also reopens them
+    /// each round).
+    fn open_stored(&mut self, ports: &Ports) -> CoreResult<()> {
+        let phrase = self.vault.open().map_err(vault_error)?;
+        self.me = Some(self.load_me(phrase)?);
+        unlock_cipher(ports, self.me.as_ref());
+        for server in self.db.servers()? {
+            self.load(server)?;
+            self.open_sync(ports, server)?;
+        }
+        Ok(())
+    }
+
+    /// QA on 0.4.5: the keychain was unavailable at startup (a Secret
+    /// Service that started after the core). Asks it again: still failing,
+    /// `keyring-unavailable`; working now, the flag clears and a stored
+    /// identity is opened as at startup.
+    fn recheck_keyring(&mut self, ports: &Ports) -> CoreResult<()> {
+        if !self.keyring_unavailable {
+            return Ok(());
+        }
+        let state = self.vault.state().map_err(vault_error)?;
+        self.keyring_unavailable = false;
+        if state == VaultState::Ready {
+            self.open_stored(ports)?;
+        }
+        Ok(())
     }
 
     /// Syncs a loaded server members-only (GAP-4) with its secret and the

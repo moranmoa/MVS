@@ -2263,6 +2263,75 @@ fn no_keyring_is_its_own_error() {
     assert!(core.get_app_info().is_ok(), "the rest of the core still answers");
 }
 
+/// A keychain that fails until it comes up, like a Secret Service started
+/// after the core.
+struct LateKeyring {
+    up: std::sync::atomic::AtomicBool,
+    inner: MemoryStore,
+}
+
+impl LateKeyring {
+    fn check(&self) -> Result<(), identity::StoreError> {
+        match self.up.load(std::sync::atomic::Ordering::SeqCst) {
+            true => Ok(()),
+            false => Err(identity::StoreError("no Secret Service yet".into())),
+        }
+    }
+}
+
+impl identity::SecretStore for LateKeyring {
+    fn load(&self, name: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, identity::StoreError> {
+        self.check()?;
+        self.inner.load(name)
+    }
+
+    fn save(&self, name: &str, secret: &[u8]) -> Result<(), identity::StoreError> {
+        self.check()?;
+        self.inner.save(name, secret)
+    }
+
+    fn delete(&self, name: &str) -> Result<(), identity::StoreError> {
+        self.check()?;
+        self.inner.delete(name)
+    }
+}
+
+/// QA on 0.4.5: a keychain that was unavailable when the core started and
+/// works later is used once it works: `getIdentity` and `createIdentity`
+/// stop saying `keyring-unavailable`, and an identity stored before opens.
+#[test]
+fn a_keychain_that_comes_up_after_the_core_is_used() {
+    let keyring = Arc::new(LateKeyring { up: false.into(), inner: MemoryStore::new() });
+    let open = || {
+        Core::open(
+            Config { db_path: None, app_version: "test".into() },
+            Ports {
+                secrets: keyring.clone(),
+                network: Arc::new(LoopbackNetwork::new()),
+                events: Arc::new(CollectingSink::new()),
+                clock: Arc::new(SystemClock),
+                cipher: Arc::new(PendingGroupKeys),
+            },
+        )
+        .expect("the core starts without a keychain")
+    };
+    let up = |on: bool| keyring.up.store(on, std::sync::atomic::Ordering::SeqCst);
+
+    // No identity yet: down at start, then up. Sign-up works.
+    let core = open();
+    assert_eq!(core.get_identity().unwrap_err().code, ErrorCode::KeyringUnavailable);
+    up(true);
+    assert!(core.get_identity().unwrap().is_none(), "signed out, and no error");
+    let created = core.create_identity(adult()).unwrap();
+
+    // An identity stored before: down at start, then up. It opens.
+    up(false);
+    let core = open();
+    assert_eq!(core.get_identity().unwrap_err().code, ErrorCode::KeyringUnavailable);
+    up(true);
+    assert_eq!(core.get_identity().unwrap().unwrap().id, created.identity.id);
+}
+
 /// T8-02 piece 4: a short link joins (the envelope fetched, opened and
 /// checked), junk under its handle doesn't stop a join (C3), a forged
 /// publication is refused (C1), and the envelope stops being served when

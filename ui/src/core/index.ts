@@ -64,6 +64,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     pendingDob: params.has('pendingDob'),
     keyPending: (params.get('keyPending') as MockOptions['keyPending']) ?? undefined,
     relayOnly: params.has('relayOnly'),
+    deviceLink: (['confirm', 'expired', 'failed'] as const).find((s) => s === params.get('deviceLink')),
     memberRelayReason: (['minor', 'metered', 'global-off'] as const).find((r) => r === params.get('memberRelay')),
     memberRelayUnseen: params.has('memberRelayUnseen'),
     outdatedMembers: params.has('outdated'),

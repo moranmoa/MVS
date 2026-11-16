@@ -3417,3 +3417,42 @@ input.switch:disabled {
   align-items: flex-start;
   gap: 0.125rem;
 }
+
+/* Device link (device-link-slice.md): the QR, the code to type, and the digits to compare. */
+.device-link-offer {
+  display: grid;
+  justify-items: center;
+  gap: 0.5rem;
+}
+
+.qr-code {
+  border-radius: var(--radius-s);
+}
+
+.device-link-code {
+  margin: 0;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  user-select: all;
+}
+
+.device-link-sas {
+  margin: 0.5rem 0;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 2.25rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-align: center;
+}
+
+.device-code-input {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  letter-spacing: 0.08em;
+}
+
+.device-warning {
+  margin: 0;
+  font-weight: 600;
+}

@@ -9,6 +9,8 @@ import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
 import type {
   CallState,
   VoiceRoom,
+  DeviceApproval,
+  DeviceLinkOffer,
   MemberRelay,
   MemberRelaySetting,
   VoiceRoomMember,
@@ -82,6 +84,8 @@ export interface MockOptions {
   memberRelayReason?: 'minor' | 'metered' | 'global-off';
   /** Member relays: the one-time disclosure not seen yet (shows at start for an owner). */
   memberRelayUnseen?: boolean;
+  /** Device link, new device: the state to reach after starting (for screenshots). */
+  deviceLink?: 'confirm' | 'expired' | 'failed';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -732,6 +736,67 @@ export class MockCore implements CoreApi {
     this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
     this.save();
     return this.identity;
+  }
+
+  // ---- device link (device-link-slice.md) ---------------------------------------
+
+  private deviceLinkCode: string | null = null;
+  private approval: DeviceApproval | null = null;
+
+  async startDeviceLink(): Promise<DeviceLinkOffer> {
+    await this.wait(100);
+    const code = 'K7QX2MZRF4';
+    this.deviceLinkCode = code;
+    const expiresAt = Date.now() + 5 * 60_000;
+    this.emit('deviceLink.state', { state: 'waiting' });
+    const then = this.options.deviceLink;
+    if (then) {
+      setTimeout(() => {
+        if (this.deviceLinkCode !== code) return;
+        if (then === 'confirm') this.emit('deviceLink.state', { state: 'confirm', sas: '482913' });
+        else this.emit('deviceLink.state', { state: then, ...(then === 'failed' ? { reason: 'network' as const } : {}) });
+      }, 50);
+    }
+    return { qr: `mvs-link:v1:${code.toLowerCase()}:demo`, code, expiresAt };
+  }
+
+  async cancelDeviceLink(): Promise<null> {
+    this.deviceLinkCode = null;
+    return null;
+  }
+
+  /**
+   * Mock only, for tests and demos: the other device's side of a link. "confirm"
+   * shows the digits; "done" signs this device in as a linked account.
+   */
+  simulateDeviceLink(state: 'confirm' | 'done' | 'expired' | 'failed', reason?: 'refused' | 'network' | 'timeout'): void {
+    if (state === 'done') {
+      this.identity = { ...this.makeIdentity('me-linked', { locale: 'he', country: 'IL', birthDate: '1998-04-12' }), displayName: 'מורן', recoveryChecked: true };
+      this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
+      this.save();
+      this.emit('deviceLink.state', { state: 'done' });
+      this.emit('identity.changed', this.identity);
+      return;
+    }
+    this.emit('deviceLink.state', { state, ...(state === 'confirm' ? { sas: '482913' } : {}), ...(reason ? { reason } : {}) });
+  }
+
+  async beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval> {
+    await this.wait(300);
+    const code = qrOrCode.trim().toUpperCase().replace(/[\s-]/g, '');
+    // Demo: any well-formed code reaches a device, except "ZZZZZZZZZZ" (expired).
+    if (!/^[A-Z2-7]{10}$/.test(code) && !qrOrCode.startsWith('mvs-link:v1:')) throw err({ code: 'not-found' });
+    if (code === 'ZZZZZZZZZZ') throw err({ code: 'not-found' });
+    if (code === 'RRRRRRRRRR') throw err({ code: 'rate-limited' });
+    this.approval = { sas: '482913', expiresAt: Date.now() + 5 * 60_000 };
+    return this.approval;
+  }
+
+  async confirmDeviceApproval(_approve: boolean): Promise<null> {
+    await this.wait(200);
+    if (!this.approval) throw err({ code: 'bad-request' });
+    this.approval = null;
+    return null;
   }
 
   async signOut(words?: string[], withoutWords?: boolean): Promise<null> {

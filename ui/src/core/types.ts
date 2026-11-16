@@ -151,6 +151,8 @@ export interface CoreError {
     | 'relay-only'
     /** #294: my own identity is already in this room from another computer (clears ~30 s after it stops). */
     | 'in-call-elsewhere'
+    /** Device link: too many approval attempts. */
+    | 'rate-limited'
     /** Voice rooms (0.4.3): this server already has 10 live rooms. */
     | 'room-cap'
     // In-app update (core/api CONFORMANCE "Updates")
@@ -321,6 +323,28 @@ export interface MemberRelay {
   disclosureSeen: boolean;
   /** The daily byte cap in MB: 256–51200, default 2048. */
   dailyCapMb: number;
+}
+
+/** Device link (device-link-slice.md), new device: what to show to the signed-in device. */
+export interface DeviceLinkOffer {
+  /** The QR payload (no secret). */
+  qr: string;
+  /** 10 base32 characters, for typing. */
+  code: string;
+  expiresAt: number;
+}
+
+export type DeviceLinkState = {
+  state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed';
+  /** 6 digits, from "confirm" on. */
+  sas?: string;
+  reason?: 'cancelled' | 'timeout' | 'refused' | 'network';
+};
+
+/** Device link, signed-in device: the digits to compare. */
+export interface DeviceApproval {
+  sas: string;
+  expiresAt: number;
 }
 
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */

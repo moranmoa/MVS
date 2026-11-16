@@ -8,7 +8,7 @@ publish = false
 default = ["os-keychain"]
 # The real OS keychain (Windows Credential Manager, macOS Keychain, Linux
 # Secret Service). Without it only `MemoryStore` is available.
-os-keychain = ["dep:keyring", "dep:keyring-core", "dep:zbus-secret-service-keyring-store"]
+os-keychain = ["dep:keyring", "dep:keyring-core", "dep:zbus-secret-service-keyring-store", "dep:secret-service"]
 
 [dependencies]
 records = { path = "../records" }
@@ -47,3 +47,7 @@ hex = "0.4"
 # the tree through keyring.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", optional = true }
+# MIT OR Apache-2.0. Checks the default collection when an entry is missing
+# (Security Lead on #388). Already in the tree through the store above; its
+# features come from there.
+secret-service = { version = "5", default-features = false, optional = true }

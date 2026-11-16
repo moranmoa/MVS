@@ -144,6 +144,33 @@ fn default_store() -> Result<(), StoreError> {
     keyring::Entry::store_status().as_ref().map(|_| ()).map_err(|e| StoreError(e.to_string()))
 }
 
+/// No entry under this name. On Linux that is only "none" when the default
+/// collection exists and is unlocked (Security Lead on #388). A locked
+/// collection, or none at all (a headless gnome-keyring that never loaded
+/// its login keyring), hides items from the search. Reporting "none" then
+/// would make the app offer sign-up over an identity it can't see, so it's
+/// an error (`keyring-unavailable`) instead.
+#[cfg(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn no_entry() -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+    use secret_service::{blocking::SecretService, EncryptionType};
+    let fail = |e: secret_service::Error| StoreError(e.to_string());
+    let ss = SecretService::connect(EncryptionType::Plain).map_err(fail)?;
+    let locked = match ss.get_default_collection() {
+        Ok(collection) => collection.is_locked().map_err(fail)?,
+        Err(_) => return Err(StoreError("the keychain has no default collection".into())),
+    };
+    if locked {
+        return Err(StoreError("the default keychain collection is locked".into()));
+    }
+    Ok(None)
+}
+
+/// Windows and macOS: a missing entry is just missing.
+#[cfg(all(feature = "os-keychain", not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))))]
+fn no_entry() -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+    Ok(None)
+}
+
 #[cfg(all(feature = "os-keychain", target_os = "windows"))]
 fn modifiers(name: &str) -> HashMap<&'static str, String> {
     HashMap::from([("target", windows_target(name)), ("persistence", "Local".to_owned())])
@@ -165,7 +192,7 @@ impl SecretStore for OsKeychain {
     fn load(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         match self.entry(name)?.get_secret() {
             Ok(secret) => Ok(Some(Zeroizing::new(secret))),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => no_entry(),
             Err(e) => Err(platform(e)),
         }
     }
@@ -226,5 +253,27 @@ mod late_secret_service {
         keychain.save("late-test", b"one").expect("found once it is up");
         assert_eq!(keychain.load("late-test").unwrap().as_deref().map(|s| s.as_slice()), Some(&b"one"[..]));
         keychain.delete("late-test").unwrap();
+    }
+}
+
+/// Security Lead on #388: a missing entry is "none" only in an unlocked
+/// default collection; once it's locked, the same lookup is an error, so
+/// the app never offers sign-up over an identity it can't see. Needs a
+/// running, unlocked gnome-keyring on the session bus; run with `--ignored`
+/// and `MVS_LOCK_KEYRING`, a shell command that locks the default
+/// collection.
+#[cfg(all(test, feature = "os-keychain", target_os = "linux"))]
+mod locked_collection {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs an unlocked gnome-keyring (MVS_LOCK_KEYRING)"]
+    fn a_missing_entry_in_a_locked_collection_is_an_error() {
+        let lock = std::env::var("MVS_LOCK_KEYRING").expect("MVS_LOCK_KEYRING");
+        let keychain = OsKeychain::new();
+        assert_eq!(keychain.load("never-saved").unwrap(), None, "unlocked: just missing");
+        let status = std::process::Command::new("sh").arg("-c").arg(&lock).status().unwrap();
+        assert!(status.success(), "the collection didn't lock");
+        assert!(keychain.load("never-saved").is_err(), "locked: an error, not None");
     }
 }

@@ -106,14 +106,42 @@ impl OsKeychain {
     }
 
     fn entry(&self, name: &str) -> Result<keyring_core::Entry, StoreError> {
-        // Sets up the platform's default store on first use.
-        if let Err(e) = keyring::Entry::store_status() {
-            return Err(StoreError(e.to_string()));
-        }
+        default_store()?;
         let owned = modifiers(name);
         let mods: HashMap<&str, &str> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         keyring_core::Entry::new_with_modifiers(KEYCHAIN_SERVICE, name, &mods).map_err(platform)
     }
+}
+
+/// Sets up the platform's default store once it works.
+///
+/// On Linux we set up the Secret Service store ourselves. keyring's own
+/// setup (`Entry::store_status`) runs once per process and keeps its first
+/// result, so a Secret Service that wasn't up yet when the core first asked
+/// (a D-Bus session or gnome-keyring started alongside the core) left that
+/// core with `keyring-unavailable` forever (QA, 0.4.5 features run). Here a
+/// failure is not kept: the next call tries again, and a success is kept.
+#[cfg(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn default_store() -> Result<(), StoreError> {
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    static SETUP: Mutex<()> = Mutex::new(());
+    if READY.get().is_some() {
+        return Ok(());
+    }
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    if READY.get().is_none() {
+        let store = zbus_secret_service_keyring_store::Store::new().map_err(platform)?;
+        keyring_core::set_default_store(store);
+        let _ = READY.set(());
+    }
+    Ok(())
+}
+
+/// Windows and macOS: their stores don't depend on a service that may start
+/// later, so keyring's once-per-process setup is enough.
+#[cfg(all(feature = "os-keychain", not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))))]
+fn default_store() -> Result<(), StoreError> {
+    keyring::Entry::store_status().as_ref().map(|_| ()).map_err(|e| StoreError(e.to_string()))
 }
 
 #[cfg(all(feature = "os-keychain", target_os = "windows"))]
@@ -175,5 +203,28 @@ mod tests {
             windows_target("identity-secret-v1"),
             "io.github.moranmoa.mvs.identity.v1/identity-secret-v1"
         );
+    }
+}
+
+/// QA on 0.4.5: a Secret Service that comes up after the first call is
+/// still found (keyring's own setup kept the first failure for the whole
+/// process). Needs `dbus-daemon` and `gnome-keyring-daemon`; run with
+/// `--ignored` and `MVS_LATE_KEYRING_START`, a shell command that starts a
+/// session bus at `DBUS_SESSION_BUS_ADDRESS` and an unlocked keyring on it.
+#[cfg(all(test, feature = "os-keychain", target_os = "linux"))]
+mod late_secret_service {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs dbus-daemon and gnome-keyring (MVS_LATE_KEYRING_START)"]
+    fn a_secret_service_started_after_the_first_call_is_used() {
+        let start = std::env::var("MVS_LATE_KEYRING_START").expect("MVS_LATE_KEYRING_START");
+        let keychain = OsKeychain::new();
+        assert!(keychain.save("late-test", b"one").is_err(), "no bus yet");
+        let status = std::process::Command::new("sh").arg("-c").arg(&start).status().unwrap();
+        assert!(status.success(), "the keyring didn't start");
+        keychain.save("late-test", b"one").expect("found once it is up");
+        assert_eq!(keychain.load("late-test").unwrap().as_deref().map(|s| s.as_slice()), Some(&b"one"[..]));
+        keychain.delete("late-test").unwrap();
     }
 }

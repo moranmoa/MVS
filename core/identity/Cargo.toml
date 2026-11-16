@@ -8,7 +8,7 @@ publish = false
 default = ["os-keychain"]
 # The real OS keychain (Windows Credential Manager, macOS Keychain, Linux
 # Secret Service). Without it only `MemoryStore` is available.
-os-keychain = ["dep:keyring", "dep:keyring-core"]
+os-keychain = ["dep:keyring", "dep:keyring-core", "dep:zbus-secret-service-keyring-store"]
 
 [dependencies]
 records = { path = "../records" }
@@ -40,3 +40,10 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 hex = "0.4"
+
+# MIT OR Apache-2.0. The Linux Secret Service store, set up by us rather
+# than through keyring's once-per-process setup, so a Secret Service that
+# comes up after the core starts is still found (QA on 0.4.5). Already in
+# the tree through keyring.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", optional = true }

@@ -37,4 +37,4 @@ fi
 docker build -q -t mvs-voice-e2e-app -f "$(mount "$repo/desktop")/Dockerfile.e2e" "$(mount "$repo/desktop")" >/dev/null
 docker run --rm -v "$(mount "$here"):/qa:ro" -v "$(mount "$work"):/bin-in:ro" mvs-voice-e2e-app sh -c "
   cp /bin-in/$OLD/mvs-core /tmp/old && cp /bin-in/$NEW/mvs-core /tmp/new && chmod +x /tmp/old /tmp/new &&
-  runuser -u pwuser -- dbus-run-session -- sh -c 'echo -n test | gnome-keyring-daemon --unlock --components=secrets >/dev/null && node /qa/upgrade.mjs /tmp/old /tmp/new'"
+  runuser -u pwuser -- dbus-run-session -- sh -c 'eval \"\$(gnome-keyring-daemon --start --components=secrets)\"; export GNOME_KEYRING_CONTROL; printf test | gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null && node /qa/upgrade.mjs /tmp/old /tmp/new'"

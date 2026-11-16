@@ -71,7 +71,7 @@ docker network create "$P-b" >/dev/null
 side() { # role
   docker run -d --name "$P-$1" --network "$P-$1" -e ROLE="$1" -e ROUNDS="${ROUNDS:-10}" -e JOIN_LOG="${JOIN_LOG:-}" \
     -v "$(mount "$rv/core"):/core:ro" -v "$(mount "$rv/cfg"):/cfg:ro" -v "$(mount "$here"):/qa:ro" -v "$(mount "$rv"):/rendezvous" \
-    mvs-voice-e2e-app sh -c "chmod 777 /rendezvous 2>/dev/null; runuser -u pwuser -- dbus-run-session -- sh -c 'echo -n test | gnome-keyring-daemon --unlock --components=secrets >/dev/null && node /qa/live.mjs'" >/dev/null
+    mvs-voice-e2e-app sh -c "chmod 777 /rendezvous 2>/dev/null; runuser -u pwuser -- dbus-run-session -- sh -c 'eval \"\$(gnome-keyring-daemon --start --components=secrets)\"; export GNOME_KEYRING_CONTROL; printf test | gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null && node /qa/live.mjs'" >/dev/null
 }
 side a
 side b

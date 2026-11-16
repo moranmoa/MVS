@@ -33,6 +33,14 @@ const KV_UPDATE_CHANNEL: &str = "update-channel";
 /// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
 /// about this computer's network.
 const KV_RELAY_ONLY: &str = "relay-only";
+/// Member relays (#368, slice 1): `auto`, `on` or `off` (default `auto`);
+/// the one-time disclosure seen (`[1]`); the daily cap in MB (u32le).
+const KV_MEMBER_RELAY: &str = "member-relay";
+const KV_MEMBER_RELAY_SEEN: &str = "member-relay-disclosure-seen";
+const KV_MEMBER_RELAY_CAP: &str = "member-relay-cap-mb";
+/// The member relay's daily cap: default and accepted range, in MB.
+pub const MEMBER_RELAY_CAP_DEFAULT_MB: u32 = 2_048;
+pub const MEMBER_RELAY_CAP_MB: std::ops::RangeInclusive<u32> = 256..=51_200;
 
 /// Fails closed: off only when never set or set to off (`[0]`); any other
 /// value is on.
@@ -221,6 +229,9 @@ struct Inner {
     me: Option<Me>,
     /// The OS keychain failed at startup (QA-20).
     keyring_unavailable: bool,
+    /// Member relays: the value last announced (`memberRelay.changed` fires
+    /// when it differs). `None` until first worked out.
+    member_relay: Option<MemberRelay>,
     /// Loaded on first use per server, then kept current record by record.
     logs: HashMap<ServerId, Log>,
     /// Messages already announced to the UI, per server, with what was
@@ -410,6 +421,7 @@ impl Core {
             vault,
             me: None,
             keyring_unavailable: false,
+            member_relay: None,
             logs: HashMap::new(),
             announced: HashMap::new(),
             net: ports.network.clone(),
@@ -447,6 +459,8 @@ impl Core {
                 inner.open_sync(&ports, server)?;
             }
         }
+        // The first member relay value: later changes are announced.
+        inner.check_member_relay(&ports, &mut Vec::new());
         Ok(Core {
             inner: Mutex::new(inner),
             ports,
@@ -577,7 +591,13 @@ impl Core {
         f: impl FnOnce(&mut Inner, &Ports, &mut Events) -> CoreResult<T>,
     ) -> CoreResult<T> {
         let mut events = Vec::new();
-        let result = f(&mut self.lock(), &self.ports, &mut events);
+        let result = {
+            let mut inner = self.lock();
+            let result = f(&mut inner, &self.ports, &mut events);
+            // Member relays: anything the command changed is announced.
+            inner.check_member_relay(&self.ports, &mut events);
+            result
+        };
         self.emit(events);
         result
     }
@@ -2052,6 +2072,16 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        let result = self.sync_round();
+        // Member relays: a role read from the log, a leave, a birth date
+        // whose 30 days ended.
+        let mut events = Vec::new();
+        self.lock().check_member_relay(&self.ports, &mut events);
+        self.emit(events);
+        result
+    }
+
+    fn sync_round(&self) -> CoreResult<()> {
         self.retry_joins();
         self.flush_leaves();
         // A restore still waiting on its backup or on servers nobody could
@@ -2254,6 +2284,41 @@ impl Core {
             ports.network.set_relay_only(on);
             Ok(())
         })
+    }
+
+    /// Member relays (#368, slice 1): the setting and what it comes to now.
+    pub fn get_member_relay(&self) -> CoreResult<MemberRelay> {
+        let now = self.ports.clock.now_ms();
+        self.lock().member_relay_now(now)
+    }
+
+    /// `auto`, `on` or `off`; a forced-off reason still wins.
+    pub fn set_member_relay(&self, setting: MemberRelaySetting) -> CoreResult<MemberRelay> {
+        self.run(|inner, ports, _| {
+            let value: &[u8] = match setting {
+                MemberRelaySetting::Auto => b"auto",
+                MemberRelaySetting::On => b"on",
+                MemberRelaySetting::Off => b"off",
+            };
+            inner.db.set(KV_MEMBER_RELAY, value)?;
+            inner.member_relay_now(ports.clock.now_ms())
+        })
+    }
+
+    /// The daily cap in MB, [`MEMBER_RELAY_CAP_MB`], else `bad-request`.
+    pub fn set_member_relay_cap(&self, mb: u32) -> CoreResult<MemberRelay> {
+        if !MEMBER_RELAY_CAP_MB.contains(&mb) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        self.run(|inner, ports, _| {
+            inner.db.set(KV_MEMBER_RELAY_CAP, &mb.to_le_bytes())?;
+            inner.member_relay_now(ports.clock.now_ms())
+        })
+    }
+
+    /// The one-time disclosure was shown and acknowledged.
+    pub fn mark_member_relay_disclosure_seen(&self) -> CoreResult<()> {
+        self.run(|inner, _, _| inner.db.set(KV_MEMBER_RELAY_SEEN, &[1]))
     }
 
     pub fn set_update_channel(&self, channel: UpdateChannel) -> CoreResult<()> {
@@ -2747,6 +2812,91 @@ impl Inner {
         let me = self.me.as_ref().map(Me::key);
         let secret = self.secret(server)?;
         Ok(self.view(server)?.summary(me, secret.as_deref()))
+    }
+
+    /// Member relays (#368, slice 1): the setting, and what it comes to now.
+    /// Forced off, whatever the setting, by the first reason that applies:
+    /// the global flag and a metered network (reserved for slice 3, never
+    /// set yet), then a minor, then relay-only.
+    fn member_relay_now(&mut self, now: u64) -> CoreResult<MemberRelay> {
+        let setting = match self.db.get(KV_MEMBER_RELAY)?.as_deref() {
+            Some(b"on") => MemberRelaySetting::On,
+            Some(b"off") => MemberRelaySetting::Off,
+            _ => MemberRelaySetting::Auto,
+        };
+        let disclosure_seen = self.db.get(KV_MEMBER_RELAY_SEEN)?.is_some();
+        let daily_cap_mb = self
+            .db
+            .get(KV_MEMBER_RELAY_CAP)?
+            .and_then(|v| v.try_into().ok())
+            .map(u32::from_le_bytes)
+            .filter(|mb| MEMBER_RELAY_CAP_MB.contains(mb))
+            .unwrap_or(MEMBER_RELAY_CAP_DEFAULT_MB);
+        let role = self.relay_role()?;
+        // The age claim's rule: an adult only by a trusted birth date (a
+        // restored date isn't, until it agrees or its 30 days are up).
+        let adult = self.me.as_ref().is_some_and(|me| {
+            me.profile.birth_date_trusted && me.profile.effective_age(now).is_some_and(|age| age >= 18)
+        });
+        let reason = if self.me.is_some() && !adult {
+            Some(MemberRelayReason::Minor)
+        } else if relay_only_in(&self.db)? {
+            Some(MemberRelayReason::RelayOnly)
+        } else {
+            None
+        };
+        let wanted = match setting {
+            MemberRelaySetting::On => true,
+            MemberRelaySetting::Off => false,
+            MemberRelaySetting::Auto => role,
+        };
+        Ok(MemberRelay {
+            setting,
+            // PO on #387: never relaying before the one-time disclosure was
+            // acknowledged, whatever the setting (fails closed: slice 2's
+            // relay reads only `effective`).
+            effective: self.me.is_some() && reason.is_none() && wanted && disclosure_seen,
+            reason,
+            role,
+            disclosure_seen,
+            daily_cap_mb,
+        })
+    }
+
+    /// Owner or admin in at least one server I'm still a member of (not
+    /// closed, kicked or left), by the log as read so far.
+    fn relay_role(&mut self) -> CoreResult<bool> {
+        let Some(key) = self.me.as_ref().map(Me::key) else { return Ok(false) };
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() || self.load(server).is_err() {
+                continue;
+            }
+            let Ok(view) = self.view(server) else { continue };
+            let state = &view.state;
+            // Kicked is checked on its own too (Security Lead on #389), not
+            // only through membership.
+            let current = state.is_member(key) && !state.kicked.contains(&key);
+            if state.closed.is_none() && current && state.role(key) >= authority::Role::Admin {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `memberRelay.changed` when the value differs from the last one
+    /// announced (a role read from the log, a join or leave, relay-only, the
+    /// birth date, the setting). Called after every command and sync round.
+    fn check_member_relay(&mut self, ports: &Ports, events: &mut Events) {
+        match self.member_relay_now(ports.clock.now_ms()) {
+            Ok(now) if self.member_relay.as_ref() != Some(&now) => {
+                if self.member_relay.is_some() {
+                    events.push(Event::MemberRelayChanged(now.clone()));
+                }
+                self.member_relay = Some(now);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("mvs-core: the member relay state wasn't read: {:?}", e.code),
+        }
     }
 
     /// Syncs a loaded server members-only (GAP-4) with its secret and the

@@ -319,6 +319,8 @@ export interface MemberRelay {
   role: boolean;
   /** The one-time disclosure was acknowledged. */
   disclosureSeen: boolean;
+  /** The daily byte cap in MB: 256–51200, default 2048. */
+  dailyCapMb: number;
 }
 
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */

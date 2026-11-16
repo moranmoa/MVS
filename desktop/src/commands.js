@@ -67,6 +67,7 @@ const COMMANDS = Object.freeze({
   // Member relays, slice 1 (#368)
   getMemberRelay: [],
   setMemberRelay: ['setting'],
+  setMemberRelayCap: ['mb'],
   markMemberRelayDisclosureSeen: [],
   restartToUpdate: [],
 });

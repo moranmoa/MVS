@@ -101,8 +101,42 @@ describe('member relays, slice 1', () => {
     expect(screen.queryByRole('dialog', { name: 'Relay for your members is on' })).toBeNull();
   });
 
+  it('the daily limit: presets, a custom value in range, only while on; the disclosure shows it', async () => {
+    const { core } = await setup();
+    const toggle = await openPrivacy();
+    const select = screen.getByRole('combobox', { name: 'Daily limit' }) as HTMLSelectElement;
+    expect(select.value).toBe('2048');
+    expect(select.selectedOptions[0].textContent?.replace(/[⁨⁩]/g, '')).toBe('2 GB (default)');
+    await act(async () => {
+      fireEvent.change(select, { target: { value: '5120' } });
+    });
+    expect((await core.getMemberRelay()).dailyCapMb).toBe(5120);
+    await act(async () => {
+      fireEvent.change(select, { target: { value: 'custom' } });
+    });
+    const gb = screen.getByRole('spinbutton', { name: 'Daily limit in GB' });
+    fireEvent.change(gb, { target: { value: '100' } });
+    await act(async () => {
+      fireEvent.blur(gb);
+    });
+    expect(screen.getByRole('alert').textContent).toBe('From 0.25 to 50 GB.');
+    expect((await core.getMemberRelay()).dailyCapMb).toBe(5120);
+    fireEvent.change(gb, { target: { value: '0.5' } });
+    await act(async () => {
+      fireEvent.blur(gb);
+    });
+    expect((await core.getMemberRelay()).dailyCapMb).toBe(512);
+    await click(screen.getByRole('button', { name: 'What this means' }));
+    const dialog = screen.getByRole('dialog', { name: 'Relay for your members is on' });
+    expect(document.getElementById(dialog.getAttribute('aria-describedby')!)?.textContent?.replace(/[⁨⁩]/g, '')).toContain('up to 512 MB a day');
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    // Off: no limit to set.
+    await click(toggle);
+    expect(screen.queryByRole('combobox', { name: 'Daily limit' })).toBeNull();
+  });
+
   it('cleanMemberRelay keeps a good value and drops anything else', () => {
-    const ok = { setting: 'auto', effective: true, role: true, disclosureSeen: false };
+    const ok = { setting: 'auto', effective: true, role: true, disclosureSeen: false, dailyCapMb: 2048 };
     expect(cleanMemberRelay(ok)).toEqual(ok);
     expect(cleanMemberRelay({ ...ok, effective: false, reason: 'minor' })).toEqual({ ...ok, effective: false, reason: 'minor' });
     for (const bad of [
@@ -115,6 +149,10 @@ describe('member relays, slice 1', () => {
       { ...ok, reason: 'because' },
       { ...ok, reason: 'minor' }, // a reason while on
       { ...ok, extra: 1 },
+      { ...ok, dailyCapMb: 255 },
+      { ...ok, dailyCapMb: 51201 },
+      { ...ok, dailyCapMb: 1024.5 },
+      { ...ok, dailyCapMb: undefined },
     ]) {
       expect(cleanMemberRelay(bad)).toBeNull();
     }

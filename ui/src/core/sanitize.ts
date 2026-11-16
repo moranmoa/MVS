@@ -424,10 +424,15 @@ export function cleanVoiceRooms(serverId: unknown, rooms: unknown): VoiceRoom[] 
   return out.sort((a, b) => a.createdAt - b.createdAt);
 }
 
+/** Member relays: the daily cap range in MB (256 MB–50 GB). */
+export const MEMBER_RELAY_CAP_MIN_MB = 256;
+export const MEMBER_RELAY_CAP_MAX_MB = 51200;
+
 /** Member relays (slice 1): the whole object, or null to drop it (anything unknown or mistyped). */
 export function cleanMemberRelay(r: unknown): MemberRelay | null {
-  if (!r || typeof r !== 'object' || !onlyKeys(r, ['setting', 'effective', 'reason', 'role', 'disclosureSeen'])) return null;
-  const { setting, effective, reason, role, disclosureSeen } = r as Record<string, unknown>;
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['setting', 'effective', 'reason', 'role', 'disclosureSeen', 'dailyCapMb'])) return null;
+  const { setting, effective, reason, role, disclosureSeen, dailyCapMb } = r as Record<string, unknown>;
+  if (typeof dailyCapMb !== 'number' || !Number.isInteger(dailyCapMb) || dailyCapMb < MEMBER_RELAY_CAP_MIN_MB || dailyCapMb > MEMBER_RELAY_CAP_MAX_MB) return null;
   if (setting !== 'auto' && setting !== 'on' && setting !== 'off') return null;
   if (typeof effective !== 'boolean' || typeof role !== 'boolean' || typeof disclosureSeen !== 'boolean') return null;
   const REASONS = ['global-off', 'minor', 'relay-only', 'metered'] as const;
@@ -435,7 +440,7 @@ export function cleanMemberRelay(r: unknown): MemberRelay | null {
   if (reason !== undefined && reason !== null && !why) return null;
   // A reason means off, whatever the setting.
   if (why && effective) return null;
-  return { setting, effective, ...(why ? { reason: why } : {}), role, disclosureSeen };
+  return { setting, effective, ...(why ? { reason: why } : {}), role, disclosureSeen, dailyCapMb };
 }
 
 const mustRelay = (r: unknown): MemberRelay => {
@@ -535,6 +540,7 @@ export function guardCore(core: CoreApi): CoreApi {
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
     getMemberRelay: () => core.getMemberRelay().then(mustRelay),
     setMemberRelay: (setting) => core.setMemberRelay(setting).then(mustRelay),
+    setMemberRelayCap: (mb) => core.setMemberRelayCap(mb).then(mustRelay),
     getMessages: wrap(core.getMessages, cleanRange),
     sendMessage: wrap(core.sendMessage, cleanMessage),
     on: <E extends CoreEventName>(event: E, handler: (p: CoreEvents[E]) => void) => {

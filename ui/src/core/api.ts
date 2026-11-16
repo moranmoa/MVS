@@ -177,6 +177,8 @@ export interface CoreCommands {
   /** Member relays (slice 1, #368): the setting, what it is now, and why it's off. */
   getMemberRelay(): Promise<MemberRelay>;
   setMemberRelay(setting: MemberRelaySetting): Promise<MemberRelay>;
+  /** The daily cap in MB (256–51200); bad-request outside it. */
+  setMemberRelayCap(mb: number): Promise<MemberRelay>;
   /** The one-time disclosure was acknowledged ("OK"). */
   markMemberRelayDisclosureSeen(): Promise<null>;
   restartToUpdate(): Promise<void>;

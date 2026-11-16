@@ -1415,6 +1415,7 @@ export class MockCore implements CoreApi {
 
   private memberRelaySetting: MemberRelaySetting = 'auto';
   private memberRelaySeen: boolean | null = null;
+  private memberRelayCap = 2048;
 
   private memberRelay(): MemberRelay {
     const me = this.identity?.id;
@@ -1428,6 +1429,7 @@ export class MockCore implements CoreApi {
       ...(reason ? { reason } : {}),
       role,
       disclosureSeen: this.memberRelaySeen ?? !this.options.memberRelayUnseen,
+      dailyCapMb: this.memberRelayCap,
     };
   }
 
@@ -1443,6 +1445,14 @@ export class MockCore implements CoreApi {
     await this.wait(100);
     if (setting !== 'auto' && setting !== 'on' && setting !== 'off') throw err({ code: 'bad-request' });
     this.memberRelaySetting = setting;
+    this.emitMemberRelay();
+    return this.memberRelay();
+  }
+
+  async setMemberRelayCap(mb: number): Promise<MemberRelay> {
+    await this.wait(100);
+    if (!Number.isInteger(mb) || mb < 256 || mb > 51200) throw err({ code: 'bad-request' });
+    this.memberRelayCap = mb;
     this.emitMemberRelay();
     return this.memberRelay();
   }

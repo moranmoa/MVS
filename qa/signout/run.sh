@@ -16,4 +16,4 @@ dl="$repo/qa/upgrade/.build/$TAG"
 docker run --rm -v "$(mount "$here"):/qa:ro" -v "$(mount "$dl"):/bin-in:ro" mvs-voice-e2e-app sh -c "
   apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends libsecret-tools >/dev/null &&
   cp /bin-in/mvs-core /tmp/core && chmod +x /tmp/core &&
-  runuser -u pwuser -- dbus-run-session -- sh -c 'echo -n test | gnome-keyring-daemon --unlock --components=secrets >/dev/null && node /qa/signout.mjs /tmp/core'"
+  runuser -u pwuser -- dbus-run-session -- sh -c 'eval \"\$(gnome-keyring-daemon --start --components=secrets)\"; export GNOME_KEYRING_CONTROL; printf test | gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null && node /qa/signout.mjs /tmp/core'"

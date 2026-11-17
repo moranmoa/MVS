@@ -16,9 +16,11 @@ use libp2p::{identify, Multiaddr, PeerId};
 use crate::node::{reachable, via_relay};
 
 /// Whether an address of ours may be announced to anyone: global, or a
-/// circuit through our relay.
+/// circuit through our relay. A circuit through any other relay (a member
+/// relay, #368 slice 2) never is: members learn of those in pull answers.
 pub(crate) fn announceable(addr: &Multiaddr, relay: &Multiaddr) -> bool {
-    via_relay(addr, relay) || reachable(addr, false)
+    let circuit = addr.iter().any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit);
+    via_relay(addr, relay) || (!circuit && reachable(addr, false))
 }
 
 pub(crate) struct GlobalIdentify {
@@ -107,7 +109,14 @@ mod tests {
     fn only_global_addresses_and_our_relay_circuits_are_announced() {
         let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{}", PeerId::random()).parse().unwrap();
         let yes = ["/ip4/8.8.8.8/tcp/4001".to_string(), format!("{relay}/p2p-circuit")];
-        let no = ["/ip4/192.168.1.5/tcp/4001", "/ip4/127.0.0.1/tcp/4001", "/ip4/10.0.0.2/tcp/1", "/ip6/fe80::1/tcp/1"];
+        let member_relay = format!("/ip4/8.8.4.4/tcp/4001/p2p/{}/p2p-circuit", PeerId::random());
+        let no = [
+            "/ip4/192.168.1.5/tcp/4001",
+            "/ip4/127.0.0.1/tcp/4001",
+            "/ip4/10.0.0.2/tcp/1",
+            "/ip6/fe80::1/tcp/1",
+            member_relay.as_str(),
+        ];
         for a in yes {
             assert!(announceable(&a.parse().unwrap(), &relay), "{a}");
         }

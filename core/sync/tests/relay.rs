@@ -1305,7 +1305,7 @@ async fn a_member_relay_serves_bound_members_only() {
     assert_eq!(a.test_member_relay_counts().await.unwrap(), (0, 0));
 
     // On: a member reserves (retrying while the gate opens), a stranger never.
-    a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB).unwrap();
+    a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB, true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !reserved_via(&b, &via_a).await {
         assert!(Instant::now() < deadline, "a member never reserved on the member relay");
@@ -1341,4 +1341,82 @@ async fn a_member_relay_serves_bound_members_only() {
 async fn reserved_via(node: &Node, via: &Multiaddr) -> bool {
     let via = via.to_string();
     node.listen_addrs().await.unwrap().iter().any(|l| l.to_string().starts_with(&via))
+}
+
+/// Member relays, slice 2b (design #368 §2): while our relay is up nobody
+/// uses a member relay. Once it has been down for a minute, members reserve
+/// on the member relay they learned of in pull answers and meet again
+/// through it; a relay-only member never does.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
+    use libp2p::multiaddr::Protocol;
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let id = |n: u8| records::PublicKey::from_bytes(SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes());
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let our_relay = start_relay(relay_key, port);
+    let listen = || "/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>().unwrap();
+    let a = bound_node("fb-a", &relay, 31, true, Arc::new(AcceptAll)).await;
+    let b = bound_node("fb-b", &relay, 32, true, Arc::new(AcceptAll)).await;
+    b.test_no_direct_dials().unwrap();
+    b.test_no_hole_punch().unwrap();
+    let c = bound_node("fb-c", &relay, 33, true, Arc::new(AcceptAll)).await;
+    // B and C only ever meet through a relay: no F2 dial, no hole punch,
+    // from the moment each starts.
+    for node in [&b, &c] {
+        node.test_no_direct_dials().unwrap();
+        node.test_no_hole_punch().unwrap();
+    }
+    let (d, _) = bound_node_on_events("fb-d", &relay, 34, true, Arc::new(AcceptAll), listen(), vec![], true).await;
+    a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB, true).unwrap();
+    let via_a = direct_addr(&a).await.with(Protocol::P2pCircuit);
+
+    // Everyone meets through our relay and binds; A's offer reaches them.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let (sb, sc) = (b.presence(test_server().0).await.unwrap(), c.presence(test_server().0).await.unwrap());
+        if sb.online.contains(&id(31)) && sb.online.contains(&id(33)) && sc.online.contains(&id(32)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the members never met: B sees {sb:?}, C sees {sc:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Our relay is up: nobody reserves on the member relay.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for node in [&b, &c, &d] {
+        assert!(!reserved_via(node, &via_a).await, "a member relay used while our relay is up");
+    }
+
+    // Our relay goes down: B and C reserve on A and meet again through it.
+    assert!(!c.direct_peers().await.unwrap().contains(&b.peer_id()), "B and C went direct before our relay went down");
+    our_relay.abort();
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while !(reserved_via(&b, &via_a).await && reserved_via(&c, &via_a).await) {
+        assert!(Instant::now() < deadline, "the members never reserved on the member relay");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    while !(c.peers().await.unwrap().contains(&b.peer_id()) && a.test_member_relay_counts().await.unwrap().1 > 0) {
+        if Instant::now() >= deadline {
+            panic!(
+                "the members never met through the member relay: B={} C={} A={} D={}; C peers {:?}, C direct {:?}, B peers {:?}, A counts {:?}",
+                b.peer_id(),
+                c.peer_id(),
+                a.peer_id(),
+                d.peer_id(),
+                c.peers().await.unwrap(),
+                c.direct_peers().await.unwrap(),
+                b.peers().await.unwrap(),
+                a.test_member_relay_counts().await.unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(!c.direct_peers().await.unwrap().contains(&b.peer_id()), "B and C went direct");
+    // Relay-only never uses a member relay (no member sees its IP).
+    assert!(!reserved_via(&d, &via_a).await, "a relay-only member used a member relay");
+
+    for node in [a, b, c, d] {
+        node.shutdown().await.unwrap();
+    }
 }

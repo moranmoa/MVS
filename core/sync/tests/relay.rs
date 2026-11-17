@@ -1257,11 +1257,20 @@ async fn a_device_link_is_found_by_its_code_and_stays_on_the_relay_circuit() {
     assert_eq!(other.device_link_hello(new.peer_id(), [2; 32]).await, Err(DeviceLinkError::Refused));
     assert_eq!(old.device_link_send(found, vec![9; 100]).await, Ok(()));
     assert_eq!(next_link_event(&mut new_events).await, DeviceLinkInbound::Sealed { ciphertext: vec![9; 100] });
-    assert_eq!(old.device_link_send(found, vec![9; 100]).await, Err(DeviceLinkError::Refused));
+    assert_eq!(old.device_link_send(found, vec![9; 100]).await, Err(DeviceLinkError::NotFound));
     assert!(old.peers().await.unwrap().contains(&new.peer_id()));
     assert!(!old.direct_peers().await.unwrap().contains(&new.peer_id()));
 
     new.device_link_close().unwrap();
+    // Closed: "not found" now, not "refused" (QA, 0.4.6).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match other.device_link_hello(new.peer_id(), [3; 32]).await {
+            Err(DeviceLinkError::NotFound) => break,
+            got => assert!(Instant::now() < deadline, "a closed link answered {got:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     for node in [new, old, other] {
         node.shutdown().await.unwrap();
     }

@@ -2869,7 +2869,7 @@ impl Task {
                     }
                     request_response::Message::Response { request_id, response } => {
                         if let Some(reply) = self.link_out.remove(&request_id) {
-                            let _ = reply.send(if response.is_empty() { Err(LinkError::Refused) } else { Ok(response) });
+                            let _ = reply.send(crate::device_link::outcome(response));
                         }
                     }
                 }
@@ -3560,7 +3560,7 @@ impl Task {
     fn on_link_request(&mut self, peer: PeerId, request: LinkRequest, channel: ResponseChannel<Vec<u8>>) {
         let (answer, inbound) = match self.link_host.as_mut() {
             Some(host) => host.answer(peer, request, Instant::now()),
-            None => (Vec::new(), None),
+            None => (vec![crate::device_link::GONE], None),
         };
         if matches!(inbound, Some(crate::device_link::Inbound::Hello { .. })) {
             self.mark_link_peer(peer);

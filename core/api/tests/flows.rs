@@ -5277,6 +5277,50 @@ fn the_network_follows_the_member_relay_setting() {
     assert_eq!(relays().last(), Some(&(false, 512, true)));
 }
 
+/// dev-ui #408: "a new device was added" is kept until `ackDeviceNotice`,
+/// and announced again after each start (the first sync round) until then.
+#[test]
+fn a_device_added_notice_stays_until_acknowledged() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-notice-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("core.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let secrets = Arc::new(MemoryStore::new());
+    let world = World::new();
+    let added = |events: Vec<Event>| -> Vec<u64> {
+        events.into_iter().filter_map(|e| match e { Event::DeviceAdded { at, .. } => Some(at), _ => None }).collect()
+    };
+    let at = {
+        let old = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
+        sign_up(&old, "Old");
+        old.core.sync_now().unwrap();
+        let new = world.peer();
+        let link = new.core.start_device_link().unwrap();
+        old.core.begin_device_approval(&link.code).unwrap();
+        new.core.sync_now().unwrap();
+        new.core.confirm_device_link(true).unwrap();
+        old.events.take();
+        old.core.confirm_device_approval(true).unwrap();
+        let events = old.events.take();
+        let json = serde_json::to_string(&events).unwrap();
+        assert!(!json.contains("label"), "an unknown label is left out: {json}");
+        added(events)[0]
+    };
+    // Restarted: announced again at the first sync round, once.
+    let old = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
+    old.core.sync_now().unwrap();
+    old.core.sync_now().unwrap();
+    assert_eq!(added(old.events.take()), [at]);
+    old.core.ack_device_notice(at).unwrap();
+    drop(old);
+    // Acknowledged: never again.
+    let old = world.peer_with(secrets, Some(db), Arc::new(PendingGroupKeys));
+    old.core.sync_now().unwrap();
+    assert!(added(old.events.take()).is_empty());
+    drop(old);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// QA on c12bf75: a refused link leaves nothing behind. The next good link
 /// on the same new device saves the account.
 #[test]

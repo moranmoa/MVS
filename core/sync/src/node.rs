@@ -788,9 +788,9 @@ impl Node {
             relay_lost_at: Some(Instant::now()),
             member_listeners: HashMap::new(),
             member_reserved: HashSet::new(),
-            relay_ping_misses: 0,
             remembered_dialed: HashMap::new(),
             remembered_checked: Instant::now(),
+            relay_ping_misses: HashMap::new(),
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
@@ -1474,11 +1474,13 @@ struct Task {
     member_listeners: HashMap<ListenerId, PeerId>,
     /// Member relay listeners whose reservation was accepted.
     member_reserved: HashSet<ListenerId>,
-    /// Failed pings in a row to our relay (`relay_ping`).
-    relay_ping_misses: u32,
     /// Remembered members dialled lately, and when the rows were last checked.
     remembered_dialed: HashMap<PeerId, Instant>,
     remembered_checked: Instant,
+    /// Failed pings in a row to our relay, per connection (`relay_ping`):
+    /// one dead connection among several (TCP and QUIC) is closed on its own
+    /// count (Security Lead, #400).
+    relay_ping_misses: HashMap<ConnectionId, u32>,
     member_relay_rest: HashMap<PeerId, Instant>,
     fallback_dialed: HashMap<(PeerId, PeerId), Instant>,
     fallback_dials: HashSet<ConnectionId>,
@@ -2318,7 +2320,7 @@ impl Task {
             debug!(%peer, lan, candidates = listen_addrs.len(), "no direct address to try");
             return;
         }
-        debug!(%peer, lan, ?addrs, "trying a direct connection");
+        debug!(%peer, lan, addrs = addrs.len(), "trying a direct connection");
         let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::Always).build();
         if let Err(err) = self.swarm.dial(opts) {
             debug!(%peer, ?err, "direct dial refused");
@@ -2371,6 +2373,22 @@ impl Task {
             Some(sealed) => {
                 log == log_name(sealed.server, Scope::Control) || self.bound.contains_key(&(peer, sealed.server))
             }
+        }
+    }
+
+    /// The channel logs of `server` we share with `peer`, pulled at once
+    /// (`peer` just bound for it).
+    fn pull_bound_channels(&mut self, peer: PeerId, server: ServerId) {
+        let logs: Vec<String> = self
+            .logs
+            .iter()
+            .filter(|log| !log.ends_with(CONTROL_SUFFIX))
+            .filter(|log| self.sealing.get(log).is_some_and(|s| s.server == server))
+            .filter(|log| self.shares(peer, log))
+            .cloned()
+            .collect();
+        for log in logs {
+            self.pull(peer, &log, "bound");
         }
     }
 
@@ -2582,7 +2600,7 @@ impl Task {
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
                 } else if self.connected.insert(peer_id) {
                     // Peer ID with its address only at debug level (PR checklist).
-                    debug!(%peer_id, address = %endpoint.get_remote_address(), "peer connected");
+                    debug!(%peer_id, relayed = is_relayed(&endpoint), "peer connected");
                     info!(%peer_id, "peer connected");
                     self.reached = true;
                     self.emit(NodeEvent::PeerConnected(peer_id));
@@ -2599,6 +2617,7 @@ impl Task {
                 self.per_ip.release(connection_id);
                 self.bootstrap_conns.remove(&connection_id);
                 self.relayed_preferred.remove(&connection_id);
+                self.relay_ping_misses.remove(&connection_id);
                 let had_direct = self.direct.contains_key(&peer_id);
                 for conns in [&mut self.relayed, &mut self.direct, &mut self.parked] {
                     if let Some(set) = conns.get_mut(&peer_id) {
@@ -2749,7 +2768,9 @@ impl Task {
             // A silently dead connection to our relay is closed after
             // RELAY_PING_MISSES failed pings, so the fallback clock starts.
             SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if peer == self.relay_peer => {
-                if relay_ping(&mut self.relay_ping_misses, result.is_ok()) {
+                let misses = self.relay_ping_misses.entry(connection).or_insert(0);
+                if relay_ping(misses, result.is_ok()) {
+                    self.relay_ping_misses.remove(&connection);
                     info!("our relay stopped answering pings: closing its connection");
                     self.swarm.close_connection(connection);
                 }
@@ -3156,14 +3177,23 @@ impl Task {
         // Presence: the answerer's binding says who it is (sent to members only).
         if let (Some(binding), Some(s)) = (response.binding.clone(), self.sealing.get(&key.1)) {
             let server = s.server;
+            let newly = !self.bound.contains_key(&(key.0, server));
             if let Some(identity) = self.verify_binding(key.0, server, binding) {
                 self.mark_seen(server, identity, key.0);
+                // Newly bound: its channels of this server are pulled now. On
+                // open they were skipped (a channel goes only to a bound peer,
+                // and the binding comes with this answer), and would otherwise
+                // wait for the next anti-entropy round: a join's first messages
+                // up to 5 s late.
+                if newly {
+                    self.pull_bound_channels(key.0, server);
+                }
                 // Slice 2: a member we know, and its member relay offer (if any).
                 self.on_member_answer(key.0, response.relay.clone());
                 // A member's direct addresses (F2): try a direct connection.
                 let addrs: Vec<Multiaddr> =
                     response.direct_addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect();
-                debug!(peer = %key.0, ?addrs, relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                debug!(peer = %key.0, addrs = addrs.len(), relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
                 // Relay-down resilience: remembered, to redial after a restart.
                 self.remember_addrs(key.0, server, identity, &addrs);
                 if !addrs.is_empty() && self.relayed.contains_key(&key.0) {
@@ -3878,7 +3908,12 @@ impl Task {
         }
         self.remembered_checked = Instant::now();
         let _ = self.store.expire_peers(unix_now(), crate::store::REMEMBERED_TTL);
-        let Some(gate) = self.access.read_gate.clone() else { return };
+        // No read gate: nobody can be shown to be a member, so nothing
+        // remembered stays (fail closed, Security Lead on #419).
+        let Some(gate) = self.access.read_gate.clone() else {
+            self.forget_remembered();
+            return;
+        };
         let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
         let gone: Vec<(ServerId, Vec<u8>)> = rows
             .into_iter()
@@ -4814,10 +4849,13 @@ mod tests {
         many.open_channel(server(), channel()).await.unwrap();
         many.append(message(0, &[], 0)).await.unwrap();
 
-        let start = Instant::now();
         let fresh = test_node("fresh", None, Some(port), access(0)).await;
         fresh.open_server(server(), secret).unwrap();
         fresh.open_channel(server(), channel()).await.unwrap();
+        // Timed from here: what's measured is the sync, not how long a new
+        // node takes to create its key and store (seconds on a busy disk,
+        // the flake that put this test on the board).
+        let start = Instant::now();
         eventually(&fresh, (0, 1), 15).await;
         let took = start.elapsed();
         assert!(took < Duration::from_secs(10), "the shared server's records took {took:?}");

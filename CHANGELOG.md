@@ -10,6 +10,25 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
+## [0.4.6] - 2026-11-17
+
+### New
+- **Approve a new device from your other device:** to sign in on a new computer, choose "Sign in with another device" there and approve it on a device that's already signed in (Settings → Devices → Add a device). Both screens show the same short code, so you can check it's really you before anything is copied. If something goes wrong, MVS tells you why.
+- **Member relays:** members of a server can help each other connect when the main relay can't be reached. You choose in Settings → Privacy, and it only starts after you read and accept a one-time explanation. Everything relayed stays encrypted. Relaying is capped at 2 GB a day by default, and you can set the cap anywhere from 0.25 to 50 GB.
+- **Member relays stay off on metered connections** (for example a phone hotspot), and the MVS team can turn them off for everyone if needed.
+- **A notice when a device is added to your account**, kept until you dismiss it.
+
+### Fixed
+- **Joining a server is faster:** channels load as soon as you connect.
+- **Safer network lookups:** MVS no longer looks up web addresses that other members' devices send it.
+- **Signing in on Linux:** if your keyring is locked or starts after MVS, MVS now waits for it instead of treating you as a new user.
+- **Steadier connections:** a relay connection that stops responding is closed and reopened within a minute.
+
+### Known
+- **The "new device added" notice shows only on the device that approved it** for now. Your other devices will show it in a later version.
+- **Voice calls are officially supported only when everyone is on the same network** (for example the same Wi-Fi). Calls across networks are on the way.
+- **Everyone needs 0.4.4 or later for voice rooms.**
+
 ## [0.4.5] - 2026-11-15
 
 ### Fixed

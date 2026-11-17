@@ -26,7 +26,7 @@ use records::{ChannelId, PublicKey, Record, RecordId, Scope, ServerId};
 use sync::{log_name, log_of, Access, Node, NodeConfig, NodeEvent, ServerSecret, Store};
 use tokio::runtime::Runtime;
 
-use crate::access::{KeyBinder, MemberReadGate, MemberStubGate};
+use crate::access::{KeyBinder, MemberReadGate, MemberStubGate, NoticeKey};
 use crate::gate::MemberGate;
 use crate::ports::{DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, Network, Reach};
 use crate::types::SendState;
@@ -114,6 +114,8 @@ pub struct SyncNetwork {
     /// Servers fetched at least once (the first fetch waits for the pull).
     fetched: Mutex<HashSet<ServerId>>,
     binder: Arc<KeyBinder>,
+    /// Signs notice fetches with `w_n`, from unlock to lock.
+    notice_key: Arc<NoticeKey>,
     /// B6: where each record written here stands.
     send_states: SendStates,
     hints: Mutex<Option<Receiver<()>>>,
@@ -212,6 +214,8 @@ impl SyncNetwork {
             stub_gate: Some(Arc::new(MemberStubGate)),
         };
         let (node, mut events) = runtime.block_on(Node::start_with(config, access))?;
+        let notice_key = Arc::new(NoticeKey::default());
+        node.set_notice_signer(Some(notice_key.clone()))?;
         // Events are only hints: a stored record wakes the core's sync loop
         // (`Core::run_sync_loop`), which re-reads the store. Coalesced (one
         // pending hint is enough) and drained, so the node never blocks.
@@ -277,6 +281,7 @@ impl SyncNetwork {
             opened: Mutex::new(HashMap::new()),
             fetched: Mutex::new(HashSet::new()),
             binder,
+            notice_key,
             send_states,
             hints: Mutex::new(Some(hints)),
             waker,
@@ -412,6 +417,7 @@ impl Network for SyncNetwork {
 
     fn lock(&self) {
         self.binder.lock();
+        self.notice_key.lock();
     }
 
     /// Asked of the node each time (never mirrored from events, which can be
@@ -476,6 +482,26 @@ impl Network for SyncNetwork {
 
     fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
         self.runtime.block_on(self.node.fetch_backup(tag)).unwrap_or_default()
+    }
+
+    fn put_notice(&self, blob: &[u8]) {
+        if !self.runtime.block_on(self.node.put_notice(blob.to_vec())).unwrap_or(false) {
+            eprintln!("mvs-core: sync refused the notice");
+        }
+    }
+
+    /// Sync fetches under the unlocked `w_n`'s own tag: another `tag_n`
+    /// gets nothing.
+    fn fetch_notices(&self, tag_n: [u8; 32]) -> Vec<Vec<u8>> {
+        use sync::NoticeSigner;
+        if self.notice_key.key().map(|key| sync::notice_tag(&key)) != Some(tag_n) {
+            return Vec::new();
+        }
+        self.runtime.block_on(self.node.fetch_notices()).unwrap_or_default()
+    }
+
+    fn notice_unlock(&self, w_n: &records::SigningKey) {
+        self.notice_key.unlock(w_n);
     }
 
     fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<DeviceLinkAddr> {

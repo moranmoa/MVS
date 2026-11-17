@@ -261,6 +261,8 @@ struct Approval {
 
 struct Inner {
     db: Db,
+    /// The core clock (G-26: the reaction fold skips records from the future).
+    clock: Arc<dyn crate::ports::Clock>,
     vault: Vault<SharedSecrets>,
     me: Option<Me>,
     /// The OS keychain failed at startup (QA-20).
@@ -461,6 +463,7 @@ impl Core {
         let vault = Vault::new(SharedSecrets(ports.secrets.clone()));
         let mut inner = Inner {
             db,
+            clock: ports.clock.clone(),
             vault,
             me: None,
             keyring_unavailable: false,
@@ -1802,6 +1805,11 @@ impl Core {
         self.voice(|calls, ctx, inner| calls.set_muted(ctx, inner, muted))
     }
 
+    /// G-84b `setDeafened`: shown to the others in my call (with mute).
+    pub fn set_deafened(&self, deafened: bool) -> CoreResult<()> {
+        self.voice(|calls, ctx, inner| calls.set_deafened(ctx, inner, deafened))
+    }
+
     /// `sendSignal`: to a participant of my call.
     pub fn send_signal(&self, to: &str, kind: SignalKind, payload: String) -> CoreResult<()> {
         let to = parse_user(to)?;
@@ -2058,7 +2066,8 @@ impl Core {
                 return Err(ErrorCode::NotFound.into());
             }
             let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
-            let folded = chat::reactions(cipher, server, channel, log, &live);
+            let now = ports.clock.now_ms();
+            let folded = chat::reactions(cipher, server, channel, log, &live, now);
             let mine = folded.on.get(&target);
             if mine.is_some_and(|m| m.is_on(&emoji, me)) == on {
                 return Ok(());
@@ -2066,14 +2075,23 @@ impl Core {
             if on && mine.is_some_and(|m| m.count_of(me) >= reaction::PER_AUTHOR) {
                 return Err(ErrorCode::BadRequest.into());
             }
-            if folded.rate.near(me, ports.clock.now_ms()) >= reaction::RATE_LIMIT {
+            // Counted the way every core will count the record I'd sign.
+            if folded.gate.near(me) >= reaction::RATE_LIMIT {
                 return Err(ErrorCode::RateLimited.into());
             }
             let plaintext =
                 reaction::Reaction::encode(target, &emoji, on).ok_or(ErrorCode::BadRequest)?;
             let sealed = inner.seal(ports, server, channel, &plaintext)?;
+            // Signed at its effective time, never before its deps: a clock
+            // that runs behind the others' must not make every core ignore
+            // it as backdated. (Sealing may have added a key rotation.)
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let deps = chat::channel_deps(log, channel);
+            let ts = folded.gate.sign_at(&deps);
+            let seq = chat::channel_seq(log, channel, &me);
+            let auth = auth_deps(&inner.view(server)?);
             let record =
-                inner.sign_in_channel(ports, server, channel, None, Kind::Reaction, sealed)?;
+                inner.sign_channel(server, channel, seq, deps, auth, ts, Kind::Reaction, sealed)?;
             let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
             if !chat::would_accept(log, &record) {
                 return Err(ErrorCode::NotAllowed.into());
@@ -3858,11 +3876,12 @@ impl Inner {
         server: ServerId,
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
+        let now = self.clock.now_ms();
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log))
+        Ok(chat::messages(cipher, server, channel, log, now))
     }
 
     /// G-21: my read marker in `channel`: the last message I read, as

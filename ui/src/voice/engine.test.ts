@@ -211,6 +211,57 @@ class FakeAnalyser {
   }
 }
 
+/** G-73: a node that records what it is connected to. */
+class FakeNode {
+  out: unknown[] = [];
+  connect(n: unknown) {
+    this.out.push(n);
+  }
+  disconnect() {
+    this.out = [];
+  }
+}
+
+/** G-73: the Web Audio playback path (gain, limiter, setSinkId); off in the plain fake. */
+class FakeWebAudioContext {
+  analysers: FakeAnalyser[] = [];
+  gains: (FakeNode & { gain: { value: number } })[] = [];
+  sources: FakeNode[] = [];
+  limiters: (FakeNode & { threshold: { value: number } })[] = [];
+  destination = new FakeNode();
+  sinks: string[] = [];
+  closed = false;
+  constructor(private sinkFails = false) {}
+  createMediaStreamSource() {
+    const n = new FakeNode();
+    this.sources.push(n);
+    return n;
+  }
+  createAnalyser() {
+    const a = new FakeAnalyser();
+    this.analysers.push(a);
+    return a;
+  }
+  createGain() {
+    const g = Object.assign(new FakeNode(), { gain: { value: 1 } });
+    this.gains.push(g);
+    return g;
+  }
+  createDynamicsCompressor() {
+    const c = Object.assign(new FakeNode(), { threshold: { value: 0 }, knee: { value: 0 }, ratio: { value: 0 }, attack: { value: 0 }, release: { value: 0 } });
+    this.limiters.push(c);
+    return c;
+  }
+  async setSinkId(id: string) {
+    if (this.sinkFails && id) throw Object.assign(new Error('no'), { name: 'NotAllowedError' });
+    this.sinks.push(id);
+  }
+  async resume() {}
+  async close() {
+    this.closed = true;
+  }
+}
+
 class FakeAudioContext {
   analysers: FakeAnalyser[] = [];
   closed = false;
@@ -231,37 +282,67 @@ class FakeAudioContext {
 interface Harness {
   env: VoiceEnv;
   mics: FakeStream[];
-  contexts: FakeAudioContext[];
-  audios: { srcObject: unknown; paused: boolean }[];
+  contexts: (FakeAudioContext | FakeWebAudioContext)[];
+  audios: { srcObject: unknown; paused: boolean; muted: boolean; volume: number }[];
   pcs: FakePC[];
+  /** G-72: the devices on the computer; a chosen ID not in it fails like an unplugged device. */
+  devices: MediaDeviceInfo[];
+  /** The deviceId each getUserMedia asked for (undefined: the default). */
+  asked: (string | undefined)[];
+  /** Plugs devices in or out, then fires devicechange. */
+  changeDevices: (list: MediaDeviceInfo[]) => Promise<void>;
 }
 
-function fakeEnv(opts: { micError?: string } = {}): Harness {
-  const h: Harness = { mics: [], contexts: [], audios: [], pcs: [], env: null as unknown as VoiceEnv };
+function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } } = {}): Harness {
+  let onChange: (() => void) | null = null;
+  const h: Harness = {
+    mics: [],
+    contexts: [],
+    audios: [],
+    pcs: [],
+    env: null as unknown as VoiceEnv,
+    devices: [
+      { kind: 'audioinput', deviceId: 'mic1', label: 'Mic' },
+      { kind: 'audiooutput', deviceId: 'spk1', label: '' },
+    ] as MediaDeviceInfo[],
+    asked: [],
+    changeDevices: async (list) => {
+      h.devices = list;
+      onChange?.();
+      await flush();
+    },
+  };
   h.env = {
     createPeerConnection: (config) => {
       const pc = new FakePC(config);
       h.pcs.push(pc);
       return pc as unknown as RTCPeerConnection;
     },
-    getUserMedia: async () => {
+    getUserMedia: async (c) => {
       if (opts.micError) throw Object.assign(new Error('no'), { name: opts.micError });
+      const wanted = ((c.audio as MediaTrackConstraints | undefined)?.deviceId as { exact?: string } | undefined)?.exact;
+      h.asked.push(wanted);
+      if (wanted && !h.devices.some((d) => d.kind === 'audioinput' && d.deviceId === wanted)) {
+        throw Object.assign(new Error('gone'), { name: 'OverconstrainedError' });
+      }
       const s = new FakeStream();
       h.mics.push(s);
       return s as unknown as MediaStream;
     },
-    enumerateDevices: async () =>
-      [
-        { kind: 'audioinput', deviceId: 'mic1', label: 'Mic' },
-        { kind: 'audiooutput', deviceId: 'spk1', label: '' },
-      ] as MediaDeviceInfo[],
+    enumerateDevices: async () => h.devices,
+    onDeviceChange: (cb) => {
+      onChange = cb;
+      return () => {
+        onChange = null;
+      };
+    },
     createAudioContext: () => {
-      const c = new FakeAudioContext();
+      const c = opts.webAudio ? new FakeWebAudioContext(opts.webAudio.sinkFails) : new FakeAudioContext();
       h.contexts.push(c);
       return c as unknown as AudioContext;
     },
     createAudioElement: () => {
-      const a = { srcObject: null as unknown, paused: true, autoplay: false, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
+      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
       h.audios.push(a);
       return a as unknown as HTMLAudioElement;
     },
@@ -321,9 +402,9 @@ const flush = async (n = 10) => {
 };
 
 /** Two engines whose cores pass signals to each other, as two verifying cores would. */
-function pair(ids: [Id, Id] = [A, B], opts: Omit<VoiceEngineOptions, 'env'> = {}) {
+function pair(ids: [Id, Id] = [A, B], opts: Omit<VoiceEngineOptions, 'env'> = {}, xEnv: Parameters<typeof fakeEnv>[0] = {}) {
   const [x, y] = ids;
-  const hx = fakeEnv();
+  const hx = fakeEnv(xEnv);
   const hy = fakeEnv();
   const cx = new FakeCore(x, [x, y]);
   const cy = new FakeCore(y, [y, x]);
@@ -395,6 +476,156 @@ describe('voice engine', () => {
       { identity: A, state: 'connected' },
       { identity: B, state: 'connected' },
     ]);
+  });
+
+  it('G-84: deafen silences everyone, also audio that starts later, and undeafen plays it again', async () => {
+    const { hx, hy, cx, cy, ex, ey } = pair();
+    ex.setDeafened(true);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.audios).toHaveLength(1);
+    expect(hx.audios[0]!.muted).toBe(true); // connected while deafened
+    expect(hy.audios[0]!.muted).toBe(false); // the other side is unaffected
+    ex.setDeafened(false);
+    expect(hx.audios[0]!.muted).toBe(false);
+    ex.setDeafened(true);
+    expect(hx.audios[0]!.muted).toBe(true);
+  });
+
+  it('G-73: a per-person volume applies now and to audio that starts later, clamped to 0..1', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    ex.setPeerVolume(B, 0.3); // before B connects
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.audios[0]!.volume).toBe(0.3);
+    ex.setPeerVolume(B, 0.8);
+    expect(hx.audios[0]!.volume).toBe(0.8);
+    ex.setPeerVolume(B, 7);
+    expect(hx.audios[0]!.volume).toBe(1);
+    ex.setPeerVolume(B, -1);
+    expect(hx.audios[0]!.volume).toBe(0);
+    ex.setPeerVolume(B, Number.NaN);
+    expect(hx.audios[0]!.volume).toBe(1);
+  });
+
+  it('G-72: a chosen mic that is gone at the start falls back to the default, once, and says which', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    const fallbacks = record<{ kind: string; deviceId: string }>((cb) => ex.on('deviceFallback', cb));
+    await ex.setInputDevice('mic-gone'); // remembered from an earlier run
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.asked).toEqual(['mic-gone', undefined]);
+    expect(fallbacks).toEqual([{ kind: 'input', deviceId: 'mic-gone' }]);
+    expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics[0]!.tracks[0]); // still talking
+  });
+
+  it('G-72: unplugging the chosen mic or speaker mid-call switches to the default and says which', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    const fallbacks = record<{ kind: string; deviceId: string }>((cb) => ex.on('deviceFallback', cb));
+    const changed = record<null>((cb) => ex.on('devicesChanged', cb));
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    await ex.setInputDevice('mic1');
+    await ex.setOutputDevice('spk1');
+    // A headset plugged in: nothing chosen is gone, only the lists changed.
+    await hx.changeDevices([...hx.devices, { kind: 'audioinput', deviceId: 'mic2', label: 'Headset' } as MediaDeviceInfo]);
+    expect(changed).toHaveLength(1);
+    expect(fallbacks).toEqual([]);
+    // Both chosen devices unplugged.
+    await hx.changeDevices([{ kind: 'audioinput', deviceId: 'mic2', label: 'Headset' } as MediaDeviceInfo]);
+    expect(fallbacks).toEqual([
+      { kind: 'output', deviceId: 'spk1' },
+      { kind: 'input', deviceId: 'mic1' },
+    ]);
+    expect(hx.asked.at(-1)).toBeUndefined(); // the default mic
+    expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics.at(-1)!.tracks[0]);
+  });
+
+  it('G-72: hear myself plays my mic on my speaker, follows a new mic, and stops with the call', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    ex.setSelfMonitor(true); // not in a call: nothing
+    expect(hx.audios).toHaveLength(0);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const before = hx.audios.length;
+    ex.setSelfMonitor(true);
+    expect(hx.audios).toHaveLength(before + 1);
+    const monitor = hx.audios.at(-1)!;
+    expect(monitor.srcObject).toBe(hx.mics[0]);
+    await ex.setInputDevice('mic1');
+    expect(monitor.srcObject).toBe(hx.mics.at(-1));
+    ex.detach();
+    expect(monitor.srcObject).toBeNull();
+    expect(monitor.paused).toBe(true);
+  });
+
+  it('G-73: Web Audio playback: each verified peer gets a gain into a limiter; 0..200%, deafen at 0', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: {} });
+    ex.setPeerVolume(B, 1.5);
+    await ex.attach(cx.state(), A);
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains).toHaveLength(0); // nothing from a peer before it is verified
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(ctx.gains).toHaveLength(1);
+    const [gain] = ctx.gains;
+    const [limiter] = ctx.limiters;
+    expect(gain!.gain.value).toBe(1.5);
+    expect(gain!.out).toEqual([limiter]);
+    expect(limiter!.out).toEqual([ctx.destination]);
+    expect(limiter!.threshold.value).toBe(-3);
+    expect(hx.audios[0]!.muted).toBe(true); // the element only feeds Web Audio
+    ex.setPeerVolume(B, 5);
+    expect(gain!.gain.value).toBe(2);
+    ex.setDeafened(true);
+    expect(gain!.gain.value).toBe(0);
+    ex.setDeafened(false);
+    expect(gain!.gain.value).toBe(2);
+  });
+
+  it('G-73: at 100% or less a peer stays on the element path (no Web Audio); above, a gain; back down, the element again', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: {} });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains).toHaveLength(0); // 100%: today's path
+    expect(hx.audios[0]!.muted).toBe(false);
+    ex.setPeerVolume(B, 0.6);
+    expect(ctx.gains).toHaveLength(0);
+    expect(hx.audios[0]!.volume).toBe(0.6);
+    ex.setPeerVolume(B, 1.4);
+    expect(ctx.gains).toHaveLength(1);
+    expect(ctx.gains[0]!.gain.value).toBe(1.4);
+    expect(hx.audios[0]!.muted).toBe(true);
+    ex.setPeerVolume(B, 0.9);
+    expect(ctx.gains[0]!.out).toEqual([]); // disconnected
+    expect(hx.audios[0]!.muted).toBe(false);
+    expect(hx.audios[0]!.volume).toBe(0.9);
+  });
+
+  it('G-73: a speaker the context cannot use falls back to the element path, capped at 100%', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { sinkFails: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    ex.setPeerVolume(B, 1.6);
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains[0]!.gain.value).toBe(1.6);
+    await ex.setOutputDevice('spk1');
+    await flush();
+    expect(ctx.gains[0]!.out).toEqual([]); // disconnected
+    expect(hx.audios[0]!.muted).toBe(false);
+    expect(hx.audios[0]!.volume).toBe(1);
+    ex.setPeerVolume(B, 0.4);
+    expect(hx.audios[0]!.volume).toBe(0.4);
+    ex.setDeafened(true);
+    expect(hx.audios[0]!.muted).toBe(true);
   });
 
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {

@@ -66,6 +66,10 @@ export interface VoiceEvents {
   /** Who is speaking now, me included, by identity. */
   speaking: Record<Id, boolean>;
   error: VoiceError;
+  /** G-72: the chosen device is gone (unplugged); the system default is used instead. */
+  deviceFallback: { kind: 'input' | 'output'; deviceId: string };
+  /** G-72: devices were plugged in or out; lists may have changed. */
+  devicesChanged: null;
 }
 
 export interface AudioDevice {
@@ -83,6 +87,8 @@ export interface VoiceEnv {
   createAudioElement(): HTMLAudioElement;
   /** The Opus entries of the audio receive capabilities; null if unknown. */
   opusCodecs(): RTCRtpCodec[] | null;
+  /** G-72: calls back when devices are plugged in or out; returns an unsubscribe. Optional. */
+  onDeviceChange?(cb: () => void): () => void;
 }
 
 export interface VoiceEngineOptions {
@@ -125,6 +131,18 @@ export interface VoiceEngine {
   setOutputDevice(deviceId: string): Promise<void>;
   listInputDevices(): Promise<AudioDevice[]>;
   listOutputDevices(): Promise<AudioDevice[]>;
+  /** G-72 mic test: my microphone's level now, 0..1 (0 without a mic or while muted). */
+  inputLevel(): number;
+  /** G-84 deafen: silences everyone's audio (also people who connect later); false plays it again. */
+  setDeafened(deafened: boolean): void;
+  /** G-72 "השמעה עצמית": plays my microphone back to me on the chosen speaker. Off when the call ends. */
+  setSelfMonitor(on: boolean): void;
+  /**
+   * G-73: one person's playback volume, 0..2 (clamped); kept for when they
+   * connect. Above 1 needs the Web Audio path; on the element fallback it
+   * plays at most 1.
+   */
+  setPeerVolume(id: Id, volume: number): void;
   on<E extends keyof VoiceEvents>(event: E, cb: (payload: VoiceEvents[E]) => void): () => void;
   /** Leaves the audio and unsubscribes from the core for good. */
   dispose(): void;
@@ -153,6 +171,8 @@ interface Peer {
   stream: MediaStream | null;
   audio: HTMLAudioElement | null;
   meter: Meter | null;
+  /** G-73: this peer's gain on the Web Audio path; null on the element path. */
+  gain: GainNode | null;
   state: PeerConnectionState;
   /** Media plays only after the certificate check. */
   verified: boolean;
@@ -176,6 +196,12 @@ export function browserEnv(): VoiceEnv {
     enumerateDevices: () => navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([]),
     createAudioContext: () => (typeof AudioContext === 'function' ? new AudioContext({ latencyHint: 'interactive' }) : null),
     createAudioElement: () => new Audio(),
+    onDeviceChange: (cb) => {
+      const md = navigator.mediaDevices;
+      if (!md?.addEventListener) return () => {};
+      md.addEventListener('devicechange', cb);
+      return () => md.removeEventListener('devicechange', cb);
+    },
     opusCodecs: () => {
       try {
         const caps = RTCRtpReceiver.getCapabilities?.('audio');
@@ -211,6 +237,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     participants: new Set(),
     speaking: new Set(),
     error: new Set(),
+    deviceFallback: new Set(),
+    devicesChanged: new Set(),
   };
   const emit = <E extends keyof VoiceEvents>(event: E, payload: VoiceEvents[E]) => {
     for (const cb of listeners[event]) {
@@ -234,6 +262,131 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const refused = new Set<Id>();
   let local: MediaStream | null = null;
   let micMuted = false;
+  /** G-84: everyone's audio silenced. */
+  let deafened = false;
+  /** G-72: my microphone played back to me, while on. */
+  let monitor: HTMLAudioElement | null = null;
+  function startMonitor() {
+    if (monitor || !local) return;
+    const a = env.createAudioElement();
+    a.autoplay = true;
+    a.srcObject = local;
+    if (outputId && 'setSinkId' in a) void a.setSinkId(outputId).catch(() => {});
+    void a.play?.()?.catch?.(() => {});
+    monitor = a;
+  }
+  function stopMonitor() {
+    if (!monitor) return;
+    monitor.pause();
+    monitor.srcObject = null;
+    monitor = null;
+  }
+  /** G-73: per-person playback volume, 0..2; 1 when not set. */
+  const volumes = new Map<Id, number>();
+  /**
+   * G-73 playback path. Web Audio: each verified peer's source → its gain →
+   * a shared limiter → the speakers (the <audio> element stays, muted: Chromium
+   * feeds remote WebRTC audio to Web Audio only while an element plays it).
+   * Falls back to the element path (volume ≤ 1) where Web Audio or the
+   * context's setSinkId is missing or fails. Decided per call.
+   */
+  let elementOnly = false;
+  let limiter: DynamicsCompressorNode | null = null;
+  let sinkSet: string | undefined;
+
+  /** The context for Web Audio playback, or null on the element path. */
+  function playbackContext(): AudioContext | null {
+    if (elementOnly) return null;
+    const c = audioContext();
+    if (!c || typeof c.createGain !== 'function' || typeof c.createDynamicsCompressor !== 'function') {
+      elementOnly = true;
+      return null;
+    }
+    if (!limiter) {
+      try {
+        // A limiter, so a peer at 200% doesn't clip.
+        limiter = c.createDynamicsCompressor();
+        limiter.threshold.value = -3;
+        limiter.knee.value = 0;
+        limiter.ratio.value = 20;
+        limiter.attack.value = 0.002;
+        limiter.release.value = 0.1;
+        limiter.connect(c.destination);
+      } catch {
+        elementOnly = true;
+        limiter = null;
+        return null;
+      }
+    }
+    if (outputId !== sinkSet) applyContextSink(c);
+    return c;
+  }
+
+  /** The chosen speaker for the whole context; without setSinkId, back to the element path. */
+  function applyContextSink(c: AudioContext) {
+    const want = outputId;
+    sinkSet = want;
+    const sink = (c as AudioContext & { setSinkId?: (id: string) => Promise<void> }).setSinkId;
+    if (!want) {
+      if (sink) void sink.call(c, '').catch(() => {});
+      return;
+    }
+    if (!sink) return toElementPath();
+    void sink.call(c, want).catch(() => toElementPath());
+  }
+
+  /** Moves every peer to the element path (volume ≤ 1). */
+  function toElementPath() {
+    if (elementOnly) return;
+    elementOnly = true;
+    for (const p of peers.values()) {
+      try {
+        p.gain?.disconnect();
+      } catch {
+        // already gone
+      }
+      p.gain = null;
+      applyPlayback(p);
+    }
+  }
+
+  /** Puts this peer's volume and the deafen state on its gain or its element. */
+  function applyPlayback(p: Peer) {
+    const v = volumes.get(p.id) ?? 1;
+    // Web Audio only for a peer turned up above 100% (voice-d, #440): echo
+    // cancellation on that path is unverified, so everyone at 100% or less
+    // stays on the element path calls have always used. A gain exists only
+    // for a peer playPeer has started (audio and meter set), so only after
+    // the certificate check.
+    const boost = v > 1 && !!p.audio && !!p.meter && !p.closed;
+    if (boost && !p.gain) {
+      const c = playbackContext();
+      if (c && limiter && p.meter) {
+        try {
+          const g = c.createGain();
+          p.meter.source.connect(g);
+          g.connect(limiter);
+          p.gain = g;
+        } catch {
+          p.gain = null;
+        }
+      }
+    } else if (!boost && p.gain) {
+      try {
+        p.gain.disconnect();
+      } catch {
+        // already gone
+      }
+      p.gain = null;
+    }
+    if (p.gain) {
+      p.gain.gain.value = deafened ? 0 : v;
+      if (p.audio) p.audio.muted = true;
+    } else if (p.audio) {
+      p.audio.muted = deafened;
+      p.audio.volume = Math.min(1, v);
+    }
+  }
   let micState: PeerConnectionState = 'connecting';
   let inputId: string | undefined;
   let outputId: string | undefined;
@@ -243,6 +396,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   let speaking: Record<Id, boolean> = {};
 
   const unsubscribe = [core.onState((s) => onState(s)), core.onSignal((s) => void onSignal(s))];
+  if (env.onDeviceChange) unsubscribe.push(env.onDeviceChange(() => void onDevicesChanged()));
 
   function emitParticipants() {
     if (!active || !me) return;
@@ -265,7 +419,71 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     });
   }
 
-  function micTrack(): MediaStreamTrack | null {
+  /**
+   * G-72: the chosen microphone, or the system default when it is gone
+   * (unplugged): then the choice is dropped and deviceFallback says which.
+   */
+  async function openChosenMic(): Promise<MediaStream> {
+    try {
+      return await openMic(inputId);
+    } catch (e) {
+      const name = (e as { name?: string })?.name;
+      if (!inputId || (name !== 'OverconstrainedError' && name !== 'NotFoundError')) throw e;
+      const lost = inputId;
+      inputId = undefined;
+      emit('deviceFallback', { kind: 'input', deviceId: lost });
+      return openMic(undefined);
+    }
+  }
+
+  /** G-72: a device was plugged in or out. A chosen device that is gone falls back to the default. */
+  async function onDevicesChanged() {
+    emit('devicesChanged', null);
+    let all: MediaDeviceInfo[];
+    try {
+      all = await env.enumerateDevices();
+    } catch {
+      return;
+    }
+    const has = (kind: MediaDeviceKind, id: string) => all.some((d) => d.kind === kind && d.deviceId === id);
+    if (outputId && !has('audiooutput', outputId)) {
+      const lost = outputId;
+      outputId = undefined;
+      for (const p of peers.values()) if (p.audio && 'setSinkId' in p.audio) void p.audio.setSinkId('').catch(() => {});
+      if (ctx && !elementOnly && limiter) applyContextSink(ctx);
+      emit('deviceFallback', { kind: 'output', deviceId: lost });
+    }
+    if (inputId && !has('audioinput', inputId)) {
+      const lost = inputId;
+      inputId = undefined;
+      emit('deviceFallback', { kind: 'input', deviceId: lost });
+      if (active && local) await switchMic();
+    }
+  }
+
+/** Opens the chosen (or default) microphone and swaps it into every connection. */
+  async function switchMic() {
+    const gen = generation;
+    const next = await openChosenMic();
+    if (gen !== generation) {
+      for (const t of next.getTracks()) t.stop();
+      return;
+    }
+    const track = next.getAudioTracks()[0] ?? null;
+    for (const p of peers.values()) {
+      for (const s of p.pc.getSenders()) if (!s.track || s.track.kind === 'audio') await s.replaceTrack(track);
+    }
+    for (const t of local?.getTracks() ?? []) t.stop();
+    dropMeter(localMeter);
+    local = next;
+    if (monitor) monitor.srcObject = next;
+    applyMute();
+    localMeter = makeMeter(next);
+    micState = 'connected';
+    emitParticipants();
+  }
+
+    function micTrack(): MediaStreamTrack | null {
     return local?.getAudioTracks()[0] ?? null;
   }
 
@@ -346,6 +564,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       stream: null,
       audio: null,
       meter: null,
+      gain: null,
       state: 'connecting',
       verified: false,
       closed: false,
@@ -414,6 +633,12 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       // closing twice is harmless
     }
     dropMeter(peer.meter);
+    try {
+      peer.gain?.disconnect();
+    } catch {
+      // already gone
+    }
+    peer.gain = null;
     if (peer.audio) {
       peer.audio.pause();
       peer.audio.srcObject = null;
@@ -472,6 +697,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     void audio.play?.()?.catch?.(() => {});
     peer.audio = audio;
     peer.meter = makeMeter(peer.stream);
+    // Only from here on, after the certificate check (verified), may a peer reach the speakers.
+    applyPlayback(peer);
   }
 
   /** Waits for ICE gathering so the SDP carries every candidate (no trickle). */
@@ -737,7 +964,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     speaking = {};
     const turnReady = ensureTurn(gen); // alongside the microphone
     try {
-      local = await openMic(inputId);
+      local = await openChosenMic();
       if (gen !== generation) {
         for (const t of local.getTracks()) t.stop();
         return;
@@ -758,6 +985,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   }
 
   function stop() {
+    stopMonitor();
     if (!active) return;
     active = false;
     generation++;
@@ -772,6 +1000,9 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     turnTimer = null;
     void ctx?.close?.().catch(() => {});
     ctx = null;
+    limiter = null;
+    sinkSet = undefined;
+    elementOnly = false;
     refused.clear();
     members = new Set();
     me = null;
@@ -817,26 +1048,12 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
         emit('error', { code: 'rejoin-to-talk' });
         return;
       }
-      const gen = generation;
-      const next = await openMic(inputId);
-      if (gen !== generation) {
-        for (const t of next.getTracks()) t.stop();
-        return;
-      }
-      const track = next.getAudioTracks()[0] ?? null;
-      for (const p of peers.values()) {
-        for (const s of p.pc.getSenders()) if (!s.track || s.track.kind === 'audio') await s.replaceTrack(track);
-      }
-      for (const t of local?.getTracks() ?? []) t.stop();
-      dropMeter(localMeter);
-      local = next;
-      applyMute();
-      localMeter = makeMeter(next);
-      micState = 'connected';
-      emitParticipants();
+      await switchMic();
     },
     async setOutputDevice(deviceId) {
       outputId = deviceId || undefined;
+      if (ctx && !elementOnly && limiter) applyContextSink(ctx);
+      if (monitor && 'setSinkId' in monitor) void monitor.setSinkId(deviceId).catch(() => {});
       await Promise.all(
         [...peers.values()].map((p) =>
           p.audio && 'setSinkId' in p.audio ? p.audio.setSinkId(deviceId).catch(() => {}) : undefined,
@@ -845,6 +1062,32 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     listInputDevices: () => listDevices('audioinput'),
     listOutputDevices: () => listDevices('audiooutput'),
+    setSelfMonitor(on) {
+      if (on && active) startMonitor();
+      else stopMonitor();
+    },
+    setPeerVolume(id, volume) {
+      const v = Number.isFinite(volume) ? Math.min(2, Math.max(0, volume)) : 1;
+      volumes.set(id, v);
+      const p = peers.get(id);
+      if (p) applyPlayback(p);
+    },
+    setDeafened(on) {
+      deafened = on;
+      for (const p of peers.values()) applyPlayback(p);
+    },
+    inputLevel() {
+      if (!active || micMuted || !localMeter) return 0;
+      try {
+        localMeter.analyser.getFloatTimeDomainData(localMeter.buffer);
+        let sum = 0;
+        for (const v of localMeter.buffer) sum += v * v;
+        // Speech RMS sits around 0.02..0.2: scale so a normal voice fills most of the bar.
+        return Math.min(1, Math.sqrt(sum / localMeter.buffer.length) * 5);
+      } catch {
+        return 0;
+      }
+    },
     on(event, cb) {
       listeners[event].add(cb);
       return () => listeners[event].delete(cb);

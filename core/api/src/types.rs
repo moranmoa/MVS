@@ -614,6 +614,9 @@ pub struct CallParticipant {
     /// A user ID.
     pub identity: Id,
     pub muted: bool,
+    /// G-84b: hears no one (only with `muted`; false from cores before 0.6.0).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
 }
 
 /// Why `server.removed` fired (server lifecycle).
@@ -660,6 +663,9 @@ pub struct VoiceMember {
     pub user_id: Id,
     /// A display hint only.
     pub muted: bool,
+    /// G-84b: a display hint only, with `muted`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
     /// ms since the epoch: its claim, checked within 2 minutes and frozen.
     pub joined_at: u64,
 }

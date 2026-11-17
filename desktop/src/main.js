@@ -13,7 +13,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, ipcMain, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, globalShortcut, ipcMain, nativeImage, protocol, session, shell } = require('electron');
 const sec = require('./security');
 const { toRequest } = require('./commands');
 const signout = require('./signout');
@@ -24,6 +24,8 @@ const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
 const { createNotifier } = require('./notify');
+const ptt = require('./ptt');
+const badge = require('./badge');
 
 // Tests only, and only in a checkout (never a release build): a throwaway
 // profile, so a test run never shares the installed app's profile
@@ -75,6 +77,63 @@ if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
 const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
+/**
+ * G-74: push-to-talk on our focused window (ptt.js). Only the one key the
+ * page chose, only during a call; the page gets ptt.down / ptt.up.
+ */
+const pushToTalk = ptt.createPtt({ emit: (name) => toPages(name, {}), active: () => callGate.inCall });
+/**
+ * G-74: the optional global "toggle mute" accelerator the page chose (checked),
+ * or null. It is registered with the OS only during a call.
+ */
+let globalMute = null;
+/** What ptt:set answered for it: 'ok' or 'shortcut-taken'. */
+let globalMuteStatus = 'ok';
+/** The accelerator registered with the OS right now, or null. */
+let globalMuteRegistered = null;
+
+function registerGlobalMute() {
+  if (!globalMute || globalMuteRegistered) return !!globalMuteRegistered;
+  let ok = false;
+  try {
+    // The page hears only that it was pressed, and only during a call.
+    ok = globalShortcut.register(globalMute, () => callGate.inCall && toPages('ptt.toggleMute', {}));
+  } catch {
+    ok = false;
+  }
+  if (ok) globalMuteRegistered = globalMute;
+  return ok;
+}
+
+function unregisterGlobalMute() {
+  if (globalMuteRegistered) globalShortcut.unregister(globalMuteRegistered);
+  globalMuteRegistered = null;
+}
+
+/** After any change to the call: push-to-talk lets go, and the global shortcut follows the call. */
+function syncCall() {
+  if (!callGate.inCall) {
+    pushToTalk.reset();
+    unregisterGlobalMute();
+  } else if (globalMute) {
+    registerGlobalMute();
+  }
+}
+/**
+ * G-62: the unread count on the taskbar (Windows: our overlay icon) or the
+ * dock / launcher. Only a checked whole number reaches the OS. Main clears it
+ * itself on sign-out and when the page dies (it can't send 0 then).
+ */
+const unread = badge.createBadge({
+  apply: (n) => {
+    if (process.platform === 'win32') {
+      const img = n > 0 ? nativeImage.createFromBitmap(badge.drawBadge(badge.label(n)), { width: badge.SIZE, height: badge.SIZE, scaleFactor: 2 }) : null;
+      for (const win of BrowserWindow.getAllWindows()) win.setOverlayIcon(img, n > 0 ? `${n} unread` : '');
+    } else {
+      app.setBadgeCount(n);
+    }
+  },
+});
 
 /** Sends a shell event (not from the core) to our own windows. */
 function toPages(name, payload) {
@@ -85,6 +144,7 @@ function toPages(name, payload) {
 
 function setCoreStatus(status) {
   callGate.onCoreStatus(status);
+  syncCall();
   coreStatus = status;
   toPages('core.status', statusForPage(status));
   // The core keeps the metered flag in memory: tell every core that comes up.
@@ -139,6 +199,7 @@ function startCore() {
     extraArgs: update.coreArgs(UPDATE),
     onEvent: (name, payload) => {
       callGate.onEvent(name, payload);
+      syncCall();
       toPages(name, payload);
     },
     onStatus: setCoreStatus,
@@ -173,6 +234,8 @@ function serveCoreIpc() {
         confirmWithoutWords: async () => (await dialog.showMessageBox(win, signout.WITHOUT_WORDS_DIALOG)).response === 1,
         request: () => core.request(req.cmd, req.args),
         clearStorage: async () => {
+          // G-62: signed out (the core said ok): no unread count left on the taskbar.
+          unread.set(0);
           await event.sender.session.clearStorageData({
             origin: sec.ORIGIN,
             storages: ['localstorage', 'indexdb', 'cachestorage', 'serviceworkers', 'cookies', 'websql', 'shadercache'],
@@ -187,6 +250,7 @@ function serveCoreIpc() {
     const token = callGate.beforeCommand(req.cmd);
     const res = await core.request(req.cmd, req.args);
     callGate.afterCommand(req.cmd, token, res);
+    syncCall();
     return res;
   });
   // The "core unavailable" screen (T8-01): try again now, and open the logs.
@@ -240,6 +304,33 @@ function serveCoreIpc() {
   ipcMain.handle('notify:show', (event, notice) => {
     if (!fromUs(event)) return false;
     return notifier.show(notice);
+  });
+  // G-74: the page's push-to-talk settings { key, globalMute }: a
+  // KeyboardEvent.code (or null) and an accelerator (or null), both checked
+  // here. 'ok', 'invalid' (nothing changed) or 'shortcut-taken' (the key is
+  // set; the global shortcut isn't: another app has it).
+  ipcMain.handle('ptt:set', (event, settings) => {
+    if (!fromUs(event)) return 'invalid';
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return 'invalid';
+    const key = ptt.cleanKey(settings.key ?? null);
+    const accel = ptt.cleanAccelerator(settings.globalMute ?? null);
+    if (key === undefined || accel === undefined) return 'invalid';
+    pushToTalk.setKey(key);
+    // The same shortcut again: nothing to do.
+    if (accel === globalMute) return globalMuteStatus;
+    unregisterGlobalMute();
+    globalMute = accel;
+    globalMuteStatus = 'ok';
+    if (!accel) return 'ok';
+    // Try it now so the page can say "taken"; it then stays registered only
+    // during a call (syncCall).
+    if (!registerGlobalMute()) globalMuteStatus = 'shortcut-taken';
+    syncCall();
+    return globalMuteStatus;
+  });
+  ipcMain.handle('badge:set', (event, count) => {
+    if (!fromUs(event)) return false;
+    return unread.set(count);
   });
   ipcMain.handle('logs:open', async (event) => {
     if (!fromUs(event)) return false;
@@ -444,14 +535,20 @@ function createWindow() {
   // A second close within 10 s closes whatever the page does.
   // Only a live, answering page is asked: a quit, a crashed or killed
   // renderer, or a hung one closes at once (a dead page never answers).
+  // G-74: push-to-talk sees our own window's keys only (never the OS's), and
+  // losing focus counts as letting go of the key.
+  win.webContents.on('before-input-event', (_e, input) => pushToTalk.onInput(input));
+  win.on('blur', () => pushToTalk.onBlur());
   win.on('unresponsive', () => unresponsive.add(win));
   win.on('responsive', () => unresponsive.delete(win));
   win.webContents.on('render-process-gone', () => {
+    unread.set(0);
     // The page held the call's audio; the call ends with it.
     if (callGate.inCall) {
       callGate.end();
       core?.request('leaveCall', {}).catch(() => {});
     }
+    syncCall();
   });
   win.on('close', (e) => {
     if (!callGate.inCall) return;
@@ -467,6 +564,7 @@ function createWindow() {
     // Closing during a call ends it here, not by trusting the page: the
     // microphone gate shuts now and the core leaves the call.
     callGate.end();
+    syncCall();
     core?.request('leaveCall', {}).catch(() => {});
   });
   // Every load (a reload too) gets the current core status.
@@ -517,6 +615,7 @@ app.on('second-instance', (_event, argv) => {
 });
 
 app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
   meteredWatch?.stop();
   callGate.end();
   core?.stop();

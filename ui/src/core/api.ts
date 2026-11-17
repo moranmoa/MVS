@@ -184,6 +184,8 @@ export interface CoreCommands {
   leaveCall(): Promise<null>;
   /** `not-allowed` when not in a call. */
   setMuted(muted: boolean): Promise<null>;
+  /** G-84b: tells the others in my call I hear no one (shown with mute). `not-allowed` outside a call. */
+  setDeafened(deafened: boolean): Promise<null>;
   /** For the voice engine only (ui/src/voice). Payload at most 12 KiB. */
   sendSignal(to: Id, kind: CallSignal['kind'], payload: string): Promise<null>;
 

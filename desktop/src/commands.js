@@ -63,6 +63,7 @@ const COMMANDS = Object.freeze({
   joinCall: ['channelId'],
   leaveCall: [],
   setMuted: ['muted'],
+  setDeafened: ['deafened'],
   sendSignal: ['to', 'kind', 'payload'],
   // App
   getStorageUsage: [],

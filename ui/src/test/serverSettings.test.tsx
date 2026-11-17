@@ -80,7 +80,7 @@ describe('context menus (B25)', () => {
     expect(screen.getByRole('menu', { name: 'Actions for ⁨#clips⁩' })).toBeTruthy();
     // G-11: the owner's move items have their own group, before Delete.
     expect(menuItems()).toEqual(['Mark as read', 'Notifications', 'Rename', 'Copy channel ID', 'Move up', 'Move down', 'Delete channel']);
-    expect(screen.getAllByRole('separator').length).toBe(3);
+    expect(within(screen.getByRole('menu')).getAllByRole('separator').length).toBe(3);
     expect(document.activeElement?.textContent).toBe('Mark as read');
 
     fireEvent.keyDown(document.activeElement!, { key: 'Escape' });

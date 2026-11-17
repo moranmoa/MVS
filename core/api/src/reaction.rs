@@ -221,7 +221,91 @@ pub fn causal_order(nodes: &[Node]) -> Vec<RecordId> {
     order
 }
 
-/// The per-author rate count of one channel, in causal order.
+/// How far a reaction's claimed time may trail its deps, or lead the
+/// folding core's clock.
+pub const SKEW_MS: u64 = 10 * 60_000;
+
+/// Effective times (the security lead's bound on the rate): a record's
+/// effective time is the latest of its claimed time and its deps'
+/// effective times, so a reaction can't claim to be older than what it was
+/// built on. Records claiming a time past `now + SKEW_MS` are left out
+/// until then (they and their effective times don't count yet), so a
+/// forward-dated record can neither be folded early nor push honest
+/// records that build on it into the future.
+pub struct Times {
+    eff: HashMap<RecordId, u64>,
+    horizon: u64,
+}
+
+impl Times {
+    pub fn new(now: u64) -> Times {
+        Times { eff: HashMap::new(), horizon: now.saturating_add(SKEW_MS) }
+    }
+
+    /// The latest effective time among `deps` that are counted.
+    pub fn dep_max(&self, deps: &[RecordId]) -> Option<u64> {
+        deps.iter().filter_map(|d| self.eff.get(d)).copied().max()
+    }
+
+    /// Takes the next node in causal order. Its effective time, or `None`
+    /// if it claims a time past the horizon.
+    pub fn add(&mut self, node: &Node) -> Option<u64> {
+        if node.ts > self.horizon {
+            return None;
+        }
+        let eff = self.dep_max(node.deps).map_or(node.ts, |d| d.max(node.ts));
+        self.eff.insert(node.id, eff);
+        Some(eff)
+    }
+
+    /// A claimed time more than [`SKEW_MS`] before its deps': ignored.
+    pub fn backdated(&self, node: &Node) -> bool {
+        self.dep_max(node.deps).is_some_and(|d| node.ts.saturating_add(SKEW_MS) < d)
+    }
+}
+
+/// The time and rate rules of the fold, fed every node of a channel in
+/// causal order.
+pub struct Gate {
+    pub times: Times,
+    pub rate: Rate,
+    now: u64,
+}
+
+impl Gate {
+    pub fn new(now: u64) -> Gate {
+        Gate { times: Times::new(now), rate: Rate::default(), now }
+    }
+
+    /// Takes the next node; for a reaction (`author` set), whether it is
+    /// counted: not from past the horizon (it waits), not backdated more
+    /// than [`SKEW_MS`] before its deps (ignored), and within the rate,
+    /// counted at its effective time capped at now (so the ten minutes a
+    /// claimed time may run ahead add no room).
+    pub fn take(&mut self, node: &Node, author: Option<PublicKey>) -> bool {
+        let backdated = self.times.backdated(node);
+        let eff = self.times.add(node);
+        match (author, eff) {
+            (Some(author), Some(eff)) => !backdated && self.rate.admit(author, eff.min(self.now)),
+            _ => false,
+        }
+    }
+
+    /// How many of `author`'s reactions count near a new one signed now
+    /// (its effective time is at least now, so it counts at now).
+    pub fn near(&self, author: PublicKey) -> usize {
+        self.rate.near(author, self.now)
+    }
+
+    /// The time to sign a new record on `deps` at: now, or its deps'
+    /// effective time if later, so it is never backdated.
+    pub fn sign_at(&self, deps: &[RecordId]) -> u64 {
+        self.times.dep_max(deps).map_or(self.now, |d| d.max(self.now))
+    }
+}
+
+/// The per-author rate count of one channel, in causal order, by
+/// effective time ([`Times`]).
 #[derive(Default)]
 pub struct Rate {
     counted: HashMap<PublicKey, BTreeMap<u64, usize>>,
@@ -490,6 +574,84 @@ mod tests {
         }
         assert!(m.is_on(&emoji[0], key(1)), "the earliest stays");
         assert!(!m.is_on(&emoji[10], key(1)), "the backdated 11th is the one ignored");
+    }
+
+    const T: u64 = 1_800_000_000_000;
+
+    fn rid(n: u32) -> RecordId {
+        let mut b = [0; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        RecordId::from_bytes(b)
+    }
+
+    /// Feeds `nodes` (ID, claimed time, deps; reactions by key(1) unless
+    /// the ID is 0) through a gate at `now`; how many reactions count.
+    fn counted(nodes: &[(RecordId, u64, Vec<RecordId>)], now: u64) -> usize {
+        let nodes: Vec<Node> = nodes.iter().map(|(id, ts, deps)| Node { id: *id, ts: *ts, deps }).collect();
+        let index: HashMap<RecordId, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+        let mut gate = Gate::new(now);
+        causal_order(&nodes)
+            .into_iter()
+            .filter(|id| gate.take(index[id], (*id != rid(0)).then_some(key(1))))
+            .count()
+    }
+
+    /// The security lead's blocker: claimed times are the author's own.
+    #[test]
+    fn invented_past_minutes_give_thirty() {
+        // A head at T, then 600 reactions on it claiming 6 a minute over the
+        // 100 minutes before: only those within ten minutes of the head
+        // count, all at the head's time, so 30.
+        let mut nodes = vec![(rid(0), T, vec![])];
+        for k in 1..=600u32 {
+            nodes.push((rid(k), T - u64::from(k) * 10_000, vec![rid(0)]));
+        }
+        assert_eq!(counted(&nodes, T), RATE_LIMIT);
+    }
+
+    #[test]
+    fn a_forward_dated_chain_gives_thirty_in_the_first_real_minute() {
+        // A chain claiming 6 a minute over the next 20 minutes: past the
+        // ten-minute horizon it waits; within it, counted at now: 30.
+        let mut nodes = vec![(rid(0), T, vec![])];
+        for k in 1..=120u32 {
+            nodes.push((rid(k), T + u64::from(k) * 10_000, vec![rid(k - 1)]));
+        }
+        assert_eq!(counted(&nodes, T), RATE_LIMIT);
+        // Twenty real minutes later the whole chain is in the past, spread
+        // over its minutes: everything counts.
+        assert_eq!(counted(&nodes, T + 21 * 60_000), 120);
+    }
+
+    #[test]
+    fn honest_spacing_still_counts() {
+        // 20 a minute for five minutes, each on the one before.
+        let mut nodes = vec![(rid(0), T, vec![])];
+        for k in 1..=100u32 {
+            nodes.push((rid(k), T + u64::from(k) * 3_000, vec![rid(k - 1)]));
+        }
+        assert_eq!(counted(&nodes, T + 10 * 60_000), 100);
+        // A reaction on a record forward-dated by a year: that record waits,
+        // and doesn't push the honest one out as backdated.
+        let year = 365 * 24 * 3_600_000;
+        let nodes = vec![(rid(0), T + year, vec![]), (rid(1), T, vec![rid(0)])];
+        assert_eq!(counted(&nodes, T), 1);
+        let gate = Gate::new(T);
+        assert_eq!(gate.sign_at(&[rid(0)]), T, "signed now, not a year ahead");
+    }
+
+    #[test]
+    fn a_new_record_is_signed_no_earlier_than_its_deps() {
+        // My clock runs 8 minutes behind the head I build on (within the
+        // ten minutes of skew supported).
+        let head = [rid(0)];
+        let mut gate = Gate::new(T);
+        gate.take(&Node { id: rid(0), ts: T + 5 * 60_000, deps: &[] }, None);
+        let behind = T - 8 * 60_000;
+        let mut late = Gate::new(behind);
+        late.take(&Node { id: rid(0), ts: T, deps: &[] }, None);
+        assert_eq!(late.sign_at(&head), T, "the head's time, not my clock's");
+        assert_eq!(gate.sign_at(&head), T + 5 * 60_000);
     }
 
     #[test]

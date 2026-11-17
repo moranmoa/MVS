@@ -128,13 +128,23 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     The design said 64 bytes, but 32 + 1 + 1 + 32 needs 66, so 66 keeps the 32-byte emoji limit.
   - **The fold** (deterministic in every core):
     - The channel's records go in causal order: deps first, and (claimed time, ID) only between records that are concurrent.
-    - The rate is counted first: an author's record is ignored when 30 of theirs are already counted within a minute of its claimed time, either way.
+    - **Time bounds** (the security lead's fix: claimed times are the author's own):
+      - A record's effective time is the later of its claimed time and its deps' effective times.
+      - A reaction claiming a time more than 10 minutes before its deps' effective time is ignored.
+      - A record claiming a time more than 10 minutes past the folding core's clock waits: it isn't counted, and its time doesn't count for the records built on it, until then.
+    - **Rate:** an author's accepted reaction is ignored when 30 of theirs are already counted within a minute of its effective time, either way. The count uses the effective time capped at now, so the 10 minutes of lead add no room.
+    - A new reaction is signed at its effective time (my clock, or its deps' time if later), so a clock up to 10 minutes slow isn't ignored as backdated.
+    - **Residual (dev-sync follow-up):** a chain built on stale heads can still spread its claimed times over the minutes since those heads. The real bound is a receive-time check at sync ingest.
     - Then a reaction counts only if it opens to a valid plaintext whose target is a shown `Message` of that channel that isn't deleted.
     - Per (message, emoji, author), the last op wins.
     - An add is ignored while the author already has 10 emoji on that message; a removal frees a place.
     - There's no per-message cap in the state, so one member can't lock a message.
   - **Known residual:** with more than 20 distinct emoji on a message, the rarest drop out of view (not out of state). One member can add at most 10.
   - **Rollout:** a `reactions-v1` cap in profile posts (above). An older core refuses kind 21 and would stall on every channel record after one, so nobody reacts until every current member posts the cap. The release that reads kind 21 also posts it.
+  - **Known residual: late joiners on an old version.** Someone who joins later with a pre-reactions build meets the kind-21 records already there and stalls on that channel's log, as with lifecycle records (#229). The gate can't see them before they join, since their caps arrive only with their first profile post. A join can't be refused on version either: the core has no version field to check. So:
+    - the release notes say reactions need everyone on that version;
+    - the in-app updater (hourly check) narrows the window;
+    - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
 - New-messages divider (G-21, option A):
   - `Channel.unreadCount?: number` and `Channel.firstUnreadIndex?: number` (additive) count the messages after my read marker that aren't mine, in `getMessages` order. `firstUnreadIndex` is the `getMessages` index of the first of them, and is absent when there are none. `Channel.unread` is `unreadCount > 0`. They appear in `listChannels` and `channel.updated`.
@@ -233,6 +243,15 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       - `not-implemented`: no voice transport (sync's piece A).
   - `leaveCall()` returns `null` and is idempotent. The app lock and quitting leave too.
   - `setMuted(muted: boolean)` returns `null`. `not-allowed` outside a call.
+  - `setDeafened(deafened: boolean)` returns `null` (G-84b). `not-allowed` outside a call. The others see it only together with mute, and only from cores that understand it:
+    - `CallParticipant` and the voice room members gain `deafened`. It's present only when true, and only together with `muted`.
+    - On the wire, every hello's `payload` advertises caps: `{"caps":["deafen"]}`, as JSON with no other keys.
+      - At most 128 bytes and 8 caps, each 1–16 characters of `[a-z0-9-]`. Unknown caps are ignored, and anything malformed means no caps.
+      - Cores before 0.6.0 never read a hello's payload.
+    - Caps are remembered per signer, up to 1024; when full, the stalest goes. They expire with the roster's hello timeout.
+    - A hello carries `deafened: true` only to signers that advertised `deafen`, because older cores refuse unknown fields.
+      - A broadcast hello is sealed twice, with a fresh nonce each time. Everyone else, my own other computers included, gets the plain one.
+    - A received `deafened` counts only with `muted`.
   - `sendSignal(to, kind: 'offer' | 'answer' | 'ice', payload: string)` returns `null`.
     - Errors:
       - `not-allowed`: not in a call, or `to` isn't in it.

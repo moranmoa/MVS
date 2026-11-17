@@ -17,8 +17,10 @@
 //! - `0x01 ‖ e_old_pub[32]` → `e_new_pub[32]` (Hello);
 //! - `0x02 ‖ ciphertext` → `0x01` (Sealed, the transfer).
 //!
-//! Anything else, no open link, a peer other than the first Hello's, or past
-//! the request cap gets an empty answer. One session per link: the first
+//! With no open link (none, expired, or its transfer done) the answer is
+//! `0x00`, which the signed-in device reports as not found. Anything else, a
+//! peer other than the first Hello's, or past the request cap gets an empty
+//! answer (refused). One session per link: the first
 //! Hello locks it to that peer. A stranger who caught the code can only make
 //! the link fail (the user starts again); the SAS covers a man in the middle.
 
@@ -40,6 +42,19 @@ pub const DEVICE_LINK_FIND_WAIT: Duration = Duration::from_secs(10);
 const RV_CONTEXT: &str = "mvs/device-link-rv/v1";
 const HELLO: u8 = 0x01;
 const SEALED: u8 = 0x02;
+/// The answer when no link is open (none, expired, or already used): the
+/// caller gets [`LinkError::NotFound`]. An empty answer (held by another
+/// device, or over the caps) is [`LinkError::Refused`].
+pub(crate) const GONE: u8 = 0x00;
+
+/// What an answer means to the signed-in device.
+pub(crate) fn outcome(answer: Vec<u8>) -> Result<Vec<u8>, LinkError> {
+    match answer.as_slice() {
+        [] => Err(LinkError::Refused),
+        [GONE] => Err(LinkError::NotFound),
+        _ => Ok(answer),
+    }
+}
 /// Requests one link answers, per peer and in all.
 const PER_PEER: u8 = 10;
 const ALL: usize = 32;
@@ -125,7 +140,13 @@ impl Host {
     /// The answer to one request, and what to hand the core. A refusal is an
     /// empty answer and nothing for the core.
     pub(crate) fn answer(&mut self, peer: PeerId, request: Request, now: Instant) -> (Vec<u8>, Option<Inbound>) {
-        if self.done || self.expired(now) || self.answered >= ALL {
+        // No open link any more (expired, or its one transfer done): a
+        // distinct "gone" answer, so the signed-in device says "not found"
+        // rather than "locked out" (QA, 0.4.6).
+        if self.done || self.expired(now) {
+            return (vec![GONE], None);
+        }
+        if self.answered >= ALL {
             return (Vec::new(), None);
         }
         if !self.asked.contains_key(&peer) && self.asked.len() >= MAX_PEERS {
@@ -262,9 +283,9 @@ mod tests {
         assert_eq!(host.answer(b, Request::Sealed(vec![9]), now), (Vec::new(), None));
         assert_eq!(host.peer(), Some(a));
         assert_eq!(host.answer(a, Request::Sealed(vec![9; 40]), now), (vec![1], Some(Inbound::Sealed { ciphertext: vec![9; 40] })));
-        // One transfer per link.
-        assert_eq!(host.answer(a, Request::Sealed(vec![9]), now), (Vec::new(), None));
-        assert_eq!(host.answer(a, Request::Hello([1; 32]), now), (Vec::new(), None));
+        // One transfer per link; after it, the link is gone (not refused).
+        assert_eq!(host.answer(a, Request::Sealed(vec![9]), now), (vec![GONE], None));
+        assert_eq!(host.answer(a, Request::Hello([1; 32]), now), (vec![GONE], None));
     }
 
     #[test]
@@ -279,7 +300,7 @@ mod tests {
         let (mut host, now) = host();
         let later = now + DEVICE_LINK_TTL;
         assert!(host.expired(later));
-        assert_eq!(host.answer(PeerId::random(), Request::Hello([1; 32]), later), (Vec::new(), None));
+        assert_eq!(host.answer(PeerId::random(), Request::Hello([1; 32]), later), (vec![GONE], None));
     }
 
     #[test]
@@ -307,6 +328,16 @@ mod tests {
             host.answer(PeerId::random(), Request::Sealed(vec![1]), now);
         }
         assert_eq!(host.asked.len(), MAX_PEERS);
+    }
+
+    /// QA, 0.4.6: an expired or used link reads "not found", a link held by
+    /// another device "refused" (locked out).
+    #[test]
+    fn a_gone_link_and_a_refusal_are_told_apart() {
+        assert_eq!(outcome(vec![GONE]), Err(LinkError::NotFound));
+        assert_eq!(outcome(Vec::new()), Err(LinkError::Refused));
+        assert_eq!(outcome(vec![1]), Ok(vec![1]));
+        assert_eq!(outcome(vec![7; 32]), Ok(vec![7; 32]));
     }
 
     #[test]

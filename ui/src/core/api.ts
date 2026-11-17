@@ -29,6 +29,7 @@ import type {
   CallState,
   CallSignal,
   VoiceRoom,
+  ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
@@ -153,6 +154,8 @@ export interface CoreCommands {
   beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
   /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */
   confirmDeviceApproval(approve: boolean): Promise<null>;
+  /** G-91: how far my servers are from coming back after a restore. */
+  getServerRestore(): Promise<ServerRestore>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -245,6 +248,8 @@ export interface CoreEvents {
   'call.signal': CallSignal;
   /** A server's rooms changed (create, join, leave, mute, edit, timeout), mine or not. Coalesced; a hint: re-read with listVoiceRooms. */
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
+  /** G-91: sent when anything in the restore progress changes. */
+  'serverRestore.changed': ServerRestore;
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
   /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */

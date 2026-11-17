@@ -21,6 +21,7 @@ import type {
   ServerSummary,
   CallState,
   VoiceRoom,
+  ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
@@ -499,6 +500,16 @@ export function cleanDeviceAdded(r: unknown): DeviceAdded | null {
   return { at, ...(clean ? { label: clean } : {}) };
 }
 
+/** G-91: a known state, whole counts, and no more waiting than found; anything else is dropped. */
+export function cleanServerRestore(r: unknown): ServerRestore | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['state', 'found', 'waiting'])) return null;
+  const { state, found, waiting } = r as Record<string, unknown>;
+  const st = (['none', 'searching', 'waiting', 'done'] as const).find((x) => x === state);
+  const count = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 10_000;
+  if (!st || !count(found) || !count(waiting) || waiting > found) return null;
+  return { state: st, found, waiting };
+}
+
 /** A cleaner may return null to drop the event altogether. */
 const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[E] | null } = {
   'identity.changed': cleanIdentity,
@@ -526,6 +537,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'memberRelay.changed': (r) => cleanMemberRelay(r),
   'deviceLink.state': (r) => cleanDeviceLinkState(r),
   'account.deviceAdded': (r) => cleanDeviceAdded(r),
+  'serverRestore.changed': (r) => cleanServerRestore(r),
   'voice.rooms': (p) => {
     const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
     return rooms ? { serverId: p.serverId, rooms } : null;
@@ -590,6 +602,12 @@ export function guardCore(core: CoreApi): CoreApi {
         return rooms;
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
+    getServerRestore: () =>
+      core.getServerRestore().then((r) => {
+        const clean = cleanServerRestore(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
     startDeviceLink: () =>
       core.startDeviceLink().then((r) => {
         const clean = cleanDeviceLinkOffer(r);

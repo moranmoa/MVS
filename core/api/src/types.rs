@@ -506,6 +506,9 @@ pub enum Event {
     /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
     #[serde(rename = "memberRelay.changed")]
     MemberRelayChanged(MemberRelay),
+    /// G-91: bringing my servers back after a restore moved on.
+    #[serde(rename = "serverRestore.changed")]
+    ServerRestoreChanged(ServerRestore),
     /// Device link, the new device: where its link stands.
     #[serde(rename = "deviceLink.state")]
     DeviceLinkState(DeviceLinkState),
@@ -688,6 +691,31 @@ pub enum MemberRelayReason {
     RelayOnly,
     /// A metered network, as the desktop shell reports it (`setMetered`).
     Metered,
+}
+
+/// Where bringing my servers back after a restore stands (G-91).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServerRestoreState {
+    /// No restore under way since this start.
+    None,
+    /// Looking for my backup on the network (none found yet).
+    Searching,
+    /// The backup is found; some servers have nobody reachable yet.
+    Waiting,
+    /// Every server from the backup is back (or isn't mine any more).
+    Done,
+}
+
+/// `getServerRestore`'s answer, and `serverRestore.changed`'s payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerRestore {
+    pub state: ServerRestoreState,
+    /// Servers the backup lists as mine (0 until it's found).
+    pub found: u32,
+    /// Of those, the ones not back yet because nobody was reachable.
+    pub waiting: u32,
 }
 
 /// `getMemberRelay`'s answer, and `memberRelay.changed`'s payload.

@@ -106,6 +106,10 @@ pub const BACKUP_REPUBLISH_MS: u64 = 24 * 3_600_000;
 /// to at most 1 h (Tech Lead); back to 1 min once it's done.
 pub const BACKUP_RETRY_FIRST_MS: u64 = 60_000;
 pub const BACKUP_RETRY_MAX_MS: u64 = 60 * 60_000;
+/// G-91: once the backup is found, the servers still waiting are tried
+/// this often (no backup fetch), so each is back within 2 minutes of a
+/// member of it being reachable (PO acceptance).
+pub const REJOIN_EVERY_MS: u64 = 30_000;
 
 pub struct Config {
     /// `None` keeps everything in memory (tests).
@@ -352,6 +356,27 @@ pub struct Core {
     /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
     /// once the restore is done.
     backup_retry: Mutex<(u64, u64)>,
+    /// G-91: the restore under way, once its backup is found.
+    restore: Mutex<RestoreProgress>,
+}
+
+/// G-91: a restore's progress. The backup is fetched until found (with
+/// backoff: a holder lookup is slow); after that only the servers still
+/// waiting are tried, every [`REJOIN_EVERY_MS`], so each comes back soon
+/// after a member of it is reachable (PO: within 2 minutes).
+struct RestoreProgress {
+    /// Live servers the backup lists (`None` until it's found).
+    found: Option<u32>,
+    /// Those not back yet: server → its sync secret.
+    waiting: BTreeMap<ServerId, Zeroizing<[u8; 32]>>,
+    /// What `getServerRestore` answers; announced when it changes.
+    status: ServerRestore,
+}
+
+impl RestoreProgress {
+    fn new(state: ServerRestoreState) -> RestoreProgress {
+        RestoreProgress { found: None, waiting: BTreeMap::new(), status: ServerRestore { state, found: 0, waiting: 0 } }
+    }
 }
 
 struct PendingJoin {
@@ -503,6 +528,13 @@ impl Core {
         }
         // The first member relay value: later changes are announced.
         inner.check_member_relay(&ports, &mut Vec::new());
+        // G-91: a restore that was still bringing servers back before a
+        // restart searches again.
+        let restore_state = if inner.db.get(KV_BACKUP_PENDING)?.is_some() {
+            ServerRestoreState::Searching
+        } else {
+            ServerRestoreState::None
+        };
         Ok(Core {
             inner: Mutex::new(inner),
             ports,
@@ -514,6 +546,7 @@ impl Core {
             backup_started: AtomicBool::new(false),
             notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
+            restore: Mutex::new(RestoreProgress::new(restore_state)),
         })
     }
 
@@ -816,10 +849,35 @@ impl Core {
         // Restore servers (#291 phase A): my backup on the network brings
         // my servers back, rejoined as the same member (the #290 path).
         self.lock().db.set(KV_BACKUP_PENDING, b"1")?;
-        if !self.restore_from_backup() {
-            self.schedule_backup_retry(false);
-        }
+        *self.restore.lock().expect("not poisoned") = RestoreProgress::new(ServerRestoreState::None);
+        self.set_restore_status(ServerRestoreState::Searching);
+        let done = self.restore_from_backup();
+        self.schedule_backup_retry(done);
         Ok(identity)
+    }
+
+    /// G-91: `getServerRestore`.
+    pub fn get_server_restore(&self) -> ServerRestore {
+        self.restore.lock().expect("not poisoned").status
+    }
+
+    /// Sets the restore's state (counts from the progress) and announces
+    /// `serverRestore.changed` if anything changed.
+    fn set_restore_status(&self, state: ServerRestoreState) {
+        let changed = {
+            let mut progress = self.restore.lock().expect("not poisoned");
+            let status = ServerRestore {
+                state,
+                found: progress.found.unwrap_or(0),
+                waiting: progress.waiting.len() as u32,
+            };
+            let changed = progress.status != status;
+            progress.status = status;
+            changed.then_some(status)
+        };
+        if let Some(status) = changed {
+            self.emit(vec![Event::ServerRestoreChanged(status)]);
+        }
     }
 
     /// Restore servers (#291 phase A): fetches my backup from the holders,
@@ -827,24 +885,42 @@ impl Core {
     /// yet as the same member (`Inner::join`: no new join, nothing posted
     /// over what the server holds). A server it lists that no longer has
     /// me as a member isn't entered (a stale backup can't undo a leave or a
-    /// kick). Servers nobody can be reached for are tried again each sync
-    /// round until all are in.
+    /// kick). Servers nobody can be reached for are tried again (G-91: every
+    /// [`REJOIN_EVERY_MS`], without fetching the backup again) until all
+    /// are in. Returns whether the restore is done.
     fn restore_from_backup(&self) -> bool {
         let Some(keys) = self.lock().me.as_ref().map(|me| me.identity.backup_keys()) else {
             return true;
         };
-        let answers = self.ports.network.fetch_backup(keys.tag());
-        // No backup found (yet): try again later.
-        let Some(plain) = backup::newest(&keys, &answers) else { return false };
-        let mut waiting = false;
-        for (id, entry) in plain.servers.iter().filter(|(_, e)| e.live()) {
-            let (Some(server), Some(secret)) = (
-                model::parse_hex32(id).map(ServerId::from_bytes),
-                model::parse_hex32(&entry.secret).map(Zeroizing::new),
-            ) else {
-                continue;
+        if self.restore.lock().expect("not poisoned").found.is_none() {
+            let answers = self.ports.network.fetch_backup(keys.tag());
+            // No backup found (yet): try again later.
+            let Some(plain) = backup::newest(&keys, &answers) else {
+                self.set_restore_status(ServerRestoreState::Searching);
+                return false;
             };
+            let live: Vec<(ServerId, Zeroizing<[u8; 32]>)> = plain
+                .servers
+                .iter()
+                .filter(|(_, e)| e.live())
+                .filter_map(|(id, entry)| {
+                    Some((
+                        model::parse_hex32(id).map(ServerId::from_bytes)?,
+                        model::parse_hex32(&entry.secret).map(Zeroizing::new)?,
+                    ))
+                })
+                .collect();
+            let mut progress = self.restore.lock().expect("not poisoned");
+            progress.found = Some(live.len() as u32);
+            progress.waiting = live.into_iter().collect();
+        }
+        let tries: Vec<(ServerId, Zeroizing<[u8; 32]>)> = {
+            let progress = self.restore.lock().expect("not poisoned");
+            progress.waiting.iter().map(|(server, secret)| (*server, secret.clone())).collect()
+        };
+        for (server, secret) in tries {
             if self.lock().db.has_server(server).unwrap_or(true) {
+                self.restore.lock().expect("not poisoned").waiting.remove(&server);
                 continue;
             }
             let fetched = self.open_and_fetch(server, &secret);
@@ -855,34 +931,47 @@ impl Core {
                 inner.join(ports, server, none, &secret, "", fetched, events)
             });
             match status {
-                Ok(JoinStatus::NobodyOnline { .. }) => waiting = true,
-                Ok(JoinStatus::Joined { .. }) => {}
+                // Nobody reachable yet: stays waiting.
+                Ok(JoinStatus::NobodyOnline { .. }) => {}
+                Ok(JoinStatus::Joined { .. }) => {
+                    self.restore.lock().expect("not poisoned").waiting.remove(&server);
+                }
+                // Not mine any more (left, kicked, closed): it doesn't come back.
                 _ => {
+                    self.restore.lock().expect("not poisoned").waiting.remove(&server);
                     let _ = self.close_candidate(server);
                 }
             }
         }
-        if !waiting {
+        let done = self.restore.lock().expect("not poisoned").waiting.is_empty();
+        if done {
             let _ = self.lock().db.delete(KV_BACKUP_PENDING);
         }
-        !waiting
+        self.set_restore_status(if done { ServerRestoreState::Done } else { ServerRestoreState::Waiting });
+        done
     }
 
-    /// After a restore attempt that isn't done: the next one after the
-    /// current wait, and the wait after that doubled, at most
-    /// [`BACKUP_RETRY_MAX_MS`]. `done`: back to [`BACKUP_RETRY_FIRST_MS`].
+    /// After a restore attempt that isn't done: while the backup isn't
+    /// found, the next fetch after the current wait, and the wait after
+    /// that doubled, at most [`BACKUP_RETRY_MAX_MS`]; once it's found, the
+    /// waiting servers again after [`REJOIN_EVERY_MS`]. `done`: back to
+    /// [`BACKUP_RETRY_FIRST_MS`].
     fn schedule_backup_retry(&self, done: bool) {
         let now = self.ports.clock.now_ms();
+        let found = self.restore.lock().expect("not poisoned").found.is_some();
         let mut retry = self.backup_retry.lock().expect("not poisoned");
         *retry = if done {
             (0, BACKUP_RETRY_FIRST_MS)
+        } else if found {
+            (now + REJOIN_EVERY_MS, retry.1)
         } else {
             (now + retry.1, (retry.1 * 2).min(BACKUP_RETRY_MAX_MS))
         };
     }
 
     /// Each sync round: a pending restore is tried again only when its
-    /// backoff is up (dev-sync on #339: a real holder lookup is slow).
+    /// wait is up (dev-sync on #339: a real holder lookup is slow; G-91:
+    /// found servers every [`REJOIN_EVERY_MS`]).
     fn retry_backup_restore(&self) {
         if self.lock().db.get(KV_BACKUP_PENDING).ok().flatten().is_none() {
             return;
@@ -2989,6 +3078,12 @@ impl Inner {
         let current = self.backup_set()?;
         let remote = backup::newest(&keys, answers);
         if remote.is_none() && current.is_empty() && known.is_empty() {
+            // Nothing to back up, and that's settled until my server set
+            // changes or the republish is due. Without this, a new account
+            // (or a restore whose backup isn't found yet) fetched on every
+            // round: a real mailbox allows 60 fetches an hour (G-91).
+            self.db.set(KV_BACKUP_WRITTEN, &Self::backup_fingerprint(&current))?;
+            self.db.set(KV_BACKUP_PUT_AT, &now.to_le_bytes())?;
             return Ok(None);
         }
         let remote = remote.unwrap_or_default();

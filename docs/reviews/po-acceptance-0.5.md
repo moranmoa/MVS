@@ -19,7 +19,7 @@ Board housekeeping for pm: the 0.4.0 rows (G-01, G-11, G-21, G-24, G-05, G-61, G
 
 ## G-29 – "someone is typing…"
 
-1. When a member types in a channel, the others in that channel see "⁨{name}⁩ באמצע כתיבה…" (one person), "⁨{a}⁩ ו־⁨{b}⁩ באמצע כתיבה…" (two), or "כמה אנשים כותבים…" (three or more); wording that's neutral for any gender, within 2 s.
+1. When a member types in a channel, the other connected members in that channel see "⁨{name}⁩ באמצע כתיבה…" (one person), "⁨{a}⁩ ו־⁨{b}⁩ באמצע כתיבה…" (two), or "כמה אנשים כותבים…" (three or more); wording that's neutral for any gender, within 2 s.
 2. The indicator disappears no later than 6 s after the last keystroke, and immediately when the message is sent or the text is cleared.
 3. **Ephemeral:** never written to the log, never stored, and never relayed to non-members (sec-lead). Sent at most once every 3 s per channel.
 4. Not sent for blocked accounts and not shown from them. Not sent in "ממסר בלבד" mode if it would need a direct connection.
@@ -30,7 +30,7 @@ Board housekeeping for pm: the 0.4.0 rows (G-01, G-11, G-21, G-24, G-05, G-61, G
 
 1. Hover or the context menu shows "הוספת אמוג'י" (not "תגובה", which already means a reply). Picking an emoji adds it under the message with a count. Clicking an existing reaction toggles mine.
 2. Mine is visually marked (border plus `aria-pressed`), and hover or focus shows who reacted (names isolated, at most 10 plus "ועוד ⁨{n}⁩").
-3. A signed record per reaction; removing mine is a tombstone. A member sees others' reactions within the normal message delivery time.
+3. A signed record per reaction; removing mine is an op=remove record. Gated by the `reactions-v1` update gate (older clients ignore reactions safely). A member sees others' reactions within the normal message delivery time.
 4. Limits: at most 20 distinct emoji per message, and only standard Unicode emoji (no custom images in this release).
 5. Reactions on a deleted message disappear with it. A blocked account's reactions are counted but its name isn't shown.
 6. Keyboard: the reaction row is reachable by Tab, with Enter/Space to toggle.
@@ -46,7 +46,7 @@ Board housekeeping for pm: the 0.4.0 rows (G-01, G-11, G-21, G-24, G-05, G-61, G
 
 ## G-91 – servers come back after a restore
 
-1. After restoring with the 12 words (or linking a device), the servers I was a member of appear on their own, without an invite link, within 2 minutes of a member of each server being online.
+1. After restoring with the 12 words (or linking a device), the servers I was a member of appear on their own, without an invite link, within 2 minutes of a member of each server being online and reachable.
 2. Until then, the restore screen says honestly what's happening ("מחפשים את השרתים שלך…") and what to do if nothing appears (an invite link still works).
 3. A server I was removed from, or that was closed, doesn't come back.
 4. Roles and the age rules are as before the restore (the 30-day rule from #306 still holds).
@@ -54,9 +54,9 @@ Board housekeeping for pm: the 0.4.0 rows (G-01, G-11, G-21, G-24, G-05, G-61, G
 
 ## G-81 – calls across networks
 
-1. Two members on different home networks (one behind CGNAT or cellular) can talk with audio in both directions, measured on the published build.
-2. Setup within 10 s at p95. If no path is found, the participant row says "אין חיבור קולי" (existing string), and the call continues for the others.
-3. Audio delay at p95 under 400 ms on a typical home connection. Results go to `qa/` with no IPs.
+1. **0.5:** two members on different home networks, at least one of them behind a normal home NAT, can talk with audio in both directions, measured on the published build. **Later, with a TURN media relay:** one side on CGNAT or cellular. TURN for voice is already in the spec (helper servers, phase 2); it is a devops task, not a new decision.
+2. Setup within 10 s at p95, measured over pairs that have a path. If no path is found, the participant row says "אין חיבור קולי" (existing string), and the call continues for the others.
+3. Audio delay at p95 under 400 ms on a typical home connection, measured with WebRTC getStats. Results go to `qa/` with no IPs.
 4. The first-call IP notice (#225) still shows before the first direct call. The voice relay, if used, is disclosed the same way as member relays (#387).
 5. "ממסר בלבד" still means no calls (unchanged until a decision says otherwise).
 6. Release notes drop "same network only" only after QA's two-network test passes.

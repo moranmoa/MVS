@@ -2245,12 +2245,14 @@ impl Task {
     /// within its caps, if it passes `check`.
     fn on_notice_request(&mut self, peer: PeerId, request: crate::notice::Request, channel: ResponseChannel<Vec<u8>>) {
         let now = Instant::now();
+        // The cheap gates (rate caps, my own device) come before any
+        // signature check (Security Lead on #425).
         let answer = match request {
             crate::notice::Request::Get(fetch) => {
                 let me = *self.swarm.local_peer_id();
-                let tag = fetch
-                    .verify(&me, unix_now() / 60)
-                    .filter(|_| self.notice_limits.allow_fetch(peer, now));
+                let tag = Some(())
+                    .filter(|_| self.notice_limits.allow_fetch(peer, now))
+                    .and_then(|_| fetch.verify(&me, unix_now() / 60));
                 let held = tag.and_then(|tag| self.store.notices(&tag).ok()).unwrap_or_default();
                 crate::notice::encode_answer(&held)
             }
@@ -2259,9 +2261,10 @@ impl Task {
                 let from = self.member_identity(peer).map(|identity| *identity.as_bytes());
                 // Phase A: my own devices only (no buddies for notices).
                 let mine = crate::backup::write_owner(from, me) == Some(None);
-                let kept = crate::notice::check(&blob, unix_now())
+                let kept = crate::notice::claimed_tag(&blob)
                     .filter(|_| mine)
-                    .filter(|(tag, _)| self.notice_limits.allow_write(peer, *tag, now))
+                    .filter(|tag| self.notice_limits.allow_write(peer, *tag, now))
+                    .and_then(|_| crate::notice::check(&blob, unix_now()))
                     .filter(|(tag, at)| self.store.put_notice(tag, *at, &blob, unix_now()).unwrap_or(false));
                 if let Some((tag, _)) = kept {
                     self.provide_backup(tag);
@@ -2305,9 +2308,13 @@ impl Task {
     /// A holder's notice answer (or failure) for fetch `id`.
     fn on_notice_answer(&mut self, request: request_response::OutboundRequestId, answer: Option<Vec<u8>>) {
         let Some(id) = self.notice_fetch_of.remove(&request) else { return };
+        // Only valid notices under my own tag come back (Security Lead on
+        // #425): the core checks again, but junk never reaches it.
+        let mine = self.notice_signer.as_ref().and_then(|s| s.key()).map(|key| crate::notice::tag_of(&key));
         if let Some(fetch) = self.fetches.get_mut(&id) {
             for notice in crate::notice::decode_answer(&answer.unwrap_or_default()) {
-                if !fetch.answers.contains(&notice) {
+                let valid = crate::notice::check(&notice, unix_now()).is_some_and(|(tag, _)| Some(tag) == mine);
+                if valid && !fetch.answers.contains(&notice) {
                     fetch.answers.push(notice);
                 }
             }

@@ -132,6 +132,12 @@ pub fn check(blob: &[u8], now: u64) -> Option<([u8; 32], u64)> {
     Some((tag, at))
 }
 
+/// The tag a notice claims, from its header alone (no signature checked):
+/// for the cheap per-tag cap before [`check`].
+pub(crate) fn claimed_tag(blob: &[u8]) -> Option<[u8; 32]> {
+    (blob.len() == NOTICE_LEN && &blob[..5] == MAGIC).then(|| blob[5..37].try_into().expect("32"))
+}
+
 /// A signed fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fetch {
@@ -354,6 +360,9 @@ pub(crate) mod tests {
         // `at` more than a day ahead; a day ahead is fine.
         assert!(check(&notice(1, now + MAX_AHEAD + 1, 9), now).is_none());
         assert!(check(&notice(1, now + MAX_AHEAD, 9), now).is_some());
+        // The header-only tag for the cheap cap: the right size and magic only.
+        assert_eq!(claimed_tag(&good), Some(tag));
+        assert_eq!(claimed_tag(&good[..NOTICE_LEN - 1]), None);
     }
 
     #[test]

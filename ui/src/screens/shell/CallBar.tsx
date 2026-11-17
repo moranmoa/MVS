@@ -46,6 +46,14 @@ export function useCallEngine(myId: Id): CallEngine {
   useEffect(() => {
     if (noMic && !meMuted) void core.setMuted(true).catch(() => {});
   }, [noMic, meMuted, core]);
+  // G-72: a chosen device was unplugged: say which, once.
+  const fallback = view.deviceFallback;
+  useEffect(() => {
+    if (!fallback) return;
+    const base = fallback.kind === 'input' ? 'call.micUnplugged' : 'call.speakerUnplugged';
+    if (fallback.label) store.showFlash(base, { name: fallback.label });
+    else store.showFlash(`${base}NoName`);
+  }, [fallback, store]);
   const simFailure: PeerFailure | null = sim === 'peerFailed' ? 'failed' : sim === 'peerRefused' ? 'refused' : null;
   const peerFailed = simFailure && other ? { ...view.peerFailed, [other]: simFailure } : view.peerFailed;
   return { ...view, error, noMic, peerFailed };

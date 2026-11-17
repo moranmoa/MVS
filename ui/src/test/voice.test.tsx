@@ -130,7 +130,7 @@ describe('G-72: voice settings in a call', () => {
       await act(async () => {
         fireEvent.change(mic, { target: { value: 'mic-b' } });
       });
-      const speaker = within(dialog).getByRole('combobox', { name: 'Speaker' });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speakers' });
       await act(async () => {
         fireEvent.change(speaker, { target: { value: 'spk-a' } });
       });

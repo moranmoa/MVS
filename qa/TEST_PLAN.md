@@ -342,6 +342,24 @@ records/authority, updater).
 
 ---
 
+## Release gates and test-machine rules (added 2026-11-17, English per the docs rule)
+
+**Windows packaged builds run only in Windows Sandbox or a VM, never on the
+owner's PC.** A packaged build ignores `MVS_TEST_USER_DATA`, and `mvs-core`
+keeps the identity secret in Credential Manager under a fixed target
+(`io.github.moranmoa.mvs.identity.v1/identity-secret-v1`), so a test identity
+made there would overwrite the owner's real one. On the owner's PC a Windows
+smoke is static only: SHA256SUMS, the manifest's sha256 and size against the
+zip, version info, signature status. INS-01..19 on Windows run in a Sandbox/VM.
+
+**Linux packages** (`.deb`, AppImage): `qa/packaged/run.sh` installs and starts
+them in Docker with no network (a packaged build's default relay is the live
+one).
+
+| ID | Pri | Gate | Steps | Expected | How |
+| --- | --- | --- | --- | --- | --- |
+| VC-ECHO-01 | 1 | 0.5 release gate: per-person volume vs echo (#440) | Two people on **two machines, both on speakers** (no headsets), in one voice room, in separate rooms of the house. Each talks for 30 s at 100%. Then on machine 1 raise person 2's volume to **200%**; person 2 talks and stays silent in turns for 60 s. Repeat the other way. | At the far end (person 2) there is no echo of their own voice and no feedback howl at 200%, and no worse echo than at 100%. Echo cancellation still works with the Web Audio gain in the path. Record: OS, speakers, what was heard. | Manual, two people. Not automatable (needs real speakers and microphones). |
+
 ## מה כבר אוטומטי ואיך מריצים
 
 ראו `qa/README.md`. בקצרה: `smoke` (8 בדיקות, מסלול ההצלחה) ו-`explore`

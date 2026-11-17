@@ -729,6 +729,11 @@ pub enum DeviceLinkReason {
     Timeout,
     Refused,
     Network,
+    /// The account arrived but this computer's keychain couldn't store it
+    /// (`keyring-unavailable` on restore).
+    Keyring,
+    /// The account arrived but couldn't be restored for another reason.
+    Restore,
 }
 
 /// `deviceLink.state`. Absent fields are left out, never null (dev-ui #391).

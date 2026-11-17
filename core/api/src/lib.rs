@@ -22,6 +22,9 @@ mod gate;
 pub mod invite_link;
 mod model;
 mod ports;
+// Member recovery: the pure parts first; the service wiring follows.
+#[allow(dead_code)]
+mod recovery;
 mod rekey;
 mod service;
 pub mod sidecar;

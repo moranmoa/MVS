@@ -1808,6 +1808,11 @@ impl Core {
         self.voice(|calls, ctx, inner| calls.set_muted(ctx, inner, muted))
     }
 
+    /// G-84b `setDeafened`: shown to the others in my call (with mute).
+    pub fn set_deafened(&self, deafened: bool) -> CoreResult<()> {
+        self.voice(|calls, ctx, inner| calls.set_deafened(ctx, inner, deafened))
+    }
+
     /// `sendSignal`: to a participant of my call.
     pub fn send_signal(&self, to: &str, kind: SignalKind, payload: String) -> CoreResult<()> {
         let to = parse_user(to)?;
@@ -4654,8 +4659,16 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
 /// cross-device notice will pass what it carries through here.
 fn notice_label(raw: Option<&str>) -> Option<String> {
     let label = raw?.trim();
-    let ok = !label.is_empty() && label.chars().count() <= 64 && !label.chars().any(char::is_control);
+    let ok = !label.is_empty() && label.chars().count() <= 64 && !label.chars().any(hidden_char);
     ok.then(|| label.to_owned())
+}
+/// Characters a label must not hold: controls, plus the invisible format and
+/// direction marks `char::is_control` misses (zero-width, bidi embeddings,
+/// overrides and isolates, word joiner, line/paragraph separators, BOM),
+/// which could make a label render reversed or hide text.
+fn hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 fn device_notices(db: &Db) -> CoreResult<Vec<u64>> {
     Ok(db.get(KV_DEVICE_NOTICES)?.and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default())
@@ -4719,6 +4732,10 @@ mod device_notice_tests {
         assert_eq!(notice_label(Some(&"x".repeat(65))), None);
         assert_eq!(notice_label(Some("bad\u{1b}[31m")), None);
         assert_eq!(notice_label(Some("two\nlines")), None);
+        for bad in ["\u{202E}gpj.exe", "a\u{200B}b", "a\u{200F}", "\u{2066}x\u{2069}", "\u{FEFF}x", "x\u{061C}", "a\u{2028}b", "a\u{2060}b"] {
+            assert_eq!(notice_label(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(notice_label(Some("מחשב נייד")).as_deref(), Some("מחשב נייד"));
         assert_eq!(notice_label(Some("   ")), None);
         assert_eq!(notice_label(None), None);
     }

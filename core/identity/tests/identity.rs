@@ -142,6 +142,7 @@ fn backup_keys_are_separate_from_the_identity() {
         id.subkey(Subkey::Device(0)).to_bytes(),
         *keys.enc_key(),
         keys.write_key().to_bytes(),
+        id.recovery_write_key().to_bytes(),
     ];
     for i in 0..secrets.len() {
         for j in i + 1..secrets.len() {

@@ -17,6 +17,7 @@ const INFO_STORAGE: &[u8] = b"local-storage/key";
 const INFO_DEVICE: &[u8] = b"device/ed25519/";
 const INFO_BACKUP_KEY: &[u8] = b"backup/key";
 const INFO_BACKUP_WRITE: &[u8] = b"backup/write/ed25519";
+const INFO_RECOVERY_WRITE: &[u8] = b"member-recovery/write/ed25519";
 /// BLAKE3 `derive_key` context for the backup tag (design note
 /// `docs/design/restore-servers-from-network.md`). Holders compute it from
 /// the public write key, so it stays public and frozen.
@@ -87,6 +88,13 @@ impl Identity {
     /// The keys of my encrypted backup (restore servers from the network).
     /// None of them is the identity key or derived from it, so the backup's
     /// holders can't link it to my ID.
+    /// `w_r`, which signs member-recovery records (`api::recovery`). Not the
+    /// backup write key, so recovery holders can't compute my backup tag;
+    /// the recovery handle is derived from its public key.
+    pub fn recovery_write_key(&self) -> SigningKey {
+        SigningKey::from_bytes(&expand(&self.prk, INFO_RECOVERY_WRITE))
+    }
+
     pub fn backup_keys(&self) -> BackupKeys {
         let write = SigningKey::from_bytes(&expand(&self.prk, INFO_BACKUP_WRITE));
         let tag = backup_tag(&write.verifying_key().to_bytes());

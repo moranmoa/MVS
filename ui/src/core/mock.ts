@@ -88,6 +88,8 @@ export interface MockOptions {
   deviceLinked?: string;
   /** Device link, new device: the state to reach after starting (for screenshots). */
   deviceLink?: 'confirm' | 'expired' | 'failed';
+  /** Time between demo messages (default 47 s); hours make the last screen cross days (G-23). */
+  messageGapMs?: number;
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -192,6 +194,10 @@ interface MockRoom {
 }
 
 export class MockCore implements CoreApi {
+  private get gapMs(): number {
+    return this.options.messageGapMs ?? MESSAGE_GAP_MS;
+  }
+
   private listeners = new Map<CoreEventName, Set<(p: unknown) => void>>();
   private servers = new Map<Id, ServerState>();
   // Invites per server, made on first use from the server's current link.
@@ -481,7 +487,7 @@ export class MockCore implements CoreApi {
       const ch: ChannelState = {
         channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0 },
         baseCount: c.count,
-        baseStart: now - 3_600_000 - c.count * MESSAGE_GAP_MS,
+        baseStart: now - 3_600_000 - c.count * this.gapMs,
         seedOffset: hashString(c.id),
         memberIds: members.slice(1).map((m) => m.id),
         overrides: new Map(),
@@ -579,7 +585,7 @@ export class MockCore implements CoreApi {
       index,
       authorId,
       body,
-      createdAt: ch.baseStart + index * MESSAGE_GAP_MS + (h % 20_000),
+      createdAt: ch.baseStart + index * this.gapMs + (h % 20_000),
     };
     if (index > 3 && h % 11 === 0) {
       const target = index - 1 - (h % 3);
@@ -1322,7 +1328,7 @@ export class MockCore implements CoreApi {
   private callOf(room: MockRoom): CallState {
     return {
       channelId: room.roomId,
-      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted })),
+      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted, ...(p.deafened && p.muted ? { deafened: true } : {}) })),
       full: room.members.length >= room.limit,
     };
   }
@@ -1431,6 +1437,16 @@ export class MockCore implements CoreApi {
     const here = this.callRoom();
     if (!this.call || !here) throw err({ code: 'not-allowed' });
     here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, muted } : p));
+    this.emitRooms(here.serverId);
+    this.call = this.callOf(here.room);
+    this.emitCall();
+    return null;
+  }
+
+  async setDeafened(deafened: boolean): Promise<null> {
+    const here = this.callRoom();
+    if (!this.call || !here) throw err({ code: 'not-allowed' });
+    here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, deafened } : p));
     this.emitRooms(here.serverId);
     this.call = this.callOf(here.room);
     this.emitCall();

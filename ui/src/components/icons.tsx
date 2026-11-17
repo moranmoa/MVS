@@ -85,6 +85,17 @@ export const MicOffIcon = (p: IconProps) => (
     <path d="M9 9v2a3 3 0 0 0 5.1 2.1M15 10V5a3 3 0 0 0-5.7-1.3M19 11a7 7 0 0 1-1.2 3.9M5 11a7 7 0 0 0 11 5.7M12 18v3M3 3l18 18" />
   </Icon>
 );
+/** G-84: deafen. */
+export const HeadphonesIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M3 18v-6a9 9 0 0 1 18 0v6M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3z" />
+  </Icon>
+);
+export const HeadphonesOffIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M3 18v-6a9 9 0 0 1 15.4-6.4M21 12v6M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3zM3 3l18 18" />
+  </Icon>
+);
 export const GearIcon = (p: IconProps) => (
   <Icon {...p}>
     <circle cx="12" cy="12" r="3" />

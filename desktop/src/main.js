@@ -13,7 +13,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, globalShortcut, ipcMain, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, globalShortcut, ipcMain, nativeImage, protocol, session, shell } = require('electron');
 const sec = require('./security');
 const { toRequest } = require('./commands');
 const signout = require('./signout');
@@ -25,6 +25,7 @@ const { createLog } = require('./logfile');
 const metered = require('./metered');
 const { createNotifier } = require('./notify');
 const ptt = require('./ptt');
+const badge = require('./badge');
 
 // Tests only, and only in a checkout (never a release build): a throwaway
 // profile, so a test run never shares the installed app's profile
@@ -83,6 +84,21 @@ const callGate = sec.createCallGate();
 const pushToTalk = ptt.createPtt({ emit: (name) => toPages(name, {}), active: () => callGate.inCall });
 /** G-74: the optional global "toggle mute" accelerator we registered, or null. */
 let globalMute = null;
+/**
+ * G-62: the unread count on the taskbar (Windows: our overlay icon) or the
+ * dock / launcher. Only a checked whole number reaches the OS. Main clears it
+ * itself on sign-out and when the page dies (it can't send 0 then).
+ */
+const unread = badge.createBadge({
+  apply: (n) => {
+    if (process.platform === 'win32') {
+      const img = n > 0 ? nativeImage.createFromBitmap(badge.drawBadge(badge.label(n)), { width: badge.SIZE, height: badge.SIZE, scaleFactor: 2 }) : null;
+      for (const win of BrowserWindow.getAllWindows()) win.setOverlayIcon(img, n > 0 ? `${n} unread` : '');
+    } else {
+      app.setBadgeCount(n);
+    }
+  },
+});
 
 /** Sends a shell event (not from the core) to our own windows. */
 function toPages(name, payload) {
@@ -182,6 +198,8 @@ function serveCoreIpc() {
         confirmWithoutWords: async () => (await dialog.showMessageBox(win, signout.WITHOUT_WORDS_DIALOG)).response === 1,
         request: () => core.request(req.cmd, req.args),
         clearStorage: async () => {
+          // G-62: signed out (the core said ok): no unread count left on the taskbar.
+          unread.set(0);
           await event.sender.session.clearStorageData({
             origin: sec.ORIGIN,
             storages: ['localstorage', 'indexdb', 'cachestorage', 'serviceworkers', 'cookies', 'websql', 'shadercache'],
@@ -275,6 +293,10 @@ function serveCoreIpc() {
     if (!ok) return 'shortcut-taken';
     globalMute = accel;
     return 'ok';
+  });
+  ipcMain.handle('badge:set', (event, count) => {
+    if (!fromUs(event)) return false;
+    return unread.set(count);
   });
   ipcMain.handle('logs:open', async (event) => {
     if (!fromUs(event)) return false;
@@ -487,6 +509,7 @@ function createWindow() {
   win.on('responsive', () => unresponsive.delete(win));
   win.webContents.on('render-process-gone', () => {
     pushToTalk.reset();
+    unread.set(0);
     // The page held the call's audio; the call ends with it.
     if (callGate.inCall) {
       callGate.end();

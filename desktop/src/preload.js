@@ -57,6 +57,11 @@ contextBridge.exposeInMainWorld('mvs', {
    * sends `ptt.toggleMute`. Resolves 'ok' | 'invalid' | 'shortcut-taken'.
    */
   setPushToTalk: (settings) => ipcRenderer.invoke('ptt:set', settings),
+  /**
+   * G-62: the unread total for the taskbar (Windows overlay) or dock: a whole
+   * number 0..9999; 0 clears it. Resolves true if accepted.
+   */
+  setUnreadCount: (count) => ipcRenderer.invoke('badge:set', count),
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

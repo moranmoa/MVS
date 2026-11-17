@@ -192,7 +192,7 @@ test('legacy desktop capture never gives a stream', async () => {
 test('the page sees only copyText, invoke, notify, onEvent, the core-down actions and the title bar', async () => {
   const keys = await page.evaluate(() => Object.keys(window.mvs).sort());
   const frame = process.platform === 'darwin' ? [] : ['windowControl', 'windowFrame'];
-  assert.deepEqual(keys, ['copyText', 'invoke', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setPushToTalk', ...frame].sort());
+  assert.deepEqual(keys, ['copyText', 'invoke', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setPushToTalk', 'setUnreadCount', ...frame].sort());
   assert.equal(await page.evaluate(() => typeof window.ipcRenderer), 'undefined');
 });
 
@@ -230,6 +230,14 @@ test('push-to-talk: only the chosen key, only in a call, released after 200 ms (
   assert.equal(await app.evaluate(({ globalShortcut }) => globalShortcut.isRegistered('Alt+Shift+F13')), false);
   await page.evaluate(() => window.__pttOff());
   await page.evaluate(() => window.mvs.invoke('leaveCall', []));
+});
+
+test('setUnreadCount takes whole numbers 0..9999 only (G-62)', async () => {
+  for (const bad of [-1, 1.5, 10000, '3', null, NaN, Infinity, { n: 1 }]) {
+    assert.equal(await page.evaluate((v) => window.mvs.setUnreadCount(v), bad), false);
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(12)), true);
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(0)), true);
 });
 
 test('copyText writes plain text only, through main', async () => {

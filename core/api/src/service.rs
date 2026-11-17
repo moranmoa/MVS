@@ -3847,7 +3847,7 @@ impl Inner {
         let phrase = self.vault.open().map_err(vault_error)?;
         let p = &me.profile;
         Ok(devicelink::Payload {
-            seed: phrase.words().join(" "),
+            seed: Zeroizing::new(phrase.words().join(" ")),
             profile: devicelink::PayloadProfile {
                 display_name: p.display_name.clone(),
                 avatar_small: p.avatar_small.clone().filter(|a| !a.is_empty()),

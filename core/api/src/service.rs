@@ -34,6 +34,10 @@ const KV_UPDATE_CHANNEL: &str = "update-channel";
 /// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
 /// about this computer's network.
 const KV_RELAY_ONLY: &str = "relay-only";
+/// Device link: "a new device was added" notices not yet acknowledged
+/// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
+/// start until acknowledged; the cross-device notice will feed it too.
+const KV_DEVICE_NOTICES: &str = "device-notices";
 /// Member relays (#368, slice 1): `auto`, `on` or `off` (default `auto`);
 /// the one-time disclosure seen (`[1]`); the daily cap in MB (u32le).
 const KV_MEMBER_RELAY: &str = "member-relay";
@@ -337,6 +341,8 @@ pub struct Core {
     signed_out: AtomicBool,
     /// Restore servers: the first sync round after start backs up (login).
     backup_started: AtomicBool,
+    /// Device link: the stored notices were announced since this start.
+    notices_announced: AtomicBool,
     /// Restore servers: when the next retry of a pending restore is due and
     /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
     /// once the restore is done.
@@ -501,6 +507,7 @@ impl Core {
             db_path: config.db_path,
             signed_out: AtomicBool::new(false),
             backup_started: AtomicBool::new(false),
+            notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
         })
     }
@@ -2110,6 +2117,7 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        self.announce_device_notices();
         // Device link, the new device: its link moves on even before sign-in.
         self.poll_device_link();
         let result = self.sync_round();
@@ -2601,8 +2609,34 @@ impl Core {
         self.ports.network.device_link_send(&addr, &sealed).map_err(link_error)?;
         // TODO(device link): the notice to my other devices goes on the
         // backup-store notice path once holders keep one (dev-sync).
-        self.emit(vec![Event::DeviceAdded { at: now }]);
+        // Kept until acknowledged, and announced now.
+        {
+            let inner = self.lock();
+            let mut notices = device_notices(&inner.db)?;
+            notices.push(now);
+            inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))?;
+        }
+        self.emit(vec![Event::DeviceAdded { at: now, label: None }]);
         Ok(())
+    }
+
+    /// Device link: the user saw the "a new device was added" notice with
+    /// this `at`; it isn't announced again. An unknown `at` is fine.
+    pub fn ack_device_notice(&self, at: u64) -> CoreResult<()> {
+        let inner = self.lock();
+        let mut notices = device_notices(&inner.db)?;
+        notices.retain(|n| *n != at);
+        inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))
+    }
+
+    /// Device link: once per start (the first sync round, when the UI is
+    /// up), every notice not yet acknowledged.
+    fn announce_device_notices(&self) {
+        if self.notices_announced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let notices = device_notices(&self.lock().db).unwrap_or_default();
+        self.emit(notices.into_iter().map(|at| Event::DeviceAdded { at, label: None }).collect());
     }
 
     pub fn set_update_channel(&self, channel: UpdateChannel) -> CoreResult<()> {
@@ -4581,6 +4615,10 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
         JoinStatus::AgeBlocked { .. } => "age-blocked",
         JoinStatus::Closed { .. } => "closed",
     }
+}
+
+fn device_notices(db: &Db) -> CoreResult<Vec<u64>> {
+    Ok(db.get(KV_DEVICE_NOTICES)?.and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default())
 }
 
 fn link_state(state: DeviceLinkPhase, sas: Option<String>, reason: Option<DeviceLinkReason>) -> Event {

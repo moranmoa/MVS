@@ -512,7 +512,13 @@ pub enum Event {
     /// Device link: a new device was added to my account (shown on the
     /// approving device at once).
     #[serde(rename = "account.deviceAdded", rename_all = "camelCase")]
-    DeviceAdded { at: u64 },
+    DeviceAdded {
+        at: u64,
+        /// A short description of the new device, plain text; left out
+        /// when unknown (today always).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Once, after `markHealthy` commits a new version. Text only.
     #[serde(rename = "update.installed")]
     UpdateInstalled { version: String, notes: Option<String> },

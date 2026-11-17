@@ -149,6 +149,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
     // As in Discord: unmuting while deafened undeafens too.
     if (!muted && engine.deafened) {
       engine.setDeafened(false);
+      void core.setDeafened(false).catch(() => {});
       mutedByDeafen.current = false;
     }
     setMute(muted);
@@ -162,8 +163,11 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         mutedByDeafen.current = true;
         setMute(true);
       }
+      // G-84b: the others see it (cores from 0.6.0 on), next to my mute.
+      void core.setDeafened(true).catch(() => {});
     } else {
       engine.setDeafened(false);
+      void core.setDeafened(false).catch(() => {});
       if (mutedByDeafen.current) setMute(false);
       mutedByDeafen.current = false;
     }

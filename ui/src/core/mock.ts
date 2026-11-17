@@ -1322,7 +1322,7 @@ export class MockCore implements CoreApi {
   private callOf(room: MockRoom): CallState {
     return {
       channelId: room.roomId,
-      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted })),
+      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted, ...(p.deafened && p.muted ? { deafened: true } : {}) })),
       full: room.members.length >= room.limit,
     };
   }
@@ -1431,6 +1431,16 @@ export class MockCore implements CoreApi {
     const here = this.callRoom();
     if (!this.call || !here) throw err({ code: 'not-allowed' });
     here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, muted } : p));
+    this.emitRooms(here.serverId);
+    this.call = this.callOf(here.room);
+    this.emitCall();
+    return null;
+  }
+
+  async setDeafened(deafened: boolean): Promise<null> {
+    const here = this.callRoom();
+    if (!this.call || !here) throw err({ code: 'not-allowed' });
+    here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, deafened } : p));
     this.emitRooms(here.serverId);
     this.call = this.callOf(here.room);
     this.emitCall();

@@ -135,6 +135,22 @@ describe('G-72: voice settings in a call', () => {
   });
 });
 
+describe('G-84b: the others see "deafened"', () => {
+  it('deafen tells the core; my roster row shows crossed headphones instead of the mic', async () => {
+    const { core, entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const told = vi.spyOn(core, 'setDeafened');
+    await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
+    expect(told).toHaveBeenCalledWith(true);
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    await waitFor(() => expect(within(roster).getAllByRole('img', { name: 'Deafened' })).toHaveLength(1));
+    await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
+    expect(told).toHaveBeenLastCalledWith(false);
+    await waitFor(() => expect(within(roster).queryAllByRole('img', { name: 'Deafened' })).toHaveLength(0));
+  });
+});
+
 describe('G-84: deafen', () => {
   it('deafen mutes me too and undeafen unmutes me; unmuting while deafened undeafens', async () => {
     fakeEngine.deafened = false;
@@ -596,6 +612,16 @@ describe('voice rooms (0.4.3)', () => {
       // #272: relayOnly is passed on only when true, and never gets the room dropped.
       expect(cleanVoiceRoom({ ...ok, relayOnly: true })).toEqual({ ...ok, relayOnly: true });
       expect(cleanVoiceRoom({ ...ok, relayOnly: false })).toEqual(ok);
+    });
+
+    it('G-84b: deafened is kept only with muted, and must be a boolean', () => {
+      const deaf = { ...ok, members: [{ ...p('1', true), deafened: true }, { ...p('2'), deafened: true }] };
+      expect(cleanVoiceRoom(deaf)?.members).toEqual([{ ...p('1', true), deafened: true }, p('2')]);
+      expect(cleanVoiceRoom({ ...ok, members: [{ ...p('1', true), deafened: 'yes' }] })).toBeNull();
+      expect(cleanCall({ channelId: id('b'), participants: [{ identity: id('1'), muted: true, deafened: true }, { identity: id('2'), muted: false, deafened: true }], full: false } as never).participants).toEqual([
+        { identity: id('1'), muted: true, deafened: true },
+        { identity: id('2'), muted: false },
+      ]);
     });
 
     it('drops a room with a bad id, limit, roster or host, or an unknown field', () => {

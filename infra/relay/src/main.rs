@@ -364,6 +364,23 @@ async fn run() -> Result<()> {
 
     info!(peer_id = %swarm.local_peer_id(), "relay node started");
 
+    // PEER_RELAYS: the other operator-run relays (comma-separated, each
+    // pinned by /p2p/<id>, IP addresses only: the relay has no DNS). They go
+    // into Kademlia so the relays share one DHT: a client asking one relay is
+    // pointed at the other for what only the other holds (e.g. a backup
+    // tag's provider record). From .env, never committed.
+    let peers = peer_relays(&env::var("PEER_RELAYS").unwrap_or_default(), *swarm.local_peer_id());
+    for (peer, addr) in &peers {
+        swarm.behaviour_mut().kademlia.add_address(peer, addr.clone());
+        if let Err(err) = swarm.dial(addr.clone()) {
+            warn!(%err, "could not dial a PEER_RELAYS entry");
+        }
+    }
+    if !peers.is_empty() {
+        let _ = swarm.behaviour_mut().kademlia.bootstrap();
+    }
+    info!(peer_relays = peers.len(), "peer relays");
+
     // The backup mailbox, on the data volume (the only writable path).
     let backup_dir = env::var("BACKUP_DIR").unwrap_or_else(|_| "/data/backup".into());
     let mut mailbox = backup::Mailbox::open(Path::new(&backup_dir))
@@ -518,6 +535,26 @@ fn provide(swarm: &mut Swarm<Behaviour>, local_id: PeerId, tag: &backup::Tag) {
     let _ = swarm.behaviour_mut().kademlia.store_mut().add_provider(record);
 }
 
+/// PEER_RELAYS entries: `/ip4|/ip6/.../p2p/<id>`, never ourselves; anything
+/// else is skipped with a warning that names its position only.
+fn peer_relays(raw: &str, me: PeerId) -> Vec<(PeerId, Multiaddr)> {
+    let mut out = Vec::new();
+    for (i, entry) in raw.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        let parsed = entry.parse::<Multiaddr>().ok().and_then(|addr| {
+            let first_ip = matches!(addr.iter().next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)));
+            match addr.iter().last() {
+                Some(Protocol::P2p(peer)) if first_ip && peer != me => Some((peer, addr)),
+                _ => None,
+            }
+        });
+        match parsed {
+            Some(p) => out.push(p),
+            None => warn!(entry = i + 1, "ignoring PEER_RELAYS entry (needs /ip4|/ip6/.../p2p/<id>, not this relay)"),
+        }
+    }
+    out
+}
+
 fn forget_circuit(swarm: &mut Swarm<Behaviour>, reserved: &mut HashSet<PeerId>, peer: &PeerId) {
     if reserved.remove(peer) {
         let relay_id = *swarm.local_peer_id();
@@ -603,6 +640,20 @@ mod tests {
         ] {
             assert!(!global(addr), "{addr} should be dropped");
         }
+    }
+
+    #[test]
+    fn peer_relays_take_pinned_ip_addresses_only() {
+        let me = PeerId::random();
+        let other = PeerId::random();
+        let raw = format!(
+            "/ip4/172.17.0.1/tcp/4011/p2p/{other}, /dns4/relay.example.org/tcp/4001/p2p/{other},\
+             /ip4/172.17.0.1/tcp/4001,/ip4/172.17.0.1/tcp/4001/p2p/{me},,/ip6/::1/tcp/4011/p2p/{other}"
+        );
+        let got = peer_relays(&raw, me);
+        assert_eq!(got.len(), 2, "the ip4 and ip6 entries for the other relay");
+        assert!(got.iter().all(|(p, _)| *p == other));
+        assert!(peer_relays("", me).is_empty());
     }
 
     #[cfg(unix)]

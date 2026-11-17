@@ -76,6 +76,21 @@ if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
 const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
+/**
+ * G-62: the unread count on the taskbar (Windows: our overlay icon) or the
+ * dock / launcher. Only a checked whole number reaches the OS. Main clears it
+ * itself on sign-out and when the page dies (it can't send 0 then).
+ */
+const unread = badge.createBadge({
+  apply: (n) => {
+    if (process.platform === 'win32') {
+      const img = n > 0 ? nativeImage.createFromBitmap(badge.drawBadge(badge.label(n)), { width: badge.SIZE, height: badge.SIZE, scaleFactor: 2 }) : null;
+      for (const win of BrowserWindow.getAllWindows()) win.setOverlayIcon(img, n > 0 ? `${n} unread` : '');
+    } else {
+      app.setBadgeCount(n);
+    }
+  },
+});
 
 /** Sends a shell event (not from the core) to our own windows. */
 function toPages(name, payload) {
@@ -174,6 +189,8 @@ function serveCoreIpc() {
         confirmWithoutWords: async () => (await dialog.showMessageBox(win, signout.WITHOUT_WORDS_DIALOG)).response === 1,
         request: () => core.request(req.cmd, req.args),
         clearStorage: async () => {
+          // G-62: signed out (the core said ok): no unread count left on the taskbar.
+          unread.set(0);
           await event.sender.session.clearStorageData({
             origin: sec.ORIGIN,
             storages: ['localstorage', 'indexdb', 'cachestorage', 'serviceworkers', 'cookies', 'websql', 'shadercache'],
@@ -241,18 +258,6 @@ function serveCoreIpc() {
   ipcMain.handle('notify:show', (event, notice) => {
     if (!fromUs(event)) return false;
     return notifier.show(notice);
-  });
-  // G-62: the unread count on the taskbar (Windows: our overlay icon) or
-  // the dock / launcher. Only a checked whole number reaches the OS.
-  const unread = badge.createBadge({
-    apply: (n) => {
-      if (process.platform === 'win32') {
-        const img = n > 0 ? nativeImage.createFromBitmap(badge.drawBadge(badge.label(n)), { width: badge.SIZE, height: badge.SIZE, scaleFactor: 2 }) : null;
-        for (const win of BrowserWindow.getAllWindows()) win.setOverlayIcon(img, n > 0 ? `${n} unread` : '');
-      } else {
-        app.setBadgeCount(n);
-      }
-    },
   });
   ipcMain.handle('badge:set', (event, count) => {
     if (!fromUs(event)) return false;
@@ -464,6 +469,7 @@ function createWindow() {
   win.on('unresponsive', () => unresponsive.add(win));
   win.on('responsive', () => unresponsive.delete(win));
   win.webContents.on('render-process-gone', () => {
+    unread.set(0);
     // The page held the call's audio; the call ends with it.
     if (callGate.inCall) {
       callGate.end();

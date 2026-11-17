@@ -922,7 +922,7 @@ async fn quic_follows_tcp_and_punches_only_members_off_relay_only() {
     let (_relay, _, relay, _) = start_relay_here();
     let a = bound_node("quic-port-a", &relay, 15, true, Arc::new(AcceptAll)).await;
     let (tcp, udp) = wait_ports(&a, ports).await;
-    assert_eq!(tcp, udp, "QUIC on another port than TCP");
+    assert_same_port_or_taken(tcp, udp, "at start");
     a.set_relay_only(true).unwrap();
     let start = Instant::now();
     while direct_listening(&a.listen_addrs().await.unwrap()) {
@@ -932,7 +932,7 @@ async fn quic_follows_tcp_and_punches_only_members_off_relay_only() {
     a.set_relay_only(false).unwrap();
     let (tcp2, udp2) = wait_ports(&a, ports).await;
     // (On a first run TCP may take a new random port here; QUIC follows it.)
-    assert_eq!(tcp2, udp2, "QUIC on another port than TCP after relay-only");
+    assert_same_port_or_taken(tcp2, udp2, "after relay-only");
     a.shutdown().await.unwrap();
 
     // QUIC-only peers that learn their QUIC address from the relay: neither
@@ -971,6 +971,18 @@ async fn quic_follows_tcp_and_punches_only_members_off_relay_only() {
 }
 
 /// The TCP and QUIC ports `node` listens on directly, once it has both.
+/// QUIC listens on the TCP port number when that UDP port is free. On
+/// Windows a random TCP port can fall in a UDP range the OS reserves (or
+/// another process holds it): then QUIC takes another port, by design. So a
+/// different port passes only if the TCP port can't be bound for UDP now
+/// (the CI flake on #408's run).
+fn assert_same_port_or_taken(tcp: u16, udp: u16, when: &str) {
+    if tcp != udp {
+        let free = std::net::UdpSocket::bind(("127.0.0.1", tcp)).is_ok();
+        assert!(!free, "QUIC on port {udp}, not on the free TCP port {tcp} ({when})");
+    }
+}
+
 async fn wait_ports(node: &Node, ports: impl Fn(&[Multiaddr]) -> (Option<u16>, Option<u16>)) -> (u16, u16) {
     let start = Instant::now();
     loop {

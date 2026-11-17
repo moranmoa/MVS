@@ -12,17 +12,26 @@ import { cleanCall, cleanVoiceRoom, cleanVoiceRooms, guardCore } from '../core/s
 
 // jsdom has no WebRTC: the engine (piece D) has its own tests in src/voice. Here it
 // is an idle engine with a working mic; ?voiceSim drives the failure states.
-const fakeEngine = vi.hoisted(() => ({ peerFailed: {} as Record<string, 'failed' | 'refused'>, stunUrls: [] as unknown[] }));
+const fakeEngine = vi.hoisted(() => ({
+  peerFailed: {} as Record<string, 'failed' | 'refused'>,
+  stunUrls: [] as unknown[],
+  picked: [] as string[],
+  level: 0.42,
+}));
 vi.mock('../voice', () => ({
   useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => (fakeEngine.stunUrls.push(options?.stunUrl), {
     ready: true,
     speaking: {},
     peerFailed: fakeEngine.peerFailed,
     setMicMuted: () => {},
-    inputs: [],
-    outputs: [],
-    setInput: () => {},
-    setOutput: () => {},
+    inputs: [
+      { deviceId: 'mic-a', label: 'Desk mic' },
+      { deviceId: 'mic-b', label: 'Headset mic' },
+    ],
+    outputs: [{ deviceId: 'spk-a', label: 'Headphones' }],
+    setInput: (id: string) => fakeEngine.picked.push(`in:${id}`),
+    setOutput: (id: string) => fakeEngine.picked.push(`out:${id}`),
+    inputLevel: () => fakeEngine.level,
   }),
 }));
 
@@ -79,6 +88,39 @@ const click = async (el: Element) =>
   act(async () => {
     fireEvent.click(el);
   });
+
+describe('G-72: voice settings in a call', () => {
+  it('picks the microphone and the speaker, and shows the mic level', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      const bar = await screen.findByRole('region', { name: 'Voice call' });
+      await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+      const dialog = screen.getByRole('dialog', { name: 'Voice settings' });
+      const mic = within(dialog).getByRole('combobox', { name: 'Microphone' }) as HTMLSelectElement;
+      expect([...mic.options].map((o) => o.text)).toEqual(['System default', 'Desk mic', 'Headset mic']);
+      fakeEngine.picked = [];
+      await act(async () => {
+        fireEvent.change(mic, { target: { value: 'mic-b' } });
+      });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speaker' });
+      await act(async () => {
+        fireEvent.change(speaker, { target: { value: 'spk-a' } });
+      });
+      expect(fakeEngine.picked).toEqual(['in:mic-b', 'out:spk-a']);
+      // The level, polled while the dialog is open.
+      await act(async () => {
+        vi.advanceTimersByTime(250);
+      });
+      const meter = within(dialog).getByRole('meter', { name: 'Mic test' });
+      expect(meter.getAttribute('aria-valuenow')).toBe('42');
+      expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('voice rooms (0.4.3)', () => {
   it('shows the rooms before joining: name, count, who is in it, the host crowned', async () => {

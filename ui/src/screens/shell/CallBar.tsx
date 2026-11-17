@@ -7,7 +7,8 @@ import { useEffect, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
-import { AlertIcon, HangUpIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
+import { Dialog } from '../../components/common';
+import { AlertIcon, GearIcon, HangUpIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
 
@@ -127,6 +128,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   const core = useCore();
   const intl = useIntl();
   const call = useStore(store, (s) => s.call);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // The call may be in another server's room than the one on screen.
   const serverId = useStore(store, (s) => Object.entries(s.voiceRooms).find(([, rooms]) => rooms.some((r) => r.roomId === s.call?.channelId))?.[0]);
   const serverName = useStore(store, (s) => s.servers.find((x) => x.id === serverId)?.name ?? '');
@@ -169,6 +171,16 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         </button>
         <button
           type="button"
+          className="icon-button call-settings"
+          aria-haspopup="dialog"
+          aria-label={intl.formatMessage({ id: 'call.voiceSettings' })}
+          title={intl.formatMessage({ id: 'call.voiceSettings' })}
+          onClick={() => setSettingsOpen(true)}
+        >
+          <GearIcon />
+        </button>
+        <button
+          type="button"
           className="icon-button call-leave"
           aria-label={intl.formatMessage({ id: 'call.leave' })}
           title={intl.formatMessage({ id: 'call.leave' })}
@@ -177,6 +189,81 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
           <HangUpIcon />
         </button>
       </div>
+      <VoiceSettings open={settingsOpen} onClose={() => setSettingsOpen(false)} engine={engine} muted={!!me?.muted} />
     </section>
   );
+}
+
+/**
+ * G-72: pick the microphone and the speaker, and test the mic. In a call only:
+ * the desktop shell grants the microphone (and with it the device names)
+ * only during one. The choice lasts for this session.
+ */
+function VoiceSettings({ open, onClose, engine, muted }: { open: boolean; onClose: () => void; engine: CallEngine; muted: boolean }) {
+  const intl = useIntl();
+  const level = useInputLevel(open && !engine.noMic && !muted, engine.inputLevel);
+  const pct = Math.round(level * 100);
+  const system = intl.formatMessage({ id: 'call.systemDefault' });
+  return (
+    <Dialog open={open} onClose={onClose} title={<FormattedMessage id="call.voiceSettings" />} className="voice-settings">
+      <label className="field">
+        <span>
+          <FormattedMessage id="call.microphone" />
+        </span>
+        <select value={engine.inputId ?? ''} onChange={(e) => engine.setInput(e.target.value)} disabled={engine.inputs.length === 0}>
+          <option value="">{system}</option>
+          {engine.inputs.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="field">
+        <span>
+          <FormattedMessage id="call.speaker" />
+        </span>
+        <select value={engine.outputId ?? ''} onChange={(e) => engine.setOutput(e.target.value)} disabled={engine.outputs.length === 0}>
+          <option value="">{system}</option>
+          {engine.outputs.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="mic-test">
+        <span id="mic-test-label">
+          <FormattedMessage id="call.micTest" />
+        </span>
+        <div
+          className="mic-level"
+          role="meter"
+          aria-labelledby="mic-test-label"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={pct}
+        >
+          <div className="mic-level-fill" style={{ inlineSize: `${pct}%` }} />
+        </div>
+        <p className="hint">
+          <FormattedMessage id={engine.noMic ? 'call.noMic' : muted ? 'call.micTestMuted' : 'call.micTestHint'} />
+        </p>
+      </div>
+    </Dialog>
+  );
+}
+
+/** Polls the mic level ten times a second while `on`; 0 otherwise. */
+function useInputLevel(on: boolean, read: () => number): number {
+  const [level, setLevel] = useState(0);
+  useEffect(() => {
+    if (!on) {
+      setLevel(0);
+      return;
+    }
+    const t = setInterval(() => setLevel(read()), 100);
+    return () => clearInterval(t);
+  }, [on, read]);
+  return level;
 }

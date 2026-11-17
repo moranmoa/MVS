@@ -104,6 +104,10 @@ impl UpdateDirs {
     pub fn staged_notes(&self) -> PathBuf {
         self.state.join("staged-notes.json")
     }
+    /// The last verified global flags (slice 3b): `{issuedAt, memberRelayOff}`.
+    pub fn flags_file(&self) -> PathBuf {
+        self.state.join("flags.json")
+    }
     pub fn downloads(&self) -> PathBuf {
         self.state.join("downloads")
     }

@@ -39,6 +39,9 @@ const KV_RELAY_ONLY: &str = "relay-only";
 const KV_MEMBER_RELAY: &str = "member-relay";
 const KV_MEMBER_RELAY_SEEN: &str = "member-relay-disclosure-seen";
 const KV_MEMBER_RELAY_CAP: &str = "member-relay-cap-mb";
+/// Slice 3b: the last verified `memberRelayOff` from the signed `flags.json`.
+/// Written only by the update loop; there is no command for it.
+const KV_MEMBER_RELAY_GLOBAL_OFF: &str = "member-relay-global-off";
 /// The member relay's daily cap: default and accepted range, in MB.
 pub const MEMBER_RELAY_CAP_DEFAULT_MB: u32 = 2_048;
 pub const MEMBER_RELAY_CAP_MB: std::ops::RangeInclusive<u32> = 256..=51_200;
@@ -2658,7 +2661,7 @@ impl Core {
     }
 
     /// The background check: once the UI is up (or after a fallback wait),
-    /// then every 6 h ± 30 min, and at once after a channel switch. Downloads
+    /// then every hour ± 5 min, and at once after a channel switch. Downloads
     /// whatever is available; the apply waits for the user (or next start).
     /// Returns when `Updates::stop` is called; without updates, at once.
     pub fn run_update_loop(&self) {
@@ -2669,6 +2672,21 @@ impl Core {
         loop {
             if let Ok(channel) = self.ui_channel() {
                 self.emit_update(updates.background_round(channel, self.now_secs()));
+                // Slice 3b: the owner's signed global switch, fetched with the
+                // check. Kept in kv; only this path writes it.
+                let off = updates.member_relay_off(channel);
+                let mut events = Vec::new();
+                {
+                    let mut inner = self.lock();
+                    let value: &[u8] = if off { b"1" } else { b"0" };
+                    if inner.db.get(KV_MEMBER_RELAY_GLOBAL_OFF).ok().flatten().as_deref() != Some(value) {
+                        if let Err(e) = inner.db.set(KV_MEMBER_RELAY_GLOBAL_OFF, value) {
+                            eprintln!("mvs-core: the global member relay flag wasn't stored: {:?}", e.code);
+                        }
+                    }
+                    inner.check_member_relay(&self.ports, &mut events);
+                }
+                self.emit(events);
             }
             if !updates.wait(crate::update::next_interval()) {
                 return;
@@ -3116,8 +3134,8 @@ impl Inner {
 
     /// Member relays (#368, slice 1): the setting, and what it comes to now.
     /// Forced off, whatever the setting, by the first reason that applies:
-    /// the global flag and a metered network (reserved for slice 3, never
-    /// set yet), then a minor, then relay-only.
+    /// the global flag (the signed `flags.json`, slice 3b), a metered network
+    /// (reserved for slice 3, never set yet), then a minor, then relay-only.
     fn member_relay_now(&mut self, now: u64) -> CoreResult<MemberRelay> {
         let setting = match self.db.get(KV_MEMBER_RELAY)?.as_deref() {
             Some(b"on") => MemberRelaySetting::On,
@@ -3138,7 +3156,10 @@ impl Inner {
         let adult = self.me.as_ref().is_some_and(|me| {
             me.profile.birth_date_trusted && me.profile.effective_age(now).is_some_and(|age| age >= 18)
         });
-        let reason = if self.me.is_some() && !adult {
+        let global_off = self.db.get(KV_MEMBER_RELAY_GLOBAL_OFF)?.as_deref() == Some(b"1");
+        let reason = if global_off {
+            Some(MemberRelayReason::GlobalOff)
+        } else if self.me.is_some() && !adult {
             Some(MemberRelayReason::Minor)
         } else if relay_only_in(&self.db)? {
             Some(MemberRelayReason::RelayOnly)

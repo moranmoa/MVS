@@ -20,6 +20,7 @@
 
 mod artifact;
 mod error;
+pub mod flags;
 mod layout;
 pub mod launcher;
 mod manifest;

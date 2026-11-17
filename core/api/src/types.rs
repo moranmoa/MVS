@@ -674,7 +674,7 @@ pub enum MemberRelaySetting {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MemberRelayReason {
-    /// The signed manifest's flag. Reserved: slice 3.
+    /// The owner's signed global switch (`flags.json`, slice 3b).
     GlobalOff,
     /// No trusted adult birth date (the age claim's rule).
     Minor,

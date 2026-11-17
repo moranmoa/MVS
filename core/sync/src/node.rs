@@ -2363,12 +2363,6 @@ impl Task {
         }
     }
 
-    /// Pulls `peer`'s share of our logs, at most `limit` (a round:
-    /// [`PULLS_PER_PEER_ROUND`]; a first contact: [`FIRST_CONTACT_PULLS`]):
-    /// those of servers it is bound to first, then the other control
-    /// logs in turn (a different slice each round), so a node with many
-    /// servers never sends a peer more pulls than its limits take. `pull`
-    /// also keeps at most [`MAX_PULLS_IN_FLIGHT`] out at once.
     /// The channel logs of `server` we share with `peer`, pulled at once
     /// (`peer` just bound for it).
     fn pull_bound_channels(&mut self, peer: PeerId, server: ServerId) {
@@ -2385,6 +2379,12 @@ impl Task {
         }
     }
 
+    /// Pulls `peer`'s share of our logs, at most `limit` (a round:
+    /// [`PULLS_PER_PEER_ROUND`]; a first contact: [`FIRST_CONTACT_PULLS`]):
+    /// those of servers it is bound to first, then the other control
+    /// logs in turn (a different slice each round), so a node with many
+    /// servers never sends a peer more pulls than its limits take. `pull`
+    /// also keeps at most [`MAX_PULLS_IN_FLIGHT`] out at once.
     fn pull_shared(&mut self, peer: PeerId, cause: &'static str, limit: usize) {
         let (mut bound, mut rest): (Vec<String>, Vec<String>) = self
             .logs

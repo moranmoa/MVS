@@ -71,6 +71,42 @@ pub const MAX_BLOB: usize = 16 * 1024;
 pub const CLOCK_WINDOW_MS: u64 = 120_000;
 pub const HELLO_EVERY_MS: u64 = 10_000;
 pub const HELLO_TIMEOUT_MS: u64 = 30_000;
+
+/// G-84b: what our hellos advertise in their payload. Cores before 0.6.0
+/// never read a hello's payload, so they accept it unchanged.
+const CAPS_PAYLOAD: &str = r#"{"caps":["deafen"]}"#;
+/// The cap that lets a hello to that signer carry `deafened`.
+const CAP_DEAFEN: &str = "deafen";
+/// Caps payloads longer than this, or with more caps, or longer caps, are no caps.
+const MAX_CAPS_PAYLOAD: usize = 128;
+const MAX_CAPS: usize = 8;
+const MAX_CAP_LEN: usize = 16;
+/// Signers whose caps we remember (expiring like the roster).
+const MAX_CAPS_ENTRIES: usize = 1024;
+
+/// A hello's payload as caps: `{"caps":[...]}` and nothing else; unknown caps
+/// are ignored, anything malformed is no caps.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCaps {
+    caps: Vec<String>,
+}
+
+/// Whether `payload` advertises the `deafen` cap.
+fn parses_deafen_cap(payload: &str) -> bool {
+    if payload.is_empty() || payload.len() > MAX_CAPS_PAYLOAD {
+        return false;
+    }
+    let Ok(wire) = serde_json::from_str::<WireCaps>(payload) else { return false };
+    let well_formed = |c: &String| {
+        !c.is_empty() && c.len() <= MAX_CAP_LEN && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    wire.caps.len() <= MAX_CAPS && wire.caps.iter().all(well_formed) && wire.caps.iter().any(|c| c == CAP_DEAFEN)
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 /// Nonces remembered for replay checks, within the clock window. When full,
 /// new envelopes are dropped (fail closed) rather than evicting a live
 /// nonce, which would let a replay through. Piece A's per-peer rate cap
@@ -209,6 +245,11 @@ struct Body {
     /// v2 hellos from the master only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     meta: Option<WireMeta>,
+    /// G-84b hellos: I hear no one. Sent only to signers whose hellos
+    /// advertise the `deafen` cap (older cores refuse unknown fields), and
+    /// only when true. Counts only together with `muted`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    deafened: bool,
 }
 
 /// On the wire: the body as sent, and the signature over
@@ -237,6 +278,7 @@ struct Opened {
     payload: String,
     joined_at: u64,
     meta: Option<WireMeta>,
+    deafened: bool,
 }
 
 fn seal(key: &SigningKey, body: &Body) -> Vec<u8> {
@@ -292,6 +334,7 @@ fn open(blob: &[u8], now: u64) -> Option<Opened> {
         payload: body.payload,
         joined_at: body.joined_at,
         meta: body.meta,
+        deafened: body.deafened,
     })
 }
 
@@ -368,6 +411,8 @@ struct Mine {
     server: ServerId,
     channel: ChannelId,
     muted: bool,
+    /// G-84b: I hear no one (shown to others with `muted`).
+    deafened: bool,
     joined_at: u64,
     /// When I joined, by my clock (for `full`).
     since: u64,
@@ -376,6 +421,8 @@ struct Mine {
 #[derive(Clone, Copy)]
 struct Peer {
     muted: bool,
+    /// G-84b: only with `muted`, from a hello that carried it.
+    deafened: bool,
     /// By our clock: when we received its last hello.
     seen: u64,
     /// Its claim, checked and frozen on the first hello of its stay.
@@ -413,6 +460,10 @@ pub(crate) struct Calls {
     /// last hello reached us. `createVoiceRoom` and `joinCall` here answer
     /// `in-call-elsewhere` (one room per identity).
     elsewhere: HashMap<ChannelId, (ServerId, u64)>,
+    /// G-84b: signers whose last hello (within [`HELLO_TIMEOUT_MS`])
+    /// advertised the `deafen` cap, and when we received it. Bounded by
+    /// [`MAX_CAPS_ENTRIES`].
+    caps: HashMap<PublicKey, u64>,
 }
 
 impl Calls {
@@ -525,23 +576,23 @@ impl Calls {
         self.rooms.values().filter(|room| room.server == server).count()
     }
 
-    /// `channel`'s members as (joinedAt, key, muted), earliest first; the
-    /// master is the first.
-    fn roster(&self, me: PublicKey, channel: ChannelId) -> Vec<(u64, PublicKey, bool)> {
-        let mut roster: Vec<(u64, PublicKey, bool)> = self
+    /// `channel`'s members as (joinedAt, key, muted, deafened), earliest
+    /// first; the master is the first.
+    fn roster(&self, me: PublicKey, channel: ChannelId) -> Vec<(u64, PublicKey, bool, bool)> {
+        let mut roster: Vec<(u64, PublicKey, bool, bool)> = self
             .rooms
             .get(&channel)
-            .map(|room| room.peers.iter().map(|(k, p)| (p.joined_at, *k, p.muted)).collect())
+            .map(|room| room.peers.iter().map(|(k, p)| (p.joined_at, *k, p.muted, p.deafened)).collect())
             .unwrap_or_default();
         if let Some(mine) = self.mine.as_ref().filter(|m| m.channel == channel) {
-            roster.push((mine.joined_at, me, mine.muted));
+            roster.push((mine.joined_at, me, mine.muted, mine.deafened && mine.muted));
         }
         roster.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
         roster
     }
 
     fn master(&self, me: PublicKey, channel: ChannelId) -> Option<PublicKey> {
-        self.roster(me, channel).first().map(|(_, key, _)| *key)
+        self.roster(me, channel).first().map(|(_, key, _, _)| *key)
     }
 
     /// Before creating or joining: relay-only, a transport, a member, and
@@ -637,7 +688,7 @@ impl Calls {
         channel: ChannelId,
         joined_at: u64,
     ) -> CoreResult<CallState> {
-        self.mine = Some(Mine { server, channel, muted: false, joined_at, since: ctx.now });
+        self.mine = Some(Mine { server, channel, muted: false, deafened: false, joined_at, since: ctx.now });
         self.dirty.insert(server);
         self.hello(ctx, members, None);
         let state = self.state(ctx.me()).expect("in a call");
@@ -677,6 +728,44 @@ impl Calls {
             ctx.events.push(Event::CallState(self.state(ctx.me()).expect("in a call")));
         }
         Ok(())
+    }
+
+    /// G-84b `setDeafened`: told to the others in my next hello (now), to
+    /// those whose cores understand it.
+    pub fn set_deafened(
+        &mut self,
+        ctx: &mut Ctx,
+        members: &mut dyn Members,
+        deafened: bool,
+    ) -> CoreResult<()> {
+        let mine = self.mine.as_mut().ok_or(ErrorCode::NotAllowed)?;
+        if mine.deafened != deafened {
+            mine.deafened = deafened;
+            self.dirty.insert(mine.server);
+            self.hello(ctx, members, None);
+            ctx.events.push(Event::CallState(self.state(ctx.me()).expect("in a call")));
+        }
+        Ok(())
+    }
+
+    /// G-84b: learns whether `from`'s hello advertises the `deafen` cap.
+    fn learn_caps(&mut self, from: PublicKey, payload: &str, now: u64) {
+        if parses_deafen_cap(payload) {
+            // Full: the stalest entry makes room (never refuse a new signer).
+            if self.caps.len() >= MAX_CAPS_ENTRIES && !self.caps.contains_key(&from) {
+                if let Some(oldest) = self.caps.iter().min_by_key(|(_, seen)| **seen).map(|(k, _)| *k) {
+                    self.caps.remove(&oldest);
+                }
+            }
+            self.caps.insert(from, now);
+        } else {
+            self.caps.remove(&from);
+        }
+    }
+
+    /// G-84b: a hello to `to` may carry `deafened`.
+    fn understands_deafen(&self, to: PublicKey, now: u64) -> bool {
+        self.caps.get(&to).is_some_and(|seen| now.saturating_sub(*seen) < HELLO_TIMEOUT_MS)
     }
 
     /// `editVoiceRoom`: the master applies it at once (its next hello, sent
@@ -823,7 +912,10 @@ impl Calls {
             .get(&signal.channel)
             .is_some_and(|room| room.peers.contains_key(&signal.from));
         match signal.kind {
-            WireKind::Hello => self.on_hello(ctx, members, &signal, in_this_call),
+            WireKind::Hello => {
+                self.learn_caps(signal.from, &signal.payload, ctx.now);
+                self.on_hello(ctx, members, &signal, in_this_call);
+            }
             WireKind::Bye => {
                 if self.remove_peer(signal.channel, signal.from) && in_this_call {
                     ctx.events.push(Event::CallState(self.state(me).expect("in a call")));
@@ -991,9 +1083,11 @@ impl Calls {
             }
         }
         let room = self.rooms.get_mut(&channel).expect("just made");
-        let changed = before.is_none_or(|p| p.muted != signal.muted);
+        // G-84b: deafened counts only together with muted.
+        let deafened = signal.deafened && signal.muted;
+        let changed = before.is_none_or(|p| p.muted != signal.muted || p.deafened != deafened);
         // Expiry runs from when we received it, never the sender's `ts`.
-        room.peers.insert(signal.from, Peer { muted: signal.muted, seen: ctx.now, joined_at });
+        room.peers.insert(signal.from, Peer { muted: signal.muted, deafened, seen: ctx.now, joined_at });
         if changed {
             self.dirty.insert(server);
         }
@@ -1019,20 +1113,53 @@ impl Calls {
     fn hello(&mut self, ctx: &mut Ctx, members: &mut dyn Members, to: Option<PublicKey>) {
         let Some(mine) = &self.mine else { return };
         let (server, channel, muted, joined_at) = (mine.server, mine.channel, mine.muted, mine.joined_at);
+        let deafened = mine.deafened && mine.muted;
         let Some(mut body) = self.body(ctx, WireKind::Hello, channel, to) else { return };
         self.own(&body, ctx.now);
         body.muted = muted;
         body.joined_at = joined_at;
+        body.payload = CAPS_PAYLOAD.into();
         if self.master(ctx.me(), channel) == Some(ctx.me()) {
             body.meta = self.rooms.get(&channel).map(|room| room.meta.wire());
         }
         match to {
-            Some(to) => self.send(ctx, to, &body),
+            Some(to) => {
+                body.deafened = deafened && self.understands_deafen(to, ctx.now);
+                self.send(ctx, to, &body);
+            }
             None => {
                 self.last_hello = ctx.now;
-                self.broadcast(ctx, members, server, body);
+                self.broadcast_hello(ctx, members, server, body, deafened);
             }
         }
+    }
+
+    /// G-84b: a hello to the server's audience, sealed twice when I'm
+    /// deafened: with `deafened` for signers whose hellos advertise the cap,
+    /// without it for everyone else (older cores, and viewers we never heard
+    /// from), so no one drops it. My other computers get the plain one.
+    fn broadcast_hello(&self, ctx: &Ctx, members: &mut dyn Members, server: ServerId, mut body: Body, deafened: bool) {
+        let Some(net) = &self.net else { return };
+        body.deafened = false;
+        let plain = seal(ctx.key, &body);
+        // The deafened variant has its own nonce (no nonce on two bodies).
+        let with = deafened.then(|| {
+            body.deafened = true;
+            let mut nonce = [0u8; 16];
+            OsRng.fill_bytes(&mut nonce);
+            body.nonce = hex::encode(nonce);
+            seal(ctx.key, &body)
+        });
+        for to in members.audience(server) {
+            if members.may_call(to, server) {
+                let blob = match &with {
+                    Some(with) if self.understands_deafen(to, ctx.now) => with.clone(),
+                    _ => plain.clone(),
+                };
+                net.send(to, blob);
+            }
+        }
+        net.send(ctx.me(), plain);
     }
 
     /// A v2 body about the live room `channel`; `None` if it isn't known.
@@ -1057,6 +1184,7 @@ impl Calls {
             }),
             joined_at: 0,
             meta: None,
+            deafened: false,
         })
     }
 
@@ -1124,14 +1252,18 @@ impl Calls {
     /// My call: me first, then the others by key.
     fn state(&self, me: PublicKey) -> Option<CallState> {
         let mine = self.mine.as_ref()?;
-        let mut participants =
-            vec![CallParticipant { identity: model::hex_id(me.as_bytes()), muted: mine.muted }];
+        let mut participants = vec![CallParticipant {
+            identity: model::hex_id(me.as_bytes()),
+            muted: mine.muted,
+            deafened: mine.deafened && mine.muted,
+        }];
         let mut limit = MAX_PARTICIPANTS;
         if let Some(room) = self.rooms.get(&mine.channel) {
             limit = usize::from(room.meta.limit);
             participants.extend(room.peers.iter().map(|(key, peer)| CallParticipant {
                 identity: model::hex_id(key.as_bytes()),
                 muted: peer.muted,
+                deafened: peer.deafened,
             }));
         }
         let full = participants.len() >= limit;
@@ -1178,9 +1310,10 @@ impl Calls {
                     master_id: model::hex_id(master.as_bytes()),
                     members: roster
                         .into_iter()
-                        .map(|(joined_at, key, muted)| VoiceMember {
+                        .map(|(joined_at, key, muted, deafened)| VoiceMember {
                             user_id: model::hex_id(key.as_bytes()),
                             muted,
+                            deafened,
                             joined_at,
                         })
                         .collect(),
@@ -1231,6 +1364,7 @@ mod tests {
             room: Some(WireRoom { creator: user(2), created_at: NOW }),
             joined_at: NOW,
             meta: None,
+            deafened: false,
         }
     }
 
@@ -1375,7 +1509,7 @@ mod tests {
     }
 
     fn members_of(calls: &Calls, me: u8, room: ChannelId) -> Vec<String> {
-        calls.roster(pk(me), room).iter().map(|(_, k, _)| hex::encode(k.as_bytes())).collect()
+        calls.roster(pk(me), room).iter().map(|(_, k, _, _)| hex::encode(k.as_bytes())).collect()
     }
 
     #[test]
@@ -1522,7 +1656,7 @@ mod tests {
         calls.received(&mut ctx, &mut club, None, &hello_in(5, 2, NOW, NOW + 2000, later, 7));
         calls.received(&mut ctx, &mut club, None, &hello_in(6, 2, NOW, NOW, later, 8));
         assert_eq!(members_of(&calls, 1, room()), [user(2), user(5), user(6)]);
-        let six = calls.roster(pk(1), room()).into_iter().find(|(_, k, _)| *k == pk(6)).unwrap();
+        let six = calls.roster(pk(1), room()).into_iter().find(|(_, k, _, _)| *k == pk(6)).unwrap();
         assert_eq!(six.0, later - CLOCK_WINDOW_MS);
     }
 
@@ -1881,4 +2015,211 @@ mod tests {
             ["sha-256 AA", "sha-1 BB"]
         );
     }
+
+    // ---- G-84b: `deafened`, only to cores that understand it ----------------
+
+    /// Records each blob and who it went to.
+    #[derive(Default)]
+    struct BlobNet(std::sync::Mutex<Vec<(PublicKey, Vec<u8>)>>);
+
+    impl VoiceNet for BlobNet {
+        fn send(&self, to: PublicKey, blob: Vec<u8>) {
+            self.0.lock().unwrap().push((to, blob));
+        }
+    }
+
+    /// A hello from `from` in `room()` with this payload, mute and deafen.
+    fn hello_with(from: u8, nonce: u8, payload: &str, muted: bool, deafened: bool) -> Vec<u8> {
+        let mut body = body(&key(from), NOW);
+        (body.kind, body.to, body.joined_at) = (WireKind::Hello, None, NOW);
+        body.nonce = hex::encode([nonce; 16]);
+        body.payload = payload.into();
+        (body.muted, body.deafened) = (muted, deafened);
+        seal(&key(from), &body)
+    }
+
+    /// The body JSON inside an envelope.
+    fn body_json(blob: &[u8]) -> serde_json::Value {
+        let envelope: Envelope = serde_json::from_slice(blob).unwrap();
+        serde_json::from_str(&envelope.body).unwrap()
+    }
+
+    /// The v2 Body as cores before 0.6.0 read it (no `deafened`), to show
+    /// what they accept.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OldBody {
+        v: u8,
+        kind: WireKind,
+        server: String,
+        channel: String,
+        from: String,
+        to: Option<String>,
+        ts: u64,
+        nonce: String,
+        #[serde(default)]
+        muted: bool,
+        #[serde(default)]
+        payload: String,
+        #[serde(default)]
+        room: Option<WireRoom>,
+        #[serde(default, rename = "joinedAt")]
+        joined_at: u64,
+        #[serde(default)]
+        meta: Option<WireMeta>,
+    }
+
+    #[test]
+    fn the_caps_payload_is_strict_json_and_ignores_unknown_caps() {
+        assert!(parses_deafen_cap(CAPS_PAYLOAD));
+        assert!(parses_deafen_cap(r#"{"caps":["future-1","deafen"]}"#));
+        for bad in [
+            "",
+            "caps=deafen",
+            r#"{"caps":["future"]}"#,
+            r#"{"caps":"deafen"}"#,
+            r#"{"caps":["deafen"],"x":1}"#,
+            r#"{"caps":["Deafen"]}"#,
+            r#"{"caps":["deafen",""]}"#,
+            r#"{"caps":["deafen","a_b"]}"#,
+            r#"{"caps":["deafen","abcdefghijklmnopq"]}"#,
+            r#"{"caps":["a","b","c","d","e","f","g","h","deafen"]}"#,
+            r#"{"caps":[],"caps":["deafen"]}"#,
+            "v=0\r\na=fingerprint:sha-256 AB:CD\r\n",
+        ] {
+            assert!(!parses_deafen_cap(bad), "{bad}");
+        }
+        let long = format!(r#"{{"caps":["deafen","{}"]}}"#, "a".repeat(110));
+        assert!(long.len() > MAX_CAPS_PAYLOAD && !parses_deafen_cap(&long));
+    }
+
+    /// Security Lead (3): a hello's payload never gated it; one carrying our
+    /// caps, or junk, is listed like any other. And our plain hello, with
+    /// the caps marker, is what a core before 0.6.0 reads; the deafened one
+    /// isn't (hence the two variants).
+    #[test]
+    fn older_cores_accept_our_plain_hello_but_not_the_deafened_one() {
+        let mut calls = new_calls();
+        let mut club = club(&[2, 3, 4]);
+        let mut events = Vec::new();
+        let mut ctx = Ctx { key: &key(1), now: NOW, events: &mut events };
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 1, CAPS_PAYLOAD, false, false));
+        calls.received(&mut ctx, &mut club, None, &hello_with(3, 2, "anything at all", false, false));
+        assert_eq!(members_of(&calls, 1, room()), [user(2), user(3)]);
+
+        let mut plain = body(&key(1), NOW);
+        (plain.kind, plain.to, plain.payload) = (WireKind::Hello, None, CAPS_PAYLOAD.into());
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("deafened"));
+        assert!(serde_json::from_str::<OldBody>(&json).is_ok());
+        plain.deafened = true;
+        assert!(serde_json::from_str::<OldBody>(&serde_json::to_string(&plain).unwrap()).is_err());
+    }
+
+    /// TL on G-84b: per recipient. Deafened, my hello carries `deafened` only
+    /// to signers that advertised the cap; an old peer in the room, a viewer
+    /// we never heard from, and my own other computers get the plain one.
+    #[test]
+    fn deafened_goes_only_to_peers_that_understand_it() {
+        let net = Arc::new(BlobNet::default());
+        let mut calls = Calls::default();
+        calls.set_net(net.clone());
+        let mut club = club(&[2, 3, 4]);
+        let mut events = Vec::new();
+        let mut ctx = Ctx { key: &key(1), now: NOW, events: &mut events };
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 1, CAPS_PAYLOAD, false, false)); // new
+        calls.received(&mut ctx, &mut club, None, &hello_with(4, 2, "", false, false)); // old, in the room
+        calls.join(&mut ctx, &mut club, SERVER, room()).unwrap();
+        calls.set_muted(&mut ctx, &mut club, true).unwrap();
+        net.0.lock().unwrap().clear();
+
+        calls.set_deafened(&mut ctx, &mut club, true).unwrap();
+        let sent = net.0.lock().unwrap().clone();
+        let deafened_to = |who: PublicKey| {
+            sent.iter()
+                .filter(|(to, _)| *to == who)
+                .map(|(_, b)| body_json(b).get("deafened").is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(deafened_to(pk(2)), [true]);
+        assert_eq!(deafened_to(pk(3)), [false]); // a viewer: never said hello
+        assert_eq!(deafened_to(pk(4)), [false]); // an old core in the room
+        assert_eq!(deafened_to(pk(1)), [false]); // my other computers
+        // Every hello carries the marker, and each variant opens.
+        assert!(sent.iter().all(|(_, b)| body_json(b)["payload"] == CAPS_PAYLOAD && open(b, NOW).is_some()));
+        // The two variants never share a nonce.
+        let nonces: std::collections::BTreeSet<_> = sent.iter().map(|(_, b)| body_json(b)["nonce"].to_string()).collect();
+        assert_eq!(nonces.len(), 2);
+        assert!(calls.state(pk(1)).unwrap().participants[0].deafened);
+
+        // Peer 2's next hello lacks the marker: from then on, the plain one.
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 3, "", false, false));
+        net.0.lock().unwrap().clear();
+        calls.hello(&mut ctx, &mut club, None);
+        assert!(net.0.lock().unwrap().iter().all(|(_, b)| body_json(b).get("deafened").is_none()));
+        // It advertises again: understood again. Its caps expire with the roster.
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 4, CAPS_PAYLOAD, false, false));
+        assert!(calls.understands_deafen(pk(2), NOW));
+        assert!(!calls.understands_deafen(pk(2), NOW + HELLO_TIMEOUT_MS));
+    }
+
+    /// An old peer joining my call gets the plain hello at once (the
+    /// newcomer reply), and the field is never sent while I'm not muted.
+    #[test]
+    fn a_newcomer_without_the_cap_gets_the_plain_hello_and_unmuted_is_never_deafened() {
+        let net = Arc::new(BlobNet::default());
+        let mut calls = Calls::default();
+        calls.set_net(net.clone());
+        let mut club = club(&[2, 4]);
+        let mut events = Vec::new();
+        let mut ctx = Ctx { key: &key(1), now: NOW, events: &mut events };
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 1, CAPS_PAYLOAD, false, false));
+        calls.join(&mut ctx, &mut club, SERVER, room()).unwrap();
+        calls.set_deafened(&mut ctx, &mut club, true).unwrap(); // not muted: not shown
+        assert!(net.0.lock().unwrap().iter().all(|(_, b)| body_json(b).get("deafened").is_none()));
+        assert!(!calls.state(pk(1)).unwrap().participants[0].deafened);
+        calls.set_muted(&mut ctx, &mut club, true).unwrap();
+        net.0.lock().unwrap().clear();
+        calls.received(&mut ctx, &mut club, None, &hello_with(4, 2, "", false, false));
+        let sent = net.0.lock().unwrap().clone();
+        let to4: Vec<_> = sent.iter().filter(|(to, _)| *to == pk(4)).collect();
+        assert_eq!(to4.len(), 1);
+        assert!(body_json(&to4[0].1).get("deafened").is_none());
+    }
+
+    /// Security Lead: a full caps map evicts the stalest entry, never refusing a new signer.
+    #[test]
+    fn a_full_caps_map_evicts_the_stalest() {
+        let mut calls = Calls::default();
+        for n in 0..MAX_CAPS_ENTRIES as u64 {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&n.to_le_bytes());
+            calls.learn_caps(PublicKey::from_bytes(k), CAPS_PAYLOAD, NOW + n);
+        }
+        let first = PublicKey::from_bytes([0; 32]);
+        assert!(calls.understands_deafen(first, NOW));
+        calls.learn_caps(pk(9), CAPS_PAYLOAD, NOW + 5000);
+        assert_eq!(calls.caps.len(), MAX_CAPS_ENTRIES);
+        assert!(calls.understands_deafen(pk(9), NOW + 5000));
+        assert!(!calls.caps.contains_key(&first), "the stalest went");
+    }
+
+    /// Receiving: deafened counts only with muted.
+    #[test]
+    fn a_peer_is_shown_deafened_only_while_muted() {
+        let mut calls = new_calls();
+        let mut club = club(&[2]);
+        let mut events = Vec::new();
+        let mut ctx = Ctx { key: &key(1), now: NOW, events: &mut events };
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 1, CAPS_PAYLOAD, true, true));
+        calls.join(&mut ctx, &mut club, SERVER, room()).unwrap();
+        let peer = |calls: &Calls| calls.state(pk(1)).unwrap().participants[1].deafened;
+        assert!(peer(&calls));
+        calls.received(&mut ctx, &mut club, None, &hello_with(2, 2, CAPS_PAYLOAD, false, true));
+        assert!(!peer(&calls), "deafened without muted is ignored");
+        let rooms = calls.rooms_of(pk(1), SERVER);
+        assert!(rooms[0].members.iter().all(|m| !m.deafened));
+    }
+
 }

@@ -14,6 +14,7 @@ import {
   type VoiceError,
   type VoiceParticipant,
 } from './engine';
+import { DEVICES_EVENT, loadDevices, saveDevices } from './devices';
 
 export interface VoiceEngineView {
   ready: boolean;
@@ -40,35 +41,21 @@ export interface VoiceEngineView {
   /** G-84: I hear no one. Back to false when the call ends. */
   deafened: boolean;
   setDeafened: (deafened: boolean) => void;
-  /** G-73: per-person volume in percent (0..100), remembered on this computer; 100 when not set. */
+  /**
+   * G-73: per-person volume in percent (0..200), remembered on this computer;
+   * 100 when not set. Above 100 needs the engine's Web Audio path; on its
+   * element fallback it plays at 100.
+   */
   volumes: Record<Id, number>;
   setVolume: (id: Id, percent: number) => void;
   /** G-72: the last chosen device that was gone; its label if known. Shown once as a notice. */
   deviceFallback: { kind: 'input' | 'output'; label: string | null; at: number } | null;
+  /** G-72: "השמעה עצמית": my microphone played back to me. Off by default and when the call ends. */
+  selfMonitor: boolean;
+  setSelfMonitor: (on: boolean) => void;
 }
 
-/** G-72: the chosen devices, remembered on this computer. */
-const DEVICES_KEY = 'mvs.voice.devices.v1';
-
-/** The stored device choice; only short printable IDs (browsers use opaque hashes). */
-export function loadDevices(): { input?: string; output?: string } {
-  const ok = (v: unknown) => (typeof v === 'string' && v.length > 0 && v.length <= 256 && /^[\x21-\x7e]+$/.test(v) ? v : undefined);
-  try {
-    const raw = JSON.parse(localStorage.getItem(DEVICES_KEY) ?? '{}') as Record<string, unknown> | null;
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-    return { input: ok(raw.input), output: ok(raw.output) };
-  } catch {
-    return {};
-  }
-}
-
-function saveDevices(d: { input?: string; output?: string }): void {
-  try {
-    localStorage.setItem(DEVICES_KEY, JSON.stringify(d));
-  } catch {
-    // Not remembered; it still applies now.
-  }
-}
+export { loadDevices } from './devices';
 
 /** G-73: per-person volumes, kept on this computer only. */
 const VOLUMES_KEY = 'mvs.voice.volumes.v1';
@@ -81,7 +68,7 @@ export function loadVolumes(): Record<Id, number> {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
     const out: Record<Id, number> = {};
     for (const [id, v] of Object.entries(raw).slice(0, MAX_VOLUMES)) {
-      if (/^[0-9a-f]{64}$/.test(id) && Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 100) out[id] = v as number;
+      if (/^[0-9a-f]{64}$/.test(id) && Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 200) out[id] = v as number;
     }
     return out;
   } catch {
@@ -138,9 +125,12 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   const [inputId, setInputId] = useState<string | undefined>(() => loadDevices().input);
   const [outputId, setOutputId] = useState<string | undefined>(() => loadDevices().output);
   const [deviceFallback, setDeviceFallback] = useState<VoiceEngineView['deviceFallback']>(null);
+  const chosenRef = useRef<{ input?: string; output?: string }>({});
   const listsRef = useRef<{ inputs: AudioDevice[]; outputs: AudioDevice[] }>({ inputs: [], outputs: [] });
   listsRef.current = { inputs, outputs };
+  chosenRef.current = { input: inputId, output: outputId };
   const [deafened, setDeafenedState] = useState(false);
+  const [selfMonitor, setSelfMonitorState] = useState(false);
   const [volumes, setVolumes] = useState<Record<Id, number>>(loadVolumes);
   const volumesRef = useRef(volumes);
   volumesRef.current = volumes;
@@ -169,7 +159,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
         const list = kind === 'input' ? listsRef.current.inputs : listsRef.current.outputs;
         const label = list.find((d) => d.deviceId === deviceId)?.label || null;
         const now = loadDevices();
-        saveDevices(kind === 'input' ? { ...now, input: undefined } : { ...now, output: undefined });
+        saveDevices(kind === 'input' ? { ...now, input: undefined } : { ...now, output: undefined }, false);
         if (kind === 'input') setInputId(undefined);
         else setOutputId(undefined);
         setDeviceFallback({ kind, label, at: Date.now() });
@@ -180,7 +170,21 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
         if (e.code === 'mic-denied' || e.code === 'no-device' || e.code === 'failed' || e.code === 'rejoin-to-talk') setError(e.code);
       }),
     ];
+    // Settings → Voice changed the choice (also during a call): follow it.
+    const follow = () => {
+      const d = loadDevices();
+      if (d.input !== chosenRef.current.input) {
+        setInputId(d.input);
+        void engine.setInputDevice(d.input ?? '').catch(() => setError('no-device'));
+      }
+      if (d.output !== chosenRef.current.output) {
+        setOutputId(d.output);
+        void engine.setOutputDevice(d.output ?? '');
+      }
+    };
+    window.addEventListener(DEVICES_EVENT, follow);
     return () => {
+      window.removeEventListener(DEVICES_EVENT, follow);
       offs.forEach((off) => off());
       engine.dispose();
       engineRef.current = null;
@@ -207,6 +211,8 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
       live = false;
       engine.setDeafened(false);
       setDeafenedState(false);
+      engine.setSelfMonitor(false);
+      setSelfMonitorState(false);
       engine.detach();
       setReady(false);
       setSpeaking({});
@@ -219,18 +225,18 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   const setMicMuted = useCallback((muted: boolean) => engineRef.current?.setMicMuted(muted), []);
   const setInput = useCallback((id: string) => {
     setInputId(id || undefined);
-    saveDevices({ ...loadDevices(), input: id || undefined });
+    saveDevices({ ...loadDevices(), input: id || undefined }, false);
     void engineRef.current?.setInputDevice(id).catch(() => setError('no-device'));
   }, []);
   const setOutput = useCallback((id: string) => {
     setOutputId(id || undefined);
-    saveDevices({ ...loadDevices(), output: id || undefined });
+    saveDevices({ ...loadDevices(), output: id || undefined }, false);
     void engineRef.current?.setOutputDevice(id);
   }, []);
 
   const inputLevel = useCallback(() => engineRef.current?.inputLevel() ?? 0, []);
   const setVolume = useCallback((id: Id, percent: number) => {
-    const pct = Math.round(Math.min(100, Math.max(0, percent)));
+    const pct = Math.round(Math.min(200, Math.max(0, percent)));
     engineRef.current?.setPeerVolume(id, pct / 100);
     setVolumes((prev) => {
       const next = { ...prev, [id]: pct };
@@ -239,10 +245,14 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
       return next;
     });
   }, []);
+  const setSelfMonitor = useCallback((on: boolean) => {
+    setSelfMonitorState(on);
+    engineRef.current?.setSelfMonitor(on);
+  }, []);
   const setDeafened = useCallback((on: boolean) => {
     setDeafenedState(on);
     engineRef.current?.setDeafened(on);
   }, []);
 
-  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel, deafened, setDeafened, volumes, setVolume, deviceFallback };
+  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel, deafened, setDeafened, volumes, setVolume, deviceFallback, selfMonitor, setSelfMonitor };
 }

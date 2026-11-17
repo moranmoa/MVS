@@ -110,8 +110,12 @@ export interface CoreCommands {
   leaveServer(serverId: Id): Promise<void>;
   /** Owner only, for good. Then `server.closed`; 30 days later `server.removed { reason: 'closed' }`. */
   closeServer(serverId: Id): Promise<void>;
-  /** Who blocks rename and close: members whose MVS is too old. Empty when the gate is open. */
-  getUpdateNeeded(serverId: Id): Promise<Id[]>;
+  /**
+   * Who blocks a gate: members whose MVS is too old. No cap: rename and close;
+   * `'reactions-v1'`: reactions (G-26). Any other cap is `bad-request`. Empty
+   * when the gate is open.
+   */
+  getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]>;
   /**
    * Invites (#214), moderator and up (`not-allowed` below). `expiresMs` is the last
    * moment a join is accepted (ms since epoch; absent = never, `bad-request` if
@@ -129,6 +133,14 @@ export interface CoreCommands {
   sendMessage(channelId: Id, body: string, replyToId?: Id): Promise<Message>;
   editMessage(messageId: Id, body: string): Promise<void>;
   deleteMessage(messageId: Id): Promise<void>;
+  /**
+   * G-26: turns my `emoji` on or off under a message; then `message.updated`.
+   * Nothing changes when it's already so. Errors: `bad-request` (not an emoji
+   * `normalizeEmoji` accepts, or my 11th on this message), `not-found` (or
+   * deleted), `not-allowed`, `update-needed` (`getUpdateNeeded(serverId,
+   * 'reactions-v1')` says who), `rate-limited` (30 a minute per channel).
+   */
+  react(messageId: Id, emoji: string, on: boolean): Promise<void>;
   retryMessage(messageId: Id): Promise<void>;
   /**
    * #288: drops a held or failed `pending-…` message and wipes its text. No
@@ -172,6 +184,8 @@ export interface CoreCommands {
   leaveCall(): Promise<null>;
   /** `not-allowed` when not in a call. */
   setMuted(muted: boolean): Promise<null>;
+  /** G-84b: tells the others in my call I hear no one (shown with mute). `not-allowed` outside a call. */
+  setDeafened(deafened: boolean): Promise<null>;
   /** For the voice engine only (ui/src/voice). Payload at most 12 KiB. */
   sendSignal(to: Id, kind: CallSignal['kind'], payload: string): Promise<null>;
 

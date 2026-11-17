@@ -115,6 +115,55 @@ gh variable set MVS_RELAY_ADDR --repo moranmoa/MVS --body "/dns4/<relay-domain>/
 `mvs-core` dials wss through libp2p's `websocket` transport in `core/sync`
 (#114).
 
+### Several relays (`MVS_RELAY_ADDRS`, `MVS_RELAY_TCP_ADDRS`)
+
+With relay-1 and relay-2 (`infra/RELAY2.md`), set two list variables. They
+win over the single ones (`MVS_RELAY_ADDR`, `MVS_RELAY_TCP_ADDR`), which stay
+as the fallback. One multiaddr per line or comma-separated; real values only
+in the variables, never in git. **The manager sets them**: they hold the
+domain and ports.
+
+- **`MVS_RELAY_ADDRS`**: the relays the app connects to, 1-4, in order of
+  preference, each pinned by its own peer ID:
+  ```text
+  /dns4/<relay-domain>/tcp/443/wss/p2p/<relay-1 peer id>
+  /dns4/<p2p-host>/tcp/4011/p2p/<relay-2 peer id>
+  ```
+  Relay-2 has no wss proxy, so its entry is direct TCP (or
+  `/udp/4011/quic-v1`). That host resolves to the home IP, the same exposure
+  the bootstrap entries below already accept; relay-1 stays behind
+  Cloudflare.
+- **`MVS_RELAY_TCP_ADDRS`**: direct routes to the same relays (DCUtR and
+  QUIC hole punching), 1-4 entries (the apps take at most 4), TCP and/or QUIC,
+  at most one per relay and transport:
+  ```text
+  /dns4/<p2p-host>/tcp/4001/p2p/<relay-1 peer id>
+  /dns4/<p2p-host>/udp/4001/quic-v1/p2p/<relay-1 peer id>
+  /dns4/<p2p-host>/tcp/4011/p2p/<relay-2 peer id>
+  /dns4/<p2p-host>/udp/4011/quic-v1/p2p/<relay-2 peer id>
+  ```
+
+**The build checks them and fails the tag build** (`write-relay-config.mjs`,
+with its cases in the dry-run self-test) if:
+- an entry has the wrong form: bootstrap entries must be plain TCP or QUIC,
+  with no `ws`/`wss` and no circuit; every entry must end in `/p2p/<id>`;
+- the lists disagree: a bootstrap entry for a relay that isn't in
+  `MVS_RELAY_ADDRS`, or a relay with no bootstrap entry;
+- there are too many entries, or a relay (or a relay plus transport) twice.
+
+Errors name the entry's position, never the address.
+
+```powershell
+gh variable set MVS_RELAY_ADDRS --repo moranmoa/MVS --body "<relay-1 wss multiaddr>,<relay-2 tcp multiaddr>"
+gh variable set MVS_RELAY_TCP_ADDRS --repo moranmoa/MVS --body "<relay-1 tcp>,<relay-1 quic>,<relay-2 tcp>,<relay-2 quic>"
+```
+
+**Check before tagging:** run the release workflow by hand on `main`
+(Actions → Release → Run workflow). Its **check relay variables** job runs the
+same checks on the real variables and prints counts only, never the values.
+The rest of that run is a dry run that uses no variables. The tag build then
+runs the checks again on the values it bakes in.
+
 ### First pre-release: data may be reset
 
 The record format is v2 from this release on, and it may still change

@@ -32,6 +32,24 @@ struct ServerArg {
     server_id: String,
 }
 
+/// `getUpdateNeeded`: no cap is server lifecycle's (G-26).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateNeededArgs {
+    server_id: String,
+    #[serde(default)]
+    cap: Option<String>,
+}
+
+/// G-26.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactArgs {
+    message_id: String,
+    emoji: String,
+    on: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RenameServerArgs {
@@ -208,6 +226,11 @@ struct MutedArg {
 }
 
 #[derive(Deserialize)]
+struct DeafenedArg {
+    deafened: bool,
+}
+
+#[derive(Deserialize)]
 struct SignalArgs {
     to: String,
     kind: SignalKind,
@@ -345,6 +368,10 @@ impl Core {
             "deleteMessage" => ok(self.delete_message(&args::<MessageIdArg>(raw)?.message_id)),
             "discardMessage" => ok(self.discard_message(&args::<MessageIdArg>(raw)?.message_id)),
             "retryMessage" => ok(self.retry_message(&args::<MessageIdArg>(raw)?.message_id)),
+            "react" => {
+                let a: ReactArgs = args(raw)?;
+                ok(self.react(&a.message_id, &a.emoji, a.on))
+            }
             "listMembers" => ok(self.list_members(&args::<ServerArg>(raw)?.server_id)),
             "createServer" => {
                 let a: CreateServerArgs = args(raw)?;
@@ -362,7 +389,10 @@ impl Core {
             }
             "leaveServer" => ok(self.leave_server(&args::<ServerArg>(raw)?.server_id)),
             "closeServer" => ok(self.close_server(&args::<ServerArg>(raw)?.server_id)),
-            "getUpdateNeeded" => ok(self.get_update_needed(&args::<ServerArg>(raw)?.server_id)),
+            "getUpdateNeeded" => {
+                let a: UpdateNeededArgs = args(raw)?;
+                ok(self.get_update_needed(&a.server_id, a.cap.as_deref()))
+            }
             "kickMember" => {
                 let a: ServerUserArgs = args(raw)?;
                 ok(self.kick_member(&a.server_id, &a.user_id))
@@ -443,6 +473,7 @@ impl Core {
             "joinCall" => ok(self.join_call(&args::<ChannelIdArg>(raw)?.channel_id)),
             "leaveCall" => ok(self.leave_call()),
             "setMuted" => ok(self.set_muted(args::<MutedArg>(raw)?.muted)),
+            "setDeafened" => ok(self.set_deafened(args::<DeafenedArg>(raw)?.deafened)),
             "sendSignal" => {
                 let a: SignalArgs = args(raw)?;
                 ok(self.send_signal(&a.to, a.kind, a.payload))

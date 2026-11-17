@@ -28,7 +28,7 @@ use tokio::runtime::Runtime;
 
 use crate::access::{KeyBinder, MemberReadGate, MemberStubGate};
 use crate::gate::MemberGate;
-use crate::ports::{Network, Reach};
+use crate::ports::{DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, Network, Reach};
 use crate::types::SendState;
 use crate::voice::VoiceNet;
 use crate::Core;
@@ -93,9 +93,30 @@ pub struct SyncNetwork {
     voice: Mutex<Option<Receiver<VoiceSignal>>>,
     /// T8-02: invite publications members pushed, until the core takes them.
     invite_pushes: InvitePushes,
+    /// Device link (new device): what arrived on the link.
+    link_inbox: LinkInbox,
+    relay: Multiaddr,
 }
 
 type InvitePushes = Arc<Mutex<Vec<(ServerId, Vec<u8>)>>>;
+/// Device link (new device): what arrived on the link, until the core takes it.
+type LinkInbox = Arc<Mutex<Vec<DeviceLinkInbound>>>;
+/// Inbound link messages kept (sync answers at most a few per link).
+const LINK_INBOX: usize = 16;
+
+fn link_error(err: sync::DeviceLinkError) -> DeviceLinkError {
+    match err {
+        sync::DeviceLinkError::NotFound => DeviceLinkError::NotFound,
+        sync::DeviceLinkError::Network => DeviceLinkError::Network,
+        sync::DeviceLinkError::Refused => DeviceLinkError::Refused,
+    }
+}
+
+/// The peer of a device-link address (only the peer ID is used: sync dials
+/// it through our own relay's circuit, whatever the address says).
+fn link_peer(to: &DeviceLinkAddr) -> Result<PeerId, DeviceLinkError> {
+    to.peer.parse().map_err(|_| DeviceLinkError::NotFound)
+}
 /// Pushed publications kept between two sync rounds; more are dropped (a
 /// member re-announces when it binds again).
 const INVITE_PUSH_QUEUE: usize = 1024;
@@ -122,8 +143,9 @@ impl SyncNetwork {
     ) -> anyhow::Result<Self> {
         let runtime =
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+        let relay_copy = relay.clone();
         let config = NodeConfig {
-            relay,
+            relay: relay.clone(),
             data_dir: data_dir.to_owned(),
             logs: Vec::new(),
             authorizer: gate,
@@ -158,6 +180,8 @@ impl SyncNetwork {
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
         let invite_pushes: InvitePushes = Arc::default();
         let pushes = invite_pushes.clone();
+        let link_inbox: LinkInbox = Arc::default();
+        let inbox = link_inbox.clone();
         runtime.spawn(async move {
             while let Some(event) = events.recv().await {
                 let wake = match event {
@@ -183,6 +207,20 @@ impl SyncNetwork {
                     // M2: someone came online or left: a hint only; the core asks
                     // the node (`online`), so a dropped event loses nothing.
                     NodeEvent::Presence { .. } => true,
+                    // Device link (new device): the core takes it at its next
+                    // round (`device_link_take`).
+                    NodeEvent::DeviceLink(inbound) => {
+                        let mut queue = inbox.lock().expect("not poisoned");
+                        if queue.len() < LINK_INBOX {
+                            queue.push(match inbound {
+                                sync::DeviceLinkInbound::Hello { e_old_pub } => DeviceLinkInbound::Hello { e_old_pub },
+                                sync::DeviceLinkInbound::Sealed { ciphertext } => {
+                                    DeviceLinkInbound::Sealed { ciphertext }
+                                }
+                            });
+                        }
+                        true
+                    }
                     _ => false,
                 };
                 if wake {
@@ -202,6 +240,8 @@ impl SyncNetwork {
             waker,
             voice: Mutex::new(Some(voice)),
             invite_pushes,
+            link_inbox,
+            relay: relay_copy,
         })
     }
 
@@ -234,6 +274,12 @@ impl SyncNetwork {
     /// Wakes the sync loop now, e.g. so it sees its stop flag.
     pub fn wake(&self) {
         let _ = self.waker.try_send(());
+    }
+
+    /// `peer`'s circuit through our relay (what sync dials for a device link).
+    fn circuit_to(&self, peer: PeerId) -> String {
+        use libp2p::multiaddr::Protocol;
+        self.relay.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer)).to_string()
     }
 
     /// Every record of `log` in sync's store, decoded again.
@@ -390,6 +436,35 @@ impl Network for SyncNetwork {
         self.runtime.block_on(self.node.fetch_backup(tag)).unwrap_or_default()
     }
 
+    fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<DeviceLinkAddr> {
+        self.link_inbox.lock().expect("not poisoned").clear();
+        let (peer, circuit) = self.runtime.block_on(self.node.device_link_open(rv, e_new_pub)).ok().flatten()?;
+        Some(DeviceLinkAddr { peer: peer.to_base58(), circuit: circuit.to_string() })
+    }
+
+    fn device_link_close(&self) {
+        let _ = self.node.device_link_close();
+        self.link_inbox.lock().expect("not poisoned").clear();
+    }
+
+    fn device_link_take(&self) -> Vec<DeviceLinkInbound> {
+        std::mem::take(&mut *self.link_inbox.lock().expect("not poisoned"))
+    }
+
+    fn device_link_find(&self, rv: [u8; 32]) -> Result<DeviceLinkAddr, DeviceLinkError> {
+        let peer = self.runtime.block_on(self.node.device_link_find(rv)).map_err(link_error)?;
+        Ok(DeviceLinkAddr { peer: peer.to_base58(), circuit: self.circuit_to(peer) })
+    }
+
+    fn device_link_hello(&self, to: &DeviceLinkAddr, e_old_pub: [u8; 32]) -> Result<[u8; 32], DeviceLinkError> {
+        let peer = link_peer(to)?;
+        self.runtime.block_on(self.node.device_link_hello(peer, e_old_pub)).map_err(link_error)
+    }
+
+    fn device_link_send(&self, to: &DeviceLinkAddr, ciphertext: &[u8]) -> Result<(), DeviceLinkError> {
+        let peer = link_peer(to)?;
+        self.runtime.block_on(self.node.device_link_send(peer, ciphertext.to_vec())).map_err(link_error)
+    }
     fn take_invite_publications(&self) -> Vec<(ServerId, Vec<u8>)> {
         std::mem::take(&mut *self.invite_pushes.lock().expect("not poisoned"))
     }

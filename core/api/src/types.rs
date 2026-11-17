@@ -175,6 +175,21 @@ pub struct Message {
     /// G-24: the body mentions me.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mentions_me: Option<bool>,
+    /// G-26: up to 20 emoji, the most popular, listed in the order they
+    /// first appeared; absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Vec<ReactionCount>>,
+}
+
+/// G-26: one emoji under a message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionCount {
+    pub emoji: String,
+    /// How many members have it on.
+    pub count: u32,
+    /// I have it on.
+    pub mine: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,7 +321,8 @@ pub enum ErrorCode {
     CheckClock,
     NothingToDownload,
     NothingStaged,
-    /// Device link: too many attempts at this link.
+    /// Device link: too many attempts at this link. Reactions (G-26): 30
+    /// of mine in one channel within a minute.
     RateLimited,
     /// Device link: another device holds this link (someone else may be
     /// trying).
@@ -506,6 +522,9 @@ pub enum Event {
     /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
     #[serde(rename = "memberRelay.changed")]
     MemberRelayChanged(MemberRelay),
+    /// G-91: bringing my servers back after a restore moved on.
+    #[serde(rename = "serverRestore.changed")]
+    ServerRestoreChanged(ServerRestore),
     /// Device link, the new device: where its link stands.
     #[serde(rename = "deviceLink.state")]
     DeviceLinkState(DeviceLinkState),
@@ -694,6 +713,31 @@ pub enum MemberRelayReason {
     RelayOnly,
     /// A metered network, as the desktop shell reports it (`setMetered`).
     Metered,
+}
+
+/// Where bringing my servers back after a restore stands (G-91).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServerRestoreState {
+    /// No restore under way since this start.
+    None,
+    /// Looking for my backup on the network (none found yet).
+    Searching,
+    /// The backup is found; some servers have nobody reachable yet.
+    Waiting,
+    /// Every server from the backup is back (or isn't mine any more).
+    Done,
+}
+
+/// `getServerRestore`'s answer, and `serverRestore.changed`'s payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerRestore {
+    pub state: ServerRestoreState,
+    /// Servers the backup lists as mine (0 until it's found).
+    pub found: u32,
+    /// Of those, the ones not back yet because nobody was reachable.
+    pub waiting: u32,
 }
 
 /// `getMemberRelay`'s answer, and `memberRelay.changed`'s payload.

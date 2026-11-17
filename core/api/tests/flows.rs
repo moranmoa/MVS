@@ -4582,6 +4582,8 @@ struct FarServers {
     world: Arc<LoopbackNetwork>,
     reachable: std::sync::atomic::AtomicBool,
     hidden: std::sync::atomic::AtomicBool,
+    /// Peers answer without the genesis (a partial fetch).
+    partial: std::sync::atomic::AtomicBool,
     fetches: std::sync::atomic::AtomicUsize,
     server_fetches: std::sync::atomic::AtomicUsize,
 }
@@ -4592,6 +4594,7 @@ impl FarServers {
             world: world.network.clone(),
             reachable: Default::default(),
             hidden: Default::default(),
+            partial: Default::default(),
             fetches: Default::default(),
             server_fetches: Default::default(),
         })
@@ -4605,7 +4608,11 @@ impl Network for FarServers {
     fn fetch(&self, server: ServerId) -> Vec<records::Record> {
         self.server_fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.reachable.load(std::sync::atomic::Ordering::SeqCst) {
-            self.world.fetch(server)
+            let mut records = self.world.fetch(server);
+            if self.partial.load(std::sync::atomic::Ordering::SeqCst) {
+                records.retain(|r| r.kind() != Kind::Genesis);
+            }
+            records
         } else {
             Vec::new()
         }
@@ -5550,4 +5557,63 @@ fn a_link_that_cant_be_stored_says_keyring() {
         .unwrap();
     assert_eq!((last.state, last.reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Keyring)));
     assert!(new.get_identity().unwrap().is_none());
+}
+
+/// G-91 (Security Lead on #457): an answer that can't be judged (peers
+/// sent the log without its genesis) keeps the server waiting; the next
+/// full answer brings it back. One bad round never loses a server.
+#[test]
+fn a_partial_answer_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    net.partial.store(true, std::sync::atomic::Ordering::SeqCst);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "still waiting");
+    net.partial.store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): the app lock drops the server secrets a
+/// waiting restore holds and pauses it; after unlock the backup is fetched
+/// again and the server still comes back.
+#[test]
+fn a_waiting_restore_pauses_while_locked_and_resumes_after() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+
+    laptop.core.lock_keys();
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tries = load(&net.server_fetches);
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty(), "nothing while locked");
+    assert_eq!(load(&net.server_fetches), tries, "no tries while locked");
+
+    let fetches = load(&net.fetches);
+    laptop.core.unlock_keys();
+    laptop.core.sync_now().unwrap();
+    assert!(load(&net.fetches) > fetches, "the backup is fetched again after unlock");
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
 }

@@ -358,6 +358,9 @@ pub struct Core {
     backup_retry: Mutex<(u64, u64)>,
     /// G-91: the restore under way, once its backup is found.
     restore: Mutex<RestoreProgress>,
+    /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
+    /// waits, holding no server secrets.
+    keys_locked: AtomicBool,
 }
 
 /// G-91: a restore's progress. The backup is fetched until found (with
@@ -547,6 +550,7 @@ impl Core {
             notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
             restore: Mutex::new(RestoreProgress::new(restore_state)),
+            keys_locked: AtomicBool::new(false),
         })
     }
 
@@ -557,6 +561,14 @@ impl Core {
         let _ = self.leave_call();
         self.ports.cipher.lock();
         self.ports.network.lock();
+        self.keys_locked.store(true, Ordering::SeqCst);
+        // G-91 (Security Lead on #457): the server secrets a restore took
+        // from the backup go too; the backup is fetched again after unlock.
+        let mut restore = self.restore.lock().expect("not poisoned");
+        restore.found = None;
+        restore.waiting.clear();
+        drop(restore);
+        *self.backup_retry.lock().expect("not poisoned") = (0, BACKUP_RETRY_FIRST_MS);
     }
 
     /// `signOut({ words } | { withoutWords: true })`: removes this identity
@@ -648,6 +660,7 @@ impl Core {
     /// After the app lock: the cipher gets our secret back. The next read or
     /// send replays what it lost (see `unlock_cipher`).
     pub fn unlock_keys(&self) {
+        self.keys_locked.store(false, Ordering::SeqCst);
         unlock_cipher(&self.ports, self.lock().me.as_ref());
     }
 
@@ -924,21 +937,18 @@ impl Core {
                 continue;
             }
             let fetched = self.open_and_fetch(server, &secret);
+            // Without the genesis the answer can't be judged (a partial
+            // fetch): "invalid" would only mean "not yet".
+            let judged = fetched.iter().any(|r| r.kind() == Kind::Genesis && r.scope() == Scope::Control);
             let status = self.run(|inner, ports, events| {
                 // No invite: a member I still am needs none; anyone else is
                 // refused by authority and nothing is stored or sent.
                 let none = RecordId::from_bytes([0; 32]);
                 inner.join(ports, server, none, &secret, "", fetched, events)
             });
-            match status {
-                // Nobody reachable yet: stays waiting.
-                Ok(JoinStatus::NobodyOnline { .. }) => {}
-                Ok(JoinStatus::Joined { .. }) => {
-                    self.restore.lock().expect("not poisoned").waiting.remove(&server);
-                }
-                // Not mine any more (left, kicked, closed): it doesn't come back.
-                _ => {
-                    self.restore.lock().expect("not poisoned").waiting.remove(&server);
+            if restore_settles(&status, judged) {
+                self.restore.lock().expect("not poisoned").waiting.remove(&server);
+                if !matches!(status, Ok(JoinStatus::Joined { .. })) {
                     let _ = self.close_candidate(server);
                 }
             }
@@ -973,6 +983,9 @@ impl Core {
     /// wait is up (dev-sync on #339: a real holder lookup is slow; G-91:
     /// found servers every [`REJOIN_EVERY_MS`]).
     fn retry_backup_restore(&self) {
+        if self.keys_locked.load(Ordering::SeqCst) {
+            return;
+        }
         if self.lock().db.get(KV_BACKUP_PENDING).ok().flatten().is_none() {
             return;
         }
@@ -4731,6 +4744,26 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
 }
 
 /// A join status's name for the join log (no link, no IDs).
+/// G-91 (Security Lead on #457): whether a restore's join answer settles
+/// that server for good. Only a definite answer does:
+/// - `Joined`: it's back;
+/// - `Closed`: its owner closed it;
+/// - `Invalid` with the genesis in hand: kicked, or no longer a member, so
+///   authority refuses the join;
+/// - `AgeBlocked`: my known age is below its minimum (an invite link still
+///   works once that changes).
+///
+/// Anything else waits for the next try: `NobodyOnline`, `Searching`,
+/// `Invalid` without the genesis (a partial fetch), and every error
+/// (locked, network, internal). One bad round never loses a server.
+fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
+    match status {
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. } | JoinStatus::AgeBlocked { .. }) => true,
+        Ok(JoinStatus::Invalid { .. }) => judged,
+        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. }) | Err(_) => false,
+    }
+}
+
 fn join_status_name(status: &JoinStatus) -> &'static str {
     match status {
         JoinStatus::Searching { .. } => "searching",
@@ -4812,7 +4845,29 @@ mod relay_only_tests {
 
 #[cfg(test)]
 mod device_notice_tests {
-    use super::{notice_label, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+    use super::{notice_label, restore_settles, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+    use crate::types::{AgeRestriction, ErrorCode, JoinStatus};
+
+    /// G-91 (Security Lead on #457): only a definite answer drops a server
+    /// from a restore; a temporary one waits for the next try.
+    #[test]
+    fn only_definite_join_answers_settle_a_restored_server() {
+        let link = String::new;
+        let joined = JoinStatus::Joined { link: link(), server_id: "s".into() };
+        let blocked = JoinStatus::AgeBlocked { link: link(), required: AgeRestriction::Eighteen };
+        for status in [joined, JoinStatus::Closed { link: link() }, blocked] {
+            assert!(restore_settles(&Ok(status.clone()), false), "{status:?}");
+        }
+        let invalid = JoinStatus::Invalid { link: link() };
+        assert!(restore_settles(&Ok(invalid.clone()), true), "kicked or not a member");
+        assert!(!restore_settles(&Ok(invalid), false), "a partial fetch: not yet");
+        for status in [JoinStatus::NobodyOnline { link: link() }, JoinStatus::Searching { link: link() }] {
+            assert!(!restore_settles(&Ok(status.clone()), true), "{status:?}");
+        }
+        for code in [ErrorCode::Internal, ErrorCode::NotFound, ErrorCode::NotAllowed, ErrorCode::BadRequest] {
+            assert!(!restore_settles(&Err(code.into()), true), "{code:?}");
+        }
+    }
 
     /// Security Lead on #415: a label is plain text, at most 64 characters.
     #[test]

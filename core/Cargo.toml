@@ -12,3 +12,8 @@ exclude = ["vendor"]
 # Remove with the libp2p 0.57 bump.
 [patch.crates-io]
 libp2p-dns = { path = "vendor/libp2p-dns" }
+# RUSTSEC-2026-0534 (gossipsub PRUNE backoff for unknown topics grows
+# memory without bound): fixed only in 0.50.1 (libp2p 0.57). The crates.io
+# 0.49.5 package with upstream's 9-line fix applied
+# (vendor/libp2p-gossipsub/README.md). Remove with the libp2p 0.57 bump.
+libp2p-gossipsub = { path = "vendor/libp2p-gossipsub" }

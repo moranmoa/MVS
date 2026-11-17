@@ -5270,9 +5270,9 @@ fn the_network_follows_the_member_relay_setting() {
     assert_eq!(relays().len(), told, "nothing changed, nothing told");
     // Slice 3a: a metered network stops serving at once; unmetered resumes it.
     owner.core.set_metered(true).unwrap();
-    assert_eq!(relays().last(), Some(&(false, 512)), "metered: serving stops");
+    assert_eq!(relays().last(), Some(&(false, 512, true)), "metered: serving stops");
     owner.core.set_metered(false).unwrap();
-    assert_eq!(relays().last(), Some(&(true, 512)), "unmetered: serving resumes");
+    assert_eq!(relays().last(), Some(&(true, 512, true)), "unmetered: serving resumes");
     owner.core.set_relay_only(true).unwrap();
     assert_eq!(relays().last(), Some(&(false, 512, true)));
 }

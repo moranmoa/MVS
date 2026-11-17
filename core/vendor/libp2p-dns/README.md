@@ -28,6 +28,24 @@ contributors). Its `Cargo.toml` is changed so that it builds as
 - the dev-dependencies removed, since its tests are not built here;
 - `Cargo.lock` and `Cargo.toml.orig` dropped.
 
+CI checks all of this on every PR. `.github/scripts/check-vendored-libp2p-dns.sh`
+downloads the 0.45.0 crate and checks its sha256 against the crates.io
+index. It then requires `src/`, `CHANGELOG.md` and `.cargo_vcs_info.json`
+to be byte-identical, rebuilds `Cargo.toml` from upstream with exactly the
+edits above, and checks the file set.
+
+## Known and not blocking: hickory-proto 0.25.2 in `Cargo.lock`
+
+`Cargo.lock` still lists `hickory-proto 0.25.2`, only as a dependency of
+**libp2p-mdns 0.48**. Lockfiles list optional dependencies whatever the
+features are, and libp2p's `mdns` feature isn't enabled in any of our
+crates. So it is **never compiled**:
+`cargo tree -i hickory-proto@0.25.2 --target all` prints nothing. Tools that
+read the lockfile, such as cargo-deny's advisories check, may still report
+the hickory 0.25 advisories for that entry. That's expected. It goes away
+with libp2p 0.57, or if we ever turn on `mdns`, which would need a bump
+first.
+
 ## Remove it
 
 Remove this folder, and the `[patch.crates-io]` entry in `core/Cargo.toml`,

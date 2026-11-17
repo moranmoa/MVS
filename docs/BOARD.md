@@ -212,6 +212,7 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | G-72 | Microphone/speaker choice and mic test | voice-c | todo (voice-c) | – | – | M | 0.6.0 |
 | G-73 | Per-person volume | voice-c | todo (voice-c) | – | – | S | 0.6.0 |
 | G-84 | Deafen | voice-c | todo (voice-c) | – | – | S | 0.6.0 |
+| G-84b | Others see my "deafened" state, not only muted (UX follow-up on #432): a `deafened` flag in the voice hello, shown in the room roster | voice-c + core voice | todo | #432 | G-84 | S | 0.6.0 |
 | G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | todo (dev-voice-shell, after G-62) | – | – | M | 0.6.0 |
 | G-64 | Join notification sound | dev-ui | todo | – | – | S | 0.6.0 |
 | G-83 | Participant count (check; `call.activity`, tech-lead decision in #224) | dev-identity → dev-ui | todo | – | – | S | 0.6.0 |

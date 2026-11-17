@@ -135,6 +135,8 @@ export interface VoiceEngine {
   inputLevel(): number;
   /** G-84 deafen: silences everyone's audio (also people who connect later); false plays it again. */
   setDeafened(deafened: boolean): void;
+  /** G-72 "השמעה עצמית": plays my microphone back to me on the chosen speaker. Off when the call ends. */
+  setSelfMonitor(on: boolean): void;
   /** G-73: one person's playback volume, 0..1 (clamped); kept for when they connect. */
   setPeerVolume(id: Id, volume: number): void;
   on<E extends keyof VoiceEvents>(event: E, cb: (payload: VoiceEvents[E]) => void): () => void;
@@ -256,6 +258,23 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   let micMuted = false;
   /** G-84: everyone's audio silenced. */
   let deafened = false;
+  /** G-72: my microphone played back to me, while on. */
+  let monitor: HTMLAudioElement | null = null;
+  function startMonitor() {
+    if (monitor || !local) return;
+    const a = env.createAudioElement();
+    a.autoplay = true;
+    a.srcObject = local;
+    if (outputId && 'setSinkId' in a) void a.setSinkId(outputId).catch(() => {});
+    void a.play?.()?.catch?.(() => {});
+    monitor = a;
+  }
+  function stopMonitor() {
+    if (!monitor) return;
+    monitor.pause();
+    monitor.srcObject = null;
+    monitor = null;
+  }
   /** G-73: per-person playback volume, 0..1; 1 when not set. */
   const volumes = new Map<Id, number>();
   let micState: PeerConnectionState = 'connecting';
@@ -346,6 +365,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     for (const t of local?.getTracks() ?? []) t.stop();
     dropMeter(localMeter);
     local = next;
+    if (monitor) monitor.srcObject = next;
     applyMute();
     localMeter = makeMeter(next);
     micState = 'connected';
@@ -847,6 +867,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   }
 
   function stop() {
+    stopMonitor();
     if (!active) return;
     active = false;
     generation++;
@@ -910,6 +931,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     async setOutputDevice(deviceId) {
       outputId = deviceId || undefined;
+      if (monitor && 'setSinkId' in monitor) void monitor.setSinkId(deviceId).catch(() => {});
       await Promise.all(
         [...peers.values()].map((p) =>
           p.audio && 'setSinkId' in p.audio ? p.audio.setSinkId(deviceId).catch(() => {}) : undefined,
@@ -918,6 +940,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     listInputDevices: () => listDevices('audioinput'),
     listOutputDevices: () => listDevices('audiooutput'),
+    setSelfMonitor(on) {
+      if (on && active) startMonitor();
+      else stopMonitor();
+    },
     setPeerVolume(id, volume) {
       const v = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 1;
       volumes.set(id, v);

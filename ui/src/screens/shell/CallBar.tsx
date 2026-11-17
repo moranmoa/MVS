@@ -11,6 +11,7 @@ import { Dialog, Name } from '../../components/common';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
+import { playTestSound } from '../../voice/devices';
 
 /**
  * The voice engine (piece D, ui/src/voice) as the call UI uses it. `peerFailed`
@@ -243,7 +244,10 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
       </div>
       <VoiceSettings
         open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          engine.setSelfMonitor(false); // never left on behind a closed dialog
+          setSettingsOpen(false);
+        }}
         engine={engine}
         muted={!!me?.muted}
         others={call.participants
@@ -322,7 +326,27 @@ function VoiceSettings({
         <p className="hint">
           <FormattedMessage id={engine.noMic ? 'call.noMic' : muted ? 'call.micTestMuted' : 'call.micTestHint'} />
         </p>
+        <label className="switch-row">
+          <span>
+            <FormattedMessage id="voice.selfMonitor" />
+          </span>
+          <input
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={engine.selfMonitor}
+            disabled={engine.noMic}
+            aria-describedby="self-monitor-hint"
+            onChange={(e) => engine.setSelfMonitor(e.target.checked)}
+          />
+        </label>
+        <p id="self-monitor-hint" className="hint">
+          <FormattedMessage id="voice.selfMonitorHint" />
+        </p>
       </div>
+      <button type="button" className="secondary" onClick={() => void playTestSound(engine.outputId)}>
+        <FormattedMessage id="voice.playTest" />
+      </button>
       {others.length > 0 && (
         <fieldset className="call-volumes">
           <legend>

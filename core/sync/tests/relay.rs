@@ -1429,3 +1429,91 @@ async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// A bound member like [`bound_node`] (LAN allowed, every member accepted),
+/// in the folder `name` names: wiped first, or kept (a restart).
+async fn member_in(name: &str, relay: &Multiaddr, key: u8, wipe: bool) -> (Node, std::path::PathBuf) {
+    let (server, channel) = test_server();
+    let dir = std::env::temp_dir().join(format!("sync-relay-{}-{name}", std::process::id()));
+    if wipe {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let config = NodeConfig {
+        relay: relay.clone(),
+        data_dir: dir.clone(),
+        logs: vec![],
+        authorizer: Arc::new(AcceptAll),
+        listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        bootstrap: vec![],
+        allow_lan: true,
+        relay_only: false,
+    };
+    let access = Access {
+        binder: Some(Arc::new(SigningKey::from_bytes(&[key; 32]))),
+        read_gate: Some(Arc::new(AcceptAll)),
+        ..Access::default()
+    };
+    let (node, _events) = Node::start_with(config, access).await.unwrap();
+    node.open_server(server, ServerSecret::from_bytes([42; 32])).unwrap();
+    node.open_channel(server, channel).await.unwrap();
+    (node, dir)
+}
+
+/// What a node remembers, read from its store.
+fn remembered(dir: &std::path::Path) -> usize {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let Ok(store) = sync::Store::open_read_only(dir.join("store.db")) else { return 0 };
+    store.remembered_peers(now, 3600).map(|rows| rows.len()).unwrap_or(0)
+}
+
+/// Relay-down resilience (1): two members on one LAN who met through our
+/// relay remember each other's direct address. The relay goes down and one
+/// of them restarts: it redials the other at the remembered address, and
+/// they sync again. Turning relay-only on purges what it remembers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_with_the_relay_down_reconnects_to_a_remembered_member() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let id = |n: u8| records::PublicKey::from_bytes(SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes());
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let our_relay = start_relay(relay_key, port);
+    let (a, a_dir) = member_in("rem-a", &relay, 41, true).await;
+    let (b, _) = member_in("rem-b", &relay, 42, true).await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !(a.presence(test_server().0).await.unwrap().online.contains(&id(42)) && remembered(&a_dir) > 0) {
+        assert!(Instant::now() < deadline, "A never bound B or never remembered its address");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Our relay goes down, and A restarts in the same folder.
+    our_relay.abort();
+    a.shutdown().await.unwrap();
+    let (a, a_dir) = member_in("rem-a", &relay, 41, false).await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !a.presence(test_server().0).await.unwrap().online.contains(&id(42)) {
+        assert!(Instant::now() < deadline, "the restarted member never reached the remembered one");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(a.direct_peers().await.unwrap().contains(&b.peer_id()), "not a direct connection");
+    // And they sync: a record B writes now reaches A.
+    let (server, channel) = test_server();
+    let log = log_name(server, Scope::Channel(channel));
+    b.append(messages(1).remove(0)).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while a.state(&log).await.unwrap().count < 1 {
+        assert!(Instant::now() < deadline, "B's record never reached A");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Relay-only: everything remembered goes.
+    a.set_relay_only(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while remembered(&a_dir) > 0 {
+        assert!(Instant::now() < deadline, "relay-only kept remembered addresses");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for node in [a, b] {
+        node.shutdown().await.unwrap();
+    }
+}

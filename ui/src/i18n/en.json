@@ -275,7 +275,7 @@
   "voice.unmuteForMe": "Unmute for me",
   "voice.personMenu": "\u2068{name}\u2069 in the call",
   "voice.micTestInCall": "You can test your microphone during a call.",
-  "voice.callSounds": "Play a sound when someone joins or leaves my call",
+  "voice.callSounds": "Play a sound when people join or leave the call",
   "voice.selfMonitor": "Hear myself",
   "voice.selfMonitorHint": "Plays your microphone back to you. Use headphones to avoid echo.",
   "call.micUnplugged": "Microphone \u2068{name}\u2069 was unplugged. Using the system default.",

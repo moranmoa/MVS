@@ -59,7 +59,7 @@ describe('Settings → Voice', () => {
 
   it('G-64: the join/leave sound switch is on by default and can be turned off', async () => {
     await openVoice([]);
-    const sw = (await screen.findByRole('switch', { name: 'Play a sound when someone joins or leaves my call' })) as HTMLInputElement;
+    const sw = (await screen.findByRole('switch', { name: 'Play a sound when people join or leave the call' })) as HTMLInputElement;
     expect(sw.checked).toBe(true);
     fireEvent.click(sw);
     expect(sw.checked).toBe(false);

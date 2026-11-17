@@ -340,6 +340,22 @@ function NotificationsSection() {
           <FormattedMessage id="notify.settings.previewDisabled" />
         </p>
       )}
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.badge" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.badge}
+          aria-describedby="notify-badge-hint"
+          onChange={(e) => set({ badge: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-badge-hint">
+        <FormattedMessage id="notify.settings.badgeHint" />
+      </p>
     </div>
   );
 }

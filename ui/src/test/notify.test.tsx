@@ -69,7 +69,7 @@ describe('which messages notify', () => {
     expect(cleanNotifyPrefs(undefined)).toEqual(defaultNotifyPrefs());
     expect(
       cleanNotifyPrefs({ desktop: 'yes', preview: false, servers: { a: { level: 'loud' }, b: { level: 'all' }, c: 5 }, channels: [] }),
-    ).toEqual({ desktop: true, preview: false, servers: { b: { level: 'all' } }, channels: {} });
+    ).toEqual({ desktop: true, preview: false, badge: true, servers: { b: { level: 'all' } }, channels: {} });
   });
 
   it('3 messages within 10 s: the first at once, then one "3 new messages"', () => {

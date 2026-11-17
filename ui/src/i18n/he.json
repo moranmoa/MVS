@@ -576,6 +576,8 @@
   "notify.settings.desktopHint": "מופיעות כשהחלון של MVS לא בחזית. אפשר לכוון כל שרת וערוץ מהתפריט שלו (לחיצה ימנית).",
   "notify.settings.preview": "תצוגה מקדימה של ההודעה בהתראה",
   "notify.settings.previewHint": "כבוי: בהתראה כתוב \"הודעה חדשה ב-#ערוץ\", בלי הטקסט.",
+  "notify.settings.badgeHint": "מספר ההודעות שלא נקראו בשורת המשימות או ב-Dock. שרתים וערוצים מושתקים לא נספרים.",
+  "notify.settings.badge": "מונה על אייקון האפליקציה",
   "notify.settings.desktopOnly": "התראות עובדות באפליקציית הדסקטופ.",
   "notify.hidden": "הודעה חדשה ב-\u2068#{channel}\u2069",
   "notify.grouped": "{count, plural, one {הודעה חדשה אחת} two {שתי הודעות חדשות} other {# הודעות חדשות}} ב-\u2068#{channel}\u2069",

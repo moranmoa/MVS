@@ -6,6 +6,7 @@ import { App } from '../app/App';
 import { channelMuteKey, MUTE_FOREVER, serverMuteKey } from '../app/mute';
 import type { Settings } from '../app/settings';
 import { unreadTotal } from '../app/unreadBadge';
+import { cleanNotifyPrefs, defaultNotifyPrefs } from '../app/notify';
 import { MockCore } from '../core/mock';
 import type { Channel } from '../core/types';
 
@@ -26,7 +27,10 @@ describe('unread badge (G-62)', () => {
     expect(unreadTotal(channels, { [serverMuteKey('s3')]: MUTE_FOREVER })).toBe(6);
     expect(unreadTotal(channels, { [channelMuteKey('a')]: MUTE_FOREVER })).toBe(1 + 2 + 5);
     // An expired mute counts again.
-    expect(unreadTotal(channels, { [serverMuteKey('s3')]: 1000 }, 2000)).toBe(11);
+    expect(unreadTotal(channels, { [serverMuteKey('s3')]: 1000 }, undefined, 2000)).toBe(11);
+    // Notifications set to "none" don't count either (server or channel).
+    const prefs = { ...defaultNotifyPrefs(), servers: { s2: { level: 'none' as const } }, channels: { b: { level: 'none' as const } } };
+    expect(unreadTotal(channels, {}, prefs)).toBe(3 + 5);
     expect(unreadTotal({ s: [ch('x', true, 50_000)] }, {})).toBe(9999);
   });
 
@@ -43,6 +47,20 @@ describe('unread badge (G-62)', () => {
     expect(Number.isInteger(sent) && sent >= 0 && sent <= 9999).toBe(true);
     act(() => unmount());
     expect(setUnreadCount).toHaveBeenLastCalledWith(0);
+  });
+
+  it('the switch: on by default; off sends 0', async () => {
+    expect(defaultNotifyPrefs().badge).toBe(true);
+    expect(cleanNotifyPrefs({ badge: 'no' }).badge).toBe(true);
+    expect(cleanNotifyPrefs({ badge: false }).badge).toBe(false);
+    const setUnreadCount = vi.fn(async (_n: number) => true);
+    (window as { mvs?: unknown }).mvs = { setUnreadCount };
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15, notify: { ...defaultNotifyPrefs(), badge: false } };
+    render(<App core={core} initialSettings={settings} />);
+    await screen.findByRole('textbox', { name: /^Message / });
+    await waitFor(() => expect(setUnreadCount).toHaveBeenCalled());
+    expect(setUnreadCount.mock.calls.every(([n]) => n === 0)).toBe(true);
   });
 
   it('outside the desktop app nothing breaks (no bridge)', async () => {

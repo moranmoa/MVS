@@ -2,7 +2,7 @@
 // the pinned "Join chat" row opens a new room; the live rooms sit under it, with
 // who is in each and the host crowned; text channels don't carry calls.
 
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
@@ -61,13 +61,19 @@ vi.mock('../voice', () => ({
   },
 }));
 
+// G-64: the join/leave cue is recorded, not played (jsdom has no Web Audio).
+vi.mock('../voice/devices', async (orig) => ({
+  ...(await orig<typeof import('../voice/devices')>()),
+  playCallCue: vi.fn(async () => {}),
+}));
+
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
 /** `ipNoticeSeen: false` starts as on a computer that never joined a call. */
-async function setup(options: MockOptions = {}, { ipNoticeSeen = true } = {}) {
+async function setup(options: MockOptions = {}, { ipNoticeSeen = true, prefs = {} as Partial<Settings> } = {}) {
   if (ipNoticeSeen) localStorage.setItem('mvs.notices.voiceIp.v1', '1');
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, ...options });
-  render(<App core={core} initialSettings={settings} />);
+  render(<App core={core} initialSettings={{ ...settings, ...prefs }} />);
   await screen.findByRole('textbox', { name: /^Message / });
   await screen.findByRole('button', { name: 'Join chat' });
   // The first room's row, once the rooms are read.
@@ -156,6 +162,22 @@ describe('G-72: voice settings in a call', () => {
   });
 });
 
+describe('G-84b: the others see "deafened"', () => {
+  it('deafen tells the core; my roster row shows crossed headphones instead of the mic', async () => {
+    const { core, entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const told = vi.spyOn(core, 'setDeafened');
+    await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
+    expect(told).toHaveBeenCalledWith(true);
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    await waitFor(() => expect(within(roster).getAllByRole('img', { name: 'Deafened' })).toHaveLength(1));
+    await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
+    expect(told).toHaveBeenLastCalledWith(false);
+    await waitFor(() => expect(within(roster).queryAllByRole('img', { name: 'Deafened' })).toHaveLength(0));
+  });
+});
+
 describe('G-72 part 2: an unplugged device', () => {
   it('says which device was unplugged and that the default is used', async () => {
     fakeEngine.fallback = { kind: 'input', label: 'Headset mic', at: 1 };
@@ -188,6 +210,86 @@ describe('G-73: volume per person', () => {
     expect(fakeEngine.picked[0]).toMatch(/^vol:.+:35$/);
     expect(within(group).getAllByRole('slider')[0]!.getAttribute('aria-valuetext')).toBe('35%');
     expect(within(group).getByText(/Only you hear the change/)).toBeTruthy();
+  });
+});
+
+describe('G-73 v2: the roster menu (0–200%, mute for me)', () => {
+  it('right-click a person in my call: Volume… (0–200%) and Mute for me, which restores the volume', async () => {
+    const { entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    const others = () => within(roster).getAllByRole('listitem').filter((li) => li.getAttribute('aria-haspopup') === 'menu');
+    expect(others()).toHaveLength(2); // not me
+    const menuFor = async (li: HTMLElement) => {
+      await act(async () => {
+        fireEvent.contextMenu(li, { clientX: 10, clientY: 10 });
+      });
+      return screen.getByRole('menu');
+    };
+    // Volume…: a dialog with a 0–200% slider.
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Volume…' }));
+    const slider = within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('slider') as HTMLInputElement;
+    expect(slider.max).toBe('200');
+    expect(slider.step).toBe('10');
+    // The 100% tick, in the middle of the track.
+    expect([...(slider.list?.options ?? [])].map((o) => o.value)).toEqual(['100']);
+    await act(async () => {
+      fireEvent.change(slider, { target: { value: '160' } });
+    });
+    expect(slider.getAttribute('aria-valuetext')).toBe('160%');
+    await click(within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('button', { name: 'Close' }));
+    // Mute for me, then Unmute for me brings back 160%.
+    fakeEngine.picked = [];
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Mute for me' }));
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Unmute for me' }));
+    expect(fakeEngine.picked.map((x) => x.split(':').at(-1))).toEqual(['0', '160']);
+  });
+});
+
+describe('G-64: a sound when someone joins or leaves my call', () => {
+  type Call = { channelId: string; participants: { identity: string; muted: boolean }[]; full: boolean };
+  const callOf = (core: MockCore) => (core as unknown as { call: Call }).call;
+  const emitCall = (core: MockCore, call: Call) =>
+    act(async () => {
+      (core as unknown as { emit: (e: 'call.state', c: Call) => void }).emit('call.state', call);
+    });
+  const cue = async () => vi.mocked((await import('../voice/devices')).playCallCue);
+
+  it('no sound for my own join; a join plays the rising cue and announces who, a leave the falling one', async () => {
+    const played = await cue();
+    played.mockClear();
+    const { core, entry } = await setup();
+    await click(entry());
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    expect(played).not.toHaveBeenCalled();
+    const before = callOf(core);
+    await emitCall(core, { ...before, participants: [...before.participants, { identity: 'u-99', muted: false }] });
+    expect(played).toHaveBeenLastCalledWith('join', undefined);
+    expect(bar.querySelector('[aria-live="polite"]')?.textContent).toMatch(/joined the call$/);
+    await emitCall(core, before);
+    expect(played).toHaveBeenLastCalledWith('leave', undefined);
+    expect(bar.querySelector('[aria-live="polite"]')?.textContent).toMatch(/left the call$/);
+    expect(played).toHaveBeenCalledTimes(2);
+  });
+
+  it('silent while deafened, and when turned off in Settings → Voice; still announced', async () => {
+    const played = await cue();
+    for (const [label, opts] of [
+      ['deafened', {}],
+      ['setting off', { prefs: { callSounds: false } }],
+    ] as const) {
+      played.mockClear();
+      const { core, entry } = await setup({}, opts);
+      await click(entry());
+      const bar = await screen.findByRole('region', { name: 'Voice call' });
+      if (label === 'deafened') await click(within(bar).getByRole('button', { name: 'Deafen' }));
+      const before = callOf(core);
+      await emitCall(core, { ...before, participants: [...before.participants, { identity: 'u-98', muted: false }] });
+      expect(played, label).not.toHaveBeenCalled();
+      expect(bar.querySelector('[aria-live="polite"]')?.textContent, label).toMatch(/joined the call$/);
+      cleanup();
+    }
   });
 });
 
@@ -652,6 +754,16 @@ describe('voice rooms (0.4.3)', () => {
       // #272: relayOnly is passed on only when true, and never gets the room dropped.
       expect(cleanVoiceRoom({ ...ok, relayOnly: true })).toEqual({ ...ok, relayOnly: true });
       expect(cleanVoiceRoom({ ...ok, relayOnly: false })).toEqual(ok);
+    });
+
+    it('G-84b: deafened is kept only with muted, and must be a boolean', () => {
+      const deaf = { ...ok, members: [{ ...p('1', true), deafened: true }, { ...p('2'), deafened: true }] };
+      expect(cleanVoiceRoom(deaf)?.members).toEqual([{ ...p('1', true), deafened: true }, p('2')]);
+      expect(cleanVoiceRoom({ ...ok, members: [{ ...p('1', true), deafened: 'yes' }] })).toBeNull();
+      expect(cleanCall({ channelId: id('b'), participants: [{ identity: id('1'), muted: true, deafened: true }, { identity: id('2'), muted: false, deafened: true }], full: false } as never).participants).toEqual([
+        { identity: id('1'), muted: true, deafened: true },
+        { identity: id('2'), muted: false },
+      ]);
     });
 
     it('drops a room with a bad id, limit, roster or host, or an unknown field', () => {

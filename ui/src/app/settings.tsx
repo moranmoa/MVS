@@ -18,6 +18,8 @@ export interface Settings {
   serverOrder?: string[];
   /** G-61: desktop notifications, levels and mutes, on this computer only. */
   notify?: NotifyPrefs;
+  /** G-64: a short sound when someone joins or leaves my call. On unless false. */
+  callSounds?: boolean;
 }
 
 export const SCALE_MIN = 0.75;
@@ -55,6 +57,7 @@ function load(): Settings {
     fontSize: num(stored.fontSize, FONT_MIN, FONT_MAX, base.fontSize),
     serverOrder: cleanOrder(stored.serverOrder),
     notify: cleanNotifyPrefs(stored.notify),
+    ...(stored.callSounds === false ? { callSounds: false } : {}),
     ...(LOCALES.includes(lang as Locale) ? { locale: lang as Locale } : {}),
     ...(theme === 'light' || theme === 'dark' ? { theme } : {}),
   };

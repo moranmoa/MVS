@@ -57,6 +57,14 @@ describe('Settings → Voice', () => {
     expect(select.value).toBe('spk-a');
   });
 
+  it('G-64: the join/leave sound switch is on by default and can be turned off', async () => {
+    await openVoice([]);
+    const sw = (await screen.findByRole('switch', { name: 'Play a sound when people join or leave the call' })) as HTMLInputElement;
+    expect(sw.checked).toBe(true);
+    fireEvent.click(sw);
+    expect(sw.checked).toBe(false);
+  });
+
   it('a remembered speaker that is not plugged in shows as the system default', async () => {
     localStorage.setItem('mvs.voice.devices.v1', JSON.stringify({ output: 'spk-gone' }));
     await openVoice([{ kind: 'audiooutput', deviceId: 'spk-a', label: 'Headphones' }]);

@@ -60,5 +60,9 @@ describe('date divider (G-23)', () => {
       expect(row.querySelector('.date-divider')).not.toBeNull();
       expect(row.querySelector('.msg.grouped')).toBeNull();
     }
+    // UX: with the day on the divider, a message head shows only the time, and the full date in its tooltip.
+    const stamp = shown[0].querySelector('.msg-head time')!;
+    expect(stamp.textContent).toMatch(/^[0-9]{1,2}:[0-9]{2}(\s?[AP]M)?$/);
+    expect(stamp.getAttribute('title')).toMatch(/[0-9]{4}/);
   });
 });

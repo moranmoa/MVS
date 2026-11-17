@@ -41,7 +41,11 @@ export interface VoiceEngineView {
   /** G-84: I hear no one. Back to false when the call ends. */
   deafened: boolean;
   setDeafened: (deafened: boolean) => void;
-  /** G-73: per-person volume in percent (0..100), remembered on this computer; 100 when not set. */
+  /**
+   * G-73: per-person volume in percent (0..200), remembered on this computer;
+   * 100 when not set. Above 100 needs the engine's Web Audio path; on its
+   * element fallback it plays at 100.
+   */
   volumes: Record<Id, number>;
   setVolume: (id: Id, percent: number) => void;
   /** G-72: the last chosen device that was gone; its label if known. Shown once as a notice. */
@@ -64,7 +68,7 @@ export function loadVolumes(): Record<Id, number> {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
     const out: Record<Id, number> = {};
     for (const [id, v] of Object.entries(raw).slice(0, MAX_VOLUMES)) {
-      if (/^[0-9a-f]{64}$/.test(id) && Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 100) out[id] = v as number;
+      if (/^[0-9a-f]{64}$/.test(id) && Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 200) out[id] = v as number;
     }
     return out;
   } catch {
@@ -232,7 +236,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
 
   const inputLevel = useCallback(() => engineRef.current?.inputLevel() ?? 0, []);
   const setVolume = useCallback((id: Id, percent: number) => {
-    const pct = Math.round(Math.min(100, Math.max(0, percent)));
+    const pct = Math.round(Math.min(200, Math.max(0, percent)));
     engineRef.current?.setPeerVolume(id, pct / 100);
     setVolumes((prev) => {
       const next = { ...prev, [id]: pct };

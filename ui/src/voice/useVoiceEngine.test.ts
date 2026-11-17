@@ -50,8 +50,8 @@ describe('G-73: stored per-person volumes', () => {
   const KEY = 'mvs.voice.volumes.v1';
   const A = 'a'.repeat(64);
   const B = 'b'.repeat(64);
-  it('keeps only 64-hex IDs with a whole percent in 0..100; anything else reads as empty', () => {
-    localStorage.setItem(KEY, JSON.stringify({ [A]: 35, [B]: 0, short: 50, [A.toUpperCase()]: 20, ['c'.repeat(64)]: 101, ['d'.repeat(64)]: 2.5, ['e'.repeat(64)]: '40' }));
+  it('keeps only 64-hex IDs with a whole percent in 0..200; anything else reads as empty', () => {
+    localStorage.setItem(KEY, JSON.stringify({ [A]: 35, [B]: 0, short: 50, [A.toUpperCase()]: 20, ['c'.repeat(64)]: 201, ['d'.repeat(64)]: 2.5, ['e'.repeat(64)]: '40' }));
     expect(loadVolumes()).toEqual({ [A]: 35, [B]: 0 });
     for (const raw of ['not json', '[1,2]', 'null', '7']) {
       localStorage.setItem(KEY, raw);

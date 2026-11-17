@@ -8,8 +8,9 @@
 // counts as a release (the key-up may never arrive after Alt+Tab).
 //
 // Optional: a global "toggle mute" shortcut through Electron's globalShortcut
-// (press only, no keyboard listener). It must carry a modifier (or be
-// F13-F24), so a plain key is never taken from every other app.
+// (press only, no keyboard listener), registered only during a call. It
+// needs two modifiers (or F13-F24), so neither a plain key nor a common
+// shortcut like Ctrl+C or Alt+F4 is ever taken from every other app.
 'use strict';
 
 const RELEASE_MS = 200;
@@ -40,8 +41,11 @@ function cleanKey(v) {
 const MODIFIERS = ['CommandOrControl', 'Control', 'Alt', 'Shift'];
 
 /**
- * A globalShortcut accelerator: 1-3 distinct modifiers + A-Z, 0-9 or F1-F24,
- * or a bare F13-F24. Null to switch off, undefined if refused.
+ * A globalShortcut accelerator: F13-F24 (no keyboard uses them for anything
+ * else) with 0-3 modifiers, or A-Z, 0-9, F1-F12 with 2-3 distinct modifiers,
+ * so a page can never take a common one-modifier shortcut (Ctrl+C, Ctrl+V,
+ * Alt+F4, Shift+F10…) from every other app. Null to switch off, undefined if
+ * refused.
  */
 function cleanAccelerator(v) {
   if (v === null) return null;
@@ -49,8 +53,10 @@ function cleanAccelerator(v) {
   const parts = v.split('+');
   const key = parts.pop();
   if (!/^(?:[A-Z0-9]|F(?:[1-9]|1[0-9]|2[0-4]))$/.test(key)) return undefined;
-  if (parts.length === 0) return /^F(?:1[3-9]|2[0-4])$/.test(key) ? v : undefined;
+  const rare = /^F(?:1[3-9]|2[0-4])$/.test(key);
+  if (parts.length === 0) return rare ? v : undefined;
   if (parts.length > 3 || new Set(parts).size !== parts.length) return undefined;
+  if (!rare && parts.length < 2) return undefined;
   if (!parts.every((m) => MODIFIERS.includes(m))) return undefined;
   // CommandOrControl already is Control on Windows and Linux.
   if (parts.includes('CommandOrControl') && parts.includes('Control')) return undefined;

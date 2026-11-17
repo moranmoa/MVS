@@ -1,6 +1,5 @@
-// G-74 (chat-and-voice-extras.md §6): Settings → "קול": voice activity or push to
-// talk, the push-to-talk key, and an optional global mute toggle. The devices and
-// the mic test (G-72) join this page later.
+// G-74 (chat-and-voice-extras.md §6): on Settings → "קול" (G-72's page): voice
+// activity or push to talk, the push-to-talk key, and an optional global mute toggle.
 
 import { useState, type KeyboardEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
@@ -52,7 +51,7 @@ function KeyCapture({
   );
 }
 
-export function VoiceSection() {
+export function PushToTalkSection() {
   const intl = useIntl();
   const store = useAppStore();
   const { settings, update } = useSettings();

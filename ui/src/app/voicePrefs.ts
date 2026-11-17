@@ -26,7 +26,7 @@ export function cleanVoicePrefs(v: unknown): VoicePrefs {
   return {
     mode: p.mode === 'ptt' ? 'ptt' : 'open',
     pttKey: typeof p.pttKey === 'string' && CODE.test(p.pttKey) ? p.pttKey : null,
-    globalMute: typeof p.globalMute === 'string' && ACCELERATOR.test(p.globalMute) ? p.globalMute : null,
+    globalMute: typeof p.globalMute === 'string' && ACCELERATOR.test(p.globalMute) && (p.globalMute.split('+').length >= 3 || /F(1[3-9]|2[0-4])$/.test(p.globalMute)) ? p.globalMute : null,
   };
 }
 
@@ -39,14 +39,15 @@ export function pttKeyFrom(e: { code: string }): string | null {
 }
 
 /**
- * The accelerator for a pressed key, or null: a modifier (Ctrl/Cmd, Alt, Shift) and a
- * letter, digit or F-key, or a bare F13–F24 (#444's rule).
+ * The accelerator for a pressed key, or null: two or three modifiers (Ctrl/Cmd, Alt,
+ * Shift) and a letter, digit or F-key, or F13–F24 with any modifiers (#444, Security
+ * Lead: one modifier would take over shortcuts like Ctrl+C or Alt+F4).
  */
 export function acceleratorFrom(e: { code: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }): string | null {
   const key = /^Key([A-Z])$/.exec(e.code)?.[1] ?? /^Digit([0-9])$/.exec(e.code)?.[1] ?? /^(F(?:[1-9]|1[0-9]|2[0-4]))$/.exec(e.code)?.[1];
   if (!key) return null;
   const mods = [e.ctrlKey || e.metaKey ? 'CommandOrControl' : null, e.altKey ? 'Alt' : null, e.shiftKey ? 'Shift' : null].filter(Boolean);
-  if (!mods.length && !/^F(1[3-9]|2[0-4])$/.test(key)) return null;
+  if (mods.length < 2 && !/^F(1[3-9]|2[0-4])$/.test(key)) return null;
   return [...mods, key].join('+');
 }
 

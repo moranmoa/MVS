@@ -24,6 +24,8 @@ describe('push-to-talk prefs (G-74)', () => {
     expect(defaultVoicePrefs()).toEqual({ mode: 'open', pttKey: null, globalMute: null });
     expect(cleanVoicePrefs({ mode: 'ptt', pttKey: 'KeyV', globalMute: 'CommandOrControl+Shift+M' })).toEqual({ mode: 'ptt', pttKey: 'KeyV', globalMute: 'CommandOrControl+Shift+M' });
     expect(cleanVoicePrefs({ mode: 'loud', pttKey: '<b>', globalMute: 'rm -rf' })).toEqual(defaultVoicePrefs());
+    expect(cleanVoicePrefs({ globalMute: 'Alt+M' }).globalMute).toBeNull();
+    expect(cleanVoicePrefs({ globalMute: 'F13' }).globalMute).toBe('F13');
     expect(cleanVoicePrefs(null)).toEqual(defaultVoicePrefs());
   });
 
@@ -36,9 +38,13 @@ describe('push-to-talk prefs (G-74)', () => {
     expect(keyLabel('Digit5')).toBe('5');
   });
 
-  it('the global toggle: a modifier and a key, or a bare F13–F24', () => {
+  it('the global toggle: two or three modifiers and a key, or F13–F24', () => {
     expect(acceleratorFrom(key('KeyM', { ctrlKey: true, shiftKey: true }))).toBe('CommandOrControl+Shift+M');
-    expect(acceleratorFrom(key('KeyM', { metaKey: true }))).toBe('CommandOrControl+M');
+    expect(acceleratorFrom(key('Digit0', { ctrlKey: true, altKey: true }))).toBe('CommandOrControl+Alt+0');
+    // One modifier would take over Ctrl+C, Alt+F4…: refused (Security Lead).
+    expect(acceleratorFrom(key('KeyM', { metaKey: true }))).toBeNull();
+    expect(acceleratorFrom(key('KeyC', { ctrlKey: true }))).toBeNull();
+    expect(acceleratorFrom(key('F14', { shiftKey: true }))).toBe('Shift+F14');
     expect(acceleratorFrom(key('F13'))).toBe('F13');
     expect(acceleratorFrom(key('KeyM'))).toBeNull();
     expect(acceleratorFrom(key('F5'))).toBeNull();

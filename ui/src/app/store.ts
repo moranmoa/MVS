@@ -139,7 +139,7 @@ export interface StoreState {
   /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
   settingsRequest: { section: string; at: number } | null;
   /** A short confirmation toast (an i18n id), e.g. "Copied" after a menu copy. */
-  flash: { id: string; at: number } | null;
+  flash: { id: string; values?: Record<string, string>; at: number } | null;
   /** Bumped when any message window changes, so readers re-render. */
   messagesVersion: number;
 }
@@ -353,8 +353,8 @@ export class Store {
     this.set({ notice: null });
   }
 
-  showFlash(id: string): void {
-    this.set({ flash: { id, at: Date.now() } });
+  showFlash(id: string, values?: Record<string, string>): void {
+    this.set({ flash: { id, values, at: Date.now() } });
   }
 
   openSettings(section: string): void {

@@ -14,11 +14,15 @@ test('cleanKey takes listed KeyboardEvent.code values only', () => {
   }
 });
 
-test('cleanAccelerator needs a modifier, or a bare F13-F24', () => {
-  for (const ok of ['CommandOrControl+Shift+M', 'Alt+F1', 'Control+Alt+Shift+9', 'F13', 'F24', 'Shift+F5']) {
+test('cleanAccelerator: two modifiers for common keys, F13-F24 as they are', () => {
+  for (const ok of ['CommandOrControl+Shift+M', 'Control+Alt+0', 'Alt+Shift+F1', 'Control+Alt+Shift+9', 'F13', 'F24', 'Shift+F13', 'Alt+Shift+F20']) {
     assert.equal(cleanAccelerator(ok), ok);
   }
   assert.equal(cleanAccelerator(null), null);
+  // Common one-modifier shortcuts are never taken from other apps.
+  for (const bad of ['CommandOrControl+C', 'CommandOrControl+V', 'CommandOrControl+W', 'Control+C', 'Alt+F4', 'Shift+F10', 'Alt+Tab', 'Shift+F5', 'Alt+F1', 'Alt+M']) {
+    assert.equal(cleanAccelerator(bad), undefined, bad);
+  }
   for (const bad of ['M', 'F5', 'Shift+Shift+M', 'Super+M', 'Meta+M', 'CommandOrControl+Control+M', 'Ctrl+M', 'Alt+m', 'Alt+Space', 'Alt+Shift+Control+CommandOrControl+M', '+M', 'Alt+', '', 5, undefined]) {
     assert.equal(cleanAccelerator(bad), undefined, String(bad));
   }

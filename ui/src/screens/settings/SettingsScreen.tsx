@@ -13,7 +13,7 @@ import { SignOutButton } from './SignOut';
 import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/notify';
 import { MemberRelaySetting } from './MemberRelay';
 import { DevicesSection } from './Devices';
-import { VoiceSection } from './VoiceSettings';
+import { VoiceSection } from './Voice';
 
 type Section = 'account' | 'privacy' | 'devices' | 'voice' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
 const SECTIONS: Section[] = ['account', 'privacy', 'devices', 'voice', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
@@ -342,6 +342,22 @@ function NotificationsSection() {
           <FormattedMessage id="notify.settings.previewDisabled" />
         </p>
       )}
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.badge" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.badge}
+          aria-describedby="notify-badge-hint"
+          onChange={(e) => set({ badge: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-badge-hint">
+        <FormattedMessage id="notify.settings.badgeHint" />
+      </p>
     </div>
   );
 }

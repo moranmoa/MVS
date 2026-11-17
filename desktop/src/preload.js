@@ -52,11 +52,17 @@ contextBridge.exposeInMainWorld('mvs', {
    * G-74: push-to-talk settings { key, globalMute }. `key` is a
    * KeyboardEvent.code (or null): while it's held in our focused window during
    * a call, `ptt.down` then `ptt.up` (200 ms after release or focus loss)
-   * arrive as events. `globalMute` is an accelerator with a modifier, e.g.
-   * 'CommandOrControl+Shift+M' (or null): pressing it anywhere during a call
-   * sends `ptt.toggleMute`. Resolves 'ok' | 'invalid' | 'shortcut-taken'.
+   * arrive as events. `globalMute` is an accelerator with two or three
+   * modifiers, e.g. 'CommandOrControl+Shift+M', or F13-F24 (or null): it is
+   * registered only during a call, and pressing it anywhere sends
+   * `ptt.toggleMute`. Resolves 'ok' | 'invalid' | 'shortcut-taken'.
    */
   setPushToTalk: (settings) => ipcRenderer.invoke('ptt:set', settings),
+  /**
+   * G-62: the unread total for the taskbar (Windows overlay) or dock: a whole
+   * number 0..9999; 0 clears it. Resolves true if accepted.
+   */
+  setUnreadCount: (count) => ipcRenderer.invoke('badge:set', count),
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

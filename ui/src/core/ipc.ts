@@ -14,14 +14,17 @@ import type { CoreError } from './types';
 export interface DesktopBridge {
   invoke(cmd: string, args: unknown[]): Promise<{ ok?: unknown; error?: CoreError | { code: string } }>;
   onEvent(callback: (event: string, payload: unknown) => void): () => void;
+  /** G-62: the unread total for the taskbar / dock (desktop only). */
+  setUnreadCount?(count: number): Promise<boolean>;
   /** G-74: push-to-talk settings (desktop only). */
   setPushToTalk?(settings: PushToTalkSettings): Promise<PushToTalkResult>;
 }
 
 /**
  * G-74: `key` is a KeyboardEvent.code (e.g. 'KeyV', 'ControlLeft', 'F13') or
- * null; `globalMute` an Electron accelerator with a modifier (e.g.
- * 'CommandOrControl+Shift+M', or a bare F13–F24) or null.
+ * null; `globalMute` an Electron accelerator with two or three modifiers
+ * (e.g. 'CommandOrControl+Shift+M', 'Control+Alt+0'), or F13–F24 with any, or
+ * null. One-modifier shortcuts (Ctrl+C, Alt+F4…) are refused.
  */
 export interface PushToTalkSettings {
   key: string | null;
@@ -67,6 +70,20 @@ declare global {
 
 export function hasDesktopBridge(): boolean {
   return typeof window !== 'undefined' && typeof window.mvs?.invoke === 'function';
+}
+
+/**
+ * G-62: shows `count` unread on the taskbar (Windows overlay) or dock. A whole
+ * number 0..9999; 0 clears it. Resolves false outside the desktop app or when
+ * the shell refuses the value, so callers need no guard.
+ */
+export async function setUnreadCount(count: number, bridge: DesktopBridge | undefined = typeof window === 'undefined' ? undefined : window.mvs): Promise<boolean> {
+  if (typeof bridge?.setUnreadCount !== 'function') return false;
+  try {
+    return (await bridge.setUnreadCount(count)) === true;
+  } catch {
+    return false;
+  }
 }
 
 /**

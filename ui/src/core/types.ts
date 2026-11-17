@@ -340,8 +340,14 @@ export type DeviceLinkState = {
   state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed';
   /** 6 digits, from "confirm" on. */
   sas?: string;
-  reason?: 'cancelled' | 'timeout' | 'refused' | 'network';
+  reason?: 'cancelled' | 'timeout' | 'refused' | 'network' | 'keyring' | 'restore';
 };
+
+/** account.deviceAdded: a device was added to my account (dev-identity's #393 name). No `label` = unknown (always, for now). */
+export interface DeviceAdded {
+  at: number;
+  label?: string;
+}
 
 /** Device link, signed-in device: the digits to compare. */
 export interface DeviceApproval {

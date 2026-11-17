@@ -57,14 +57,15 @@ class Sidecar {
    * @param {object} o
    * @param {string} o.exe absolute path of mvs-core
    * @param {string} o.dataDir absolute path of its data folder
-   * @param {string|null} [o.relay] relay multiaddr, already checked (config.js)
+   * @param {string|null} [o.relay] relay multiaddr, already checked (config.js); the one-relay form of `relays`
+   * @param {string[]} [o.relays] relay multiaddrs in order of preference, already checked (config.js relaysFor); one `--relay` each
    * @param {string[]} [o.bootstrap] the relay's direct multiaddrs, already checked (config.js)
    * @param {string[]} [o.extraArgs] further switches for mvs-core
    * @param {string|null} [o.script] checkouts only: a .js stand-in for the core, run as `exe <script> ...` with ELECTRON_RUN_AS_NODE=1 (exe is then Electron itself)
    * @param {(name: string, payload: unknown) => void} o.onEvent
    * @param {(line: string) => void} [o.log] for stderr lines and lifecycle notes
    */
-  constructor({ exe, dataDir, script = null, relay = null, bootstrap = [], extraArgs = [], onEvent, onStatus = () => {}, log = () => {}, timeouts = {}, backoffBase = 500, spawnImpl = spawn }) {
+  constructor({ exe, dataDir, script = null, relay = null, relays = null, bootstrap = [], extraArgs = [], onEvent, onStatus = () => {}, log = () => {}, timeouts = {}, backoffBase = 500, spawnImpl = spawn }) {
     if (!path.isAbsolute(exe)) throw new Error('mvs-core must be given by an absolute path');
     if (!path.isAbsolute(dataDir)) throw new Error('the data folder must be an absolute path');
     this.exe = exe;
@@ -73,7 +74,8 @@ class Sidecar {
     this.dataDir = dataDir;
     // Optional: the relay multiaddr (config.js checks it) and extra switches
     // from other parts of the shell (e.g. the updater); strings only.
-    this.relay = relay;
+    if (relays !== null && (!Array.isArray(relays) || relays.some((a) => typeof a !== 'string'))) throw new Error('relays must be strings');
+    this.relays = relays ?? (relay ? [relay] : []);
     // The relay's direct addresses (config.js checks them); only with a relay.
     if (!Array.isArray(bootstrap) || bootstrap.some((a) => typeof a !== 'string')) throw new Error('bootstrap must be strings');
     this.bootstrap = bootstrap;
@@ -119,7 +121,9 @@ class Sidecar {
       ...(this.script ? [this.script] : []),
       '--data-dir',
       this.dataDir,
-      ...(this.relay ? ['--relay', this.relay, ...this.bootstrap.flatMap((b) => ['--bootstrap', b])] : []),
+      ...(this.relays.length
+        ? [...this.relays.flatMap((r) => ['--relay', r]), ...this.bootstrap.flatMap((b) => ['--bootstrap', b])]
+        : []),
       ...this.extraArgs,
     ];
     let child;

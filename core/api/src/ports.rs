@@ -220,6 +220,30 @@ pub trait Network: Send + Sync {
         Vec::new()
     }
 
+    // ---- holder notice slot (`notice-slot-spec.md`, dev-sync's network) ----
+
+    /// Hands my notice (`"mvsn1" ‖ …`, exactly `sync::NOTICE_LEN` bytes) to
+    /// the holders. Best effort.
+    fn put_notice(&self, blob: &[u8]) {
+        let _ = blob;
+    }
+
+    /// The notices holders keep under `tag_n` (the unlocked `w_n`'s tag;
+    /// nothing while [`Network::notice_unlock`] hasn't been called).
+    /// Untrusted answers: the core checks and opens each, removes
+    /// duplicates by (`at`, hash), and ignores anything older than its last
+    /// acknowledgement for that kind, since holders can replay.
+    fn fetch_notices(&self, tag_n: [u8; 32]) -> Vec<Vec<u8>> {
+        let _ = tag_n;
+        Vec::new()
+    }
+
+    /// The notice write key `w_n`, which signs notice fetches, from unlock
+    /// to [`Network::lock`].
+    fn notice_unlock(&self, w_n: &records::SigningKey) {
+        let _ = w_n;
+    }
+
     // ---- device link (`device-link-port-api.md`, dev-sync's network) ----
 
     /// New device: starts (or replaces) the one link, provider of `rv` for

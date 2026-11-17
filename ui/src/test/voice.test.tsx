@@ -3,6 +3,7 @@
 // who is in each and the host crowned; text channels don't carry calls.
 
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import { Store } from '../app/store';
@@ -12,18 +13,39 @@ import { cleanCall, cleanVoiceRoom, cleanVoiceRooms, guardCore } from '../core/s
 
 // jsdom has no WebRTC: the engine (piece D) has its own tests in src/voice. Here it
 // is an idle engine with a working mic; ?voiceSim drives the failure states.
-const fakeEngine = vi.hoisted(() => ({ peerFailed: {} as Record<string, 'failed' | 'refused'>, stunUrls: [] as unknown[] }));
+const fakeEngine = vi.hoisted(() => ({
+  peerFailed: {} as Record<string, 'failed' | 'refused'>,
+  stunUrls: [] as unknown[],
+  picked: [] as string[],
+  level: 0.42,
+  deafened: false,
+}));
 vi.mock('../voice', () => ({
-  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => (fakeEngine.stunUrls.push(options?.stunUrl), {
+  // A hook: deafen is React state, as in the real one, so the call bar re-renders.
+  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
+    const [deafened, setDeafened] = useState(false);
+    fakeEngine.deafened = deafened;
+    fakeEngine.stunUrls.push(options?.stunUrl);
+    return {
     ready: true,
     speaking: {},
     peerFailed: fakeEngine.peerFailed,
     setMicMuted: () => {},
-    inputs: [],
-    outputs: [],
-    setInput: () => {},
-    setOutput: () => {},
-  }),
+    inputs: [
+      { deviceId: 'mic-a', label: 'Desk mic' },
+      { deviceId: 'mic-b', label: 'Headset mic' },
+    ],
+    outputs: [{ deviceId: 'spk-a', label: 'Headphones' }],
+    setInput: (id: string) => fakeEngine.picked.push(`in:${id}`),
+    setOutput: (id: string) => fakeEngine.picked.push(`out:${id}`),
+    inputLevel: () => fakeEngine.level,
+    deafened,
+    setDeafened: (on: boolean) => {
+      fakeEngine.deafened = on;
+      setDeafened(on);
+    },
+    };
+  },
 }));
 
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
@@ -79,6 +101,83 @@ const click = async (el: Element) =>
   act(async () => {
     fireEvent.click(el);
   });
+
+describe('G-72: voice settings in a call', () => {
+  it('picks the microphone and the speaker, and shows the mic level', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      const bar = await screen.findByRole('region', { name: 'Voice call' });
+      await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+      const dialog = screen.getByRole('dialog', { name: 'Voice settings' });
+      const mic = within(dialog).getByRole('combobox', { name: 'Microphone' }) as HTMLSelectElement;
+      expect([...mic.options].map((o) => o.text)).toEqual(['System default', 'Desk mic', 'Headset mic']);
+      fakeEngine.picked = [];
+      await act(async () => {
+        fireEvent.change(mic, { target: { value: 'mic-b' } });
+      });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speaker' });
+      await act(async () => {
+        fireEvent.change(speaker, { target: { value: 'spk-a' } });
+      });
+      expect(fakeEngine.picked).toEqual(['in:mic-b', 'out:spk-a']);
+      // The level, polled while the dialog is open.
+      await act(async () => {
+        vi.advanceTimersByTime(250);
+      });
+      const meter = within(dialog).getByRole('meter', { name: 'Mic test' });
+      expect(meter.getAttribute('aria-valuenow')).toBe('42');
+      expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('G-84: deafen', () => {
+  it('deafen mutes me too and undeafen unmutes me; unmuting while deafened undeafens', async () => {
+    fakeEngine.deafened = false;
+    const { entry } = await setup();
+    await click(entry());
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    const deafen = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' });
+    const mute = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Mute' });
+    expect(deafen().getAttribute('aria-pressed')).toBe('false');
+    expect(mute().getAttribute('aria-pressed')).toBe('false');
+
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(true);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    expect(within(bar).getByRole('status').textContent).toContain("You can't hear the call");
+
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(false);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('false'));
+
+    // Unmuting while deafened undeafens.
+    await click(deafen());
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    await click(mute());
+    expect(fakeEngine.deafened).toBe(false);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('false'));
+  });
+
+  it('undeafen leaves me muted if I was muted before deafening', async () => {
+    fakeEngine.deafened = false;
+    const { entry } = await setup();
+    await click(entry());
+    const mute = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Mute' });
+    const deafen = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' });
+    await screen.findByRole('region', { name: 'Voice call' });
+    await click(mute());
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    await click(deafen());
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(false);
+    expect(mute().getAttribute('aria-pressed')).toBe('true');
+  });
+});
 
 describe('voice rooms (0.4.3)', () => {
   it('shows the rooms before joining: name, count, who is in it, the host crowned', async () => {

@@ -1,7 +1,7 @@
 // Our own title bar (docs/ux/specs/desktop-chrome.md §2): drawn only when the
 // desktop shell gives us our own frame (`window.mvs.windowFrame`).
 
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
@@ -38,7 +38,10 @@ describe('title bar', () => {
     const windowControl = shell('custom');
     const { emit } = await setup();
     const bar = document.querySelector<HTMLElement>('.titlebar')!;
-    expect(bar.textContent).toBe('MVS · גיימרים ישראל');
+    // The server name arrives through Shell's useWindowTitle effect, a passive
+    // effect that can run after the commit that showed the textbox setup()
+    // waits for: wait for it rather than read it at once (flaky in CI).
+    await waitFor(() => expect(bar.textContent).toBe('MVS · גיימרים ישראל'));
     expect(bar.querySelector('img.titlebar-mark')).not.toBeNull();
     // The buttons keep the physical order in every language.
     expect(bar.querySelector('.titlebar-controls')!.getAttribute('dir')).toBe('ltr');

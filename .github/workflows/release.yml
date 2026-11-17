@@ -241,6 +241,13 @@ jobs:
           want='{"relay":"/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","relays":["/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt"],"bootstrap":["/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc"]}'
           got=$(cat "$RUNNER_TEMP/relay-selftest.json")
           [ "$got" = "$want" ] || { echo "::error::relay list config was altered on the way: $got"; exit 1; }
+          # The same lists comma-separated (spaces and empty entries ignored):
+          # the same config.
+          RELAYS='/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc, /dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt,' \
+          RELAYS_TCP='/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc,' \
+            node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
+          got=$(cat "$RUNNER_TEMP/relay-selftest.json")
+          [ "$got" = "$want" ] || { echo "::error::comma-separated relay list config was altered on the way: $got"; exit 1; }
           # The same relay twice is refused.
           if RELAYS=$'/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc' \
             node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then

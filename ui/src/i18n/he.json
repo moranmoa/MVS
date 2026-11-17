@@ -261,6 +261,8 @@
   "call.leave": "יציאה מהשיחה",
   "call.voiceSettings": "הגדרות קול",
   "call.deafen": "השתקת השמע",
+  "call.volumes": "עוצמת קול לכל אחד בשיחה",
+  "call.volumesHint": "השינוי נשמע רק אצלך, ונשמר במחשב הזה.",
   "call.deafenedNote": "השמע בשיחה כבוי, והמיקרופון מושתק.",
   "call.microphone": "מיקרופון",
   "call.speaker": "רמקול",

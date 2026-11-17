@@ -2502,7 +2502,11 @@ impl Core {
             Ok(identity) => vec![link_state(DeviceLinkPhase::Done, None, None), Event::IdentityChanged(identity)],
             Err(e) => {
                 eprintln!("mvs-core: a device link's account wasn't restored: {:?}", e.code);
-                vec![link_state(DeviceLinkPhase::Failed, None, None)]
+                let reason = match e.code {
+                    ErrorCode::KeyringUnavailable => DeviceLinkReason::Keyring,
+                    _ => DeviceLinkReason::Restore,
+                };
+                vec![link_state(DeviceLinkPhase::Failed, None, Some(reason))]
             }
         };
         self.emit(done);

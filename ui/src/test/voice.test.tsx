@@ -24,6 +24,7 @@ vi.mock('../voice', () => ({
   // A hook: deafen is React state, as in the real one, so the call bar re-renders.
   useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
     const [deafened, setDeafened] = useState(false);
+    const [volumes, setVolumes] = useState<Record<string, number>>({});
     fakeEngine.deafened = deafened;
     fakeEngine.stunUrls.push(options?.stunUrl);
     return {
@@ -43,6 +44,11 @@ vi.mock('../voice', () => ({
     setDeafened: (on: boolean) => {
       fakeEngine.deafened = on;
       setDeafened(on);
+    },
+    volumes,
+    setVolume: (id: string, pct: number) => {
+      fakeEngine.picked.push(`vol:${id}:${pct}`);
+      setVolumes((v) => ({ ...v, [id]: pct }));
     },
     };
   },
@@ -132,6 +138,27 @@ describe('G-72: voice settings in a call', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('G-73: volume per person', () => {
+  it('a slider per other person in my call, with their name and the percent', async () => {
+    const { entry } = await setup();
+    await click(entry()); // the demo room has 2 people already
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+    const group = within(screen.getByRole('dialog', { name: 'Voice settings' })).getByRole('group', { name: 'Volume for each person in the call' });
+    const sliders = within(group).getAllByRole('slider');
+    expect(sliders).toHaveLength(2);
+    expect(sliders.every((s) => s.getAttribute('aria-valuetext') === '100%')).toBe(true);
+    fakeEngine.picked = [];
+    await act(async () => {
+      fireEvent.change(sliders[0]!, { target: { value: '35' } });
+    });
+    expect(fakeEngine.picked).toHaveLength(1);
+    expect(fakeEngine.picked[0]).toMatch(/^vol:.+:35$/);
+    expect(within(group).getAllByRole('slider')[0]!.getAttribute('aria-valuetext')).toBe('35%');
+    expect(within(group).getByText(/Only you hear the change/)).toBeTruthy();
   });
 });
 

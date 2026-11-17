@@ -43,10 +43,6 @@ const PROTOCOL_VERSION: &str = "/mvs/0.1.0";
 /// (`/ipfs/kad/1.0.0`). Clients (core/sync) must use the same name.
 const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/mvs/kad/1.0.0");
 
-/// TODO(R2): drop once core/sync speaks KAD_PROTOCOL. Until then the relay
-/// also answers on the IPFS name so today's clients can still use its DHT.
-const LEGACY_KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.0.0");
-
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     // Limits first: they deny a connection before any other behaviour
@@ -301,16 +297,19 @@ async fn run() -> Result<()> {
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
-        .with_dns()?
-        .with_websocket(noise::Config::new, yamux::Config::default)
-        .await?
+        // WebSocket by hand: libp2p 0.56's builder step for it always adds a
+        // DNS transport, and the relay has none (it never dials a name).
+        .with_other_transport(|key| {
+            use libp2p::{core::upgrade::Version, Transport as _};
+            Ok(libp2p_websocket::Config::new(tcp::tokio::Transport::new(tcp::Config::default()))
+                .upgrade(Version::V1Lazy)
+                .authenticate(noise::Config::new(key)?)
+                .multiplex(yamux::Config::default()))
+        })?
         .with_behaviour(|key| {
             let peer_id = key.public().to_peer_id();
             let mut kad_config = kad::Config::new(KAD_PROTOCOL);
-            // Ours first: it is preferred whenever both sides support it.
-            // Deprecated in favour of Config::new, which takes one name only.
-            #[allow(deprecated)]
-            kad_config.set_protocol_names(vec![KAD_PROTOCOL, LEGACY_KAD_PROTOCOL]);
+            // Only our own name: every release since v0.2.0 speaks it (R2).
             // The mailbox's provider records live in this (the only) DHT
             // server's own store: no 12-hourly republish queries for up to
             // MAX_TAGS keys. Revisit with a second bootstrap (GAP-9).
@@ -473,6 +472,7 @@ async fn run() -> Result<()> {
             SwarmEvent::Behaviour(BehaviourEvent::Backup(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Request { request, channel, .. },
+                ..
             })) => {
                 let source = match peer_ips.get(&peer) {
                     Some(ip) if !proxies.contains(ip) => backup::Source::Ip(*ip),

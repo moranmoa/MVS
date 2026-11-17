@@ -94,7 +94,13 @@ jobs:
           persist-credentials: false
       - name: Install cargo-deny (checksum verified)
         run: .github/scripts/install-cargo-deny.sh
-      - run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
+      - name: core
+        run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
+      # The relay too: it has public listeners (e.g. RUSTSEC-2026-0525, a remote
+      # panic in libp2p-quic, was only caught by hand). Runs even if core fails.
+      - name: relay
+        if: always()
+        run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check advisories
 
   ui:
     name: ui build, tests and licences

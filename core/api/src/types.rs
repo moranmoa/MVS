@@ -306,6 +306,8 @@ pub enum ErrorCode {
     CheckClock,
     NothingToDownload,
     NothingStaged,
+    /// Device link: too many attempts at this link.
+    RateLimited,
     DiskFull,
 }
 
@@ -501,6 +503,13 @@ pub enum Event {
     /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
     #[serde(rename = "memberRelay.changed")]
     MemberRelayChanged(MemberRelay),
+    /// Device link, the new device: where its link stands.
+    #[serde(rename = "deviceLink.state")]
+    DeviceLinkState(DeviceLinkState),
+    /// Device link: a new device was added to my account (shown on the
+    /// approving device at once).
+    #[serde(rename = "account.deviceAdded", rename_all = "camelCase")]
+    DeviceAdded { at: u64 },
     /// Once, after `markHealthy` commits a new version. Text only.
     #[serde(rename = "update.installed")]
     UpdateInstalled { version: String, notes: Option<String> },
@@ -687,4 +696,53 @@ pub struct MemberRelay {
     pub disclosure_seen: bool,
     /// The daily byte cap, 256..=51,200 MB (default 2,048).
     pub daily_cap_mb: u32,
+}
+
+/// Device link (`device-link-slice.md`): `startDeviceLink`'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLinkStart {
+    /// `mvs-link:1:` and base58: printable ASCII, at most 1,024 characters.
+    pub qr: String,
+    /// 10 base32 characters, `[A-Z2-7]`: a rendezvous only.
+    pub code: String,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceLinkPhase {
+    Waiting,
+    Confirm,
+    Done,
+    Expired,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceLinkReason {
+    Cancelled,
+    Timeout,
+    Refused,
+    Network,
+}
+
+/// `deviceLink.state`. Absent fields are left out, never null (dev-ui #391).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLinkState {
+    pub state: DeviceLinkPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sas: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<DeviceLinkReason>,
+}
+
+/// `beginDeviceApproval`'s answer: the digits to compare.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceApproval {
+    pub sas: String,
+    pub expires_at: u64,
 }

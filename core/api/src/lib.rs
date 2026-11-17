@@ -15,6 +15,7 @@ pub mod backup;
 mod chat;
 pub mod crypto;
 mod datadir;
+mod devicelink;
 mod db;
 mod dispatch;
 mod gate;

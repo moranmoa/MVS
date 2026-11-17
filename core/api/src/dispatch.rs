@@ -231,6 +231,17 @@ struct ChannelArg {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QrOrCodeArg {
+    qr_or_code: String,
+}
+
+#[derive(Deserialize)]
+struct ApproveArg {
+    approve: bool,
+}
+
+#[derive(Deserialize)]
 struct MemberRelayArg {
     setting: MemberRelaySetting,
 }
@@ -383,6 +394,10 @@ impl Core {
             "setMemberRelay" => ok(self.set_member_relay(args::<MemberRelayArg>(raw)?.setting)),
             "setMemberRelayCap" => ok(self.set_member_relay_cap(args::<MemberRelayCapArg>(raw)?.mb)),
             "markMemberRelayDisclosureSeen" => ok(self.mark_member_relay_disclosure_seen()),
+            "startDeviceLink" => ok(self.start_device_link()),
+            "cancelDeviceLink" => ok(self.cancel_device_link()),
+            "beginDeviceApproval" => ok(self.begin_device_approval(&args::<QrOrCodeArg>(raw)?.qr_or_code)),
+            "confirmDeviceApproval" => ok(self.confirm_device_approval(args::<ApproveArg>(raw)?.approve)),
             // The shell restarts; nothing for the core to do.
             "restartToUpdate" => Ok(Value::Null),
 

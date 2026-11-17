@@ -262,6 +262,35 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the setting, the cap or the disclosure changing.
     The core checks after every command and every sync round.
   - `core.status.memberRelay.effective` is the desktop shell's to add (it builds `core.status`). It can follow `memberRelay.changed`.
+- Device link, "approve on your other device" (`device-link-slice.md`). The network is dev-sync's `/mvs/device-link/1`, behind the port in `device-link-port-api.md`.
+  - **New device** (signed out):
+    - `startDeviceLink()` returns `{ qr, code, expiresAt }`. It's `not-allowed` once signed in, and `offline` without a relay reservation.
+      - `qr` is `mvs-link:1:` and base58 of `e_new_pub ‖ peer ID ‖ "\n" ‖ circuit address`. It's printable ASCII, at most 1024 characters.
+      - `code` is 10 characters of base32 (`[A-Z2-7]`), a rendezvous only: `derive_key("mvs/device-link-rv/v1", code)`.
+      - The link lasts 5 minutes. A new `startDeviceLink` replaces it.
+    - `cancelDeviceLink()` returns `null`.
+    - Event `deviceLink.state`: `{ state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed', sas?, reason?: 'cancelled' | 'timeout' | 'refused' | 'network' }`. Absent fields are left out, never `null`.
+      - `waiting` comes on start.
+      - `confirm`, with `sas`, comes on the approving device's first hello.
+      - `done` comes once the account is restored, followed by `identity.changed`.
+      - `expired` (`timeout`) comes after 5 minutes.
+      - `failed` comes with `cancelled`, or with `refused` (a box that doesn't open), or with no reason (the restore failed).
+  - **Approving device** (signed in):
+    - `beginDeviceApproval(qrOrCode)` returns `{ sas, expiresAt }`. A code may be lowercase, with spaces or dashes. Errors:
+      - `bad-request`: neither a QR nor a code;
+      - `not-allowed`: signed out;
+      - `not-found`: no such link, expired, its one session already taken, or a QR whose key isn't the one answering;
+      - `rate-limited`: after 3 attempts at one link;
+      - `offline`.
+      A retry from the same device reuses its one-time key, so it's the same session with the same digits.
+    - `confirmDeviceApproval(approve: boolean)` returns `null`. `true` sends the account and emits `account.deviceAdded { at }`. `false` ends this attempt, and nothing is sent. Errors: `bad-request` with no approval in progress, `not-found` once expired.
+  - **Crypto:**
+    - one-time X25519 keys;
+    - the SAS is `derive_key("mvs/device-link-sas/v1", e_new_pub ‖ e_old_pub)`, its first 4 bytes little-endian, mod 10^6, as 6 digits;
+    - the transfer key is `HKDF-SHA256(X25519, info "mvs/device-link/v1" ‖ e_new_pub ‖ e_old_pub)`. A low-order point gives no key;
+    - the account goes as one XChaCha20-Poly1305 box, a 24-byte nonce first: `{ seed, profile: { displayName, avatarSmall?, color? }, birthDate, birthDateTrusted, country }`.
+  - **Restore:** the new device follows `restoreIdentity`'s path: the keychain, then the backup's servers (#291). The birth date stays trusted if it was (#306), and the picture and colour are checked as for a profile post.
+  - **Not yet:** the notice on my other devices needs a notice slot at the backup holders (dev-sync). For now only the approving device shows `account.deviceAdded`.
 - Invites (#208), all moderator and up (`not-allowed` below that):
   - `createInvite(serverId, input?: { expiresMs?: number, maxUses?: number })`
     returns `{ id, link, expiresAt?, maxUses? }`. `expiresMs` is the last time a

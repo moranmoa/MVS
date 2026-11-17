@@ -72,6 +72,8 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::CallSignal { .. } => "call.signal",
             Event::VoiceRooms { .. } => "voice.rooms",
             Event::MemberRelayChanged(_) => "memberRelay.changed",
+            Event::DeviceLinkState(_) => "deviceLink.state",
+            Event::DeviceAdded { .. } => "account.deviceAdded",
         })
         .collect()
 }
@@ -5012,4 +5014,135 @@ fn member_relay_cap_and_setting_survive_a_restart() {
     assert!(r.effective, "on, for an adult with no server");
     drop(peer);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The `deviceLink.state` payloads since the last take.
+fn link_states(peer: &Peer) -> Vec<DeviceLinkState> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::DeviceLinkState(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Device link (`device-link-slice.md`): the new device starts a link, the
+/// signed-in one reaches it by the typed code, both show the same digits,
+/// the approval sends the account sealed, and the new device is the same
+/// identity, with the birth date still trusted, the profile, and my
+/// servers back. The approving device shows "a new device was added".
+#[test]
+fn a_device_link_by_code_brings_the_account_over() {
+    let world = World::new();
+    let old = world.peer();
+    let me = sign_up(&old, "Moran");
+    old.core
+        .update_profile(ProfileInput { display_name: "Moran".into(), bio: None, avatar_data_url: None, avatar_small: None, color: Some("#3b82f6".into()) })
+        .unwrap();
+    let server = old.core.create_server("Mine", AgeRestriction::None).unwrap();
+    old.core.sync_now().unwrap(); // the server backup goes out
+
+    let new = world.peer();
+    let link = new.core.start_device_link().unwrap();
+    assert!(link.qr.starts_with("mvs-link:1:") && link.qr.len() <= 1024 && link.qr.is_ascii());
+    assert!(link.code.len() == 10 && link.code.bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)));
+    assert_eq!(link_states(&new)[0].state, DeviceLinkPhase::Waiting);
+
+    let approval = old.core.begin_device_approval(&link.code.to_lowercase()).unwrap();
+    new.core.sync_now().unwrap();
+    let states = link_states(&new);
+    assert_eq!(states.len(), 1);
+    assert_eq!((states[0].state, states[0].sas.as_deref()), (DeviceLinkPhase::Confirm, Some(approval.sas.as_str())));
+
+    old.events.take();
+    old.core.confirm_device_approval(true).unwrap();
+    assert!(old.events.take().iter().any(|e| matches!(e, Event::DeviceAdded { .. })));
+    new.events.take();
+    new.core.sync_now().unwrap();
+    let events = new.events.take();
+    let done = events.iter().position(|e| matches!(e, Event::DeviceLinkState(s) if s.state == DeviceLinkPhase::Done));
+    let changed = events.iter().position(|e| matches!(e, Event::IdentityChanged(_)));
+    assert!(done.is_some() && changed > done, "done, then identity.changed: {:?}", names(&events));
+
+    let mine = new.core.get_identity().unwrap().unwrap();
+    assert_eq!(mine.id, me.id);
+    assert_eq!((mine.display_name.as_str(), mine.color.as_deref()), ("Moran", Some("#3b82f6")));
+    assert_eq!((mine.birth_date.as_str(), mine.country.as_str()), ("1990-05-01", "IL"));
+    assert!(mine.pending_birth_date.is_none(), "trusted: no 30-day wait");
+    new.core.sync_now().unwrap();
+    assert!(new.core.list_servers().unwrap().iter().any(|s| s.id == server.id), "my servers came back");
+
+    // One use: the link is gone.
+    assert_eq!(old.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(old.core.confirm_device_approval(true).unwrap_err().code, ErrorCode::BadRequest);
+}
+
+/// Device link: the QR path; a QR whose key isn't the link's, a second
+/// approving device, 3 attempts, a refusal, expiry and cancel; and the
+/// event leaves absent fields out.
+#[test]
+fn a_device_link_holds_its_rules() {
+    let world = World::new();
+    let old = world.peer();
+    sign_up(&old, "Old");
+    let other = world.peer();
+    sign_up(&other, "Other");
+    let new = world.peer();
+
+    // Absent fields are left out, never null (dev-ui #391).
+    let link = new.core.start_device_link().unwrap();
+    let waiting = serde_json::to_string(&Event::DeviceLinkState(link_states(&new).remove(0))).unwrap();
+    assert!(!waiting.contains("null") && !waiting.contains("sas") && !waiting.contains("reason"), "{waiting}");
+
+    // Not a QR, not a code: bad-request. Signed out: can't approve.
+    assert_eq!(old.core.begin_device_approval("hello").unwrap_err().code, ErrorCode::BadRequest);
+    assert_eq!(new.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::NotAllowed);
+
+    // A QR whose key isn't the one answering (a swapped QR): not-found. Its
+    // Hello took the link's one session, so that link is spent.
+    assert_eq!(old.core.begin_device_approval(&new_key_qr(&link.qr)).unwrap_err().code, ErrorCode::NotFound);
+
+    // A new link (it replaces the last). The real QR: digits. A second
+    // approving device is refused (one session).
+    let link = new.core.start_device_link().unwrap();
+    let first = old.core.begin_device_approval(&link.qr).unwrap();
+    assert_eq!(other.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::NotFound);
+    // The same device again (a retry): the same session, the same digits.
+    assert_eq!(old.core.begin_device_approval(&link.qr).unwrap().sas, first.sas);
+    // Refused: nothing is sent; the third attempt is the last.
+    old.core.confirm_device_approval(false).unwrap();
+    assert_eq!(old.core.confirm_device_approval(true).unwrap_err().code, ErrorCode::BadRequest);
+    old.core.begin_device_approval(&link.qr).unwrap();
+    old.core.confirm_device_approval(false).unwrap();
+    assert_eq!(old.core.begin_device_approval(&link.qr).unwrap_err().code, ErrorCode::RateLimited);
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "nothing was sent");
+
+    // Expiry: 5 minutes on, the new device's link ends.
+    link_states(&new);
+    advance(&world, 5 * 60_000);
+    new.core.sync_now().unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].reason), (DeviceLinkPhase::Expired, Some(DeviceLinkReason::Timeout)));
+
+    // Cancel: failed, cancelled; the code then finds nothing.
+    let again = new.core.start_device_link().unwrap();
+    link_states(&new);
+    new.core.cancel_device_link().unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Cancelled)));
+    assert_eq!(other.core.begin_device_approval(&again.code).unwrap_err().code, ErrorCode::NotFound);
+
+    // Signed in, a device can't start a link.
+    assert_eq!(old.core.start_device_link().unwrap_err().code, ErrorCode::NotAllowed);
+}
+
+/// The same QR with another 32-byte key in front (as a swapped QR would be).
+fn new_key_qr(qr: &str) -> String {
+    let data = qr.strip_prefix("mvs-link:1:").unwrap();
+    let mut bytes = bs58::decode(data).into_vec().unwrap();
+    bytes[0] ^= 1;
+    format!("mvs-link:1:{}", bs58::encode(bytes).into_string())
 }

@@ -29,6 +29,8 @@ import type {
   CallState,
   CallSignal,
   VoiceRoom,
+  CoreSettings,
+  TypingState,
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
@@ -153,6 +155,11 @@ export interface CoreCommands {
   beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
   /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */
   confirmDeviceApproval(approve: boolean): Promise<null>;
+  // G-29 typing (g29-typing-design.md)
+  /** true while typing (the core sends at most every 3 s), false on send or clear. Not sent with the setting off. */
+  setTyping(channelId: Id, on: boolean): Promise<null>;
+  getSettings(): Promise<CoreSettings>;
+  setTypingIndicator(on: boolean): Promise<null>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -243,6 +250,8 @@ export interface CoreEvents {
   'call.signal': CallSignal;
   /** A server's rooms changed (create, join, leave, mute, edit, timeout), mine or not. Coalesced; a hint: re-read with listVoiceRooms. */
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
+  /** G-29: who is typing in a channel (coalesced, at most 5; a typer drops 6 s after the last "on"). */
+  typing: TypingState;
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
   /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */

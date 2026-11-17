@@ -355,6 +355,18 @@ export interface DeviceApproval {
   expiresAt: number;
 }
 
+/** G-29: who is typing in a channel now (ephemeral; at most 5). */
+export interface TypingState {
+  channelId: Id;
+  userIds: Id[];
+}
+
+/** Settings the core keeps on this device. */
+export interface CoreSettings {
+  /** G-29: "Show others when I'm typing" (default on). Off: nothing is sent; others are still shown. */
+  typingIndicator: boolean;
+}
+
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */
 export interface CallSignal {
   from: Id;

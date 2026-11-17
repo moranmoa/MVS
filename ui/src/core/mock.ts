@@ -9,6 +9,7 @@ import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
 import type {
   CallState,
   VoiceRoom,
+  CoreSettings,
   DeviceApproval,
   DeviceLinkOffer,
   MemberRelay,
@@ -90,6 +91,8 @@ export interface MockOptions {
   deviceLink?: 'confirm' | 'expired' | 'failed';
   /** Time between demo messages (default 47 s); hours make the last screen cross days (G-23). */
   messageGapMs?: number;
+  /** G-29: this many demo members are typing in the open channel (1-3). */
+  typing?: number;
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -227,6 +230,17 @@ export class MockCore implements CoreApi {
     if (options.deviceLinked !== undefined) {
       const label = options.deviceLinked;
       this.timers.push(setTimeout(() => this.simulateDeviceAdded(label, Date.now() - 2 * 60_000), 50));
+    }
+    if (options.typing) {
+      const n = Math.min(3, options.typing);
+      // Keeps saying so, as a typing peer does, so screenshots never catch it expired.
+      const tick = () => {
+        const [server] = this.servers.values();
+        if (!server) return;
+        const ids = server.members.filter((m) => m.id !== this.identity?.id && m.presence === 'online').slice(0, n).map((m) => m.id);
+        this.simulateTyping(server.channels[0].channel.id, ids);
+      };
+      this.timers.push(setTimeout(tick, 50), setInterval(tick, 3000));
     }
     if (options.updateInstalled) {
       this.timers.push(
@@ -1441,6 +1455,32 @@ export class MockCore implements CoreApi {
     this.call = this.callOf(here.room);
     this.emitCall();
     return null;
+  }
+
+  // ---- G-29 typing ---------------------------------------------------------------
+
+  private typingIndicator = true;
+  /** What this device last said about typing, by channel (for tests). */
+  typingSent: Record<Id, boolean> = {};
+
+  async setTyping(channelId: Id, on: boolean): Promise<null> {
+    if (!this.channelIndex.has(channelId)) throw err({ code: 'not-found' });
+    if (this.typingIndicator) this.typingSent[channelId] = on;
+    return null;
+  }
+
+  async getSettings(): Promise<CoreSettings> {
+    return { typingIndicator: this.typingIndicator };
+  }
+
+  async setTypingIndicator(on: boolean): Promise<null> {
+    this.typingIndicator = on;
+    return null;
+  }
+
+  /** Mock only: members typing in a channel (an empty list stops them). */
+  simulateTyping(channelId: Id, userIds: Id[]): void {
+    this.emit('typing', { channelId, userIds });
   }
 
   async sendSignal(): Promise<null> {

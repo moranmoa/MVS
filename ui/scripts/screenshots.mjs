@@ -1147,6 +1147,15 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
+// ---- G-29 typing (440-441, chat-and-voice-extras.md) ----------------------------
+for (const [n, name] of [[1, '440-typing-one-he'], [3, '441-typing-many-he']]) {
+  const p = await chat(`?demo=1&still=1&lang=he&theme=light&update=999999&typing=${n}`, 'x');
+  await p.locator('.typing-text').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, name);
+  await p.close();
+}
+
 // Relay-only (#272): 270–271.
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&relayOnly=1&settings=privacy', 'x');

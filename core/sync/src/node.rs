@@ -53,6 +53,7 @@ use zeroize::Zeroizing;
 
 use crate::access::{self, Binder, Binding, Handle, ReadGate, ServerSecret};
 use crate::limits::{Acks, DialBackoff, Pending, PerIp, RateLimiter, Refused};
+use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
@@ -294,6 +295,9 @@ pub enum NodeEvent {
     /// member of `server`, `from` its identity. Opaque here: the api
     /// verifies it (C1) and calls [`Node::serve_invite`] if it holds.
     InvitePublication { server: ServerId, from: PublicKey, bytes: Vec<u8> },
+    /// Device link (new device): the signed-in device's Hello or its sealed
+    /// transfer, already answered. See `device_link`.
+    DeviceLink(crate::device_link::Inbound),
 }
 
 /// Presence on one server (M2). `online` holds bound identities (anyone
@@ -342,14 +346,19 @@ enum Command {
     RelayOnly { on: bool },
     NoDirectDials,
     NoHolePunch,
+    MemberRelay { on: bool, daily_cap_mb: u32 },
     #[cfg(test)]
     Served { peer: PeerId, log: String, reply: oneshot::Sender<usize> },
     #[cfg(test)]
     RateLimited { reply: oneshot::Sender<usize> },
     #[cfg(test)]
     InboundPulls { reply: oneshot::Sender<usize> },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     Dial { addr: Multiaddr },
+    #[cfg(any(test, feature = "test-util"))]
+    Listen { addr: Multiaddr },
+    #[cfg(any(test, feature = "test-util"))]
+    MemberRelayCounts { reply: oneshot::Sender<(u64, u64)> },
     #[cfg(test)]
     Disconnect { peer: PeerId },
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
@@ -360,6 +369,10 @@ enum Command {
     FetchInvite { handle: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
     PutBackup { blob: Vec<u8>, reply: oneshot::Sender<bool> },
     FetchBackup { tag: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
+    LinkOpen { rv: [u8; 32], e_new_pub: [u8; 32], reply: oneshot::Sender<Option<(PeerId, Multiaddr)>> },
+    LinkClose,
+    LinkFind { rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>> },
+    LinkRequest { peer: PeerId, request: crate::device_link::Request, reply: LinkReply },
     Shutdown { reply: oneshot::Sender<()> },
 }
 
@@ -420,6 +433,14 @@ struct SyncResponse {
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    /// First: a connection it refuses (a device-link peer off the relay
+    /// circuit) must reach no other behaviour. Behaviours are asked in field
+    /// order, and one asked before a refusal keeps a connection the swarm
+    /// never reports closed (request-response then trips over it).
+    guard: DialGuard,
+    /// Member relays (`member_relay`): circuit relay v2 for bound current
+    /// members only, off unless the core turns it on.
+    member_relay: crate::member_relay::MemberRelay,
     relay_client: relay::client::Behaviour,
     identify: crate::announce::GlobalIdentify,
     ping: ping::Behaviour,
@@ -427,7 +448,6 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour<gossipsub::IdentityTransform, MaxCountSubscriptionFilter<LogTopics>>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     limits: connection_limits::Behaviour,
-    guard: DialGuard,
     /// Hole punching (DCUtR), with verified members only (`punch`).
     punch: crate::punch::MemberPunch,
     /// Voice signalling (`/mvs/voice/1`), with verified members only (`voice`).
@@ -438,16 +458,40 @@ struct Behaviour {
     invite_ask: crate::invite::AskBehaviour,
     /// Server-list backups (`/mvs/backup/1`, G-91).
     backup: crate::backup::BackupBehaviour,
+    /// "Approve on your other device" (`/mvs/device-link/1`), relay circuit
+    /// only (`device_link`).
+    device_link: crate::device_link::LinkBehaviour,
 }
 
 type SharedBackoff = Arc<Mutex<DialBackoff<PeerId>>>;
+/// Device-link peers: reached through relay circuits only. Shared with the
+/// swarm's `DialGuard`, which refuses any other connection to them.
+type LinkPeers = Arc<Mutex<HashSet<PeerId>>>;
+type LinkReply = oneshot::Sender<Result<Vec<u8>, LinkError>>;
 
 /// Refuses every outgoing connection to a peer that is still backing off
 /// after failed dials, whoever asks: our discovery, or Kademlia's own lookups
 /// (which otherwise asked the relay for a circuit to a gone peer every
 /// round).
+/// Also refuses any connection to or from a device-link peer that is not a
+/// relay circuit (a direct dial, or a hole punch): the link stays relayed.
 struct DialGuard {
     backoff: SharedBackoff,
+    link_peers: LinkPeers,
+}
+
+impl DialGuard {
+    fn circuit_only(&self, peer: &PeerId, relayed: bool) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        if !relayed && self.link_peers.lock().unwrap().contains(peer) {
+            debug!(%peer, "device link: refusing a direct connection");
+            return Err(libp2p::swarm::ConnectionDenied::new("device link peers are reached through the relay only"));
+        }
+        Ok(())
+    }
+}
+
+fn has_circuit(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| p == Protocol::P2pCircuit)
 }
 
 impl NetworkBehaviour for DialGuard {
@@ -472,21 +516,23 @@ impl NetworkBehaviour for DialGuard {
     fn handle_established_inbound_connection(
         &mut self,
         _: ConnectionId,
-        _: PeerId,
-        _: &Multiaddr,
-        _: &Multiaddr,
+        peer: PeerId,
+        local: &Multiaddr,
+        remote: &Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.circuit_only(&peer, has_circuit(local) || has_circuit(remote))?;
         Ok(libp2p::swarm::dummy::ConnectionHandler)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
         _: ConnectionId,
-        _: PeerId,
-        _: &Multiaddr,
+        peer: PeerId,
+        addr: &Multiaddr,
         _: libp2p::core::Endpoint,
         _: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.circuit_only(&peer, has_circuit(addr))?;
         Ok(libp2p::swarm::dummy::ConnectionHandler)
     }
 
@@ -602,6 +648,7 @@ impl Node {
         let (events, event_rx) = mpsc::channel(EVENT_BUFFER);
         let (answers, answer_rx) = mpsc::unbounded_channel();
         let (decoded, decoded_rx) = mpsc::unbounded_channel();
+        let link_peers = swarm.behaviour().guard.link_peers.clone();
         let mut task = Task {
             swarm,
             store,
@@ -682,6 +729,12 @@ impl Node {
             backup_lookups: HashMap::new(),
             backups_expired: Instant::now(),
             backup_looked_up: HashMap::new(),
+            link_host: None,
+            link_peers,
+            link_until: HashMap::new(),
+            link_finds: HashMap::new(),
+            link_waiting: Vec::new(),
+            link_out: HashMap::new(),
         };
         for log in config.logs {
             task.open(log, None);
@@ -768,9 +821,29 @@ impl Node {
         rx.await.unwrap()
     }
 
-    /// Tests: dial `addr` (a node met later than its bootstrap).
-    #[cfg(test)]
-    fn test_dial(&self, addr: Multiaddr) {
+    /// Tests only: dial `addr` (a node met later than its bootstrap, or a
+    /// direct dial the device-link guard must refuse).
+    #[doc(hidden)]
+    /// Tests only: listen on `addr` (a reservation on a member relay, until
+    /// the client side of member relays lands).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_listen(&self, addr: Multiaddr) {
+        let _ = self.send(Command::Listen { addr });
+    }
+
+    /// Tests only: reservations and circuits this node accepted as a member
+    /// relay since it started.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_member_relay_counts(&self) -> Result<(u64, u64)> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::MemberRelayCounts { reply })?;
+        Ok(rx.await?)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_dial(&self, addr: Multiaddr) {
         self.send(Command::Dial { addr }).unwrap();
     }
 
@@ -805,6 +878,14 @@ impl Node {
     #[doc(hidden)]
     pub fn test_no_direct_dials(&self) -> Result<()> {
         self.send(Command::NoDirectDials)
+    }
+
+    /// Member relays (design #368, slice 2): relay for bound current members
+    /// of servers we share, or stop; `daily_cap_mb` is the core's
+    /// `dailyCapMb`. From `MemberRelay.effective` (#389). Never while
+    /// relay-only.
+    pub fn set_member_relay(&self, on: bool, daily_cap_mb: u32) -> Result<()> {
+        self.send(Command::MemberRelay { on, daily_cap_mb })
     }
 
     /// Tests only: no hole punching (DCUtR) from or with this node, so the
@@ -909,6 +990,57 @@ impl Node {
     }
 
     /// Closes all connections and the store.
+    /// Device link, new device: opens (or replaces) the one link. We become
+    /// a DHT provider of `rv` for [`crate::DEVICE_LINK_TTL`] and answer one
+    /// signed-in device on `/mvs/device-link/1`: its Hello with `e_new_pub`.
+    /// What arrives comes as [`NodeEvent::DeviceLink`]. While a link is open
+    /// this node dials nobody directly and is reached by its link peer
+    /// through the relay only. Our peer ID and relay circuit address (for
+    /// the QR), or None without a relay reservation (try again later).
+    pub async fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Result<Option<(PeerId, Multiaddr)>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LinkOpen { rv, e_new_pub, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Device link, new device: stops providing the rendezvous and answering.
+    pub fn device_link_close(&self) -> Result<()> {
+        self.send(Command::LinkClose)
+    }
+
+    /// Device link, signed-in device: who provides `rv` (a provider lookup,
+    /// at most [`crate::DEVICE_LINK_FIND_WAIT`]).
+    pub async fn device_link_find(&self, rv: [u8; 32]) -> Result<PeerId, LinkError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LinkFind { rv, reply }).map_err(|_| LinkError::Network)?;
+        rx.await.unwrap_or(Err(LinkError::Network))
+    }
+
+    /// Device link, signed-in device: Hello to `peer` through our relay's
+    /// circuit only; its `e_new_pub`.
+    pub async fn device_link_hello(&self, peer: PeerId, e_old_pub: [u8; 32]) -> Result<[u8; 32], LinkError> {
+        let answer = self.link_request(peer, LinkRequest::Hello(e_old_pub)).await?;
+        answer.try_into().map_err(|_| LinkError::Refused)
+    }
+
+    /// Device link, signed-in device: the sealed transfer to the peer we
+    /// said Hello to. Ok once it acknowledged receipt.
+    pub async fn device_link_send(&self, peer: PeerId, ciphertext: Vec<u8>) -> Result<(), LinkError> {
+        if ciphertext.is_empty() || ciphertext.len() >= crate::MAX_DEVICE_LINK {
+            return Err(LinkError::Refused);
+        }
+        match self.link_request(peer, LinkRequest::Sealed(ciphertext)).await?.as_slice() {
+            [1] => Ok(()),
+            _ => Err(LinkError::Refused),
+        }
+    }
+
+    async fn link_request(&self, peer: PeerId, request: LinkRequest) -> Result<Vec<u8>, LinkError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LinkRequest { peer, request, reply }).map_err(|_| LinkError::Network)?;
+        rx.await.unwrap_or(Err(LinkError::Network))
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Shutdown { reply })?;
@@ -1016,12 +1148,14 @@ async fn build_swarm(
                     request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
                 ),
                 limits: connection_limits::Behaviour::new(limits),
-                guard: DialGuard { backoff },
+                guard: DialGuard { backoff, link_peers: LinkPeers::default() },
+                member_relay: crate::member_relay::MemberRelay::new(peer_id),
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
                 backup: crate::backup::behaviour(),
+                device_link: crate::device_link::behaviour(),
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_TIMEOUT))
@@ -1255,6 +1389,17 @@ struct Task {
     backups_expired: Instant,
     /// When each tag's providers were last looked up.
     backup_looked_up: HashMap<[u8; 32], Instant>,
+    /// Device link, new device: the one open link.
+    link_host: Option<LinkHost>,
+    /// Device-link peers (either side), reached through the relay only, and
+    /// until when; the set is shared with the `DialGuard`.
+    link_peers: LinkPeers,
+    link_until: HashMap<PeerId, Instant>,
+    /// Provider lookups for a code, and until when they may run.
+    link_finds: HashMap<kad::QueryId, (oneshot::Sender<Result<PeerId, LinkError>>, Instant)>,
+    /// Requests waiting for a relayed connection to their peer, and until when.
+    link_waiting: Vec<(PeerId, LinkRequest, LinkReply, Instant)>,
+    link_out: HashMap<request_response::OutboundRequestId, LinkReply>,
 }
 
 /// One [`Node::fetch_invite`]: answers so far, until every peer answered or
@@ -1326,7 +1471,9 @@ impl Task {
                     self.pull_soon();
                     self.direct_fallback();
                     self.recheck_punch();
+                    self.recheck_member_relay();
                     self.expire_fetches();
+                    self.link_tick();
                     let gone = self.presence.expire(Instant::now());
                     self.went_offline(gone);
                 }
@@ -1416,10 +1563,25 @@ impl Task {
             Command::InboundPulls { reply } => {
                 let _ = reply.send(self.pulls_received);
             }
-            #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
+            Command::Listen { addr } => {
+                let _ = self.swarm.listen_on(addr);
+            }
+    #[cfg(any(test, feature = "test-util"))]
+            Command::MemberRelayCounts { reply } => {
+                let relay = &self.swarm.behaviour().member_relay;
+                let _ = reply.send((relay.reservations, relay.circuits));
+            }
+    #[cfg(any(test, feature = "test-util"))]
             Command::Dial { addr } => {
                 let _ = self.swarm.dial(addr);
             }
+            Command::LinkOpen { rv, e_new_pub, reply } => {
+                let _ = reply.send(self.link_open(rv, e_new_pub));
+            }
+            Command::LinkClose => self.link_close(),
+            Command::LinkFind { rv, reply } => self.link_find(rv, reply),
+            Command::LinkRequest { peer, request, reply } => self.link_request(peer, request, reply),
             #[cfg(test)]
             Command::Disconnect { peer } => {
                 let _ = self.swarm.disconnect_peer_id(peer);
@@ -1442,6 +1604,12 @@ impl Task {
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
+            Command::MemberRelay { on, daily_cap_mb } => {
+                // Relay-only users never relay (design §1), whatever the core says.
+                let on = on && !self.relay_only;
+                self.swarm.behaviour_mut().member_relay.set(on, daily_cap_mb);
+                self.recheck_member_relay();
+            }
             Command::ListenAddrs { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
@@ -1941,6 +2109,9 @@ impl Task {
         // No hole punching either way while relay-only (GAP-6).
         self.swarm.behaviour_mut().punch.set_enabled(!on);
         if on {
+            // Relay-only users never relay for members (design #368 §1); the
+            // core turns it on again, if it should be, once this is off.
+            self.swarm.behaviour_mut().member_relay.stop();
             for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
                 self.swarm.remove_listener(id);
             }
@@ -1975,7 +2146,12 @@ impl Task {
     /// off; see `punch`. Each side does this once it verified the other;
     /// until then the side that would answer holds the request.
     fn try_punch(&mut self, peer: PeerId) {
-        if self.relay_only || self.direct.contains_key(&peer) || !self.relayed.contains_key(&peer) || !self.is_member(peer) {
+        if self.relay_only
+            || self.direct.contains_key(&peer)
+            || !self.relayed.contains_key(&peer)
+            || self.link_blocks(&peer)
+            || !self.is_member(peer)
+        {
             return;
         }
         if self.swarm.behaviour_mut().punch.open(peer) {
@@ -1985,6 +2161,17 @@ impl Task {
 
     /// Every second: close the punch gate of a peer that stopped being a
     /// member (kicked, or our read gate changed) since we opened it.
+    /// Every second: the member relay's gates follow who is a bound current
+    /// member now (design #368 §1 rule 1). Never while relay-only.
+    fn recheck_member_relay(&mut self) {
+        if !self.swarm.behaviour().member_relay.enabled() {
+            return;
+        }
+        let peers: Vec<PeerId> = self.swarm.behaviour().member_relay.connected().copied().collect();
+        let members = if self.relay_only { HashSet::new() } else { peers.into_iter().filter(|p| self.is_member(*p)).collect() };
+        self.swarm.behaviour_mut().member_relay.set_members(members);
+    }
+
     fn recheck_punch(&mut self) {
         for peer in self.swarm.behaviour().punch.open_peers() {
             if !self.is_member(peer) {
@@ -2030,7 +2217,9 @@ impl Task {
     }
 
     fn dial_direct(&mut self, peer: PeerId) {
-        if !self.direct_dials {
+        // Device link: no direct dial while a link is open here, nor to a
+        // link peer (`try_direct` and `direct_fallback` both end here).
+        if !self.direct_dials || self.link_blocks(&peer) {
             return;
         }
         let lan = self.allow_lan && self.is_member(peer);
@@ -2293,6 +2482,7 @@ impl Task {
                     self.track_connection(peer_id, connection_id, &endpoint);
                     if is_relayed(&endpoint) {
                         self.try_punch(peer_id);
+                        self.flush_link_waiting();
                     }
                 }
                 if peer_id == self.relay_peer {
@@ -2332,6 +2522,7 @@ impl Task {
                         debug!(%peer_id, "direct connection gone: relayed again");
                         self.relayed.insert(peer_id, parked);
                         self.emit(NodeEvent::Link { peer: peer_id, direct: false });
+                        self.flush_link_waiting();
                     }
                 }
                 if num_established > 0 {
@@ -2536,6 +2727,41 @@ impl Task {
                 debug!(%peer, %error, "backup request failed");
                 if let Some(id) = self.backup_fetch_of.remove(&request_id) {
                     self.fetch_answered(id, None);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                id,
+                result: kad::QueryResult::GetProviders(result),
+                step,
+                ..
+            })) if self.link_finds.contains_key(&id) => {
+                let providers = match result {
+                    Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => providers.into_iter().collect(),
+                    _ => Vec::new(),
+                };
+                self.on_link_providers(id, providers, step.last);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::DeviceLink(request_response::Event::Message { peer, message, .. })) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.on_link_request(peer, request, channel)
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        if let Some(reply) = self.link_out.remove(&request_id) {
+                            let _ = reply.send(if response.is_empty() { Err(LinkError::Refused) } else { Ok(response) });
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::DeviceLink(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            })) => {
+                debug!(%peer, %error, "device link request failed");
+                if let Some(reply) = self.link_out.remove(&request_id) {
+                    let _ = reply.send(Err(LinkError::Network));
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
@@ -3080,6 +3306,162 @@ impl Task {
                 self.parked.entry(peer).or_default().extend(old);
             }
         }
+    }
+}
+
+/// Device link (`device_link`): rendezvous, circuit-only requests, and the
+/// one link a new device answers.
+const MAX_LINK_FINDS: usize = 4;
+const MAX_LINK_WAITING: usize = 8;
+const MAX_LINK_PEERS: usize = 64;
+const LINK_REQUEST_WAIT: Duration = Duration::from_secs(20);
+
+impl Task {
+    /// Our relay circuit address, once the relay holds a reservation for us.
+    fn our_circuit(&self) -> Option<Multiaddr> {
+        let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit);
+        let reserved = self.circuit.is_some()
+            && self.swarm.is_connected(&self.relay_peer)
+            && self.swarm.external_addresses().any(|a| *a == circuit);
+        reserved.then(|| circuit.with(Protocol::P2p(*self.swarm.local_peer_id())))
+    }
+
+    fn link_open(&mut self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<(PeerId, Multiaddr)> {
+        let circuit = self.our_circuit()?;
+        self.link_close();
+        if let Err(err) = self.swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(&rv)) {
+            debug!(%err, "device link: announcing the rendezvous failed");
+            return None;
+        }
+        self.link_host = Some(LinkHost::new(rv, e_new_pub, Instant::now()));
+        info!("device link open");
+        Some((*self.swarm.local_peer_id(), circuit))
+    }
+
+    fn link_close(&mut self) {
+        if let Some(host) = self.link_host.take() {
+            self.swarm.behaviour_mut().kad.stop_providing(&kad::RecordKey::new(&host.rv));
+            info!("device link closed");
+        }
+    }
+
+    /// Whether a direct path to `peer` is off because of a device link: any
+    /// peer while a link is open here (new device), or a link peer.
+    fn link_blocks(&self, peer: &PeerId) -> bool {
+        self.link_host.is_some() || self.link_until.contains_key(peer)
+    }
+
+    /// From now on `peer` is reached through the relay only: the guard
+    /// refuses any other connection, and direct ones already open close.
+    fn mark_link_peer(&mut self, peer: PeerId) {
+        if !self.link_until.contains_key(&peer) && self.link_until.len() >= MAX_LINK_PEERS {
+            return;
+        }
+        let until = Instant::now() + crate::DEVICE_LINK_TTL + Duration::from_secs(60);
+        self.link_until.insert(peer, until);
+        self.link_peers.lock().unwrap().insert(peer);
+        self.fallback_at.remove(&peer);
+        self.swarm.behaviour_mut().punch.close(peer);
+        for id in self.direct.get(&peer).cloned().unwrap_or_default() {
+            debug!(%peer, "device link: closing a direct connection");
+            self.swarm.close_connection(id);
+        }
+    }
+
+    fn link_find(&mut self, rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>>) {
+        if self.link_finds.len() >= MAX_LINK_FINDS {
+            let _ = reply.send(Err(LinkError::Network));
+            return;
+        }
+        let query = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&rv));
+        self.link_finds.insert(query, (reply, Instant::now() + crate::DEVICE_LINK_FIND_WAIT));
+    }
+
+    fn on_link_providers(&mut self, query: kad::QueryId, providers: Vec<PeerId>, last: bool) {
+        let me = *self.swarm.local_peer_id();
+        let found = providers.into_iter().find(|p| *p != me);
+        if found.is_none() && !last {
+            return;
+        }
+        if let Some((reply, _)) = self.link_finds.remove(&query) {
+            let _ = reply.send(found.ok_or(LinkError::NotFound));
+        }
+        if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&query) {
+            q.finish();
+        }
+    }
+
+    fn link_request(&mut self, peer: PeerId, request: LinkRequest, reply: LinkReply) {
+        if peer == *self.swarm.local_peer_id() || peer == self.relay_peer || self.link_waiting.len() >= MAX_LINK_WAITING {
+            let _ = reply.send(Err(LinkError::Network));
+            return;
+        }
+        self.mark_link_peer(peer);
+        if !self.link_until.contains_key(&peer) {
+            let _ = reply.send(Err(LinkError::Network));
+            return;
+        }
+        self.link_waiting.push((peer, request, reply, Instant::now() + LINK_REQUEST_WAIT));
+        if !self.relayed.contains_key(&peer) {
+            // Through our relay's circuit only, never an address from the DHT.
+            let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer));
+            let opts = DialOpts::peer_id(peer).addresses(vec![circuit]).condition(PeerCondition::Always).build();
+            if let Err(err) = self.swarm.dial(opts) {
+                debug!(%peer, ?err, "device link: dialling the circuit failed");
+            }
+        }
+        self.flush_link_waiting();
+    }
+
+    /// Sends each waiting request whose peer is now reached through a
+    /// relayed connection only; fails those past their time.
+    fn flush_link_waiting(&mut self) {
+        let now = Instant::now();
+        for (peer, request, reply, until) in std::mem::take(&mut self.link_waiting) {
+            if self.relayed.contains_key(&peer) && !self.direct.contains_key(&peer) {
+                let id = self.swarm.behaviour_mut().device_link.send_request(&peer, request);
+                self.link_out.insert(id, reply);
+            } else if now >= until {
+                let _ = reply.send(Err(LinkError::Network));
+            } else {
+                self.link_waiting.push((peer, request, reply, until));
+            }
+        }
+    }
+
+    fn on_link_request(&mut self, peer: PeerId, request: LinkRequest, channel: ResponseChannel<Vec<u8>>) {
+        let (answer, inbound) = match self.link_host.as_mut() {
+            Some(host) => host.answer(peer, request, Instant::now()),
+            None => (Vec::new(), None),
+        };
+        if matches!(inbound, Some(crate::device_link::Inbound::Hello { .. })) {
+            self.mark_link_peer(peer);
+            debug!(%peer, "device link: hello");
+        }
+        let _ = self.swarm.behaviour_mut().device_link.send_response(channel, answer);
+        if let Some(inbound) = inbound {
+            self.emit(NodeEvent::DeviceLink(inbound));
+        }
+    }
+
+    /// Every second: the link's five minutes, link peers' marks, lookups and
+    /// requests past their time.
+    fn link_tick(&mut self) {
+        let now = Instant::now();
+        if self.link_host.as_ref().is_some_and(|h| h.expired(now)) {
+            self.link_close();
+        }
+        let gone: Vec<PeerId> = self.link_until.iter().filter(|(_, until)| now >= **until).map(|(p, _)| *p).collect();
+        for peer in gone {
+            self.link_until.remove(&peer);
+            self.link_peers.lock().unwrap().remove(&peer);
+        }
+        let late: Vec<kad::QueryId> =
+            self.link_finds.iter().filter(|(_, (_, until))| now >= *until).map(|(q, _)| *q).collect();
+        for query in late {
+            self.on_link_providers(query, Vec::new(), true);
+        }
+        self.flush_link_waiting();
     }
 }
 

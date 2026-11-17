@@ -3192,6 +3192,9 @@ impl Inner {
                 if self.member_relay.is_some() {
                     events.push(Event::MemberRelayChanged(now.clone()));
                 }
+                // Slice 2: the network relays for members only while this
+                // says so (the first check, at start, sets it too).
+                ports.network.set_member_relay(now.effective, now.daily_cap_mb);
                 self.member_relay = Some(now);
             }
             Ok(_) => {}

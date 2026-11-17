@@ -2798,11 +2798,13 @@ fn a_call_between_members() {
 struct RelayOnlyNet {
     world: Arc<LoopbackNetwork>,
     applied: std::sync::Mutex<Vec<bool>>,
+    /// Each member relay setting (on, daily cap) it was given.
+    relays: std::sync::Mutex<Vec<(bool, u32)>>,
 }
 
 impl RelayOnlyNet {
     fn new(world: &Arc<LoopbackNetwork>) -> Arc<RelayOnlyNet> {
-        Arc::new(RelayOnlyNet { world: world.clone(), applied: Default::default() })
+        Arc::new(RelayOnlyNet { world: world.clone(), applied: Default::default(), relays: Default::default() })
     }
 
     fn applied(&self) -> Vec<bool> {
@@ -2821,6 +2823,10 @@ impl Network for RelayOnlyNet {
 
     fn set_relay_only(&self, on: bool) {
         self.applied.lock().unwrap().push(on);
+    }
+
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
+        self.relays.lock().unwrap().push((on, daily_cap_mb));
     }
 }
 
@@ -5197,4 +5203,26 @@ fn a_racing_device_cant_sign_the_new_device_in() {
     new.core.confirm_device_link(true).unwrap();
     assert!(link_states(&new).iter().any(|s| s.state == DeviceLinkPhase::Done));
     assert_eq!(new.core.get_identity().unwrap().unwrap().id, me.id);
+}
+
+/// Member relays, slice 2: the network is told `effective` and the daily
+/// cap at start and on every change, and only then.
+#[test]
+fn the_network_follows_the_member_relay_setting() {
+    let world = World::new();
+    let net = RelayOnlyNet::new(&world.network);
+    let owner = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    sign_up(&owner, "Owner");
+    let relays = || net.relays.lock().unwrap().clone();
+    assert_eq!(relays(), [(false, 2_048)], "told at start");
+    owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    assert_eq!(relays().last(), Some(&(true, 2_048)));
+    owner.core.set_member_relay_cap(512).unwrap();
+    assert_eq!(relays().last(), Some(&(true, 512)));
+    let told = relays().len();
+    owner.core.sync_now().unwrap();
+    assert_eq!(relays().len(), told, "nothing changed, nothing told");
+    owner.core.set_relay_only(true).unwrap();
+    assert_eq!(relays().last(), Some(&(false, 512)));
 }

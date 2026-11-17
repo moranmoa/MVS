@@ -198,6 +198,13 @@ pub trait Network: Send + Sync {
         let _ = on;
     }
 
+    /// Member relays (#368, slice 2): relay for bound current members of
+    /// servers we share (`MemberRelay.effective`), up to `daily_cap_mb` a
+    /// day. At start and on each change.
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
+        let _ = (on, daily_cap_mb);
+    }
+
     /// Restore servers, phase A (#291): hands my sealed backup to the
     /// holders (dev-sync's `/mvs/backup/1` stores and the relay mailbox, when
     /// they exist). Best effort; the next sync round writes again.

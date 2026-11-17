@@ -680,7 +680,7 @@ pub enum MemberRelayReason {
     Minor,
     /// Relay-only is on.
     RelayOnly,
-    /// A metered network. Reserved: slice 3.
+    /// A metered network, as the desktop shell reports it (`setMetered`).
     Metered,
 }
 

@@ -22,6 +22,7 @@ const deeplink = require('./deeplink');
 const { relaysFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
+const metered = require('./metered');
 const { createNotifier } = require('./notify');
 
 // Tests only, and only in a checkout (never a release build): a throwaway
@@ -86,6 +87,17 @@ function setCoreStatus(status) {
   callGate.onCoreStatus(status);
   coreStatus = status;
   toPages('core.status', statusForPage(status));
+  // The core keeps the metered flag in memory: tell every core that comes up.
+  if (status.state === 'up') sendMetered();
+}
+
+/** Member relays, slice 3a: the metered-connection watch (metered.js). */
+let meteredWatch = null;
+
+/** Tells the core whether we're on a metered connection (shell only; the page can't). */
+function sendMetered() {
+  if (!core || coreStatus.state !== 'up' || !meteredWatch) return;
+  Promise.resolve(core.request('setMetered', { metered: meteredWatch.current() })).catch(() => {});
 }
 
 // In-app update (B8): on only in an installed copy that has mvs-launcher; the
@@ -487,6 +499,7 @@ app.whenReady().then(() => {
   // With updates on, links go to the launcher, which starts the healthy version.
   if (app.isPackaged) app.setAsDefaultProtocolClient(deeplink.SCHEME, UPDATE ? UPDATE.launcher : process.execPath, ['--']);
   startCore();
+  meteredWatch = metered.watchMetered({ onChange: () => sendMetered() });
   createWindow();
   const first = deeplink.inviteFromArgv(process.argv);
   if (first) openInvite(first);
@@ -504,6 +517,7 @@ app.on('second-instance', (_event, argv) => {
 });
 
 app.on('will-quit', () => {
+  meteredWatch?.stop();
   callGate.end();
   core?.stop();
 });

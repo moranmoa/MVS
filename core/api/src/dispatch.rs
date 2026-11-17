@@ -237,6 +237,11 @@ struct QrOrCodeArg {
 }
 
 #[derive(Deserialize)]
+struct AtArg {
+    at: u64,
+}
+
+#[derive(Deserialize)]
 struct MatchArg {
     r#match: bool,
 }
@@ -412,6 +417,7 @@ impl Core {
             "beginDeviceApproval" => ok(self.begin_device_approval(&args::<QrOrCodeArg>(raw)?.qr_or_code)),
             "confirmDeviceApproval" => ok(self.confirm_device_approval(args::<ApproveArg>(raw)?.approve)),
             "confirmDeviceLink" => ok(self.confirm_device_link(args::<MatchArg>(raw)?.r#match)),
+            "ackDeviceNotice" => ok(self.ack_device_notice(args::<AtArg>(raw)?.at)),
             // The shell restarts; nothing for the core to do.
             "restartToUpdate" => Ok(Value::Null),
 

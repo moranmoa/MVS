@@ -34,6 +34,12 @@ const KV_UPDATE_CHANNEL: &str = "update-channel";
 /// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
 /// about this computer's network.
 const KV_RELAY_ONLY: &str = "relay-only";
+/// Device link: "a new device was added" notices not yet acknowledged
+/// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
+/// start until acknowledged; the cross-device notice will feed it too.
+const KV_DEVICE_NOTICES: &str = "device-notices";
+/// At most this many notices are kept, the newest.
+const MAX_DEVICE_NOTICES: usize = 32;
 /// Member relays (#368, slice 1): `auto`, `on` or `off` (default `auto`);
 /// the one-time disclosure seen (`[1]`); the daily cap in MB (u32le).
 const KV_MEMBER_RELAY: &str = "member-relay";
@@ -340,6 +346,8 @@ pub struct Core {
     signed_out: AtomicBool,
     /// Restore servers: the first sync round after start backs up (login).
     backup_started: AtomicBool,
+    /// Device link: the stored notices were announced since this start.
+    notices_announced: AtomicBool,
     /// Restore servers: when the next retry of a pending restore is due and
     /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
     /// once the restore is done.
@@ -504,6 +512,7 @@ impl Core {
             db_path: config.db_path,
             signed_out: AtomicBool::new(false),
             backup_started: AtomicBool::new(false),
+            notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
         })
     }
@@ -2113,6 +2122,7 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        self.announce_device_notices();
         // Device link, the new device: its link moves on even before sign-in.
         self.poll_device_link();
         let result = self.sync_round();
@@ -2608,8 +2618,37 @@ impl Core {
         self.ports.network.device_link_send(&addr, &sealed).map_err(link_error)?;
         // TODO(device link): the notice to my other devices goes on the
         // backup-store notice path once holders keep one (dev-sync).
-        self.emit(vec![Event::DeviceAdded { at: now }]);
+        // Kept until acknowledged, and announced now.
+        {
+            let inner = self.lock();
+            let mut notices = device_notices(&inner.db)?;
+            notices.push(now);
+            // The newest MAX_DEVICE_NOTICES only (Tech Lead on #415).
+            let extra = notices.len().saturating_sub(MAX_DEVICE_NOTICES);
+            notices.drain(..extra);
+            inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))?;
+        }
+        self.emit(vec![Event::DeviceAdded { at: now, label: notice_label(None) }]);
         Ok(())
+    }
+
+    /// Device link: the user saw the "a new device was added" notice with
+    /// this `at`; it isn't announced again. An unknown `at` is fine.
+    pub fn ack_device_notice(&self, at: u64) -> CoreResult<()> {
+        let inner = self.lock();
+        let mut notices = device_notices(&inner.db)?;
+        notices.retain(|n| *n != at);
+        inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))
+    }
+
+    /// Device link: once per start (the first sync round, when the UI is
+    /// up), every notice not yet acknowledged.
+    fn announce_device_notices(&self) {
+        if self.notices_announced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let notices = device_notices(&self.lock().db).unwrap_or_default();
+        self.emit(notices.into_iter().map(|at| Event::DeviceAdded { at, label: notice_label(None) }).collect());
     }
 
     pub fn set_update_channel(&self, channel: UpdateChannel) -> CoreResult<()> {
@@ -4608,6 +4647,20 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
     }
 }
 
+
+/// A device notice's label as shown: plain text, trimmed, at most 64
+/// characters, with no control characters; anything else, or empty, is
+/// left out (Security Lead on #415). Today the new device sends none; the
+/// cross-device notice will pass what it carries through here.
+fn notice_label(raw: Option<&str>) -> Option<String> {
+    let label = raw?.trim();
+    let ok = !label.is_empty() && label.chars().count() <= 64 && !label.chars().any(char::is_control);
+    ok.then(|| label.to_owned())
+}
+fn device_notices(db: &Db) -> CoreResult<Vec<u64>> {
+    Ok(db.get(KV_DEVICE_NOTICES)?.and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default())
+}
+
 fn link_state(state: DeviceLinkPhase, sas: Option<String>, reason: Option<DeviceLinkReason>) -> Event {
     Event::DeviceLinkState(DeviceLinkState { state, sas, reason })
 }
@@ -4651,5 +4704,35 @@ mod relay_only_tests {
         std::fs::write(&junk, vec![0x5a; 4096]).unwrap();
         assert!(stored_relay_only(&junk));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod device_notice_tests {
+    use super::{notice_label, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+
+    /// Security Lead on #415: a label is plain text, at most 64 characters.
+    #[test]
+    fn labels_are_plain_short_text_or_left_out() {
+        assert_eq!(notice_label(Some("  Windows laptop ")).as_deref(), Some("Windows laptop"));
+        assert_eq!(notice_label(Some(&"א".repeat(64))).map(|l| l.chars().count()), Some(64));
+        assert_eq!(notice_label(Some(&"x".repeat(65))), None);
+        assert_eq!(notice_label(Some("bad\u{1b}[31m")), None);
+        assert_eq!(notice_label(Some("two\nlines")), None);
+        assert_eq!(notice_label(Some("   ")), None);
+        assert_eq!(notice_label(None), None);
+    }
+
+    /// Tech Lead on #415: the stored list keeps only the newest 32.
+    #[test]
+    fn the_notice_list_is_capped() {
+        let db = Db::open(None).unwrap();
+        let notices: Vec<u64> = (0..40).collect();
+        let extra = notices.len().saturating_sub(MAX_DEVICE_NOTICES);
+        let kept: Vec<u64> = notices[extra..].to_vec();
+        db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&kept).unwrap()).unwrap();
+        let stored = super::device_notices(&db).unwrap();
+        assert_eq!(stored.len(), 32);
+        assert_eq!((stored[0], stored[31]), (8, 39), "the newest are kept");
     }
 }

@@ -112,7 +112,7 @@ export function PushToTalkSection() {
         <span className="field-label">
           <FormattedMessage id="voice.globalMute" />
         </span>
-        <div className="row">
+        <div className="key-row">
           <KeyCapture
             value={prefs.globalMute ? acceleratorLabel(prefs.globalMute) : null}
             label={intl.formatMessage({ id: 'voice.globalMute' })}

@@ -308,6 +308,9 @@ pub enum ErrorCode {
     NothingStaged,
     /// Device link: too many attempts at this link.
     RateLimited,
+    /// Device link: another device holds this link (someone else may be
+    /// trying).
+    LockedOut,
     DiskFull,
 }
 

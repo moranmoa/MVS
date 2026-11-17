@@ -5056,6 +5056,8 @@ fn a_device_link_by_code_brings_the_account_over() {
     assert_eq!(states.len(), 1);
     assert_eq!((states[0].state, states[0].sas.as_deref()), (DeviceLinkPhase::Confirm, Some(approval.sas.as_str())));
 
+    // The new device shows the same digits; its user confirms the match.
+    new.core.confirm_device_link(true).unwrap();
     old.events.take();
     old.core.confirm_device_approval(true).unwrap();
     assert!(old.events.take().iter().any(|e| matches!(e, Event::DeviceAdded { .. })));
@@ -5108,7 +5110,7 @@ fn a_device_link_holds_its_rules() {
     // approving device is refused (one session).
     let link = new.core.start_device_link().unwrap();
     let first = old.core.begin_device_approval(&link.qr).unwrap();
-    assert_eq!(other.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(other.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::LockedOut);
     // The same device again (a retry): the same session, the same digits.
     assert_eq!(old.core.begin_device_approval(&link.qr).unwrap().sas, first.sas);
     // Refused: nothing is sent; the third attempt is the last.
@@ -5145,4 +5147,54 @@ fn new_key_qr(qr: &str) -> String {
     let mut bytes = bs58::decode(data).into_vec().unwrap();
     bytes[0] ^= 1;
     format!("mvs-link:1:{}", bs58::encode(bytes).into_string())
+}
+
+/// Security Lead on #394: a DHT server saw the rendezvous and races the
+/// first Hello with its own account. The new device applies nothing until
+/// its user confirms the digits; mine is then locked out (`locked-out`), and
+/// "they don't match" ends the link with nothing applied. With the right
+/// device, the account that arrived before the confirm is applied on it.
+#[test]
+fn a_racing_device_cant_sign_the_new_device_in() {
+    let world = World::new();
+    let mine = world.peer();
+    let me = sign_up(&mine, "Me");
+    let mallory = world.peer();
+    sign_up(&mallory, "Mallory");
+    let new = world.peer();
+
+    let link = new.core.start_device_link().unwrap();
+    // Before any Hello there are no digits to confirm.
+    assert_eq!(new.core.confirm_device_link(true).unwrap_err().code, ErrorCode::BadRequest);
+    // Mallory gets there first and sends her account at once.
+    let theirs = mallory.core.begin_device_approval(&link.code).unwrap();
+    assert_eq!(mine.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::LockedOut);
+    mallory.core.confirm_device_approval(true).unwrap();
+    link_states(&new);
+    new.core.sync_now().unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].sas.as_deref()), (DeviceLinkPhase::Confirm, Some(theirs.sas.as_str())));
+    assert!(states.iter().all(|s| s.state != DeviceLinkPhase::Done));
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "nothing applied before the confirm");
+    // My digits aren't hers: "they don't match".
+    new.core.confirm_device_link(false).unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Refused)));
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "her account was wiped, never applied");
+    assert_eq!(new.core.confirm_device_link(true).unwrap_err().code, ErrorCode::NotFound);
+
+    // Start again with my device; this time the account arrives first and
+    // the confirm applies it.
+    let link = new.core.start_device_link().unwrap();
+    let approval = mine.core.begin_device_approval(&link.qr).unwrap();
+    mine.core.confirm_device_approval(true).unwrap();
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "held until the confirm");
+    let states = link_states(&new);
+    assert!(states.iter().any(|s| s.sas.as_deref() == Some(approval.sas.as_str())));
+    new.core.confirm_device_link(true).unwrap();
+    assert!(link_states(&new).iter().any(|s| s.state == DeviceLinkPhase::Done));
+    assert_eq!(new.core.get_identity().unwrap().unwrap().id, me.id);
 }

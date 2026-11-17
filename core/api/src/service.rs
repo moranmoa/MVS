@@ -230,6 +230,12 @@ struct NewLink {
     key: OneTimeKey,
     expires_at: u64,
     old_pub: Option<[u8; 32]>,
+    /// My user said the digits match (`confirmDeviceLink(true)`). Nothing
+    /// is applied before: a DHT server that saw the rendezvous could race
+    /// the first Hello and send its own seed (Security Lead on #394).
+    confirmed: bool,
+    /// The opened account, held until `confirmed`.
+    held: Option<devicelink::Payload>,
 }
 
 /// Device link, the approving device's side, per link: the one-time key
@@ -2373,7 +2379,7 @@ impl Core {
                 return Err(ErrorCode::Internal.into());
             }
             let expires_at = ports.clock.now_ms() + devicelink::LINK_TTL_MS;
-            inner.device_link = Some(NewLink { key, expires_at, old_pub: None });
+            inner.device_link = Some(NewLink { key, expires_at, old_pub: None, confirmed: false, held: None });
             events.push(link_state(DeviceLinkPhase::Waiting, None, None));
             Ok(DeviceLinkStart { qr, code, expires_at })
         })
@@ -2393,14 +2399,14 @@ impl Core {
 
     /// New device, each sync round (and on the network's wake-up): the
     /// approving device's Hello shows the digits (`confirm`); its sealed
-    /// account is opened and restored (`done`, then `identity.changed`); a
-    /// link past its 5 minutes ends (`expired`).
+    /// account is opened and held until my user confirms the digits
+    /// (`confirmDeviceLink`), then restored (`done`, then
+    /// `identity.changed`); a link past its 5 minutes ends (`expired`).
     pub fn poll_device_link(&self) {
         let mut events = Vec::new();
         let payload = {
             let mut inner = self.lock();
             let Some(link) = inner.device_link.as_mut() else { return };
-            let mut payload = None;
             let mut end = None;
             for inbound in self.ports.network.device_link_take() {
                 match inbound {
@@ -2415,31 +2421,74 @@ impl Core {
                             devicelink::open(&key, &ciphertext)
                         });
                         match opened {
-                            Some(p) => payload = Some(p),
+                            Some(p) => link.held = Some(p),
                             None => end = Some((DeviceLinkPhase::Failed, DeviceLinkReason::Refused)),
                         }
+                        // The network takes one transfer per link.
+                        self.ports.network.device_link_close();
                         break;
                     }
                     DeviceLinkInbound::Hello { .. } => {}
                 }
             }
-            if payload.is_none() && end.is_none() && self.ports.clock.now_ms() >= link.expires_at {
+            let ready = link.confirmed && link.held.is_some();
+            if !ready && end.is_none() && self.ports.clock.now_ms() >= link.expires_at {
                 end = Some((DeviceLinkPhase::Expired, DeviceLinkReason::Timeout));
             }
-            if payload.is_some() || end.is_some() {
-                // One use: the keys are wiped, the link closed.
+            if let Some((phase, reason)) = end {
+                // One use: the keys and anything held are wiped.
                 inner.device_link = None;
                 self.ports.network.device_link_close();
-            }
-            if let Some((phase, reason)) = end {
                 events.push(link_state(phase, None, Some(reason)));
+                None
+            } else if ready {
+                inner.device_link.take().and_then(|mut link| link.held.take())
+            } else {
+                None
             }
-            payload
         };
         self.emit(events);
-        let Some(payload) = payload else { return };
-        // The same identity and person: the age isn't asked again, and the
-        // birth date stays as trusted as it was (#306).
+        if let Some(payload) = payload {
+            self.apply_link(payload);
+        }
+    }
+
+    /// New device: my user compared the digits with the approving device's.
+    /// `true` lets the account be applied (now, if it has arrived, else when
+    /// it does); `false` ends the link (`failed`, `refused`) and wipes
+    /// anything held. Nothing is applied before `true`: whoever got to the
+    /// link first may not be my device (Security Lead on #394).
+    /// `not-found` with no link; `bad-request` before the digits are shown.
+    pub fn confirm_device_link(&self, matches: bool) -> CoreResult<()> {
+        let payload = {
+            let mut inner = self.lock();
+            let link = inner.device_link.as_mut().ok_or(ErrorCode::NotFound)?;
+            if link.old_pub.is_none() {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            if !matches {
+                inner.device_link = None;
+                self.ports.network.device_link_close();
+                drop(inner);
+                self.emit(vec![link_state(DeviceLinkPhase::Failed, None, Some(DeviceLinkReason::Refused))]);
+                return Ok(());
+            }
+            link.confirmed = true;
+            match link.held.is_some() {
+                true => inner.device_link.take().and_then(|mut link| link.held.take()),
+                false => None,
+            }
+        };
+        if let Some(payload) = payload {
+            self.apply_link(payload);
+        }
+        Ok(())
+    }
+
+    /// New device: the account, through `restoreIdentity`'s path. The same
+    /// identity and person: the age isn't asked again, and the birth date
+    /// stays as trusted as it was (#306).
+    fn apply_link(&self, payload: devicelink::Payload) {
         let profile = Profile {
             display_name: payload.profile.display_name.clone(),
             avatar_small: payload.profile.avatar_small.clone().filter(|a| avatar::valid_avatar(a)),
@@ -2462,7 +2511,8 @@ impl Core {
     /// Signed-in device: reaches the link in `qr_or_code` and returns the
     /// digits to compare. `bad-request` for neither a QR nor a code;
     /// `not-found` for no such link (or expired, or another device's
-    /// session); `rate-limited` after 3 attempts at one link; `offline`.
+    /// session); `locked-out` when another device's Hello holds the link;
+    /// `rate-limited` after 3 attempts at one link; `offline`.
     pub fn begin_device_approval(&self, qr_or_code: &str) -> CoreResult<DeviceApproval> {
         let target = Target::parse(qr_or_code).ok_or(ErrorCode::BadRequest)?;
         let id = target.link_id();
@@ -2473,6 +2523,8 @@ impl Core {
                 return Err(ErrorCode::NotAllowed.into());
             }
             inner.approving = None;
+            // Expired approvals go (Tech Lead on #393).
+            inner.approvals.retain(|_, a| now < a.expires_at);
             let approval = inner.approvals.entry(id).or_insert_with(|| Approval {
                 key: OneTimeKey::generate(),
                 attempts: 0,
@@ -4518,7 +4570,10 @@ fn link_state(state: DeviceLinkPhase, sas: Option<String>, reason: Option<Device
 
 fn link_error(e: DeviceLinkError) -> CoreError {
     match e {
-        DeviceLinkError::NotFound | DeviceLinkError::Refused => ErrorCode::NotFound.into(),
+        DeviceLinkError::NotFound => ErrorCode::NotFound.into(),
+        // Another device's Hello holds the link: someone else may be trying
+        // (Security Lead on #394; dev-ui shows "start again").
+        DeviceLinkError::Refused => ErrorCode::LockedOut.into(),
         DeviceLinkError::Network => ErrorCode::Offline.into(),
     }
 }

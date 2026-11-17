@@ -200,7 +200,8 @@ jobs:
           tar -xzf "ui-artifact/mvs-ui-${VERSION}.tar.gz" -C ui/dist
 
       # Relay address baked into the app. It lives in the repository
-      # variable MVS_RELAY_ADDR (Settings -> Variables), never in git: it
+      # variable MVS_RELAY_ADDR, or the list MVS_RELAY_ADDRS (one per line;
+      # multi-relay part A) (Settings -> Variables), never in git: it
       # contains the owner's domain. Without it the app runs offline.
       # Only a tag build reads it: pull-request dry runs (public artifacts on
       # a public repo) always get {}, and the dry-run job asserts that.
@@ -232,12 +233,29 @@ jobs:
           want='{"relay":"/dns4/relay.example.invalid/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","stun":"stun:stun.relay.example.invalid:3478"}'
           got=$(cat "$RUNNER_TEMP/relay-selftest.json")
           [ "$got" = "$want" ] || { echo "::error::stun config was altered on the way: $got"; exit 1; }
-          echo "ok: relay, bootstrap and stun reach the config unchanged"
+          # Multi-relay (part A): a two-line list wins over RELAY; "relay" is
+          # its first entry. RELAYS_TCP pairs by order.
+          RELAYS=$'/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt\n' \
+          RELAYS_TCP=/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc \
+            node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
+          want='{"relay":"/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","relays":["/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt"],"bootstrap":["/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc"]}'
+          got=$(cat "$RUNNER_TEMP/relay-selftest.json")
+          [ "$got" = "$want" ] || { echo "::error::relay list config was altered on the way: $got"; exit 1; }
+          # The same relay twice is refused.
+          if RELAYS=$'/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc' \
+            node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
+            echo "::error::a relay listed twice was accepted"; exit 1
+          fi
+          echo "ok: relay, relay list, bootstrap and stun reach the config unchanged"
       - name: Build-time config (relay)
         env:
           RELAY: ${{ github.event_name == 'push' && vars.MVS_RELAY_ADDR || '' }}
+          # Multi-relay (part A): one multiaddr per line, 1-4, preferred over
+          # MVS_RELAY_ADDR when set; MVS_RELAY_TCP_ADDRS pairs with it by order.
+          RELAYS: ${{ github.event_name == 'push' && vars.MVS_RELAY_ADDRS || '' }}
           # Plain-TCP route to the relay (DCUtR, #219); optional.
           RELAY_TCP: ${{ github.event_name == 'push' && vars.MVS_RELAY_TCP_ADDR || '' }}
+          RELAYS_TCP: ${{ github.event_name == 'push' && vars.MVS_RELAY_TCP_ADDRS || '' }}
           # Our own STUN server for voice (stun:<host>:3478); optional.
           STUN: ${{ github.event_name == 'push' && vars.MVS_STUN_URL || '' }}
           MSYS2_ENV_CONV_EXCL: RELAY

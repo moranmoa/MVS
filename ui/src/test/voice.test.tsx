@@ -210,6 +210,8 @@ describe('G-73 v2: the roster menu (0–200%, mute for me)', () => {
     const slider = within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('slider') as HTMLInputElement;
     expect(slider.max).toBe('200');
     expect(slider.step).toBe('10');
+    // The 100% tick, in the middle of the track.
+    expect([...(slider.list?.options ?? [])].map((o) => o.value)).toEqual(['100']);
     await act(async () => {
       fireEvent.change(slider, { target: { value: '160' } });
     });

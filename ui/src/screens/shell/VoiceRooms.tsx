@@ -12,7 +12,7 @@ import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { CrownIcon, MicOffIcon, SpeakerIcon } from '../../components/icons';
 import { isCoreError, useCore, type Id, type Member, type ServerSummary, type VoiceRoom } from '../../core';
 import { VOICE_ROOM_LIMIT_MAX, VOICE_ROOM_NAME_MAX, VOICE_ROOMS_MAX } from '../../core/sanitize';
-import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, type CallEngine } from './CallBar';
+import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, VOLUME_TICKS, VolumeTicks, type CallEngine } from './CallBar';
 
 const NO_MEMBERS: Member[] = [];
 const NO_ROOMS: VoiceRoom[] = [];
@@ -303,6 +303,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
               min={0}
               max={200}
               step={10}
+              list={VOLUME_TICKS}
               value={volumeOf(volumeFor.id)}
               aria-valuetext={intl.formatNumber(volumeOf(volumeFor.id) / 100, { style: 'percent' })}
               onChange={(e) => engine.setVolume(volumeFor.id, Number(e.target.value))}
@@ -312,6 +313,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
         <p className="hint">
           <FormattedMessage id="call.volumesHint" />
         </p>
+        <VolumeTicks />
       </Dialog>
 
       <Dialog

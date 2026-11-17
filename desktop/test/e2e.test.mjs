@@ -189,8 +189,16 @@ test('legacy desktop capture never gives a stream', async () => {
 test('the page sees only copyText, invoke, notify, onEvent, the core-down actions and the title bar', async () => {
   const keys = await page.evaluate(() => Object.keys(window.mvs).sort());
   const frame = process.platform === 'darwin' ? [] : ['windowControl', 'windowFrame'];
-  assert.deepEqual(keys, ['copyText', 'invoke', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', ...frame].sort());
+  assert.deepEqual(keys, ['copyText', 'invoke', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setUnreadCount', ...frame].sort());
   assert.equal(await page.evaluate(() => typeof window.ipcRenderer), 'undefined');
+});
+
+test('setUnreadCount takes whole numbers 0..9999 only (G-62)', async () => {
+  for (const bad of [-1, 1.5, 10000, '3', null, NaN, Infinity, { n: 1 }]) {
+    assert.equal(await page.evaluate((v) => window.mvs.setUnreadCount(v), bad), false);
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(12)), true);
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(0)), true);
 });
 
 test('copyText writes plain text only, through main', async () => {

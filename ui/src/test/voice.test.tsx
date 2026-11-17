@@ -3,6 +3,7 @@
 // who is in each and the host crowned; text channels don't carry calls.
 
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import { Store } from '../app/store';
@@ -12,18 +13,52 @@ import { cleanCall, cleanVoiceRoom, cleanVoiceRooms, guardCore } from '../core/s
 
 // jsdom has no WebRTC: the engine (piece D) has its own tests in src/voice. Here it
 // is an idle engine with a working mic; ?voiceSim drives the failure states.
-const fakeEngine = vi.hoisted(() => ({ peerFailed: {} as Record<string, 'failed' | 'refused'>, stunUrls: [] as unknown[] }));
+const fakeEngine = vi.hoisted(() => ({
+  peerFailed: {} as Record<string, 'failed' | 'refused'>,
+  stunUrls: [] as unknown[],
+  picked: [] as string[],
+  level: 0.42,
+  deafened: false,
+  selfMonitor: false,
+  fallback: null as null | { kind: 'input' | 'output'; label: string | null; at: number },
+}));
 vi.mock('../voice', () => ({
-  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => (fakeEngine.stunUrls.push(options?.stunUrl), {
+  // A hook: deafen is React state, as in the real one, so the call bar re-renders.
+  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
+    const [deafened, setDeafened] = useState(false);
+    const [selfMonitor, setSelfMonitor] = useState(false);
+    fakeEngine.selfMonitor = selfMonitor;
+    const [volumes, setVolumes] = useState<Record<string, number>>({});
+    fakeEngine.deafened = deafened;
+    fakeEngine.stunUrls.push(options?.stunUrl);
+    return {
     ready: true,
     speaking: {},
     peerFailed: fakeEngine.peerFailed,
     setMicMuted: () => {},
-    inputs: [],
-    outputs: [],
-    setInput: () => {},
-    setOutput: () => {},
-  }),
+    inputs: [
+      { deviceId: 'mic-a', label: 'Desk mic' },
+      { deviceId: 'mic-b', label: 'Headset mic' },
+    ],
+    outputs: [{ deviceId: 'spk-a', label: 'Headphones' }],
+    setInput: (id: string) => fakeEngine.picked.push(`in:${id}`),
+    setOutput: (id: string) => fakeEngine.picked.push(`out:${id}`),
+    inputLevel: () => fakeEngine.level,
+    deafened,
+    setDeafened: (on: boolean) => {
+      fakeEngine.deafened = on;
+      setDeafened(on);
+    },
+    deviceFallback: fakeEngine.fallback,
+    selfMonitor,
+    setSelfMonitor,
+    volumes,
+    setVolume: (id: string, pct: number) => {
+      fakeEngine.picked.push(`vol:${id}:${pct}`);
+      setVolumes((v) => ({ ...v, [id]: pct }));
+    },
+    };
+  },
 }));
 
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
@@ -79,6 +114,160 @@ const click = async (el: Element) =>
   act(async () => {
     fireEvent.click(el);
   });
+
+describe('G-72: voice settings in a call', () => {
+  it('picks the microphone and the speaker, and shows the mic level', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      const bar = await screen.findByRole('region', { name: 'Voice call' });
+      await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+      const dialog = screen.getByRole('dialog', { name: 'Voice settings' });
+      const mic = within(dialog).getByRole('combobox', { name: 'Microphone' }) as HTMLSelectElement;
+      expect([...mic.options].map((o) => o.text)).toEqual(['System default', 'Desk mic', 'Headset mic']);
+      fakeEngine.picked = [];
+      await act(async () => {
+        fireEvent.change(mic, { target: { value: 'mic-b' } });
+      });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speakers' });
+      await act(async () => {
+        fireEvent.change(speaker, { target: { value: 'spk-a' } });
+      });
+      expect(fakeEngine.picked).toEqual(['in:mic-b', 'out:spk-a']);
+      // The level, polled while the dialog is open.
+      await act(async () => {
+        vi.advanceTimersByTime(250);
+      });
+      const meter = within(dialog).getByRole('meter', { name: 'Mic test' });
+      expect(meter.getAttribute('aria-valuenow')).toBe('42');
+      expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
+      // Hear myself: off by default, and closing the dialog turns it off.
+      const hear = within(dialog).getByRole('switch', { name: 'Hear myself' }) as HTMLInputElement;
+      expect(hear.checked).toBe(false);
+      await click(hear);
+      expect(fakeEngine.selfMonitor).toBe(true);
+      expect(within(dialog).getByRole('button', { name: 'Play test sound' })).toBeTruthy();
+      await click(within(dialog).getByRole('button', { name: 'Close' }));
+      expect(fakeEngine.selfMonitor).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('G-72 part 2: an unplugged device', () => {
+  it('says which device was unplugged and that the default is used', async () => {
+    fakeEngine.fallback = { kind: 'input', label: 'Headset mic', at: 1 };
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      await screen.findByRole('region', { name: 'Voice call' });
+      await waitFor(() => expect(screen.getByText(/Headset mic/).closest('[role=status]')?.textContent).toBe('Microphone ⁨Headset mic⁩ was unplugged. Using the system default.'));
+    } finally {
+      fakeEngine.fallback = null;
+    }
+  });
+});
+
+describe('G-73: volume per person', () => {
+  it('a slider per other person in my call, with their name and the percent', async () => {
+    const { entry } = await setup();
+    await click(entry()); // the demo room has 2 people already
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+    const group = within(screen.getByRole('dialog', { name: 'Voice settings' })).getByRole('group', { name: 'Volume for each person in the call' });
+    const sliders = within(group).getAllByRole('slider');
+    expect(sliders).toHaveLength(2);
+    expect(sliders.every((s) => s.getAttribute('aria-valuetext') === '100%')).toBe(true);
+    fakeEngine.picked = [];
+    await act(async () => {
+      fireEvent.change(sliders[0]!, { target: { value: '35' } });
+    });
+    expect(fakeEngine.picked).toHaveLength(1);
+    expect(fakeEngine.picked[0]).toMatch(/^vol:.+:35$/);
+    expect(within(group).getAllByRole('slider')[0]!.getAttribute('aria-valuetext')).toBe('35%');
+    expect(within(group).getByText(/Only you hear the change/)).toBeTruthy();
+  });
+});
+
+describe('G-73 v2: the roster menu (0–200%, mute for me)', () => {
+  it('right-click a person in my call: Volume… (0–200%) and Mute for me, which restores the volume', async () => {
+    const { entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    const others = () => within(roster).getAllByRole('listitem').filter((li) => li.getAttribute('aria-haspopup') === 'menu');
+    expect(others()).toHaveLength(2); // not me
+    const menuFor = async (li: HTMLElement) => {
+      await act(async () => {
+        fireEvent.contextMenu(li, { clientX: 10, clientY: 10 });
+      });
+      return screen.getByRole('menu');
+    };
+    // Volume…: a dialog with a 0–200% slider.
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Volume…' }));
+    const slider = within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('slider') as HTMLInputElement;
+    expect(slider.max).toBe('200');
+    expect(slider.step).toBe('10');
+    // The 100% tick, in the middle of the track.
+    expect([...(slider.list?.options ?? [])].map((o) => o.value)).toEqual(['100']);
+    await act(async () => {
+      fireEvent.change(slider, { target: { value: '160' } });
+    });
+    expect(slider.getAttribute('aria-valuetext')).toBe('160%');
+    await click(within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('button', { name: 'Close' }));
+    // Mute for me, then Unmute for me brings back 160%.
+    fakeEngine.picked = [];
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Mute for me' }));
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Unmute for me' }));
+    expect(fakeEngine.picked.map((x) => x.split(':').at(-1))).toEqual(['0', '160']);
+  });
+});
+
+describe('G-84: deafen', () => {
+  it('deafen mutes me too and undeafen unmutes me; unmuting while deafened undeafens', async () => {
+    fakeEngine.deafened = false;
+    const { entry } = await setup();
+    await click(entry());
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    const deafen = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' });
+    const mute = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Mute' });
+    expect(deafen().getAttribute('aria-pressed')).toBe('false');
+    expect(mute().getAttribute('aria-pressed')).toBe('false');
+
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(true);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    expect(within(bar).getByRole('status').textContent).toContain("You can't hear the call");
+
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(false);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('false'));
+
+    // Unmuting while deafened undeafens.
+    await click(deafen());
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    await click(mute());
+    expect(fakeEngine.deafened).toBe(false);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('false'));
+  });
+
+  it('undeafen leaves me muted if I was muted before deafening', async () => {
+    fakeEngine.deafened = false;
+    const { entry } = await setup();
+    await click(entry());
+    const mute = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Mute' });
+    const deafen = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' });
+    await screen.findByRole('region', { name: 'Voice call' });
+    await click(mute());
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    await click(deafen());
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(false);
+    expect(mute().getAttribute('aria-pressed')).toBe('true');
+  });
+});
 
 describe('voice rooms (0.4.3)', () => {
   it('shows the rooms before joining: name, count, who is in it, the host crowned', async () => {

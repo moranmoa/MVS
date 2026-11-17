@@ -21,6 +21,8 @@ export interface NotifyPrefs {
    * the body is "New message in #channel" unless the person opts in.
    */
   preview: boolean;
+  /** G-62: the unread count on the app icon (taskbar / dock). On by default. */
+  badge: boolean;
   servers: Record<Id, NotifyScope>;
   /** A channel's level overrides its server's. */
   channels: Record<Id, NotifyScope>;
@@ -32,7 +34,7 @@ export const GROUP_MS = 10_000;
 export const STALE_MS = 10 * 60_000;
 
 export function defaultNotifyPrefs(): NotifyPrefs {
-  return { desktop: true, preview: false, servers: {}, channels: {} };
+  return { desktop: true, preview: false, badge: true, servers: {}, channels: {} };
 }
 
 const LEVELS: readonly NotifyLevel[] = ['all', 'mentions', 'none'];
@@ -56,6 +58,7 @@ export function cleanNotifyPrefs(v: unknown): NotifyPrefs {
   return {
     desktop: typeof p.desktop === 'boolean' ? p.desktop : d.desktop,
     preview: typeof p.preview === 'boolean' ? p.preview : d.preview,
+    badge: typeof p.badge === 'boolean' ? p.badge : d.badge,
     servers: cleanScopes(p.servers),
     channels: cleanScopes(p.channels),
   };

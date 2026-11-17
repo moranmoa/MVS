@@ -73,6 +73,10 @@ jobs:
         run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check licenses sources bans
       - name: relay
         run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check licenses sources bans
+      # core/vendor/libp2p-dns must stay the crates.io 0.45.0 package (sha256
+      # pinned) with only the edits its README lists.
+      - name: vendored libp2p-dns matches crates.io
+        run: bash .github/scripts/check-vendored-libp2p-dns.sh
 
   advisories:
     # Informational for now: the open advisories are all in libp2p 0.54's

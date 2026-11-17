@@ -94,5 +94,11 @@ multiple-versions = "allow"
 wildcards = "deny"
 allow-wildcard-paths = true
 
+# hickory-proto 0.25.2 (name-compression CPU, SVCB/zone panics, header-count
+# memory): the code we build uses hickory 0.26 through the vendored
+# libp2p-dns (core/vendor/libp2p-dns/README.md). Cargo.lock still lists 0.25.2
+# as libp2p-mdns 0.48's entry; the mdns feature is off everywhere, so it is
+# never compiled (cargo tree -i hickory-proto@0.25.2 --target all is empty).
+# Advisories reported for it are known and non-blocking until libp2p 0.57.
 [advisories]
 version = 2

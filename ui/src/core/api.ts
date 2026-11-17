@@ -29,6 +29,9 @@ import type {
   CallState,
   CallSignal,
   VoiceRoom,
+  DeviceApproval,
+  DeviceLinkOffer,
+  DeviceLinkState,
   MemberRelay,
   MemberRelaySetting,
 } from './types';
@@ -137,6 +140,16 @@ export interface CoreCommands {
   // Safety
   blockUser(userId: Id): Promise<void>;
   kickMember(serverId: Id, userId: Id): Promise<void>;
+  // Device link (device-link-slice.md)
+  /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
+  startDeviceLink(): Promise<DeviceLinkOffer>;
+  cancelDeviceLink(): Promise<null>;
+  /** New device, on "confirm": the digits match the other device (Security Lead: nothing is applied before true). false fails the link. */
+  confirmDeviceLink(match: boolean): Promise<null>;
+  /** Signed-in device: reach the new device by its QR payload or code. Rejects not-found (no such link, or expired), rate-limited. */
+  beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
+  /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */
+  confirmDeviceApproval(approve: boolean): Promise<null>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -227,6 +240,8 @@ export interface CoreEvents {
   'call.signal': CallSignal;
   /** A server's rooms changed (create, join, leave, mute, edit, timeout), mine or not. Coalesced; a hint: re-read with listVoiceRooms. */
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
+  /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
+  'deviceLink.state': DeviceLinkState;
   /** Member relays: anything in it changed (role, servers, relay-only, birth date, setting). */
   'memberRelay.changed': MemberRelay;
 }

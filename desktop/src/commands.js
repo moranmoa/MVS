@@ -48,6 +48,12 @@ const COMMANDS = Object.freeze({
   // Safety
   blockUser: ['userId'],
   kickMember: ['serverId', 'userId'],
+  // Device link (device-link-slice.md)
+  startDeviceLink: [],
+  cancelDeviceLink: [],
+  confirmDeviceLink: ['match'],
+  beginDeviceApproval: ['qrOrCode'],
+  confirmDeviceApproval: ['approve'],
   // Voice (#223); voice rooms (0.4.3)
   listVoiceRooms: ['serverId'],
   createVoiceRoom: ['serverId'],

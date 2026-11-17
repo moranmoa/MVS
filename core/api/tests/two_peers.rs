@@ -556,3 +556,73 @@ fn two_members_join_a_call_and_signal_over_sync() {
     owner.core.leave_call().unwrap();
     guest.core.leave_call().unwrap();
 }
+
+/// A device with no identity yet (a fresh install), on `SyncNetwork`.
+fn fresh_device(name: &str, relay: &str) -> Peer {
+    let dir = std::env::temp_dir().join(format!("mvs-two-peers-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let net = Arc::new(
+        SyncNetwork::start(relay.parse().unwrap(), &dir, Arc::new(MemberGate::new())).unwrap(),
+    );
+    let events = Arc::new(CollectingSink::new());
+    let cipher = Arc::new(GroupKeysCipher::locked());
+    let core = Core::open(
+        Config { db_path: Some(dir.join("core.db")), app_version: "test".into() },
+        Ports {
+            secrets: Arc::new(MemoryStore::new()),
+            network: net.clone(),
+            events: events.clone(),
+            clock: Arc::new(SystemClock),
+            cipher: cipher.clone(),
+        },
+    )
+    .unwrap();
+    Peer { core, events, net, _cipher: cipher, _dir: dir }
+}
+
+/// Device link end to end over the real node (`/mvs/device-link/1`, the DHT
+/// rendezvous, a relay between them): the signed-in device finds the new
+/// one by its typed code, both see the same digits, the account comes over,
+/// and the two devices never connect directly.
+#[test]
+fn a_device_link_brings_the_account_over_sync() {
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let relay = start_relay(&runtime);
+    let old = peer("LinkOld", OWNER, &relay);
+    let me = old.core.get_identity().unwrap().unwrap().id;
+    let new = fresh_device("LinkNew", &relay);
+
+    // The new device needs its relay reservation first.
+    let mut link = None;
+    eventually("the new device to start a link", || {
+        link = new.core.start_device_link().ok();
+        link.is_some()
+    });
+    let link = link.unwrap();
+    // The rendezvous record takes a moment to reach the relay's DHT.
+    let mut approval = None;
+    eventually("the signed-in device to find the code", || {
+        approval = old.core.begin_device_approval(&link.code).ok();
+        approval.is_some()
+    });
+    let approval = approval.unwrap();
+    let mut sas = None;
+    eventually("the new device to show the digits", || {
+        new.core.sync_now().unwrap();
+        sas = new.events.take().into_iter().find_map(|e| match e {
+            Event::DeviceLinkState(s) if s.state == DeviceLinkPhase::Confirm => s.sas,
+            _ => None,
+        });
+        sas.is_some()
+    });
+    assert_eq!(sas.as_deref(), Some(approval.sas.as_str()), "both devices show the same digits");
+
+    new.core.confirm_device_link(true).unwrap();
+    old.core.confirm_device_approval(true).unwrap();
+    eventually("the account to arrive on the new device", || {
+        new.core.sync_now().unwrap();
+        new.core.get_identity().unwrap().is_some_and(|i| i.id == me)
+    });
+    assert!(!old.net.direct_peers().contains(&new.net.peer_id()), "the link went direct (old side)");
+    assert!(!new.net.direct_peers().contains(&old.net.peer_id()), "the link went direct (new side)");
+}

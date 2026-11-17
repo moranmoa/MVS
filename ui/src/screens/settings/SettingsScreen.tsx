@@ -12,9 +12,10 @@ import { ProfileEditor, type ProfileEditorHandle } from './ProfileEditor';
 import { SignOutButton } from './SignOut';
 import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/notify';
 import { MemberRelaySetting } from './MemberRelay';
+import { DevicesSection } from './Devices';
 
-type Section = 'account' | 'privacy' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
-const SECTIONS: Section[] = ['account', 'privacy', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
+type Section = 'account' | 'privacy' | 'devices' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
+const SECTIONS: Section[] = ['account', 'privacy', 'devices', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
 
 const GB = 1024 ** 3;
 const LIMIT_STEPS = [1, 2, 5, 10, 20, 50].map((g) => g * GB);
@@ -85,6 +86,7 @@ export function SettingsScreen({
           {section === 'storage' && <StorageSection />}
           {section === 'diagnostics' && <DiagnosticsSection />}
           {section === 'about' && <AboutSection />}
+          {section === 'devices' && <DevicesSection />}
           {section === 'notifications' && <NotificationsSection />}
           {section === 'privacy' && <PrivacySection focus={request?.section === 'privacy' ? request.at : undefined} />}
         </section>

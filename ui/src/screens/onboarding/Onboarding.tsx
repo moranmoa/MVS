@@ -12,6 +12,7 @@ import { CheckIcon } from '../../components/icons';
 import { LanguagePicker } from '../../components/LanguagePicker';
 import { RecoveryCheck, RecoveryWordsPanel } from './RecoveryWords';
 import { RestoreScreen } from './Restore';
+import { DeviceLinkScreen } from './DeviceLink';
 
 export type Step =
   | 'language'
@@ -24,6 +25,8 @@ export type Step =
   | 'check'
   | 'profile'
   | 'restore'
+  /** Device link: signed in from another device. */
+  | 'device'
   | 'restored';
 
 /** Numbered steps shown as "step x of y"; blocked/preparing/restore are not counted. */
@@ -64,6 +67,8 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
   };
   // Restore asks the agreement, country and birth date again, as for a new
   // account (spec, age: restore asks again), then the words, then the profile.
+  // Device link: this device got an existing account (agreement only).
+  const [linked, setLinked] = useState(false);
   const [restoring, setRestoringState] = useState(() => storage()?.getItem(RESTORING_KEY) === '1');
   const setRestoring = (on: boolean) => {
     setRestoringState(on);
@@ -86,6 +91,7 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
     dob: 'country',
     check: 'words',
     restore: 'dob',
+    device: 'language',
   };
 
   const createAccount = async (dob: string) => {
@@ -135,9 +141,21 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
                 setRestoring(true);
                 setStep('agreement');
               }}
+              onDevice={() => setStep('device')}
             />
           )}
-          {step === 'agreement' && <AgreementStep onNext={() => setStep('country')} />}
+          {step === 'device' && (
+            <DeviceLinkScreen
+              onLinked={() => {
+                // The same account: only the agreement is asked on this device.
+                setLinked(true);
+                void core.getIdentity().then((identity) => identity && store.setIdentity(identity));
+                setStep('agreement');
+              }}
+              onCancel={() => setStep('language')}
+            />
+          )}
+          {step === 'agreement' && <AgreementStep onNext={() => (linked ? onFinished() : setStep('country'))} />}
           {step === 'country' && <CountryStep value={country} onChange={setCountry} onNext={() => setStep('dob')} />}
           {step === 'dob' && (
             <DobStep
@@ -225,7 +243,7 @@ function StepBody({ children }: { children: ReactNode }) {
   );
 }
 
-function LanguageStep({ onNext, onRestore }: { onNext: () => void; onRestore: () => void }) {
+function LanguageStep({ onNext, onRestore, onDevice }: { onNext: () => void; onRestore: () => void; onDevice: () => void }) {
   const intl = useIntl();
   return (
     <>
@@ -245,6 +263,9 @@ function LanguageStep({ onNext, onRestore }: { onNext: () => void; onRestore: ()
         </button>
         <button type="button" className="link" onClick={onRestore}>
           <FormattedMessage id="onb.restoreLink" />
+        </button>
+        <button type="button" className="link" onClick={onDevice}>
+          <FormattedMessage id="deviceLink.start" />
         </button>
       </div>
     </>

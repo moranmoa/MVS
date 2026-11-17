@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand_core::OsRng;
+use updater::flags::{FlagsBody, SignedFlags, FLAGS_FORMAT};
 use updater::{
     hash_reader, parse_root_fetch, verify_artifact, ClientPolicy, Decision, ManifestBody, SignedManifest, SignedRoot,
     SigningKey, TrustRoot, TrustRootFile, Version,
@@ -43,6 +44,14 @@ updater - signed update manifests (spike 7)
                  [--artifact <FILE> --platform <P>]
       Applies root rotations, checks signatures and expiry, then the client
       rules and the artifact hash when given. Exit code 0 only if all pass.
+
+  updater sign-flags --key <FILE.key> --member-relay-off <true|false> --out <flags.json>
+      Global flags (member relays slice 3b), signed under their own context;
+      issuedAt is now. Clients keep the newest verified file.
+
+  updater verify-flags --flags <flags.json> --root <root.json> [--root-update <rotation.json>]...
+      Applies root rotations, then checks the flags signatures. Exit code 0
+      only if they verify; prints the value.
 ";
 
 /// Refuse to sign a manifest issued further in the future than this: a
@@ -62,6 +71,8 @@ fn main() -> ExitCode {
         "hash" => hash(&a),
         "sign-manifest" => sign_manifest(&a),
         "verify" => verify(&a),
+        "sign-flags" => sign_flags(&a),
+        "verify-flags" => verify_flags(&a),
         _ => Err(format!("unknown command {cmd:?}\n\n{USAGE}")),
     });
     match result {
@@ -449,5 +460,41 @@ fn verify(a: &Args) -> Result<(), String> {
         let revoked: Vec<String> = body.revoked.iter().map(ToString::to_string).collect();
         println!("revoked: {}", revoked.join(", "));
     }
+    Ok(())
+}
+
+/// The current root after `--root-update` rotations, refusing a fork.
+fn chained_root(a: &Args) -> Result<TrustRoot, String> {
+    let root = load_root(a.need("root")?)?;
+    let files = a.all("root-update").into_iter().map(read).collect::<Result<Vec<_>, String>>()?;
+    let updates = parse_root_fetch(&files).map_err(|e| format!("--root-update: {e}"))?;
+    let chain = root.update_chain(&updates);
+    if let Some(v) = chain.fork_at {
+        return Err(format!("two different validly signed rotations to root v{v}: not choosing one"));
+    }
+    Ok(chain.root)
+}
+
+fn sign_flags(a: &Args) -> Result<(), String> {
+    let key = load_secret(a.need("key")?)?;
+    let off = match a.need("member-relay-off")? {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--member-relay-off must be true or false, not {other:?}")),
+    };
+    let body = FlagsBody { v: FLAGS_FORMAT, issued_at: unix_now()?, member_relay_off: off };
+    let mut flags = SignedFlags::new(&body).map_err(|e| e.to_string())?;
+    flags.sign(&key);
+    let out = a.need("out")?;
+    fs::write(out, format!("{}\n", flags.to_json())).map_err(|e| format!("{out}: {e}"))?;
+    println!("{out}: memberRelayOff {off}, issuedAt {}", body.issued_at);
+    Ok(())
+}
+
+fn verify_flags(a: &Args) -> Result<(), String> {
+    let flags = SignedFlags::from_json(&read(a.need("flags")?)?).map_err(|e| e.to_string())?;
+    let root = chained_root(a)?;
+    let v = flags.verify(&root, unix_now()?).map_err(|e| e.to_string())?;
+    println!("flags ok: memberRelayOff {}, issuedAt {}", v.member_relay_off(), v.issued_at());
     Ok(())
 }

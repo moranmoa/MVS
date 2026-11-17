@@ -38,11 +38,16 @@ const KV_RELAY_ONLY: &str = "relay-only";
 /// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
 /// start until acknowledged; the cross-device notice will feed it too.
 const KV_DEVICE_NOTICES: &str = "device-notices";
+/// At most this many notices are kept, the newest.
+const MAX_DEVICE_NOTICES: usize = 32;
 /// Member relays (#368, slice 1): `auto`, `on` or `off` (default `auto`);
 /// the one-time disclosure seen (`[1]`); the daily cap in MB (u32le).
 const KV_MEMBER_RELAY: &str = "member-relay";
 const KV_MEMBER_RELAY_SEEN: &str = "member-relay-disclosure-seen";
 const KV_MEMBER_RELAY_CAP: &str = "member-relay-cap-mb";
+/// Slice 3b: the last verified `memberRelayOff` from the signed `flags.json`.
+/// Written only by the update loop; there is no command for it.
+const KV_MEMBER_RELAY_GLOBAL_OFF: &str = "member-relay-global-off";
 /// The member relay's daily cap: default and accepted range, in MB.
 pub const MEMBER_RELAY_CAP_DEFAULT_MB: u32 = 2_048;
 pub const MEMBER_RELAY_CAP_MB: std::ops::RangeInclusive<u32> = 256..=51_200;
@@ -2524,7 +2529,11 @@ impl Core {
             Ok(identity) => vec![link_state(DeviceLinkPhase::Done, None, None), Event::IdentityChanged(identity)],
             Err(e) => {
                 eprintln!("mvs-core: a device link's account wasn't restored: {:?}", e.code);
-                vec![link_state(DeviceLinkPhase::Failed, None, None)]
+                let reason = match e.code {
+                    ErrorCode::KeyringUnavailable => DeviceLinkReason::Keyring,
+                    _ => DeviceLinkReason::Restore,
+                };
+                vec![link_state(DeviceLinkPhase::Failed, None, Some(reason))]
             }
         };
         self.emit(done);
@@ -2614,9 +2623,12 @@ impl Core {
             let inner = self.lock();
             let mut notices = device_notices(&inner.db)?;
             notices.push(now);
+            // The newest MAX_DEVICE_NOTICES only (Tech Lead on #415).
+            let extra = notices.len().saturating_sub(MAX_DEVICE_NOTICES);
+            notices.drain(..extra);
             inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))?;
         }
-        self.emit(vec![Event::DeviceAdded { at: now, label: None }]);
+        self.emit(vec![Event::DeviceAdded { at: now, label: notice_label(None) }]);
         Ok(())
     }
 
@@ -2636,7 +2648,7 @@ impl Core {
             return;
         }
         let notices = device_notices(&self.lock().db).unwrap_or_default();
-        self.emit(notices.into_iter().map(|at| Event::DeviceAdded { at, label: None }).collect());
+        self.emit(notices.into_iter().map(|at| Event::DeviceAdded { at, label: notice_label(None) }).collect());
     }
 
     pub fn set_update_channel(&self, channel: UpdateChannel) -> CoreResult<()> {
@@ -2706,7 +2718,7 @@ impl Core {
     }
 
     /// The background check: once the UI is up (or after a fallback wait),
-    /// then every 6 h ± 30 min, and at once after a channel switch. Downloads
+    /// then every hour ± 5 min, and at once after a channel switch. Downloads
     /// whatever is available; the apply waits for the user (or next start).
     /// Returns when `Updates::stop` is called; without updates, at once.
     pub fn run_update_loop(&self) {
@@ -2717,6 +2729,21 @@ impl Core {
         loop {
             if let Ok(channel) = self.ui_channel() {
                 self.emit_update(updates.background_round(channel, self.now_secs()));
+                // Slice 3b: the owner's signed global switch, fetched with the
+                // check. Kept in kv; only this path writes it.
+                let off = updates.member_relay_off(channel);
+                let mut events = Vec::new();
+                {
+                    let mut inner = self.lock();
+                    let value: &[u8] = if off { b"1" } else { b"0" };
+                    if inner.db.get(KV_MEMBER_RELAY_GLOBAL_OFF).ok().flatten().as_deref() != Some(value) {
+                        if let Err(e) = inner.db.set(KV_MEMBER_RELAY_GLOBAL_OFF, value) {
+                            eprintln!("mvs-core: the global member relay flag wasn't stored: {:?}", e.code);
+                        }
+                    }
+                    inner.check_member_relay(&self.ports, &mut events);
+                }
+                self.emit(events);
             }
             if !updates.wait(crate::update::next_interval()) {
                 return;
@@ -3164,8 +3191,8 @@ impl Inner {
 
     /// Member relays (#368, slice 1): the setting, and what it comes to now.
     /// Forced off, whatever the setting, by the first reason that applies:
-    /// the global flag (reserved for slice 3, never set yet), then a minor,
-    /// then relay-only, then a metered network (the shell's `setMetered`).
+    /// the global flag (the signed `flags.json`, slice 3b), then a minor, then
+    /// relay-only, then a metered network (the shell's `setMetered`).
     fn member_relay_now(&mut self, now: u64) -> CoreResult<MemberRelay> {
         let setting = match self.db.get(KV_MEMBER_RELAY)?.as_deref() {
             Some(b"on") => MemberRelaySetting::On,
@@ -3186,7 +3213,10 @@ impl Inner {
         let adult = self.me.as_ref().is_some_and(|me| {
             me.profile.birth_date_trusted && me.profile.effective_age(now).is_some_and(|age| age >= 18)
         });
-        let reason = if self.me.is_some() && !adult {
+        let global_off = self.db.get(KV_MEMBER_RELAY_GLOBAL_OFF)?.as_deref() == Some(b"1");
+        let reason = if global_off {
+            Some(MemberRelayReason::GlobalOff)
+        } else if self.me.is_some() && !adult {
             Some(MemberRelayReason::Minor)
         } else if relay_only_in(&self.db)? {
             Some(MemberRelayReason::RelayOnly)
@@ -3881,7 +3911,7 @@ impl Inner {
         let phrase = self.vault.open().map_err(vault_error)?;
         let p = &me.profile;
         Ok(devicelink::Payload {
-            seed: phrase.words().join(" "),
+            seed: Zeroizing::new(phrase.words().join(" ")),
             profile: devicelink::PayloadProfile {
                 display_name: p.display_name.clone(),
                 avatar_small: p.avatar_small.clone().filter(|a| !a.is_empty()),
@@ -4617,6 +4647,16 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
     }
 }
 
+
+/// A device notice's label as shown: plain text, trimmed, at most 64
+/// characters, with no control characters; anything else, or empty, is
+/// left out (Security Lead on #415). Today the new device sends none; the
+/// cross-device notice will pass what it carries through here.
+fn notice_label(raw: Option<&str>) -> Option<String> {
+    let label = raw?.trim();
+    let ok = !label.is_empty() && label.chars().count() <= 64 && !label.chars().any(char::is_control);
+    ok.then(|| label.to_owned())
+}
 fn device_notices(db: &Db) -> CoreResult<Vec<u64>> {
     Ok(db.get(KV_DEVICE_NOTICES)?.and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default())
 }
@@ -4664,5 +4704,35 @@ mod relay_only_tests {
         std::fs::write(&junk, vec![0x5a; 4096]).unwrap();
         assert!(stored_relay_only(&junk));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod device_notice_tests {
+    use super::{notice_label, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+
+    /// Security Lead on #415: a label is plain text, at most 64 characters.
+    #[test]
+    fn labels_are_plain_short_text_or_left_out() {
+        assert_eq!(notice_label(Some("  Windows laptop ")).as_deref(), Some("Windows laptop"));
+        assert_eq!(notice_label(Some(&"א".repeat(64))).map(|l| l.chars().count()), Some(64));
+        assert_eq!(notice_label(Some(&"x".repeat(65))), None);
+        assert_eq!(notice_label(Some("bad\u{1b}[31m")), None);
+        assert_eq!(notice_label(Some("two\nlines")), None);
+        assert_eq!(notice_label(Some("   ")), None);
+        assert_eq!(notice_label(None), None);
+    }
+
+    /// Tech Lead on #415: the stored list keeps only the newest 32.
+    #[test]
+    fn the_notice_list_is_capped() {
+        let db = Db::open(None).unwrap();
+        let notices: Vec<u64> = (0..40).collect();
+        let extra = notices.len().saturating_sub(MAX_DEVICE_NOTICES);
+        let kept: Vec<u64> = notices[extra..].to_vec();
+        db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&kept).unwrap()).unwrap();
+        let stored = super::device_notices(&db).unwrap();
+        assert_eq!(stored.len(), 32);
+        assert_eq!((stored[0], stored[31]), (8, 39), "the newest are kept");
     }
 }

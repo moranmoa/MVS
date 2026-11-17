@@ -680,7 +680,7 @@ pub enum MemberRelaySetting {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MemberRelayReason {
-    /// The signed manifest's flag. Reserved: slice 3.
+    /// The owner's signed global switch (`flags.json`, slice 3b).
     GlobalOff,
     /// No trusted adult birth date (the age claim's rule).
     Minor,
@@ -735,6 +735,11 @@ pub enum DeviceLinkReason {
     Timeout,
     Refused,
     Network,
+    /// The account arrived but this computer's keychain couldn't store it
+    /// (`keyring-unavailable` on restore).
+    Keyring,
+    /// The account arrived but couldn't be restored for another reason.
+    Restore,
 }
 
 /// `deviceLink.state`. Absent fields are left out, never null (dev-ui #391).

@@ -258,3 +258,14 @@ test('mvs-core gets one --relay per relay, in order, then --bootstrap', () => {
   assert.throws(() => spawnedArgs({ relays: RELAY }), /strings/);
   assert.throws(() => spawnedArgs({ relays: [42] }), /strings/);
 });
+
+test('checkout: relay and bootstrap lists take commas and/or newlines, spaces and empty entries ignored', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(m);
+  assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: ` ${RELAY} ,, ${RELAY2},` }, warn }), [RELAY, RELAY2]);
+  assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: `${RELAY},\r\n${RELAY2}\r\n` }, warn }), [RELAY, RELAY2]);
+  // The same relay twice, once per separator: dropped, not named.
+  assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: `${RELAY},${RELAY}\n${RELAY2}` }, warn }), [RELAY, RELAY2]);
+  assert.deepEqual(bootstrapFor({ packaged: false, env: { MVS_BOOTSTRAP: ` ${TCP} ,\n,` }, warn }), [TCP]);
+  assert.ok(warnings.every((w) => !/example\.org|12D3KooW/.test(w)), 'warnings never name an address');
+});

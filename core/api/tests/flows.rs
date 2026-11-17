@@ -5320,3 +5320,85 @@ fn a_device_added_notice_stays_until_acknowledged() {
     drop(old);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// QA on c12bf75: a refused link leaves nothing behind. The next good link
+/// on the same new device saves the account.
+#[test]
+fn a_refused_link_then_a_good_one_signs_in() {
+    let world = World::new();
+    let old = world.peer();
+    let me = sign_up(&old, "Me");
+    let new = world.peer();
+
+    let link = new.core.start_device_link().unwrap();
+    old.core.begin_device_approval(&link.code).unwrap();
+    new.core.sync_now().unwrap();
+    new.core.confirm_device_link(false).unwrap();
+    assert_eq!(old.core.confirm_device_approval(true).unwrap_err().code, ErrorCode::NotFound, "the link is closed");
+
+    let link = new.core.start_device_link().unwrap();
+    let approval = old.core.begin_device_approval(&link.code).unwrap();
+    new.core.sync_now().unwrap();
+    assert!(link_states(&new).iter().any(|s| s.sas.as_deref() == Some(approval.sas.as_str())));
+    new.core.confirm_device_link(true).unwrap();
+    old.core.confirm_device_approval(true).unwrap();
+    new.core.sync_now().unwrap();
+    assert!(link_states(&new).iter().any(|s| s.state == DeviceLinkPhase::Done));
+    assert_eq!(new.core.get_identity().unwrap().unwrap().id, me.id);
+}
+
+/// A keychain that reads (empty) but can't store, like a headless
+/// gnome-keyring with no login collection.
+struct NoWriteKeyring;
+
+impl identity::SecretStore for NoWriteKeyring {
+    fn load(&self, _: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, identity::StoreError> {
+        Ok(None)
+    }
+
+    fn save(&self, _: &str, _: &[u8]) -> Result<(), identity::StoreError> {
+        Err(identity::StoreError("no collection to store in".into()))
+    }
+
+    fn delete(&self, _: &str) -> Result<(), identity::StoreError> {
+        Ok(())
+    }
+}
+
+/// QA on c12bf75: when the account arrives but this computer's keychain
+/// can't store it, `failed` says so (`keyring`), not nothing.
+#[test]
+fn a_link_that_cant_be_stored_says_keyring() {
+    let world = World::new();
+    let old = world.peer();
+    sign_up(&old, "Me");
+    let events = Arc::new(CollectingSink::new());
+    let new = Core::open(
+        Config { db_path: None, app_version: "test".into() },
+        Ports {
+            secrets: Arc::new(NoWriteKeyring),
+            network: world.network.clone(),
+            events: events.clone(),
+            clock: world.clock.clone(),
+            cipher: Arc::new(PendingGroupKeys),
+        },
+    )
+    .unwrap();
+    let link = new.start_device_link().unwrap();
+    old.core.begin_device_approval(&link.code).unwrap();
+    new.sync_now().unwrap();
+    new.confirm_device_link(true).unwrap();
+    old.core.confirm_device_approval(true).unwrap();
+    new.sync_now().unwrap();
+    let last = events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::DeviceLinkState(s) => Some(s),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!((last.state, last.reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Keyring)));
+    assert!(new.get_identity().unwrap().is_none());
+}

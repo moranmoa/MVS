@@ -3505,3 +3505,31 @@ input.switch:disabled {
 .device-notice-body .actions {
   margin-block-start: 0.25rem;
 }
+
+/* G-74: push to talk. */
+.key-capture {
+  justify-self: start;
+  min-width: 8rem;
+}
+
+.key-capture.waiting {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+
+.key-capture kbd {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-weight: 700;
+}
+
+.radio-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* The push-to-talk key is held: the mic shows active. */
+.call-actions .call-mute.talking {
+  background: var(--accent);
+  color: var(--accent-text);
+}

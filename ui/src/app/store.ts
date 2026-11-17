@@ -132,6 +132,8 @@ export interface StoreState {
    * voice room, and also learned from a call ended or a join refused for it.
    */
   relayOnly: boolean;
+  /** G-74: the shell's answer to the push-to-talk settings ('unsupported' outside the desktop app). */
+  pttStatus: 'ok' | 'invalid' | 'shortcut-taken' | 'unsupported' | 'pending';
   /** Member relays (slice 1, #368); null until read. */
   memberRelay: MemberRelay | null;
   /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
@@ -156,6 +158,7 @@ export class Store {
     callError: null,
     voiceRooms: {},
     relayOnly: false,
+    pttStatus: 'pending',
     memberRelay: null,
     flash: null,
     settingsRequest: null,
@@ -434,6 +437,10 @@ export class Store {
   /** Settings → Privacy (#272). The core ends a call in progress when it goes on. */
   setMemberRelay(memberRelay: MemberRelay): void {
     this.set({ memberRelay });
+  }
+
+  setPttStatus(pttStatus: StoreState['pttStatus']): void {
+    if (pttStatus !== this.state.pttStatus) this.set({ pttStatus });
   }
 
   async setRelayOnly(on: boolean): Promise<void> {

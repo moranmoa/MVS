@@ -1,7 +1,7 @@
 // "A new device was added to your account" (device link follow-up): the notice
 // on my other devices, "It was me" / "It wasn't me", and its sanitizer.
 
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
@@ -21,6 +21,18 @@ async function setup() {
   return { core };
 }
 const notices = () => screen.queryAllByRole('alert').filter((a) => a.classList.contains('device-notice'));
+/**
+ * The notices once `n` are shown. Waits rather than reading at once: in a
+ * busy full-suite run the notice can render after the act() that sent the
+ * event returned (flaky on CI and locally, about 1 run in 7).
+ */
+async function shown(n = 1): Promise<HTMLElement[]> {
+  return waitFor(() => {
+    const list = notices();
+    expect(list).toHaveLength(n);
+    return list;
+  });
+}
 
 describe('new device added notice', () => {
   it('shows the device and the time; "It was me" acknowledges it to the core and it goes', async () => {
@@ -28,7 +40,7 @@ describe('new device added notice', () => {
     const ack = vi.spyOn(core, 'ackDeviceNotice');
     const at = new Date(2026, 10, 17, 9, 5).getTime();
     act(() => core.simulateDeviceAdded('Windows laptop', at));
-    const [notice] = notices();
+    const [notice] = await shown();
     expect(within(notice).getByText('A new device was added to your account')).toBeTruthy();
     // Untrusted text from the new device: quoted, never the headline.
     expect(notice.textContent?.replace(/[\u2068\u2069]/g, '')).toContain('a device that calls itself “Windows laptop”');
@@ -38,24 +50,24 @@ describe('new device added notice', () => {
     expect(notice.textContent).toMatch(/Nov 17/);
     // Re-sent until acknowledged: one notice per device, not two.
     act(() => core.simulateDeviceAdded('Windows laptop', at));
-    expect(notices()).toHaveLength(1);
+    await shown(1);
     await act(async () => {
       fireEvent.click(within(notice).getByRole('button', { name: 'It was me' }));
     });
     expect(ack).toHaveBeenCalledWith(at);
-    expect(notices()).toHaveLength(0);
+    await shown(0);
   });
 
   it('no label (the core sends none yet) says "A new device"', async () => {
     const { core } = await setup();
     act(() => core.simulateDeviceAdded(''));
-    expect(notices()[0].textContent).toContain('A new device');
+    expect((await shown())[0].textContent).toContain('A new device');
   });
 
   it('"It wasn\'t me" explains what to do, and the notice stays', async () => {
     const { core } = await setup();
     act(() => core.simulateDeviceAdded('Linux'));
-    fireEvent.click(within(notices()[0]).getByRole('button', { name: "It wasn't me" }));
+    fireEvent.click(within((await shown())[0]).getByRole('button', { name: "It wasn't me" }));
     const dialog = screen.getByRole('dialog', { name: 'An unknown device was added' });
     expect(within(dialog).getAllByRole('listitem')).toHaveLength(3);
     expect(dialog.textContent).toContain('full access to your account');

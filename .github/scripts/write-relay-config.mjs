@@ -6,8 +6,8 @@
 //   node write-relay-config.mjs <out.json>
 //
 // Multi-relay (part A): RELAYS and RELAYS_TCP are lists, one multiaddr per
-// line, 1-4 relays, no relay (peer ID) twice; RELAYS_TCP pairs with RELAYS by
-// order. RELAYS wins over RELAY, and RELAYS_TCP over RELAY_TCP; the singles
+// line or comma-separated (or both), 1-4 relays, no relay (peer ID) twice;
+// RELAYS_TCP pairs with RELAYS by order. RELAYS wins over RELAY, and RELAYS_TCP over RELAY_TCP; the singles
 // stay as the fallback.
 //
 // Output: {"relay": ..., "relays": [...], "bootstrap": [...], "stun": ...}; each key
@@ -55,20 +55,21 @@ function stunUrl(value) {
 const MAX_RELAYS = 4;
 const peerId = (addr) => addr.slice(addr.lastIndexOf("/p2p/") + 5);
 
-// A list variable: one multiaddr per line (blank lines and surrounding
-// spaces ignored), each checked, at most MAX_RELAYS, no peer ID twice. Errors
-// name the line number only, never the address.
+// A list variable: multiaddrs separated by newlines and/or commas (a
+// multiaddr never contains either); each entry trimmed, empty ones dropped,
+// each checked, at most MAX_RELAYS, no peer ID twice. Errors name the entry's
+// position only, never the address.
 function checkedList(name, text) {
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  if (lines.length > MAX_RELAYS) {
+  const entries = text.split(/[\r\n,]/).map((e) => e.trim()).filter(Boolean);
+  if (entries.length > MAX_RELAYS) {
     console.error(`::error::${name}: at most ${MAX_RELAYS} entries`);
     process.exit(1);
   }
   const seen = new Set();
-  return lines.map((line, i) => {
-    const addr = checked(`${name}, line ${i + 1},`, line);
+  return entries.map((entry, i) => {
+    const addr = checked(`${name}, entry ${i + 1},`, entry);
     if (seen.has(peerId(addr))) {
-      console.error(`::error::${name}, line ${i + 1}: the same relay twice`);
+      console.error(`::error::${name}, entry ${i + 1}: the same relay twice`);
       process.exit(1);
     }
     seen.add(peerId(addr));

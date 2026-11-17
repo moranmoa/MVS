@@ -132,7 +132,8 @@ function bootstrapFor({ packaged, resourcesPath, env = process.env, warn = (m) =
       return []; // relayFor already warned
     }
   } else {
-    list = env.MVS_BOOTSTRAP ? env.MVS_BOOTSTRAP.split(',') : undefined;
+    // Commas and/or newlines, like MVS_RELAYS; entries trimmed, empty ones dropped.
+    list = env.MVS_BOOTSTRAP ? env.MVS_BOOTSTRAP.split(/[\r\n,]/).map((s) => s.trim()).filter(Boolean) : undefined;
   }
   if (list === undefined || list === null) return [];
   if (!Array.isArray(list)) {

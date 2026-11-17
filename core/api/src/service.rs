@@ -17,10 +17,11 @@ use zeroize::Zeroizing;
 
 use crate::avatar;
 use crate::backup;
+use crate::devicelink::{self, OneTimeKey, Target};
 use crate::chat;
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
-use crate::ports::{CipherError, GroupCipher, Network, Ports, Reach, SharedSecrets};
+use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
 use crate::rekey::JoinBucket;
 use crate::types::*;
 use crate::update::Updates;
@@ -223,6 +224,31 @@ impl Me {
     }
 }
 
+/// Device link, the new device's side: the one-time key, until when, and
+/// the approving device's key once its Hello came (one session).
+struct NewLink {
+    key: OneTimeKey,
+    expires_at: u64,
+    old_pub: Option<[u8; 32]>,
+    /// My user said the digits match (`confirmDeviceLink(true)`). Nothing
+    /// is applied before: a DHT server that saw the rendezvous could race
+    /// the first Hello and send its own seed (Security Lead on #394).
+    confirmed: bool,
+    /// The opened account, held until `confirmed`.
+    held: Option<devicelink::Payload>,
+}
+
+/// Device link, the approving device's side, per link: the one-time key
+/// (the same for a retry, so the one session stays ours), the attempts, and
+/// once a Hello was answered, the address, the new device's key and when
+/// it ends.
+struct Approval {
+    key: OneTimeKey,
+    attempts: u32,
+    link: Option<(DeviceLinkAddr, [u8; 32])>,
+    expires_at: u64,
+}
+
 struct Inner {
     db: Db,
     vault: Vault<SharedSecrets>,
@@ -232,6 +258,12 @@ struct Inner {
     /// Member relays: the value last announced (`memberRelay.changed` fires
     /// when it differs). `None` until first worked out.
     member_relay: Option<MemberRelay>,
+    /// Device link, the new device: my one link.
+    device_link: Option<NewLink>,
+    /// Device link, the approving device: by link (the QR's key or the
+    /// code's rendezvous), with the one in progress.
+    approvals: HashMap<[u8; 32], Approval>,
+    approving: Option<[u8; 32]>,
     /// Loaded on first use per server, then kept current record by record.
     logs: HashMap<ServerId, Log>,
     /// Messages already announced to the UI, per server, with what was
@@ -422,6 +454,9 @@ impl Core {
             me: None,
             keyring_unavailable: false,
             member_relay: None,
+            device_link: None,
+            approvals: HashMap::new(),
+            approving: None,
             logs: HashMap::new(),
             announced: HashMap::new(),
             net: ports.network.clone(),
@@ -729,26 +764,33 @@ impl Core {
         words: Vec<String>,
         input: Option<NewIdentityInput>,
     ) -> CoreResult<Identity> {
+        // TODO(backup): the spec restores these from the encrypted identity
+        // backup (docs/design, restore servers); until then the UI asks
+        // again. The name comes after, from `updateProfile`.
+        let profile = match input {
+            Some(input) => Profile {
+                country: input.country,
+                birth_date: input.birth_date,
+                locale: Some(input.locale),
+                ..Profile::default()
+            },
+            None => Profile::default(),
+        };
+        self.restore_with_profile(&words.join(" "), profile)
+    }
+
+    /// The restore path: the words into the keychain, `profile` sealed, then
+    /// my servers back from my backup (#291). Device link comes here too,
+    /// with the profile the approving device sent.
+    fn restore_with_profile(&self, words: &str, profile: Profile) -> CoreResult<Identity> {
         let identity = self.run(|inner, ports, _| {
             inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());
             }
-            let phrase = RecoveryPhrase::parse(&words.join(" ")).map_err(phrase_error)?;
+            let phrase = RecoveryPhrase::parse(words).map_err(phrase_error)?;
             inner.vault.restore(&phrase).map_err(vault_error)?;
             inner.db.delete(KV_RECOVERY_CHALLENGE)?;
-            // TODO(backup): the spec restores these from the encrypted
-            // identity backup (docs/design, restore servers); until then the
-            // UI asks again. The name comes after, from `updateProfile`.
-            let profile = match input {
-                Some(input) => Profile {
-                    country: input.country,
-                    birth_date: input.birth_date,
-                    locale: Some(input.locale),
-                    ..Profile::default()
-                },
-                None => Profile::default(),
-            };
             let me = inner.new_me(phrase, profile)?;
             let identity = inner.identity_json(&me)?;
             inner.me = Some(me);
@@ -2064,6 +2106,8 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        // Device link, the new device: its link moves on even before sign-in.
+        self.poll_device_link();
         let result = self.sync_round();
         // Member relays: a role read from the log, a leave, a birth date
         // whose 30 days ended.
@@ -2311,6 +2355,240 @@ impl Core {
     /// The one-time disclosure was shown and acknowledged.
     pub fn mark_member_relay_disclosure_seen(&self) -> CoreResult<()> {
         self.run(|inner, _, _| inner.db.set(KV_MEMBER_RELAY_SEEN, &[1]))
+    }
+
+    // ---- device link (`device-link-slice.md`) ----------------------------
+
+    /// New device: a one-time key, a code and a QR, served for 5 minutes.
+    /// Replaces any earlier link. `not-allowed` once signed in; `offline`
+    /// without a relay reservation yet.
+    pub fn start_device_link(&self) -> CoreResult<DeviceLinkStart> {
+        self.run(|inner, ports, events| {
+            if inner.me.is_some() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            ports.network.device_link_close();
+            inner.device_link = None;
+            let key = OneTimeKey::generate();
+            let code = devicelink::new_code();
+            let rv = devicelink::rendezvous(&code).expect("a fresh code is valid");
+            let addr = ports.network.device_link_open(rv, key.public).ok_or(ErrorCode::Offline)?;
+            let qr = devicelink::qr(&key.public, &addr);
+            if qr.len() > devicelink::MAX_QR {
+                ports.network.device_link_close();
+                return Err(ErrorCode::Internal.into());
+            }
+            let expires_at = ports.clock.now_ms() + devicelink::LINK_TTL_MS;
+            inner.device_link = Some(NewLink { key, expires_at, old_pub: None, confirmed: false, held: None });
+            events.push(link_state(DeviceLinkPhase::Waiting, None, None));
+            Ok(DeviceLinkStart { qr, code, expires_at })
+        })
+    }
+
+    /// New device: ends the link (`failed`, `cancelled`). Nothing to cancel
+    /// is fine.
+    pub fn cancel_device_link(&self) -> CoreResult<()> {
+        self.run(|inner, ports, events| {
+            if inner.device_link.take().is_some() {
+                ports.network.device_link_close();
+                events.push(link_state(DeviceLinkPhase::Failed, None, Some(DeviceLinkReason::Cancelled)));
+            }
+            Ok(())
+        })
+    }
+
+    /// New device, each sync round (and on the network's wake-up): the
+    /// approving device's Hello shows the digits (`confirm`); its sealed
+    /// account is opened and held until my user confirms the digits
+    /// (`confirmDeviceLink`), then restored (`done`, then
+    /// `identity.changed`); a link past its 5 minutes ends (`expired`).
+    pub fn poll_device_link(&self) {
+        let mut events = Vec::new();
+        let payload = {
+            let mut inner = self.lock();
+            let Some(link) = inner.device_link.as_mut() else { return };
+            let mut end = None;
+            for inbound in self.ports.network.device_link_take() {
+                match inbound {
+                    DeviceLinkInbound::Hello { e_old_pub } if link.old_pub.is_none() => {
+                        link.old_pub = Some(e_old_pub);
+                        let sas = devicelink::sas(&link.key.public, &e_old_pub);
+                        events.push(link_state(DeviceLinkPhase::Confirm, Some(sas), None));
+                    }
+                    DeviceLinkInbound::Sealed { ciphertext } => {
+                        let opened = link.old_pub.and_then(|old| {
+                            let key = link.key.transfer_key(&old, &link.key.public, &old)?;
+                            devicelink::open(&key, &ciphertext)
+                        });
+                        match opened {
+                            Some(p) => link.held = Some(p),
+                            None => end = Some((DeviceLinkPhase::Failed, DeviceLinkReason::Refused)),
+                        }
+                        // The network takes one transfer per link.
+                        self.ports.network.device_link_close();
+                        break;
+                    }
+                    DeviceLinkInbound::Hello { .. } => {}
+                }
+            }
+            let ready = link.confirmed && link.held.is_some();
+            if !ready && end.is_none() && self.ports.clock.now_ms() >= link.expires_at {
+                end = Some((DeviceLinkPhase::Expired, DeviceLinkReason::Timeout));
+            }
+            if let Some((phase, reason)) = end {
+                // One use: the keys and anything held are wiped.
+                inner.device_link = None;
+                self.ports.network.device_link_close();
+                events.push(link_state(phase, None, Some(reason)));
+                None
+            } else if ready {
+                inner.device_link.take().and_then(|mut link| link.held.take())
+            } else {
+                None
+            }
+        };
+        self.emit(events);
+        if let Some(payload) = payload {
+            self.apply_link(payload);
+        }
+    }
+
+    /// New device: my user compared the digits with the approving device's.
+    /// `true` lets the account be applied (now, if it has arrived, else when
+    /// it does); `false` ends the link (`failed`, `refused`) and wipes
+    /// anything held. Nothing is applied before `true`: whoever got to the
+    /// link first may not be my device (Security Lead on #394).
+    /// `not-found` with no link; `bad-request` before the digits are shown.
+    pub fn confirm_device_link(&self, matches: bool) -> CoreResult<()> {
+        let payload = {
+            let mut inner = self.lock();
+            let link = inner.device_link.as_mut().ok_or(ErrorCode::NotFound)?;
+            if link.old_pub.is_none() {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            if !matches {
+                inner.device_link = None;
+                self.ports.network.device_link_close();
+                drop(inner);
+                self.emit(vec![link_state(DeviceLinkPhase::Failed, None, Some(DeviceLinkReason::Refused))]);
+                return Ok(());
+            }
+            link.confirmed = true;
+            match link.held.is_some() {
+                true => inner.device_link.take().and_then(|mut link| link.held.take()),
+                false => None,
+            }
+        };
+        if let Some(payload) = payload {
+            self.apply_link(payload);
+        }
+        Ok(())
+    }
+
+    /// New device: the account, through `restoreIdentity`'s path. The same
+    /// identity and person: the age isn't asked again, and the birth date
+    /// stays as trusted as it was (#306).
+    fn apply_link(&self, payload: devicelink::Payload) {
+        let profile = Profile {
+            display_name: payload.profile.display_name.clone(),
+            avatar_small: payload.profile.avatar_small.clone().filter(|a| avatar::valid_avatar(a)),
+            color: payload.profile.color.clone().filter(|c| avatar::valid_color(c)),
+            birth_date: payload.birth_date.clone(),
+            birth_date_trusted: payload.birth_date_trusted,
+            country: payload.country.clone(),
+            ..Profile::default()
+        };
+        let done = match self.restore_with_profile(&payload.seed, profile) {
+            Ok(identity) => vec![link_state(DeviceLinkPhase::Done, None, None), Event::IdentityChanged(identity)],
+            Err(e) => {
+                eprintln!("mvs-core: a device link's account wasn't restored: {:?}", e.code);
+                vec![link_state(DeviceLinkPhase::Failed, None, None)]
+            }
+        };
+        self.emit(done);
+    }
+
+    /// Signed-in device: reaches the link in `qr_or_code` and returns the
+    /// digits to compare. `bad-request` for neither a QR nor a code;
+    /// `not-found` for no such link (or expired, or another device's
+    /// session); `locked-out` when another device's Hello holds the link;
+    /// `rate-limited` after 3 attempts at one link; `offline`.
+    pub fn begin_device_approval(&self, qr_or_code: &str) -> CoreResult<DeviceApproval> {
+        let target = Target::parse(qr_or_code).ok_or(ErrorCode::BadRequest)?;
+        let id = target.link_id();
+        let now = self.ports.clock.now_ms();
+        let old_pub = {
+            let mut inner = self.lock();
+            if inner.me.is_none() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.approving = None;
+            // Expired approvals go (Tech Lead on #393).
+            inner.approvals.retain(|_, a| now < a.expires_at);
+            let approval = inner.approvals.entry(id).or_insert_with(|| Approval {
+                key: OneTimeKey::generate(),
+                attempts: 0,
+                link: None,
+                expires_at: now + devicelink::LINK_TTL_MS,
+            });
+            if approval.attempts >= devicelink::MAX_ATTEMPTS {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            approval.attempts += 1;
+            approval.key.public
+        };
+        // The network, outside the lock (a lookup can take seconds).
+        let net = &self.ports.network;
+        let addr = match &target {
+            Target::Qr { addr, .. } => addr.clone(),
+            Target::Code { rendezvous } => net.device_link_find(*rendezvous).map_err(link_error)?,
+        };
+        let new_pub = net.device_link_hello(&addr, old_pub).map_err(link_error)?;
+        if matches!(&target, Target::Qr { new_pub: qr_pub, .. } if *qr_pub != new_pub) {
+            return Err(ErrorCode::NotFound.into());
+        }
+        let mut inner = self.lock();
+        let approval = inner.approvals.get_mut(&id).ok_or(ErrorCode::NotFound)?;
+        approval.link = Some((addr, new_pub));
+        approval.expires_at = now + devicelink::LINK_TTL_MS;
+        let expires_at = approval.expires_at;
+        inner.approving = Some(id);
+        Ok(DeviceApproval { sas: devicelink::sas(&new_pub, &old_pub), expires_at })
+    }
+
+    /// Signed-in device: the user compared the digits. `true` sends my
+    /// account, sealed, and shows "a new device was added"; `false` ends
+    /// this attempt. `bad-request` with no approval in progress; `not-found`
+    /// once it expired.
+    pub fn confirm_device_approval(&self, approve: bool) -> CoreResult<()> {
+        let now = self.ports.clock.now_ms();
+        let (addr, sealed) = {
+            let mut inner = self.lock();
+            let id = inner.approving.take().ok_or(ErrorCode::BadRequest)?;
+            let approval = inner.approvals.get(&id).ok_or(ErrorCode::BadRequest)?;
+            let Some((addr, new_pub)) = approval.link.clone() else {
+                return Err(ErrorCode::BadRequest.into());
+            };
+            if now >= approval.expires_at {
+                inner.approvals.remove(&id);
+                return Err(ErrorCode::NotFound.into());
+            }
+            if !approve {
+                return Ok(());
+            }
+            let old_pub = approval.key.public;
+            let key = approval.key.transfer_key(&new_pub, &new_pub, &old_pub).ok_or(ErrorCode::NotFound)?;
+            let payload = inner.link_payload()?;
+            let sealed = devicelink::seal(&key, &payload);
+            // One use: this link's key is wiped.
+            inner.approvals.remove(&id);
+            (addr, sealed)
+        };
+        self.ports.network.device_link_send(&addr, &sealed).map_err(link_error)?;
+        // TODO(device link): the notice to my other devices goes on the
+        // backup-store notice path once holders keep one (dev-sync).
+        self.emit(vec![Event::DeviceAdded { at: now }]);
+        Ok(())
     }
 
     pub fn set_update_channel(&self, channel: UpdateChannel) -> CoreResult<()> {
@@ -2914,6 +3192,9 @@ impl Inner {
                 if self.member_relay.is_some() {
                     events.push(Event::MemberRelayChanged(now.clone()));
                 }
+                // Slice 2: the network relays for members only while this
+                // says so (the first check, at start, sets it too).
+                ports.network.set_member_relay(now.effective, now.daily_cap_mb);
                 self.member_relay = Some(now);
             }
             Ok(_) => {}
@@ -3541,6 +3822,25 @@ impl Inner {
             None => Profile::default(),
         };
         self.me_from(phrase, identity, profile)
+    }
+
+    /// Device link: what the approving device sends. The words come from the
+    /// keychain (they are gone from memory once the recovery check passed).
+    fn link_payload(&self) -> CoreResult<devicelink::Payload> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let phrase = self.vault.open().map_err(vault_error)?;
+        let p = &me.profile;
+        Ok(devicelink::Payload {
+            seed: phrase.words().join(" "),
+            profile: devicelink::PayloadProfile {
+                display_name: p.display_name.clone(),
+                avatar_small: p.avatar_small.clone().filter(|a| !a.is_empty()),
+                color: p.color.clone().filter(|c| !c.is_empty()),
+            },
+            birth_date: p.birth_date.clone(),
+            birth_date_trusted: p.birth_date_trusted,
+            country: p.country.clone(),
+        })
     }
 
     fn identity_json(&self, me: &Me) -> CoreResult<Identity> {
@@ -4264,6 +4564,20 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
         JoinStatus::Invalid { .. } => "invalid",
         JoinStatus::AgeBlocked { .. } => "age-blocked",
         JoinStatus::Closed { .. } => "closed",
+    }
+}
+
+fn link_state(state: DeviceLinkPhase, sas: Option<String>, reason: Option<DeviceLinkReason>) -> Event {
+    Event::DeviceLinkState(DeviceLinkState { state, sas, reason })
+}
+
+fn link_error(e: DeviceLinkError) -> CoreError {
+    match e {
+        DeviceLinkError::NotFound => ErrorCode::NotFound.into(),
+        // Another device's Hello holds the link: someone else may be trying
+        // (Security Lead on #394; dev-ui shows "start again").
+        DeviceLinkError::Refused => ErrorCode::LockedOut.into(),
+        DeviceLinkError::Network => ErrorCode::Offline.into(),
     }
 }
 

@@ -104,6 +104,11 @@ describe('Settings → Voice (G-74)', () => {
     await open(null);
     await waitFor(() => expect(screen.getByRole('note').textContent).toBe('Push to talk works in the desktop app.'));
     expect((screen.getByRole('radio', { name: 'Push to talk' }) as HTMLInputElement).disabled).toBe(true);
+    // UX: the line explains the disabled controls.
+    expect(screen.getByRole('radio', { name: 'Push to talk' }).getAttribute('aria-describedby')).toBe('ptt-desktop-only');
+    const toggle = screen.getByRole('button', { name: 'Global mute toggle' }) as HTMLButtonElement;
+    expect(toggle.disabled).toBe(true);
+    expect(toggle.getAttribute('aria-describedby')).toContain('ptt-desktop-only');
   });
 
   it('the shell gets the key only in push-to-talk mode', async () => {

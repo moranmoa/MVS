@@ -14,6 +14,7 @@ function KeyCapture({
   label,
   describedBy,
   invalid,
+  disabled,
   capture,
   onChange,
   onRejected,
@@ -22,6 +23,7 @@ function KeyCapture({
   label: string;
   describedBy?: string;
   invalid?: boolean;
+  disabled?: boolean;
   capture: (e: KeyboardEvent) => string | null;
   onChange: (v: string) => void;
   /** A key (not a lone modifier) that can't be used was pressed; null once a good one is. */
@@ -35,6 +37,7 @@ function KeyCapture({
       aria-label={label}
       aria-describedby={describedBy}
       aria-invalid={invalid || undefined}
+      disabled={disabled}
       onClick={() => setWaiting(true)}
       onBlur={() => setWaiting(false)}
       onKeyDown={(e) => {
@@ -71,7 +74,7 @@ export function PushToTalkSection() {
   return (
     <div className="stack voice-settings">
       {unsupported && (
-        <p className="muted small" role="note">
+        <p className="muted small" role="note" id="ptt-desktop-only">
           <FormattedMessage id="voice.desktopOnly" />
         </p>
       )}
@@ -81,7 +84,7 @@ export function PushToTalkSection() {
         </legend>
         {(['open', 'ptt'] as const).map((m) => (
           <label key={m} className="radio-row">
-            <input type="radio" name="voice-mode" checked={prefs.mode === m} onChange={() => set({ mode: m })} />
+            <input type="radio" name="voice-mode" checked={prefs.mode === m} aria-describedby={unsupported ? 'ptt-desktop-only' : undefined} onChange={() => set({ mode: m })} />
             <FormattedMessage id={m === 'open' ? 'voice.mode.open' : 'voice.mode.ptt'} />
           </label>
         ))}
@@ -94,7 +97,8 @@ export function PushToTalkSection() {
           <KeyCapture
             value={prefs.pttKey ? keyLabel(prefs.pttKey) : null}
             label={intl.formatMessage({ id: 'voice.pttKey' })}
-            describedBy="ptt-key-hint"
+            describedBy={unsupported ? 'ptt-desktop-only ptt-key-hint' : 'ptt-key-hint'}
+            disabled={unsupported}
             invalid={status === 'invalid'}
             capture={(e) => pttKeyFrom(e)}
             onChange={(pttKey) => set({ pttKey })}
@@ -112,7 +116,8 @@ export function PushToTalkSection() {
           <KeyCapture
             value={prefs.globalMute ? acceleratorLabel(prefs.globalMute) : null}
             label={intl.formatMessage({ id: 'voice.globalMute' })}
-            describedBy="global-mute-hint"
+            describedBy={unsupported ? 'ptt-desktop-only global-mute-hint' : 'global-mute-hint'}
+            disabled={unsupported}
             invalid={!!muteError}
             capture={(e) => acceleratorFrom(e)}
             onChange={(globalMute) => set({ globalMute })}

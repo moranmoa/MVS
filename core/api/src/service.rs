@@ -3210,7 +3210,7 @@ impl Inner {
                 }
                 // Slice 2: the network relays for members only while this
                 // says so (the first check, at start, sets it too).
-                ports.network.set_member_relay(now.effective, now.daily_cap_mb);
+                ports.network.set_member_relay(now.effective, now.daily_cap_mb, now.role);
                 self.member_relay = Some(now);
             }
             Ok(_) => {}

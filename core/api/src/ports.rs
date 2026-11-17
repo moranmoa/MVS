@@ -200,9 +200,10 @@ pub trait Network: Send + Sync {
 
     /// Member relays (#368, slice 2): relay for bound current members of
     /// servers we share (`MemberRelay.effective`), up to `daily_cap_mb` a
-    /// day. At start and on each change.
-    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
-        let _ = (on, daily_cap_mb);
+    /// day; `role`: an owner or admin relay (members try those first). At
+    /// start and on each change.
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        let _ = (on, daily_cap_mb, role);
     }
 
     /// Restore servers, phase A (#291): hands my sealed backup to the

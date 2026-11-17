@@ -11,7 +11,8 @@ import { Dialog, Name } from '../../components/common';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
-import { playTestSound } from '../../voice/devices';
+import { playCallCue, playTestSound } from '../../voice/devices';
+import { useSettings } from '../../app/settings';
 
 /**
  * The voice engine (piece D, ui/src/voice) as the call UI uses it. `peerFailed`
@@ -146,6 +147,32 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   const serverId = useStore(store, (s) => Object.entries(s.voiceRooms).find(([, rooms]) => rooms.some((r) => r.roomId === s.call?.channelId))?.[0]);
   const serverName = useStore(store, (s) => s.servers.find((x) => x.id === serverId)?.name ?? '');
   const members = useStore(store, (s) => (serverId ? s.members[serverId] : undefined)) ?? NO_MEMBERS;
+  const { settings } = useSettings();
+  // G-64: who joined or left my call since the last update, as a short sound
+  // (unless turned off, or I'm deafened) and a line for screen readers.
+  // Nothing for my own join: the first list of a call is just remembered.
+  const seen = useRef<{ channel: string; ids: Set<Id> } | null>(null);
+  const [cue, setCue] = useState('');
+  useEffect(() => {
+    if (!call || call.participants.length === 0) {
+      seen.current = null;
+      return;
+    }
+    const ids = new Set(call.participants.map((p) => p.identity).filter((id) => id !== myId));
+    const before = seen.current;
+    seen.current = { channel: call.channelId, ids };
+    if (!before || before.channel !== call.channelId) return;
+    const joined = [...ids].filter((id) => !before.ids.has(id));
+    const left = [...before.ids].filter((id) => !ids.has(id));
+    if (joined.length === 0 && left.length === 0) return;
+    const nameOf = (id: Id) => members.find((m) => m.id === id)?.displayName || codeOf(id);
+    setCue(
+      joined.length > 0
+        ? intl.formatMessage({ id: 'call.personJoined' }, { name: nameOf(joined[0]) })
+        : intl.formatMessage({ id: 'call.personLeft' }, { name: nameOf(left[0]) }),
+    );
+    if (settings.callSounds !== false && !engine.deafened) void playCallCue(joined.length > 0 ? 'join' : 'leave', engine.outputId);
+  }, [call, myId, members, intl, settings.callSounds, engine.deafened, engine.outputId]);
   if (!call) return null;
 
   const me = call.participants.find((p) => p.identity === myId);
@@ -187,6 +214,9 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
 
   return (
     <section className="call-bar" aria-label={intl.formatMessage({ id: 'call.label' })}>
+      <span className="visually-hidden" aria-live="polite">
+        {cue}
+      </span>
       <p className="call-where">
         <PhoneIcon />
         <FormattedMessage id="call.inCall" values={{ server: serverName }} />

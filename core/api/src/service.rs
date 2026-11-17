@@ -22,6 +22,7 @@ use crate::chat;
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
 use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
+use crate::recovery;
 use crate::rekey::JoinBucket;
 use crate::types::*;
 use crate::update::Updates;
@@ -98,6 +99,16 @@ const KV_BACKUP_PENDING: &str = "backup-pending";
 /// when it was last put (u64le ms).
 const KV_BACKUP_WRITTEN: &str = "backup-written";
 const KV_BACKUP_PUT_AT: &str = "backup-put-at";
+/// G-91 phase B: my backup buddies (JSON [`Buddies`]) and when each
+/// co-member was last seen online (JSON hex key -> ms).
+const KV_BACKUP_BUDDIES: &str = "backup-buddies";
+const KV_MEMBER_SEEN: &str = "member-seen";
+/// G-91 phase B: how many co-members hold my backup (design §2), one per
+/// owner group (Tech Lead).
+pub const BACKUP_BUDDIES: usize = 3;
+/// G-91 phase B: how often the buddies are checked (a gone one is
+/// replaced at the check after it went).
+pub const BUDDY_CHECK_MS: u64 = 10 * 60_000;
 /// Restore servers: an unchanged backup is put again this often (design
 /// §4), so holders keep it and copies heal.
 pub const BACKUP_REPUBLISH_MS: u64 = 24 * 3_600_000;
@@ -285,6 +296,9 @@ struct Inner {
     net: Arc<dyn Network>,
     /// The online members last reported per server (M2).
     presence_seen: HashMap<ServerId, Reach>,
+    /// G-91: when each co-member was last seen online (core clock), for
+    /// picking backup buddies; persisted with each buddy check.
+    member_seen: HashMap<PublicKey, u64>,
     /// Who each channel was last keyed for by our own rotation, so a
     /// moderator re-keys when members join (in memory: once after a restart).
     keyed_for: HashMap<(ServerId, ChannelId), BTreeSet<PublicKey>>,
@@ -352,6 +366,25 @@ pub struct Core {
     /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
     /// once the restore is done.
     backup_retry: Mutex<(u64, u64)>,
+    /// G-91 phase B: when the buddies were last checked (core clock).
+    buddies_checked: Mutex<Option<u64>>,
+}
+
+/// G-91 phase B: my backup buddies, as stored.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Buddies {
+    /// When this set was picked (core clock, ms).
+    picked_at: u64,
+    list: Vec<Buddy>,
+}
+
+/// One buddy: its identity key and the owner group it was picked
+/// through (both hex).
+#[derive(Serialize, Deserialize)]
+struct Buddy {
+    member: String,
+    owner: String,
 }
 
 struct PendingJoin {
@@ -476,6 +509,7 @@ impl Core {
             announced: HashMap::new(),
             net: ports.network.clone(),
             presence_seen: HashMap::new(),
+            member_seen: HashMap::new(),
             keyed_for: HashMap::new(),
             join_buckets: HashMap::new(),
             join_waiting: BTreeSet::new(),
@@ -514,6 +548,7 @@ impl Core {
             backup_started: AtomicBool::new(false),
             notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
+            buddies_checked: Mutex::new(None),
         })
     }
 
@@ -900,6 +935,20 @@ impl Core {
     fn backup_round(&self) {
         let now = self.ports.clock.now_ms();
         let login = !self.backup_started.load(Ordering::SeqCst);
+        // G-91 phase B: the buddies, checked every BUDDY_CHECK_MS; a new set
+        // makes this round write.
+        {
+            let mut checked = self.buddies_checked.lock().expect("not poisoned");
+            if checked.is_none_or(|at| now.saturating_sub(at) >= BUDDY_CHECK_MS) {
+                let mut inner = self.lock();
+                if inner.me.is_some() {
+                    if let Err(e) = inner.buddy_check(now) {
+                        eprintln!("mvs-core: the backup buddies weren't checked: {:?}", e.code);
+                    }
+                    *checked = Some(now);
+                }
+            }
+        }
         let tag = {
             let inner = self.lock();
             match inner.backup_due(now, login) {
@@ -920,7 +969,18 @@ impl Core {
         let answers = self.ports.network.fetch_backup(tag);
         let blob = self.lock().backup_merge(now, &answers);
         match blob {
-            Ok(Some(blob)) => self.ports.network.put_backup(tag, &blob),
+            Ok(Some(blob)) => {
+                self.ports.network.put_backup(tag, &blob);
+                // G-91 phase B: and to my buddies (the network re-checks each
+                // is a bound current co-member at send time).
+                let buddies: Vec<PublicKey> = match self.lock().buddies() {
+                    Ok(b) => b.list.iter().filter_map(|b| model::parse_hex32(&b.member)).map(PublicKey::from_bytes).collect(),
+                    Err(_) => Vec::new(),
+                };
+                if !buddies.is_empty() {
+                    self.ports.network.put_backup_to(tag, &blob, &buddies);
+                }
+            }
             Ok(None) => {}
             Err(e) => eprintln!("mvs-core: the server backup wasn't written: {:?}", e.code),
         }
@@ -2242,7 +2302,7 @@ impl Core {
                     inner.join_waiting.remove(&server);
                 }
                 // M2: someone came online or went offline (members only).
-                if inner.db.has_server(server)? && inner.presence_changed(server)? && !changed {
+                if inner.db.has_server(server)? && inner.presence_changed(server, ports.clock.now_ms())? && !changed {
                     let view = inner.view(server)?;
                     events.push(Event::MembersChanged {
                         server_id: model::hex_id(server.as_bytes()),
@@ -2815,12 +2875,15 @@ impl voice::Members for Inner {
 impl Inner {
     /// Whether the online members of `server` changed since last reported
     /// (and remembers the new set). Members only: authority's, not kicked.
-    fn presence_changed(&mut self, server: ServerId) -> CoreResult<bool> {
+    fn presence_changed(&mut self, server: ServerId, now: u64) -> CoreResult<bool> {
         let view = self.view(server)?;
         let mut reach = self.net.presence(server).unwrap_or_default();
         let member = |key: &PublicKey| view.state.members.contains(key) && !view.is_kicked(key);
         reach.online.retain(member);
         reach.direct.retain(|key| reach.online.contains(key));
+        for key in &reach.online {
+            self.member_seen.insert(*key, now);
+        }
         Ok(self.presence_seen.insert(server, reach.clone()) != Some(reach))
     }
 
@@ -3018,6 +3081,102 @@ impl Inner {
         self.db.set(KV_BACKUP_WRITTEN, &Self::backup_fingerprint(&current))?;
         self.db.set(KV_BACKUP_PUT_AT, &now.to_le_bytes())?;
         Ok(Some(blob))
+    }
+
+    /// G-91 phase B: my current backup buddies (identity keys).
+    fn buddies(&self) -> CoreResult<Buddies> {
+        Ok(self.db.get(KV_BACKUP_BUDDIES)?.and_then(|json| serde_json::from_slice(&json).ok()).unwrap_or_default())
+    }
+
+    /// G-91 phase B: every co-member as a buddy candidate, through each
+    /// server I'm in (closed ones left out), with the last-seen times
+    /// merged into the stored ones (and stored).
+    fn buddy_candidates(&mut self, now: u64) -> CoreResult<Vec<recovery::Candidate>> {
+        let me = self.me.as_ref().map(Me::key).ok_or(ErrorCode::NotFound)?;
+        let mut seen: BTreeMap<String, u64> =
+            self.db.get(KV_MEMBER_SEEN)?.and_then(|json| serde_json::from_slice(&json).ok()).unwrap_or_default();
+        for (key, at) in self.member_seen.drain() {
+            let entry = seen.entry(hex::encode(key.as_bytes())).or_insert(at);
+            *entry = (*entry).max(at);
+        }
+        let mut out = Vec::new();
+        let mut members = BTreeSet::new();
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            let view = self.view(server)?;
+            if !view.state.is_member(me) {
+                continue;
+            }
+            let since = view.member_since();
+            let my_join = since.get(&me).copied().unwrap_or(0);
+            let others = view.state.members.len().saturating_sub(1) as u32;
+            for key in view.state.members.iter().filter(|k| **k != me && !view.is_kicked(k)) {
+                members.insert(hex::encode(key.as_bytes()));
+                out.push(recovery::Candidate {
+                    member: *key.as_bytes(),
+                    owner: *view.owner.as_bytes(),
+                    adult: view.state.adults.contains(key),
+                    current: true,
+                    blocked: self.db.is_blocked(key)?,
+                    mine: false,
+                    last_seen: seen.get(&hex::encode(key.as_bytes())).copied().unwrap_or(0),
+                    others_in_server: others,
+                    shared_since: since.get(key).copied().unwrap_or(now).max(my_join),
+                    my_join,
+                });
+            }
+        }
+        // Only co-members are kept; someone in no shared server is forgotten.
+        seen.retain(|key, _| members.contains(key));
+        self.db.set(KV_MEMBER_SEEN, &serde_json::to_vec(&seen).expect("plain map"))?;
+        Ok(out)
+    }
+
+    /// G-91 phase B: checks my buddies and picks again when one is gone,
+    /// two share an owner (at once), or (routine, at most daily) 2 or more
+    /// are stale or there's room for more. A new set makes the next backup
+    /// round write, so the new buddies get the current version. Returns
+    /// whether the set changed.
+    fn buddy_check(&mut self, now: u64) -> CoreResult<bool> {
+        let candidates = self.buddy_candidates(now)?;
+        let stored = self.buddies()?;
+        let status: Vec<recovery::HolderStatus> = stored
+            .list
+            .iter()
+            .filter_map(|b| {
+                let member = model::parse_hex32(&b.member)?;
+                let picked_through = model::parse_hex32(&b.owner)?;
+                let rows: Vec<&recovery::Candidate> = candidates.iter().filter(|c| c.member == member).collect();
+                let owner = if rows.iter().any(|c| c.owner == picked_through) {
+                    picked_through
+                } else {
+                    rows.first().map_or(picked_through, |c| c.owner)
+                };
+                let last_seen = rows.first().map_or(0, |c| c.last_seen);
+                Some(recovery::HolderStatus { member, owner, gone: rows.is_empty(), last_seen })
+            })
+            .collect();
+        let fresh = recovery::pick_owner_groups(&candidates, now, BACKUP_BUDDIES, false);
+        let routine = now.saturating_sub(stored.picked_at) >= recovery::RESHARE_GAP_MS;
+        let repick = match recovery::reshare_reason(&status, fresh.len(), stored.picked_at, now) {
+            Some(_) => true,
+            // The first pick, or room for more buddies than I have.
+            None => (status.is_empty() || routine) && fresh.len() > status.len(),
+        };
+        if !repick || fresh.iter().map(|p| p.member).eq(status.iter().map(|s| s.member)) {
+            return Ok(false);
+        }
+        let list = fresh
+            .iter()
+            .map(|p| Buddy { member: hex::encode(p.member), owner: hex::encode(p.owner) })
+            .collect();
+        self.db.set(KV_BACKUP_BUDDIES, &serde_json::to_vec(&Buddies { picked_at: now, list }).expect("plain struct"))?;
+        // The next backup round writes, to the new buddies too.
+        self.db.delete(KV_BACKUP_WRITTEN)?;
+        Ok(true)
     }
 
     /// Each sync round: a raise whose 30 days are up takes effect, and its

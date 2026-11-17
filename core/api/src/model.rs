@@ -387,6 +387,26 @@ impl<'a> ServerView<'a> {
         self.state.kicked.contains(key)
     }
 
+    /// G-91: since when each current member has been in this server: the
+    /// owner from the genesis, others from their earliest join record.
+    /// (Record times are the authors' own: good enough to rank holders.)
+    pub fn member_since(&self) -> BTreeMap<PublicKey, u64> {
+        let mut since: BTreeMap<PublicKey, u64> = BTreeMap::new();
+        for record in self.records.iter().filter(|r| r.server() == self.id) {
+            let author = record.author();
+            let counts = match record.kind() {
+                Kind::Genesis => author == self.owner,
+                Kind::Join => true,
+                _ => false,
+            };
+            if counts && self.state.members.contains(&author) {
+                let at = since.entry(author).or_insert(record.ts());
+                *at = (*at).min(record.ts());
+            }
+        }
+        since
+    }
+
     /// `authority`'s member set, with names from profile posts. Ordered by
     /// role, then key.
     /// Each author's latest display name from their profile posts. A name

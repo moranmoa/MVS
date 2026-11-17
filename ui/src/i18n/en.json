@@ -260,6 +260,8 @@
   "channelOrder.notAllowed": "Only the owner can change the channel order. It went back to how it was.",
   "call.leave": "Leave call",
   "call.voiceSettings": "Voice settings",
+  "call.deafen": "Deafen",
+  "call.deafenedNote": "You can't hear the call, and you're muted.",
   "call.microphone": "Microphone",
   "call.speaker": "Speaker",
   "call.systemDefault": "System default",

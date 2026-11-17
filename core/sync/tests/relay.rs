@@ -1529,3 +1529,84 @@ async fn a_restart_with_the_relay_down_reconnects_to_a_remembered_member() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// A notice as the core makes it (`notice-slot-spec.md`): the header, a
+/// fixed-size opaque body, and the `w_n` signature. `seed` makes `w_n`.
+fn notice_blob(seed: u8, at: u64) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let w = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let w_pub = w.verifying_key().to_bytes();
+    let mut blob = b"mvsn1".to_vec();
+    blob.extend_from_slice(&sync::notice_tag(&w_pub));
+    blob.extend_from_slice(&w_pub);
+    blob.extend_from_slice(&at.to_le_bytes());
+    blob.extend_from_slice(&[7; 24]);
+    blob.extend_from_slice(&[9; sync::NOTICE_BODY]);
+    let sig = w.sign(&blob).to_bytes();
+    blob.extend_from_slice(&sig);
+    assert_eq!(blob.len(), sync::NOTICE_LEN);
+    blob
+}
+
+/// Holder notice slot, relay only: my device puts a notice, my other
+/// device keeps it, and a third device of mine that never got the put
+/// fetches it with a signed fetch, all over relay circuits. A fetch signed
+/// by another key gets nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn my_other_device_fetches_a_notice_through_the_relay() {
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let circuits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _relay = start_relay_counting(relay_key, port, circuits, true);
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let device = |name: &'static str| {
+        let (relay, listen) = (relay.clone(), listen.clone());
+        async move {
+            let node = bound_node_on_events(name, &relay, 43, false, Arc::new(AcceptAll), listen, vec![], true).await.0;
+            let w_n: Arc<dyn sync::NoticeSigner> = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[6; 32]));
+            node.set_notice_signer(Some(w_n)).unwrap();
+            node
+        }
+    };
+    let a = device("notice-a").await;
+    let a2 = device("notice-a2").await;
+    let start = Instant::now();
+    while !a.peers().await.unwrap().contains(&a2.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(60), "my devices never met");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let notice = notice_blob(6, now);
+    let mut forged = notice.clone();
+    forged[100] ^= 1;
+    assert!(!a.put_notice(forged).await.unwrap(), "a malformed notice is refused");
+    assert!(!a.put_notice(notice[..100].to_vec()).await.unwrap(), "so is a wrong size");
+    // A2 keeps it once it has bound A (at most 4 writes an hour per tag).
+    for _ in 0..3 {
+        assert!(a.put_notice(notice.clone()).await.unwrap());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    assert!(a2.fetch_notices().await.unwrap().contains(&notice), "my other device didn't keep it");
+
+    // A third device of mine, which never got the put, fetches it.
+    let a3 = device("notice-a3").await;
+    let start = Instant::now();
+    loop {
+        if a3.fetch_notices().await.unwrap().contains(&notice) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(90), "my third device never fetched it");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Another key's fetch: nothing (the same empty answer as "none").
+    let other: Arc<dyn sync::NoticeSigner> = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[8; 32]));
+    a3.set_notice_signer(Some(other)).unwrap();
+    assert!(a3.fetch_notices().await.unwrap().is_empty());
+    // No signer: no fetch.
+    a3.set_notice_signer(None).unwrap();
+    assert!(a3.fetch_notices().await.unwrap().is_empty());
+    for node in [a, a2, a3] {
+        node.shutdown().await.unwrap();
+    }
+}

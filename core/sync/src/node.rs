@@ -161,6 +161,11 @@ pub const BACKUP_FETCH_WAIT: Duration = Duration::from_secs(3);
 const BACKUP_LOOKUP_EVERY: Duration = Duration::from_secs(60);
 /// Providers of a backup tag one fetch asks.
 const MAX_BACKUP_PROVIDERS: usize = 8;
+/// How long [`Node::fetch_notices`] waits for holders.
+pub const NOTICE_FETCH_WAIT: Duration = Duration::from_secs(3);
+/// Holders one notice fetch asks (Tech Lead: the first answer merged with
+/// at most one more, not every holder).
+const NOTICE_HOLDERS: usize = 2;
 /// Peers one envelope fetch asks.
 const MAX_FETCH_PEERS: usize = 16;
 /// Traffic on every connection at least this often, well under the 100 s a
@@ -398,6 +403,9 @@ enum Command {
     FetchInvite { handle: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
     PutBackup { blob: Vec<u8>, reply: oneshot::Sender<bool> },
     FetchBackup { tag: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
+    PutNotice { blob: Vec<u8>, reply: oneshot::Sender<bool> },
+    FetchNotices { reply: oneshot::Sender<Vec<Vec<u8>>> },
+    NoticeSigner { signer: Option<Arc<dyn crate::notice::NoticeSigner>> },
     LinkOpen { rv: [u8; 32], e_new_pub: [u8; 32], reply: oneshot::Sender<Option<(PeerId, Multiaddr)>> },
     LinkClose,
     LinkFind { rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>> },
@@ -502,6 +510,8 @@ struct Behaviour {
     invite_ask: crate::invite::AskBehaviour,
     /// Server-list backups (`/mvs/backup/1`, G-91).
     backup: crate::backup::BackupBehaviour,
+    /// Holder notice slot (`/mvs/notice/1`).
+    notice: crate::notice::NoticeBehaviour,
     /// "Approve on your other device" (`/mvs/device-link/1`), relay circuit
     /// only (`device_link`).
     device_link: crate::device_link::LinkBehaviour,
@@ -775,6 +785,9 @@ impl Node {
             backup_lookups: HashMap::new(),
             backups_expired: Instant::now(),
             backup_looked_up: HashMap::new(),
+            notice_limits: crate::notice::NoticeLimits::new(),
+            notice_fetch_of: HashMap::new(),
+            notice_signer: None,
             link_host: None,
             link_peers,
             link_until: HashMap::new(),
@@ -1053,6 +1066,35 @@ impl Node {
         Ok(rx.await?)
     }
 
+    /// Holder notice slot: keeps my notice here (announced under its tag)
+    /// and hands it to the holders: my own other devices that are
+    /// connected, and the relay. False, nothing kept or sent, if it fails
+    /// `notice::check` (size, tag, signature, `at` at most a day ahead).
+    /// Best effort.
+    pub async fn put_notice(&self, blob: Vec<u8>) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::PutNotice { blob, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Holder notice slot: the notices held for my tag, here and by at
+    /// most two holders, each asked with a fetch signed by the
+    /// [`crate::NoticeSigner`] (none sent without one, or while it is
+    /// locked). Within [`crate::node::NOTICE_FETCH_WAIT`]. Untrusted: the
+    /// core checks and opens each, removes duplicates by (`at`, hash) and
+    /// ignores anything older than its last acknowledgement (holders can
+    /// replay).
+    pub async fn fetch_notices(&self) -> Result<Vec<Vec<u8>>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::FetchNotices { reply })?;
+        Ok(rx.await?)
+    }
+
+    /// The core's `w_n` signer for notice fetches (None: no fetches).
+    pub fn set_notice_signer(&self, signer: Option<Arc<dyn crate::NoticeSigner>>) -> Result<()> {
+        self.send(Command::NoticeSigner { signer })
+    }
+
     /// Closes all connections and the store.
     /// Device link, new device: opens (or replaces) the one link. We become
     /// a DHT provider of `rv` for [`crate::DEVICE_LINK_TTL`] and answer one
@@ -1219,6 +1261,7 @@ async fn build_swarm(
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
                 backup: crate::backup::behaviour(),
+                notice: crate::notice::behaviour(),
                 device_link: crate::device_link::behaviour(),
             })
         })?
@@ -1453,6 +1496,11 @@ struct Task {
     backups_expired: Instant,
     /// When each tag's providers were last looked up.
     backup_looked_up: HashMap<[u8; 32], Instant>,
+    /// Holder notice slot: caps, fetches in flight, and the core's `w_n`
+    /// signer (present while unlocked; without it no fetch is sent).
+    notice_limits: crate::notice::NoticeLimits,
+    notice_fetch_of: HashMap<request_response::OutboundRequestId, u64>,
+    notice_signer: Option<Arc<dyn crate::notice::NoticeSigner>>,
     /// Device link, new device: the one open link.
     link_host: Option<LinkHost>,
     /// Device-link peers (either side), reached through the relay only, and
@@ -1690,6 +1738,11 @@ impl Task {
                 let _ = reply.send(self.put_backup(blob));
             }
             Command::FetchBackup { tag, reply } => self.fetch_backup(tag, reply),
+            Command::PutNotice { blob, reply } => {
+                let _ = reply.send(self.put_notice(blob));
+            }
+            Command::FetchNotices { reply } => self.fetch_notices(reply),
+            Command::NoticeSigner { signer } => self.notice_signer = signer,
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
@@ -2030,12 +2083,16 @@ impl Task {
         let live: HashSet<u64> = self.fetches.keys().copied().collect();
         self.fetch_of.retain(|_, id| live.contains(id));
         self.backup_fetch_of.retain(|_, id| live.contains(id));
+        self.notice_fetch_of.retain(|_, id| live.contains(id));
         self.backup_lookups.retain(|_, (id, _)| live.contains(id));
         // Others' backups past their retention (phase B; mine stay).
         if self.backups_expired.elapsed() >= Duration::from_secs(3600) {
             self.backups_expired = Instant::now();
             if let Err(err) = self.store.expire_backups(unix_now(), crate::backup::RETENTION.as_secs()) {
                 warn!(%err, "expiring held backups failed");
+            }
+            if let Err(err) = self.store.expire_notices(unix_now(), crate::notice::RETENTION.as_secs()) {
+                warn!(%err, "expiring held notices failed");
             }
         }
     }
@@ -2164,6 +2221,116 @@ impl Task {
         }
         let until = Instant::now() + BACKUP_FETCH_WAIT;
         self.fetches.insert(id, Fetch { reply, waiting, answers, until });
+    }
+
+
+    /// See [`Node::put_notice`].
+    fn put_notice(&mut self, blob: Vec<u8>) -> bool {
+        let Some((tag, at)) = crate::notice::check(&blob, unix_now()) else { return false };
+        if let Err(err) = self.store.put_notice(&tag, at, &blob, unix_now()) {
+            warn!(%err, "keeping my notice failed");
+        }
+        self.provide_backup(tag);
+        for peer in self.notice_holders(usize::MAX) {
+            self.swarm.behaviour_mut().notice.send_request(&peer, crate::notice::Request::Put(blob.clone()));
+        }
+        true
+    }
+
+    /// Holders for my notices: my own other devices that are connected,
+    /// then the relay (its mailbox, once devops adds `/mvs/notice/1`; an
+    /// older one fails at negotiation). At most `max`.
+    fn notice_holders(&self, max: usize) -> Vec<PeerId> {
+        let mut holders = self.my_devices();
+        if self.swarm.is_connected(&self.relay_peer) {
+            holders.push(self.relay_peer);
+        }
+        holders.truncate(max);
+        holders
+    }
+
+    /// `/mvs/notice/1` from a peer. A fetch, if signed for us within the
+    /// minute skew and within the caps, gets the notices held under its
+    /// tag, newest first; anything else the same empty answer (R3). A write
+    /// is kept only from my own other devices (the backup gate, phase A),
+    /// within its caps, if it passes `check`.
+    fn on_notice_request(&mut self, peer: PeerId, request: crate::notice::Request, channel: ResponseChannel<Vec<u8>>) {
+        let now = Instant::now();
+        // The cheap gates (rate caps, my own device) come before any
+        // signature check (Security Lead on #425).
+        let answer = match request {
+            crate::notice::Request::Get(fetch) => {
+                let me = *self.swarm.local_peer_id();
+                let tag = Some(())
+                    .filter(|_| self.notice_limits.allow_fetch(peer, now))
+                    .and_then(|_| fetch.verify(&me, unix_now() / 60));
+                let held = tag.and_then(|tag| self.store.notices(&tag).ok()).unwrap_or_default();
+                crate::notice::encode_answer(&held)
+            }
+            crate::notice::Request::Put(blob) => {
+                let me = self.access.binder.as_ref().map(|b| *b.identity().as_bytes());
+                let from = self.member_identity(peer).map(|identity| *identity.as_bytes());
+                // Phase A: my own devices only (no buddies for notices).
+                let mine = crate::backup::write_owner(from, me) == Some(None);
+                let kept = crate::notice::claimed_tag(&blob)
+                    .filter(|_| mine)
+                    .filter(|tag| self.notice_limits.allow_write(peer, *tag, now))
+                    .and_then(|_| crate::notice::check(&blob, unix_now()))
+                    .filter(|(tag, at)| self.store.put_notice(tag, *at, &blob, unix_now()).unwrap_or(false));
+                if let Some((tag, _)) = kept {
+                    self.provide_backup(tag);
+                }
+                vec![u8::from(kept.is_some())]
+            }
+        };
+        let _ = self.swarm.behaviour_mut().notice.send_response(channel, answer);
+    }
+
+    /// See [`Node::fetch_notices`]: what I hold for my tag, plus one signed
+    /// fetch to each of at most [`NOTICE_HOLDERS`] holders.
+    fn fetch_notices(&mut self, reply: oneshot::Sender<Vec<Vec<u8>>>) {
+        let Some(signer) = self.notice_signer.clone() else {
+            let _ = reply.send(Vec::new());
+            return;
+        };
+        let Some(key) = signer.key() else {
+            let _ = reply.send(Vec::new());
+            return;
+        };
+        let answers = self.store.notices(&crate::notice::tag_of(&key)).unwrap_or_default();
+        let id = self.next_fetch;
+        self.next_fetch += 1;
+        let minute = unix_now() / 60;
+        let mut waiting = 0;
+        for peer in self.notice_holders(NOTICE_HOLDERS) {
+            let Some(fetch) = crate::notice::Fetch::sign(&*signer, &peer, minute) else { continue };
+            let request = self.swarm.behaviour_mut().notice.send_request(&peer, crate::notice::Request::Get(fetch));
+            self.notice_fetch_of.insert(request, id);
+            waiting += 1;
+        }
+        if waiting == 0 {
+            let _ = reply.send(answers);
+            return;
+        }
+        let until = Instant::now() + NOTICE_FETCH_WAIT;
+        self.fetches.insert(id, Fetch { reply, waiting, answers, until });
+    }
+
+    /// A holder's notice answer (or failure) for fetch `id`.
+    fn on_notice_answer(&mut self, request: request_response::OutboundRequestId, answer: Option<Vec<u8>>) {
+        let Some(id) = self.notice_fetch_of.remove(&request) else { return };
+        // Only valid notices under my own tag come back (Security Lead on
+        // #425): the core checks again, but junk never reaches it.
+        let mine = self.notice_signer.as_ref().and_then(|s| s.key()).map(|key| crate::notice::tag_of(&key));
+        if let Some(fetch) = self.fetches.get_mut(&id) {
+            for notice in crate::notice::decode_answer(&answer.unwrap_or_default()) {
+                let valid = crate::notice::check(&notice, unix_now()).is_some_and(|(tag, _)| Some(tag) == mine);
+                if valid && !fetch.answers.contains(&notice) {
+                    fetch.answers.push(notice);
+                }
+            }
+        }
+        self.fetch_answered(id, None);
     }
 
     /// Providers found for a backup fetch's tag: each asked once, through
@@ -2714,6 +2881,9 @@ impl Task {
                     // which may not hold us. And the backups we hold are
                     // announced again (a restarted relay forgot them).
                     self.swarm.add_external_address(self.relay_addr.clone().with(Protocol::P2pCircuit));
+                    for tag in self.store.notice_tags().unwrap_or_default() {
+                        self.provide_backup(tag);
+                    }
                     for tag in self.store.backup_tags().unwrap_or_default() {
                         self.provide_backup(tag);
                     }
@@ -2863,6 +3033,25 @@ impl Task {
                 request_id,
                 ..
             })) => self.on_invite_answer(request_id, None),
+            SwarmEvent::Behaviour(BehaviourEvent::Notice(request_response::Event::Message { peer, message, .. })) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.on_notice_request(peer, request, channel)
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        self.on_notice_answer(request_id, Some(response))
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Notice(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            })) => {
+                debug!(%peer, %error, "notice request failed");
+                self.on_notice_answer(request_id, None);
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Backup(request_response::Event::Message { peer, message, .. })) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => {

@@ -41,6 +41,8 @@ pub const RETENTION: Duration = Duration::from_secs(180 * 24 * 3600);
 /// "buddy". Off in phase A (Tech Lead on #339): a node keeps only my own
 /// backup, from my own devices; the store already bounds others' (one per
 /// owner, [`MAX_HELD`], [`RETENTION`]) for when it is turned on.
+/// Turning it on (members as holders, of backups or notices) needs the
+/// Security Lead's re-review first (#425).
 pub const BUDDIES: bool = false;
 
 /// Whose a write from a peer is, if this node keeps it: `Some(None)` for

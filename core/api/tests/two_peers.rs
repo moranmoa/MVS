@@ -37,7 +37,7 @@ fn peer(name: &str, words: &str, relay: &str) -> Peer {
     let dir = std::env::temp_dir().join(format!("mvs-two-peers-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let net = Arc::new(
-        SyncNetwork::start(relay.parse().unwrap(), &dir, Arc::new(MemberGate::new())).unwrap(),
+        SyncNetwork::start(vec![relay.parse().unwrap()], &dir, Arc::new(MemberGate::new())).unwrap(),
     );
     let events = Arc::new(CollectingSink::new());
     // Locked: the core unlocks it when the identity is restored.
@@ -562,7 +562,7 @@ fn fresh_device(name: &str, relay: &str) -> Peer {
     let dir = std::env::temp_dir().join(format!("mvs-two-peers-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let net = Arc::new(
-        SyncNetwork::start(relay.parse().unwrap(), &dir, Arc::new(MemberGate::new())).unwrap(),
+        SyncNetwork::start(vec![relay.parse().unwrap()], &dir, Arc::new(MemberGate::new())).unwrap(),
     );
     let events = Arc::new(CollectingSink::new());
     let cipher = Arc::new(GroupKeysCipher::locked());

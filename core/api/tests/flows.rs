@@ -2799,7 +2799,7 @@ struct RelayOnlyNet {
     world: Arc<LoopbackNetwork>,
     applied: std::sync::Mutex<Vec<bool>>,
     /// Each member relay setting (on, daily cap) it was given.
-    relays: std::sync::Mutex<Vec<(bool, u32)>>,
+    relays: std::sync::Mutex<Vec<(bool, u32, bool)>>,
 }
 
 impl RelayOnlyNet {
@@ -2825,8 +2825,8 @@ impl Network for RelayOnlyNet {
         self.applied.lock().unwrap().push(on);
     }
 
-    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
-        self.relays.lock().unwrap().push((on, daily_cap_mb));
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        self.relays.lock().unwrap().push((on, daily_cap_mb, role));
     }
 }
 
@@ -4973,6 +4973,51 @@ fn member_relay_follows_my_role_and_is_forced_off() {
     assert_eq!(relay_events(&bob).len(), 1);
 }
 
+/// Member relays, slice 3a: the shell's metered flag (`setMetered`) forces
+/// relaying off with reason `metered`, one event each way; clearing it
+/// restores the value. Relay-only, earlier in the order, wins the reason.
+#[test]
+fn member_relay_is_off_on_a_metered_network() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    assert!(relay_of(&owner).effective);
+    owner.events.take();
+
+    owner.core.set_metered(true).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert_eq!((ev[0].effective, ev[0].reason), (false, Some(MemberRelayReason::Metered)));
+    owner.core.set_metered(true).unwrap();
+    assert!(relay_events(&owner).is_empty(), "the same flag again");
+
+    // Relay-only comes first in the order; metered shows again after it.
+    owner.core.set_relay_only(true).unwrap();
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::RelayOnly));
+    owner.core.set_relay_only(false).unwrap();
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::Metered));
+    owner.events.take();
+
+    owner.core.set_metered(false).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].reason.is_none());
+
+    // Over the wire, as the shell sends it; anything else is bad-request.
+    let wire = |args: &str| -> serde_json::Value {
+        let request = format!(r#"{{"cmd":"setMetered","args":{args}}}"#);
+        serde_json::from_str(&owner.core.handle(&request)).unwrap()
+    };
+    let reply = wire(r#"{"metered":true}"#);
+    assert_eq!(reply["ok"], serde_json::Value::Null, "{reply}");
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::Metered));
+    for bad in [r#"{"metered":"yes"}"#, r#"{}"#, r#"{"metered":true,"x":1}"#] {
+        assert_eq!(wire(bad)["error"]["code"], "bad-request", "{bad}");
+    }
+}
+
 /// Member relays: a minor (no trusted adult birth date) stays off even with
 /// "on", and even as an owner.
 #[test]
@@ -5214,15 +5259,20 @@ fn the_network_follows_the_member_relay_setting() {
     let owner = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
     sign_up(&owner, "Owner");
     let relays = || net.relays.lock().unwrap().clone();
-    assert_eq!(relays(), [(false, 2_048)], "told at start");
+    assert_eq!(relays(), [(false, 2_048, false)], "told at start");
     owner.core.create_server("Relay", AgeRestriction::None).unwrap();
     owner.core.mark_member_relay_disclosure_seen().unwrap();
-    assert_eq!(relays().last(), Some(&(true, 2_048)));
+    assert_eq!(relays().last(), Some(&(true, 2_048, true)));
     owner.core.set_member_relay_cap(512).unwrap();
-    assert_eq!(relays().last(), Some(&(true, 512)));
+    assert_eq!(relays().last(), Some(&(true, 512, true)));
     let told = relays().len();
     owner.core.sync_now().unwrap();
     assert_eq!(relays().len(), told, "nothing changed, nothing told");
+    // Slice 3a: a metered network stops serving at once; unmetered resumes it.
+    owner.core.set_metered(true).unwrap();
+    assert_eq!(relays().last(), Some(&(false, 512, true)), "metered: serving stops");
+    owner.core.set_metered(false).unwrap();
+    assert_eq!(relays().last(), Some(&(true, 512, true)), "unmetered: serving resumes");
     owner.core.set_relay_only(true).unwrap();
-    assert_eq!(relays().last(), Some(&(false, 512)));
+    assert_eq!(relays().last(), Some(&(false, 512, true)));
 }

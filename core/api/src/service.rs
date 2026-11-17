@@ -261,6 +261,9 @@ struct Inner {
     /// Member relays: the value last announced (`memberRelay.changed` fires
     /// when it differs). `None` until first worked out.
     member_relay: Option<MemberRelay>,
+    /// Slice 3a: the shell says the network is metered (`setMetered`). In
+    /// memory only: the shell sets it at every start.
+    metered: bool,
     /// Device link, the new device: my one link.
     device_link: Option<NewLink>,
     /// Device link, the approving device: by link (the QR's key or the
@@ -457,6 +460,7 @@ impl Core {
             me: None,
             keyring_unavailable: false,
             member_relay: None,
+            metered: false,
             device_link: None,
             approvals: HashMap::new(),
             approving: None,
@@ -2355,6 +2359,16 @@ impl Core {
         })
     }
 
+    /// Slice 3a: the desktop shell's metered-connection flag (shell only,
+    /// never the page). Kept in memory; forces member relaying off with
+    /// reason `metered` while set.
+    pub fn set_metered(&self, metered: bool) -> CoreResult<()> {
+        self.run(|inner, _, _| {
+            inner.metered = metered;
+            Ok(())
+        })
+    }
+
     /// The one-time disclosure was shown and acknowledged.
     pub fn mark_member_relay_disclosure_seen(&self) -> CoreResult<()> {
         self.run(|inner, _, _| inner.db.set(KV_MEMBER_RELAY_SEEN, &[1]))
@@ -3134,8 +3148,8 @@ impl Inner {
 
     /// Member relays (#368, slice 1): the setting, and what it comes to now.
     /// Forced off, whatever the setting, by the first reason that applies:
-    /// the global flag (the signed `flags.json`, slice 3b), a metered network
-    /// (reserved for slice 3, never set yet), then a minor, then relay-only.
+    /// the global flag (the signed `flags.json`, slice 3b), then a minor, then
+    /// relay-only, then a metered network (the shell's `setMetered`).
     fn member_relay_now(&mut self, now: u64) -> CoreResult<MemberRelay> {
         let setting = match self.db.get(KV_MEMBER_RELAY)?.as_deref() {
             Some(b"on") => MemberRelaySetting::On,
@@ -3163,6 +3177,8 @@ impl Inner {
             Some(MemberRelayReason::Minor)
         } else if relay_only_in(&self.db)? {
             Some(MemberRelayReason::RelayOnly)
+        } else if self.metered {
+            Some(MemberRelayReason::Metered)
         } else {
             None
         };
@@ -3215,7 +3231,7 @@ impl Inner {
                 }
                 // Slice 2: the network relays for members only while this
                 // says so (the first check, at start, sets it too).
-                ports.network.set_member_relay(now.effective, now.daily_cap_mb);
+                ports.network.set_member_relay(now.effective, now.daily_cap_mb, now.role);
                 self.member_relay = Some(now);
             }
             Ok(_) => {}

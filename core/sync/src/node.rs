@@ -166,6 +166,35 @@ const MAX_FETCH_PEERS: usize = 16;
 /// Traffic on every connection at least this often, well under the 100 s a
 /// proxy like Cloudflare lets a WebSocket sit idle.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// A ping unanswered this long fails (the default is 20 s).
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Our relay's connection is closed after this many failed pings in a row.
+/// libp2p's ping no longer closes anything itself, and a connection that died
+/// silently (a NAT entry gone, a laptop lid) would otherwise sit until
+/// IDLE_TIMEOUT. Worst case [`relay_silent_for`]: within a minute, so the
+/// member relay fallback (RELAY_DOWN_AFTER) starts from a real loss.
+const RELAY_PING_MISSES: u32 = 2;
+
+/// The longest our relay can stay silent before its connection is closed.
+#[cfg(test)]
+const fn relay_silent_for() -> Duration {
+    Duration::from_secs((PING_INTERVAL.as_secs() + PING_TIMEOUT.as_secs()) * RELAY_PING_MISSES as u64)
+}
+
+/// One ping result from our relay: the misses in a row so far, and whether
+/// to close the connection now.
+fn relay_ping(misses: &mut u32, ok: bool) -> bool {
+    if ok {
+        *misses = 0;
+        return false;
+    }
+    *misses += 1;
+    if *misses >= RELAY_PING_MISSES {
+        *misses = 0;
+        return true;
+    }
+    false
+}
 /// Bytes of served pull pages: per peer, and for all peers together.
 const SERVED_BYTES_BURST: u32 = 16 * 1024 * 1024;
 const SERVED_BYTES_RATE: u32 = 2 * 1024 * 1024;
@@ -346,7 +375,7 @@ enum Command {
     RelayOnly { on: bool },
     NoDirectDials,
     NoHolePunch,
-    MemberRelay { on: bool, daily_cap_mb: u32 },
+    MemberRelay { on: bool, daily_cap_mb: u32, preferred: bool },
     #[cfg(test)]
     Served { peer: PeerId, log: String, reply: oneshot::Sender<usize> },
     #[cfg(test)]
@@ -429,6 +458,19 @@ struct SyncResponse {
     /// carries them.
     #[serde(default)]
     direct_addrs: Vec<ByteBuf>,
+    /// We relay for members (#368 slice 2): where to reach us, only to a
+    /// member, never on identify or the DHT (design §1 rule 2).
+    #[serde(default)]
+    relay: Option<RelayOffer>,
+}
+
+/// A member relay's offer, in pull answers to members only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RelayOffer {
+    /// Our direct listen addresses (at most `MAX_DIRECT_CANDIDATES`).
+    addrs: Vec<ByteBuf>,
+    /// An owner or admin relay: tried first.
+    preferred: bool,
 }
 
 #[derive(NetworkBehaviour)]
@@ -438,6 +480,9 @@ struct Behaviour {
     /// order, and one asked before a refusal keeps a connection the swarm
     /// never reports closed (request-response then trips over it).
     guard: DialGuard,
+    /// Second, for the same reason: a connection over a limit is refused
+    /// before any behaviour that keeps per-connection state saw it.
+    limits: connection_limits::Behaviour,
     /// Member relays (`member_relay`): circuit relay v2 for bound current
     /// members only, off unless the core turns it on.
     member_relay: crate::member_relay::MemberRelay,
@@ -447,7 +492,6 @@ struct Behaviour {
     kad: kad::Behaviour<kad::store::MemoryStore>,
     gossipsub: gossipsub::Behaviour<gossipsub::IdentityTransform, MaxCountSubscriptionFilter<LogTopics>>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
-    limits: connection_limits::Behaviour,
     /// Hole punching (DCUtR), with verified members only (`punch`).
     punch: crate::punch::MemberPunch,
     /// Voice signalling (`/mvs/voice/1`), with verified members only (`voice`).
@@ -601,6 +645,8 @@ impl Node {
         let backoff: SharedBackoff =
             Arc::new(Mutex::new(DialBackoff::new(DIAL_BACKOFF_MIN, DIAL_BACKOFF_MAX, MAX_TRACKED_PEERS)));
         let mut swarm = build_swarm(key, config.relay.clone(), backoff.clone(), config.allow_lan).await?;
+        // Member relays: the daily count survives restarts (the Tech Lead, #395).
+        swarm.behaviour_mut().member_relay.keep_budget_in(config.data_dir.join("member-relay.budget"));
         // A stable port: `listen` with TCP port 0 reuses the one saved in
         // `listen.port` (written on first start); if it is taken now, a random
         // one, and the saved one is kept for next time.
@@ -735,6 +781,17 @@ impl Node {
             link_finds: HashMap::new(),
             link_waiting: Vec::new(),
             link_out: HashMap::new(),
+            relay_offers: HashMap::new(),
+            known_members: HashMap::new(),
+            // Down until it holds our reservation (the fallback waits
+            // RELAY_DOWN_AFTER, so a normal start never uses it).
+            relay_lost_at: Some(Instant::now()),
+            member_listeners: HashMap::new(),
+            member_reserved: HashSet::new(),
+            relay_ping_misses: 0,
+            member_relay_rest: HashMap::new(),
+            fallback_dialed: HashMap::new(),
+            fallback_dials: HashSet::new(),
         };
         for log in config.logs {
             task.open(log, None);
@@ -882,10 +939,11 @@ impl Node {
 
     /// Member relays (design #368, slice 2): relay for bound current members
     /// of servers we share, or stop; `daily_cap_mb` is the core's
-    /// `dailyCapMb`. From `MemberRelay.effective` (#389). Never while
+    /// `dailyCapMb`; `preferred`: an owner or admin relay (`MemberRelay.role`),
+    /// which members try first. From `MemberRelay.effective` (#389). Never while
     /// relay-only.
-    pub fn set_member_relay(&self, on: bool, daily_cap_mb: u32) -> Result<()> {
-        self.send(Command::MemberRelay { on, daily_cap_mb })
+    pub fn set_member_relay(&self, on: bool, daily_cap_mb: u32, preferred: bool) -> Result<()> {
+        self.send(Command::MemberRelay { on, daily_cap_mb, preferred })
     }
 
     /// Tests only: no hole punching (DCUtR) from or with this node, so the
@@ -1140,7 +1198,7 @@ async fn build_swarm(
                     ),
                     relay,
                 ),
-                ping: ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL)),
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL).with_timeout(PING_TIMEOUT)),
                 kad,
                 gossipsub,
                 sync: request_response::cbor::Behaviour::new(
@@ -1400,6 +1458,21 @@ struct Task {
     /// Requests waiting for a relayed connection to their peer, and until when.
     link_waiting: Vec<(PeerId, LinkRequest, LinkReply, Instant)>,
     link_out: HashMap<request_response::OutboundRequestId, LinkReply>,
+    /// Member relays, client side (#368 slice 2, design §2): offers members
+    /// made (addresses, preferred, when), members we saw bound, since when our
+    /// relay is down, our reservations on member relays (listener → relay),
+    /// relays resting after a failure, and circuit dials through them.
+    relay_offers: HashMap<PeerId, (Vec<Multiaddr>, bool, Instant)>,
+    known_members: HashMap<PeerId, Instant>,
+    relay_lost_at: Option<Instant>,
+    member_listeners: HashMap<ListenerId, PeerId>,
+    /// Member relay listeners whose reservation was accepted.
+    member_reserved: HashSet<ListenerId>,
+    /// Failed pings in a row to our relay (`relay_ping`).
+    relay_ping_misses: u32,
+    member_relay_rest: HashMap<PeerId, Instant>,
+    fallback_dialed: HashMap<(PeerId, PeerId), Instant>,
+    fallback_dials: HashSet<ConnectionId>,
 }
 
 /// One [`Node::fetch_invite`]: answers so far, until every peer answered or
@@ -1486,7 +1559,10 @@ impl Task {
                     self.probed.retain(|_, at| now < *at + UNBOUND_REPROBE);
                     self.pull_all("round");
                 }
-                _ = discovery.tick() => self.discover(),
+                _ = discovery.tick() => {
+                    self.discover();
+                    self.member_relay_fallback();
+                }
             }
         }
     }
@@ -1604,10 +1680,10 @@ impl Task {
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
-            Command::MemberRelay { on, daily_cap_mb } => {
+            Command::MemberRelay { on, daily_cap_mb, preferred } => {
                 // Relay-only users never relay (design §1), whatever the core says.
                 let on = on && !self.relay_only;
-                self.swarm.behaviour_mut().member_relay.set(on, daily_cap_mb);
+                self.swarm.behaviour_mut().member_relay.set(on, daily_cap_mb, preferred);
                 self.recheck_member_relay();
             }
             Command::ListenAddrs { reply } => {
@@ -2397,6 +2473,7 @@ impl Task {
     fn bound_identity(&mut self, peer: PeerId, server: ServerId, binding: Option<Binding>) -> Option<PublicKey> {
         let identity = self.verify_binding(peer, server, binding?)?;
         self.mark_seen(server, identity, peer);
+        self.remember_member(peer);
         Some(identity)
     }
 
@@ -2460,6 +2537,7 @@ impl Task {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                 self.dial_backoff.lock().unwrap().connected(&peer_id);
+                self.fallback_dials.remove(&connection_id);
                 if let ConnectedPoint::Dialer { address, .. } = &endpoint {
                     if let Some((a, _)) = self.bootstrap.iter().find(|(a, _)| without_peer(a) == without_peer(address)) {
                         self.bootstrap_conns.insert(connection_id, a.clone());
@@ -2532,6 +2610,7 @@ impl Task {
                     // The reservation went with the connection (e.g. the relay
                     // restarted): ask for a new one once we're back.
                     info!("relay connection lost");
+                    self.relay_lost();
                     if let Some(id) = self.circuit.take() {
                         self.swarm.remove_listener(id);
                     }
@@ -2562,7 +2641,13 @@ impl Task {
                 } else {
                     // Only addresses we would dial ourselves go into our DHT
                     // table (which, in server mode, we also serve to others).
-                    let known: Vec<Multiaddr> = info.listen_addrs.iter().filter(|a| self.reachable(a)).cloned().collect();
+                    // Never a circuit through any relay but ours (member relays).
+                    let known: Vec<Multiaddr> = info
+                        .listen_addrs
+                        .iter()
+                        .filter(|a| self.reachable(a) && (via_relay(a, &self.relay_addr) || !a.iter().any(|p| p == Protocol::P2pCircuit)))
+                        .cloned()
+                        .collect();
                     for addr in known {
                         self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                     }
@@ -2574,7 +2659,16 @@ impl Task {
                     }
                 }
             }
-            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { renewal, .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. })) => {
+                if relay_peer_id != self.relay_peer {
+                    // A member relay (slice 2): our circuit there is for members
+                    // only, never announced (identify, DHT).
+                    if !renewal {
+                        debug!("reserved on a member relay");
+                    }
+                    return;
+                }
+                self.relay_back();
                 if !renewal {
                     // Reachable through the relay now: look for peers and catch
                     // up at once rather than at the next timer tick.
@@ -2603,18 +2697,27 @@ impl Task {
                     self.quic_listener = listen_quic(&mut self.swarm, &self.listen, &address);
                 }
             }
+            SwarmEvent::NewListenAddr { listener_id, .. } if self.member_listeners.contains_key(&listener_id) => {
+                self.member_reserved.insert(listener_id);
+            }
+            SwarmEvent::ListenerClosed { listener_id, .. } if self.member_listeners.contains_key(&listener_id) => {
+                self.member_listener_closed(listener_id);
+            }
             SwarmEvent::ListenerClosed { listener_id, .. } if self.circuit == Some(listener_id) => {
                 // Reservation refused or lost: the next discovery tick asks again.
                 self.circuit = None;
                 self.swarm.remove_external_address(&self.relay_addr.clone().with(Protocol::P2pCircuit));
             }
-            SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), error, .. } if peer != self.relay_peer => {
+            SwarmEvent::OutgoingConnectionError { connection_id, peer_id: Some(peer), error, .. } if peer != self.relay_peer => {
                 // Back off this peer, and forget circuit addresses that failed
                 // (a reservation that ended): the relay denies each such dial.
                 // A dial our own guard refused isn't a new failure.
                 // Nor is an extra dial to a peer we are connected to (a
                 // direct or hole-punch attempt that failed).
-                if !matches!(error, libp2p::swarm::DialError::Denied { .. }) && !self.connected.contains(&peer) {
+                // Nor a dial through a member relay to a member who holds no
+                // reservation there (the fallback tries each known member).
+                let fallback = self.fallback_dials.remove(&connection_id);
+                if !fallback && !matches!(error, libp2p::swarm::DialError::Denied { .. }) && !self.connected.contains(&peer) {
                     let jitter = |wait| jittered(wait, OsRng.next_u32());
                     self.dial_backoff.lock().unwrap().failed(peer, Instant::now(), jitter);
                 }
@@ -2626,6 +2729,24 @@ impl Task {
                     }
                 }
                 debug!(%peer, ?error, "dial failed");
+            }
+            // Slice 2: Kademlia also files the address a connection was dialled
+            // on; a circuit through a member relay must never reach the DHT we
+            // serve (design #368 §1 rule 2), so it is taken out again at once.
+            // A silently dead connection to our relay is closed after
+            // RELAY_PING_MISSES failed pings, so the fallback clock starts.
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if peer == self.relay_peer => {
+                if relay_ping(&mut self.relay_ping_misses, result.is_ok()) {
+                    info!("our relay stopped answering pings: closing its connection");
+                    self.swarm.close_connection(connection);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
+                for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
+                    if addr.iter().any(|p| p == Protocol::P2pCircuit) {
+                        self.swarm.behaviour_mut().kad.remove_address(&peer, addr);
+                    }
+                }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
                 result: kad::QueryResult::GetClosestPeers(Ok(ok)),
@@ -2748,7 +2869,7 @@ impl Task {
                     }
                     request_response::Message::Response { request_id, response } => {
                         if let Some(reply) = self.link_out.remove(&request_id) {
-                            let _ = reply.send(if response.is_empty() { Err(LinkError::Refused) } else { Ok(response) });
+                            let _ = reply.send(crate::device_link::outcome(response));
                         }
                     }
                 }
@@ -2862,6 +2983,11 @@ impl Task {
         let allow_lan = self.allow_lan;
         let relay_only = self.relay_only;
         let mine: Vec<Multiaddr> = direct_candidates_of(self.swarm.listeners().cloned().collect());
+        // Slice 2: our member relay offer (to members only, in `member_extras`).
+        let offer = (!relay_only && self.swarm.behaviour_mut().member_relay.offering()).then(|| RelayOffer {
+            addrs: mine.iter().map(|a| ByteBuf::from(a.to_vec())).collect(),
+            preferred: self.swarm.behaviour().member_relay.preferred(),
+        });
         let store = self.reader.clone();
         let answers = self.answers.clone();
         tokio::task::spawn_blocking(move || {
@@ -2873,7 +2999,7 @@ impl Task {
                 Some(gate) if !gate.allows(&store) => (empty_response(), Vec::new()),
                 _ => answer_with_ids(&store, &log, &request.have, max_bytes),
             };
-            member_extras(&mut response, ours, &acks, &mine, allow_lan && !relay_only, &store);
+            member_extras(&mut response, ours, &acks, &mine, allow_lan && !relay_only, offer.as_ref(), &store);
             let _ = answers.send((peer, channel, response, max_bytes, ids, log));
         });
     }
@@ -3017,6 +3143,8 @@ impl Task {
             let server = s.server;
             if let Some(identity) = self.verify_binding(key.0, server, binding) {
                 self.mark_seen(server, identity, key.0);
+                // Slice 2: a member we know, and its member relay offer (if any).
+                self.on_member_answer(key.0, response.relay.clone());
                 // A member's direct addresses (F2): try a direct connection.
                 let addrs: Vec<Multiaddr> =
                     response.direct_addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect();
@@ -3432,7 +3560,7 @@ impl Task {
     fn on_link_request(&mut self, peer: PeerId, request: LinkRequest, channel: ResponseChannel<Vec<u8>>) {
         let (answer, inbound) = match self.link_host.as_mut() {
             Some(host) => host.answer(peer, request, Instant::now()),
-            None => (Vec::new(), None),
+            None => (vec![crate::device_link::GONE], None),
         };
         if matches!(inbound, Some(crate::device_link::Inbound::Hello { .. })) {
             self.mark_link_peer(peer);
@@ -3462,6 +3590,196 @@ impl Task {
             self.on_link_providers(query, Vec::new(), true);
         }
         self.flush_link_waiting();
+    }
+}
+
+/// Member relays, client side (design #368 §2).
+/// Our relay counts as down after this long without a connection to it.
+const RELAY_DOWN_AFTER: Duration = Duration::from_secs(60);
+/// Member relays we reserve on at once (design §1 rule 3).
+const MAX_MEMBER_RELAYS: usize = 2;
+/// A member relay that failed (reservation refused or lost) rests this long.
+const MEMBER_RELAY_REST: Duration = Duration::from_secs(120);
+/// A refused reservation (no reservation held yet) is tried again after this.
+const MEMBER_RELAY_RETRY: Duration = Duration::from_secs(15);
+/// Each member is dialled through each member relay at most this often, and
+/// at most this many such dials go out per round.
+const FALLBACK_DIAL_EVERY: Duration = Duration::from_secs(30);
+const MAX_FALLBACK_DIALS: usize = 16;
+/// Offers and members remembered, and for how long a member counts as known.
+const MAX_RELAY_OFFERS: usize = 64;
+const MAX_KNOWN_MEMBERS: usize = 1024;
+const KNOWN_MEMBER_TTL: Duration = Duration::from_secs(24 * 3600);
+
+impl Task {
+    /// A peer that proved a binding (in a request or an answer): one the
+    /// fallback dials through member relays when our relay is down.
+    fn remember_member(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        if self.known_members.len() >= MAX_KNOWN_MEMBERS && !self.known_members.contains_key(&peer) {
+            self.known_members.retain(|_, at| now.duration_since(*at) < KNOWN_MEMBER_TTL);
+        }
+        if self.known_members.len() < MAX_KNOWN_MEMBERS || self.known_members.contains_key(&peer) {
+            self.known_members.insert(peer, now);
+        }
+    }
+
+    /// A verified member's answer: remember it, and its relay offer (or that
+    /// it no longer makes one). Only addresses we may dial for a member.
+    fn on_member_answer(&mut self, peer: PeerId, offer: Option<RelayOffer>) {
+        let now = Instant::now();
+        self.remember_member(peer);
+        let addrs: Vec<Multiaddr> = offer
+            .as_ref()
+            .map(|o| o.addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect())
+            .unwrap_or_default();
+        let addrs: Vec<Multiaddr> =
+            direct_candidates_of(addrs).into_iter().filter(|a| dialable(a, self.allow_lan)).collect();
+        match offer {
+            Some(offer) if !addrs.is_empty() => {
+                if self.relay_offers.len() < MAX_RELAY_OFFERS || self.relay_offers.contains_key(&peer) {
+                    self.relay_offers.insert(peer, (addrs, offer.preferred, now));
+                }
+            }
+            _ => {
+                self.relay_offers.remove(&peer);
+            }
+        }
+    }
+
+    /// Our relay is gone: from now on the fallback clock runs.
+    fn relay_lost(&mut self) {
+        if self.relay_lost_at.is_none() {
+            self.relay_lost_at = Some(Instant::now());
+        }
+    }
+
+    /// Our relay holds our reservation again: back to it, member relays let go.
+    fn relay_back(&mut self) {
+        self.relay_lost_at = None;
+        self.drop_member_relays();
+    }
+
+    fn drop_member_relays(&mut self) {
+        if !self.member_listeners.is_empty() {
+            info!(count = self.member_listeners.len(), "leaving member relays");
+        }
+        self.member_reserved.clear();
+        for (id, _) in std::mem::take(&mut self.member_listeners) {
+            self.swarm.remove_listener(id);
+        }
+    }
+
+    /// The circuit address through member relay `relay`.
+    fn member_circuit(&self, relay: PeerId) -> Option<Multiaddr> {
+        let (addrs, _, _) = self.relay_offers.get(&relay)?;
+        Some(addrs.first()?.clone().with(Protocol::P2p(relay)).with(Protocol::P2pCircuit))
+    }
+
+    /// Every discovery round: once our relay has been down for
+    /// [`RELAY_DOWN_AFTER`], hold reservations on up to [`MAX_MEMBER_RELAYS`]
+    /// member relays (owner and admin relays first, then by peer ID, so the
+    /// members of a server pick the same ones and meet there), and dial the
+    /// members we know through them. Never while relay-only: relay-only
+    /// promises no member sees our IP (design §2).
+    fn member_relay_fallback(&mut self) {
+        if self.relay_only {
+            self.drop_member_relays();
+            return;
+        }
+        let Some(lost) = self.relay_lost_at else { return };
+        if lost.elapsed() < RELAY_DOWN_AFTER {
+            return;
+        }
+        let now = Instant::now();
+        let me = *self.swarm.local_peer_id();
+        self.member_relay_rest.retain(|_, until| now < *until);
+        self.relay_offers.retain(|_, (_, _, at)| now.duration_since(*at) < KNOWN_MEMBER_TTL);
+        let active: HashSet<PeerId> = self.member_listeners.values().copied().collect();
+        if active.len() < MAX_MEMBER_RELAYS {
+            let mut offers: Vec<(bool, PeerId)> = self
+                .relay_offers
+                .iter()
+                .filter(|(p, _)| **p != me && !active.contains(*p) && !self.member_relay_rest.contains_key(*p))
+                .map(|(p, (_, preferred, _))| (!*preferred, *p))
+                .collect();
+            offers.sort();
+            for (_, relay) in offers.into_iter().take(MAX_MEMBER_RELAYS - active.len()) {
+                let Some(addr) = self.member_circuit(relay) else { continue };
+                // Its gate opens only for a member it has verified on a direct
+                // connection: connect first, and reserve once the binding went
+                // both ways (we see it bound; our pull carried ours).
+                if !self.direct.contains_key(&relay) {
+                    // Chosen on purpose: a backoff left by circuit dials that
+                    // failed when our relay went down doesn't hold it back.
+                    self.dial_backoff.lock().unwrap().connected(&relay);
+                    let addrs = self.relay_offers.get(&relay).map(|(a, _, _)| a.clone()).unwrap_or_default();
+                    let opts = DialOpts::peer_id(relay).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build();
+                    if let Err(err) = self.swarm.dial(opts) {
+                        debug!(%relay, %err, "dialling a member relay failed");
+                    } else {
+                        debug!(%relay, "dialling a member relay");
+                    }
+                    continue;
+                }
+                if !self.bound.keys().any(|(p, _)| *p == relay) {
+                    debug!(%relay, "member relay not bound yet");
+                    continue;
+                }
+                match self.swarm.listen_on(addr) {
+                    Ok(id) => {
+                        info!("our relay is down: reserving on a member relay");
+                        self.member_listeners.insert(id, relay);
+                    }
+                    Err(err) => {
+                        debug!(%relay, %err, "member relay reservation failed");
+                        self.member_relay_rest.insert(relay, now + MEMBER_RELAY_REST);
+                    }
+                }
+            }
+        }
+        // Meet the members we know through the member relays we hold.
+        self.fallback_dialed.retain(|_, at| now.duration_since(*at) < FALLBACK_DIAL_EVERY);
+        let relays: Vec<PeerId> = self.member_listeners.values().copied().collect();
+        let members: Vec<PeerId> = self
+            .known_members
+            .iter()
+            .filter(|(p, at)| now.duration_since(**at) < KNOWN_MEMBER_TTL && **p != me && !self.connected.contains(*p))
+            .map(|(p, _)| *p)
+            .collect();
+        if !relays.is_empty() {
+            debug!(relays = relays.len(), members = members.len(), "meeting members through member relays");
+        }
+        let mut dials = 0;
+        for relay in relays {
+            let Some(circuit) = self.member_circuit(relay) else { continue };
+            for member in members.iter().filter(|m| **m != relay) {
+                if dials >= MAX_FALLBACK_DIALS || self.fallback_dialed.contains_key(&(relay, *member)) {
+                    continue;
+                }
+                self.fallback_dialed.insert((relay, *member), now);
+                let opts = DialOpts::peer_id(*member)
+                    .addresses(vec![circuit.clone().with(Protocol::P2p(*member))])
+                    .condition(PeerCondition::DisconnectedAndNotDialing)
+                    .build();
+                let id = opts.connection_id();
+                if self.swarm.dial(opts).is_ok() {
+                    self.fallback_dials.insert(id);
+                    dials += 1;
+                }
+            }
+        }
+    }
+
+    /// A member relay reservation ended (rest that relay) or was refused
+    /// before it began (try again shortly: its gate may not be open yet).
+    fn member_listener_closed(&mut self, id: ListenerId) {
+        if let Some(relay) = self.member_listeners.remove(&id) {
+            let held = self.member_reserved.remove(&id);
+            debug!(%relay, held, "member relay reservation ended");
+            let rest = if held { MEMBER_RELAY_REST } else { MEMBER_RELAY_RETRY };
+            self.member_relay_rest.insert(relay, Instant::now() + rest);
+        }
     }
 }
 
@@ -3710,7 +4028,7 @@ fn decode_page(log: &str, page: &[WireEntry]) -> Vec<Incoming> {
 }
 
 fn empty_response() -> SyncResponse {
-    SyncResponse { records: Vec::new(), more: false, acks: Vec::new(), binding: None, direct_addrs: Vec::new() }
+    SyncResponse { records: Vec::new(), more: false, acks: Vec::new(), binding: None, direct_addrs: Vec::new(), relay: None }
 }
 
 /// What a pull answer carries beyond the page: our binding and the
@@ -3723,11 +4041,15 @@ fn member_extras(
     acks: &[RecordId],
     direct: &[Multiaddr],
     share_direct: bool,
+    offer: Option<&RelayOffer>,
     store: &Store,
 ) {
     for_members_only(response, ours, acks, store);
     if response.binding.is_some() && share_direct {
         response.direct_addrs = direct.iter().map(|a| ByteBuf::from(a.to_vec())).collect();
+    }
+    if response.binding.is_some() {
+        response.relay = offer.cloned();
     }
 }
 
@@ -4488,6 +4810,20 @@ mod tests {
         }
     }
 
+    /// The Tech Lead on #399: a silently dead connection to our relay is
+    /// closed within about a minute (two failed pings in a row), so the
+    /// member relay fallback starts; one lost ping alone closes nothing.
+    #[test]
+    fn a_silent_relay_is_closed_within_a_minute() {
+        assert!(relay_silent_for() <= Duration::from_secs(60), "{:?}", relay_silent_for());
+        let mut misses = 0;
+        assert!(!relay_ping(&mut misses, false), "one miss");
+        assert!(!relay_ping(&mut misses, true), "an answer resets");
+        assert!(!relay_ping(&mut misses, false));
+        assert!(relay_ping(&mut misses, false), "two in a row close it");
+        assert_eq!(misses, 0);
+    }
+
     #[test]
     fn t23_maps_stay_under_the_cap_dropping_the_oldest() {
         let mut map: HashMap<u32, Instant> = HashMap::new();
@@ -4814,12 +5150,22 @@ mod tests {
         let answer = |n: u8, share_direct: bool| {
             let mut response = empty_response();
             let check = ReadCheck { gate: gate.clone(), identity: test_key(n).identity(), server: server() };
-            member_extras(&mut response, Some((check, binding.clone())), &[], &direct, share_direct, &store);
+            member_extras(&mut response, Some((check, binding.clone())), &[], &direct, share_direct, None, &store);
             response.direct_addrs
         };
         assert_eq!(answer(1, true).len(), 1, "a member gets our direct addresses");
         assert!(answer(1, false).is_empty(), "relay-only (or LAN off): none, even to a member");
         assert!(answer(2, true).is_empty(), "a non-member: none");
+        // Slice 2: our member relay offer, to a member only.
+        let offer = RelayOffer { addrs: vec![ByteBuf::from(direct[0].to_vec())], preferred: true };
+        let offered = |n: u8| {
+            let mut response = empty_response();
+            let check = ReadCheck { gate: gate.clone(), identity: test_key(n).identity(), server: server() };
+            member_extras(&mut response, Some((check, binding.clone())), &[], &direct, false, Some(&offer), &store);
+            response.relay
+        };
+        assert_eq!(offered(1), Some(offer.clone()), "a member learns we relay");
+        assert_eq!(offered(2), None, "a non-member never does");
     }
 
     /// The answer side of presence: our binding and acks go only to a

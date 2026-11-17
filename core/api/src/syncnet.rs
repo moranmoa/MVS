@@ -55,6 +55,34 @@ pub fn relay_addr(text: &str) -> Result<Multiaddr, String> {
         _ => Err("must end in /p2p/<relay peer id>".to_owned()),
     }
 }
+
+/// Most relays a node is given (`--relay`, repeatable; multi-relay part A).
+pub const MAX_RELAYS: usize = 4;
+
+/// The relay list: 1 to [`MAX_RELAYS`] entries, each checked by
+/// [`relay_addr`], no two for the same relay (peer ID), in the given order.
+/// Errors never quote an address (they reach the log).
+pub fn relay_addrs<S: AsRef<str>>(texts: &[S]) -> Result<Vec<Multiaddr>, String> {
+    if texts.is_empty() {
+        return Err("no relay".to_owned());
+    }
+    if texts.len() > MAX_RELAYS {
+        return Err(format!("more than {MAX_RELAYS} relays"));
+    }
+    let mut out: Vec<Multiaddr> = Vec::with_capacity(texts.len());
+    let mut ids = std::collections::HashSet::new();
+    for (i, text) in texts.iter().enumerate() {
+        let addr = relay_addr(text.as_ref()).map_err(|why| format!("relay {}: {why}", i + 1))?;
+        let Some(libp2p::multiaddr::Protocol::P2p(id)) = addr.iter().last() else {
+            unreachable!("relay_addr checked the /p2p suffix")
+        };
+        if !ids.insert(id) {
+            return Err(format!("relay {}: the same relay twice", i + 1));
+        }
+        out.push(addr);
+    }
+    Ok(out)
+}
 type SendStates = Arc<Mutex<HashMap<RecordId, SendState>>>;
 
 /// Send states kept; past this the delivered ones are forgotten.
@@ -123,9 +151,13 @@ const INVITE_PUSH_QUEUE: usize = 1024;
 
 impl SyncNetwork {
     /// Starts a node in `data_dir` (its `store.db` and `node.key`) that
-    /// reaches peers through `relay`.
-    pub fn start(relay: Multiaddr, data_dir: &Path, gate: Arc<MemberGate>) -> anyhow::Result<Self> {
-        Self::start_with_bootstrap(relay, Vec::new(), false, data_dir, gate)
+    /// reaches peers through `relays` (see [`relay_addrs`]).
+    pub fn start(
+        relays: Vec<Multiaddr>,
+        data_dir: &Path,
+        gate: Arc<MemberGate>,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_bootstrap(relays, Vec::new(), false, data_dir, gate)
     }
 
     /// Like [`SyncNetwork::start`], also dialling `bootstrap` directly (each
@@ -135,12 +167,22 @@ impl SyncNetwork {
     /// node starts with it, so a relay-only start never listens or dials
     /// directly.
     pub fn start_with_bootstrap(
-        relay: Multiaddr,
+        relays: Vec<Multiaddr>,
         bootstrap: Vec<Multiaddr>,
         relay_only: bool,
         data_dir: &Path,
         gate: Arc<MemberGate>,
     ) -> anyhow::Result<Self> {
+        // Multi-relay part A: the list reaches here, but until sync takes
+        // several (part B, dev-sync) only the first is used, so behaviour
+        // doesn't change. Counts only in the log, never addresses.
+        let Some(relay) = relays.first().cloned() else { anyhow::bail!("no relay") };
+        if relays.len() > 1 {
+            tracing::debug!(
+                relays = relays.len(),
+                "multi-relay: using the first relay until sync takes several"
+            );
+        }
         let runtime =
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
         let relay_copy = relay.clone();
@@ -326,8 +368,8 @@ impl Network for SyncNetwork {
         }
     }
 
-    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
-        if let Err(e) = self.node.set_member_relay(on, daily_cap_mb) {
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        if let Err(e) = self.node.set_member_relay(on, daily_cap_mb, role) {
             tracing::warn!(%e, "member relay setting not applied");
         }
     }
@@ -521,7 +563,7 @@ mod tests {
             "/ip4/127.0.0.1/tcp/9/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc"
                 .parse()
                 .unwrap();
-        let net = SyncNetwork::start(relay, &dir, Arc::new(MemberGate::new())).unwrap();
+        let net = SyncNetwork::start(vec![relay], &dir, Arc::new(MemberGate::new())).unwrap();
         let owner = SigningKey::from_bytes(&[4; 32]);
         let genesis = authority::sign_genesis(&owner, [1; 16], 1, b"{}").unwrap();
         // GAP-4: nothing is synced, or published, for a server not opened.
@@ -557,7 +599,7 @@ mod tests {
                 .join(format!("mvs-syncnet-relayonly-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             let net = SyncNetwork::start_with_bootstrap(
-                relay.clone(),
+                vec![relay.clone()],
                 bootstrap,
                 relay_only,
                 &dir,
@@ -605,7 +647,33 @@ mod tests {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::relay_addr;
+    use super::{relay_addr, relay_addrs, MAX_RELAYS};
+
+    const ID_A: &str = "12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc";
+    const ID_B: &str = "12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt";
+
+    #[test]
+    fn a_relay_list_has_one_to_four_distinct_checked_entries() {
+        let a = format!("/dns4/relay.example.org/tcp/443/wss/p2p/{ID_A}");
+        let b = format!("/dns4/relay2.example.org/tcp/443/wss/p2p/{ID_B}");
+        // In order, as given.
+        let got = relay_addrs(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(got.iter().map(|m| m.to_string()).collect::<Vec<_>>(), [a.clone(), b.clone()]);
+        assert_eq!(relay_addrs(&[a.as_str()]).unwrap().len(), 1);
+        // Empty, a bad entry, too many.
+        assert_eq!(relay_addrs::<&str>(&[]).unwrap_err(), "no relay");
+        let err = relay_addrs(&[a.as_str(), "/dns4/relay3.example.org/tcp/443"]).unwrap_err();
+        assert!(err.starts_with("relay 2:"), "{err}");
+        let five: Vec<String> = (0..=MAX_RELAYS)
+            .map(|i| format!("/ip4/127.0.0.1/tcp/{}/p2p/{ID_A}", 4000 + i))
+            .collect();
+        assert_eq!(relay_addrs(&five).unwrap_err(), format!("more than {MAX_RELAYS} relays"));
+        // The same relay (peer ID) twice, even at another address.
+        let a_tcp = format!("/dns4/relay.example.org/tcp/4001/p2p/{ID_A}");
+        assert_eq!(relay_addrs(&[a.clone(), a_tcp]).unwrap_err(), "relay 2: the same relay twice");
+        // Errors never quote the address.
+        assert!(!err.contains("example.org"));
+    }
 
     #[test]
     fn a_relay_must_name_its_peer_id() {

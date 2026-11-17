@@ -30,7 +30,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libp2p::core::{transport::PortUse, Endpoint};
 use libp2p::multiaddr::Protocol;
@@ -54,42 +55,79 @@ pub const MAX_CIRCUIT_BYTES: u64 = 8 << 20;
 pub const MIN_DAILY_CAP_MB: u32 = 256;
 pub const MAX_DAILY_CAP_MB: u32 = 51_200;
 pub const DEFAULT_DAILY_CAP_MB: u32 = 2048;
-const DAY: Duration = Duration::from_secs(24 * 3600);
+/// A day, in seconds of wall-clock time.
+const DAY: u64 = 24 * 3600;
 
-/// Bytes relayed per day, charged per circuit (see the module docs).
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Bytes relayed per day, charged per circuit (see the module docs). The day
+/// is wall-clock time, and both numbers are kept in a file beside the store,
+/// so a restart doesn't reset the cap.
 #[derive(Debug)]
 pub(crate) struct DailyBudget {
     cap: u64,
     used: u64,
-    since: Instant,
+    /// When the current day began (Unix seconds).
+    since: u64,
+    file: Option<PathBuf>,
 }
 
 impl DailyBudget {
-    pub(crate) fn new(cap_mb: u32, now: Instant) -> Self {
-        DailyBudget { cap: cap_bytes(cap_mb), used: 0, since: now }
+    pub(crate) fn new(cap_mb: u32, now: u64) -> Self {
+        DailyBudget { cap: cap_bytes(cap_mb), used: 0, since: now, file: None }
+    }
+
+    /// Kept in `file` from now on, starting from what it holds (if valid).
+    pub(crate) fn keep_in(&mut self, file: PathBuf, now: u64) {
+        let saved = std::fs::read_to_string(&file).ok().and_then(|text| {
+            let mut parts = text.split_whitespace().map(str::parse::<u64>);
+            Some((parts.next()?.ok()?, parts.next()?.ok()?))
+        });
+        // A clock set back keeps the saved day until it has passed: never less
+        // than what was spent. A day starting more than a day from now can't
+        // come from a clock set back: the file is damaged, and ignored.
+        if let Some((since, used)) = saved.filter(|(since, _)| *since <= now + DAY) {
+            self.since = since;
+            self.used = used;
+        }
+        self.file = Some(file);
+        self.roll(now);
+    }
+
+    fn save(&self) {
+        if let Some(file) = &self.file {
+            if let Err(err) = std::fs::write(file, format!("{} {}\n", self.since, self.used)) {
+                tracing::warn!(%err, "member relay: the daily count wasn't saved");
+            }
+        }
     }
 
     pub(crate) fn set_cap(&mut self, cap_mb: u32) {
         self.cap = cap_bytes(cap_mb);
     }
 
-    fn roll(&mut self, now: Instant) {
-        if now.duration_since(self.since) >= DAY {
+    fn roll(&mut self, now: u64) {
+        if now.saturating_sub(self.since) >= DAY {
             self.used = 0;
             self.since = now;
+            self.save();
         }
     }
 
     /// Whether one more circuit fits today.
-    pub(crate) fn has_room(&mut self, now: Instant) -> bool {
+    pub(crate) fn has_room(&mut self, now: u64) -> bool {
         self.roll(now);
         self.used + MAX_CIRCUIT_BYTES <= self.cap
     }
 
     /// One accepted circuit: its full byte cap.
-    pub(crate) fn charge(&mut self, now: Instant) {
+    pub(crate) fn charge(&mut self, now: u64) {
         self.roll(now);
         self.used = self.used.saturating_add(MAX_CIRCUIT_BYTES);
+        self.save();
     }
 }
 
@@ -164,6 +202,8 @@ pub(crate) struct MemberRelay {
     inner: relay::Behaviour,
     /// `MemberRelay.effective`: relaying at all.
     enabled: bool,
+    /// `MemberRelay.role`: an owner or admin relay.
+    preferred: bool,
     budget: DailyBudget,
     /// Direct connections per peer (each with a gate), and the open ones.
     conns: HashMap<PeerId, HashSet<ConnectionId>>,
@@ -195,7 +235,8 @@ impl MemberRelay {
         MemberRelay {
             inner: relay::Behaviour::new(local, config()),
             enabled: false,
-            budget: DailyBudget::new(DEFAULT_DAILY_CAP_MB, Instant::now()),
+            preferred: false,
+            budget: DailyBudget::new(DEFAULT_DAILY_CAP_MB, unix_now()),
             conns: HashMap::new(),
             opened: HashSet::new(),
             members: HashSet::new(),
@@ -206,15 +247,34 @@ impl MemberRelay {
         }
     }
 
-    /// From the core: relay or not, and the daily cap (MB). Off closes every
+    /// From the core: relay or not, the daily cap (MB), and whether we are
+    /// an owner or admin somewhere (`MemberRelay.role`). Off closes every
     /// gate (reservations and circuits stall, then time out).
-    pub(crate) fn set(&mut self, on: bool, daily_cap_mb: u32) {
+    pub(crate) fn set(&mut self, on: bool, daily_cap_mb: u32, preferred: bool) {
+        self.preferred = preferred;
         self.budget.set_cap(daily_cap_mb);
         if on != self.enabled {
             tracing::info!(on, "member relay");
         }
         self.enabled = on;
-        self.refresh(Instant::now());
+        self.refresh(unix_now());
+    }
+
+    /// Whether members should be told we relay: on, with budget left.
+    pub(crate) fn offering(&mut self) -> bool {
+        self.enabled && self.budget.has_room(unix_now())
+    }
+
+    /// An owner or admin relay (members try those first, design §2).
+    pub(crate) fn preferred(&self) -> bool {
+        self.preferred
+    }
+
+    /// Keeps the daily count in `file` (beside the store), starting from what
+    /// it holds, so a restart doesn't reset the cap.
+    pub(crate) fn keep_budget_in(&mut self, file: PathBuf) {
+        self.budget.keep_in(file, unix_now());
+        self.refresh(unix_now());
     }
 
     /// Off, keeping the cap (relay-only turned on).
@@ -223,7 +283,7 @@ impl MemberRelay {
             tracing::info!(on = false, "member relay");
         }
         self.enabled = false;
-        self.refresh(Instant::now());
+        self.refresh(unix_now());
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -234,7 +294,7 @@ impl MemberRelay {
     pub(crate) fn set_members(&mut self, members: HashSet<PeerId>) {
         if members != self.members {
             self.members = members;
-            self.refresh(Instant::now());
+            self.refresh(unix_now());
         }
     }
 
@@ -245,7 +305,7 @@ impl MemberRelay {
 
     /// Opens exactly the gates that should be open: relaying, budget left,
     /// and the peer a member.
-    fn refresh(&mut self, now: Instant) {
+    fn refresh(&mut self, now: u64) {
         let room = self.enabled && self.budget.has_room(now);
         for (peer, conns) in &self.conns {
             let want = room && self.members.contains(peer);
@@ -274,7 +334,7 @@ impl MemberRelay {
             self.conns.entry(peer).or_default().insert(id);
         }
         let gate = RelayGate { inner, closed, open: false };
-        self.refresh(Instant::now());
+        self.refresh(unix_now());
         gate
     }
 
@@ -374,7 +434,7 @@ impl NetworkBehaviour for MemberRelay {
             Poll::Ready(ToSwarm::GenerateEvent(event)) => {
                 match &event {
                     relay::Event::CircuitReqAccepted { .. } => {
-                        let now = Instant::now();
+                        let now = unix_now();
                         self.circuits += 1;
                         self.budget.charge(now);
                         if !self.budget.has_room(now) {
@@ -400,7 +460,7 @@ mod tests {
 
     #[test]
     fn the_daily_budget_charges_whole_circuits_and_never_goes_over() {
-        let now = Instant::now();
+        let now = unix_now();
         let mut budget = DailyBudget::new(MIN_DAILY_CAP_MB, now);
         let fits = (u64::from(MIN_DAILY_CAP_MB) << 20) / MAX_CIRCUIT_BYTES;
         for _ in 0..fits {
@@ -413,12 +473,54 @@ mod tests {
         assert!(budget.has_room(now + DAY));
     }
 
+    /// The Tech Lead on #395: a restart must not reset the daily cap.
+    #[test]
+    fn the_daily_count_survives_a_restart_and_a_new_day_clears_it() {
+        let dir = std::env::temp_dir().join(format!("sync-relay-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("member-relay.budget");
+        let now = 1_000_000;
+        let mut first = DailyBudget::new(MIN_DAILY_CAP_MB, now);
+        first.keep_in(file.clone(), now);
+        while first.has_room(now) {
+            first.charge(now);
+        }
+        // Restarted later the same day: still spent.
+        let mut again = DailyBudget::new(MIN_DAILY_CAP_MB, now + 3600);
+        again.keep_in(file.clone(), now + 3600);
+        assert!(!again.has_room(now + 3600), "a restart reset the daily cap");
+        assert_eq!(again.used, first.used);
+        // A clock set back doesn't move the day forward or clear the count.
+        let mut back = DailyBudget::new(MIN_DAILY_CAP_MB, now - 7200);
+        back.keep_in(file.clone(), now - 7200);
+        assert!(!back.has_room(now - 7200));
+        // The next day, after a restart: room again, and saved as such.
+        let mut tomorrow = DailyBudget::new(MIN_DAILY_CAP_MB, now + DAY);
+        tomorrow.keep_in(file.clone(), now + DAY);
+        assert!(tomorrow.has_room(now + DAY));
+        let mut later = DailyBudget::new(MIN_DAILY_CAP_MB, now + DAY + 1);
+        later.keep_in(file.clone(), now + DAY + 1);
+        assert_eq!(later.used, 0);
+        // A day start far in the future is damaged too (the Tech Lead, #399).
+        std::fs::write(&file, format!("{} {}", now + 2 * DAY, 1u64 << 30)).unwrap();
+        let mut future = DailyBudget::new(MIN_DAILY_CAP_MB, now);
+        future.keep_in(file.clone(), now);
+        assert_eq!((future.used, future.since), (0, now));
+        // A damaged file is ignored (a fresh day), not trusted.
+        std::fs::write(&file, "junk").unwrap();
+        let mut fresh = DailyBudget::new(MIN_DAILY_CAP_MB, now);
+        fresh.keep_in(file, now);
+        assert_eq!(fresh.used, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_cap_stays_within_the_core_bounds() {
         assert_eq!(cap_bytes(1), u64::from(MIN_DAILY_CAP_MB) << 20);
         assert_eq!(cap_bytes(u32::MAX), u64::from(MAX_DAILY_CAP_MB) << 20);
         assert_eq!(cap_bytes(DEFAULT_DAILY_CAP_MB), 2048 << 20);
-        let mut budget = DailyBudget::new(DEFAULT_DAILY_CAP_MB, Instant::now());
+        let mut budget = DailyBudget::new(DEFAULT_DAILY_CAP_MB, unix_now());
         budget.set_cap(MIN_DAILY_CAP_MB);
         assert_eq!(budget.cap, 256 << 20);
     }
@@ -468,7 +570,7 @@ mod tests {
         // A member, but relaying is off: still closed.
         relay.set_members(HashSet::from([member]));
         assert!(drain(&mut relay).is_empty());
-        relay.set(true, DEFAULT_DAILY_CAP_MB);
+        relay.set(true, DEFAULT_DAILY_CAP_MB, false);
         assert_eq!(drain(&mut relay), vec![(conn(1), true)]);
         assert!(relay.is_open(&member) && !relay.is_open(&stranger));
         gate.on_behaviour_event(GateIn::Open);
@@ -481,7 +583,7 @@ mod tests {
         // Budget spent: every gate closes, even a member's.
         relay.set_members(HashSet::from([member]));
         drain(&mut relay);
-        let now = Instant::now();
+        let now = unix_now();
         while relay.budget.has_room(now) {
             relay.budget.charge(now);
         }
@@ -492,9 +594,9 @@ mod tests {
         let mut relay = MemberRelay::new(PeerId::random());
         established(&mut relay, 3, member);
         relay.set_members(HashSet::from([member]));
-        relay.set(true, DEFAULT_DAILY_CAP_MB);
+        relay.set(true, DEFAULT_DAILY_CAP_MB, false);
         drain(&mut relay);
-        relay.set(false, DEFAULT_DAILY_CAP_MB);
+        relay.set(false, DEFAULT_DAILY_CAP_MB, false);
         assert_eq!(drain(&mut relay), vec![(conn(3), false)]);
     }
 
@@ -506,7 +608,7 @@ mod tests {
         let remote: Multiaddr = "/ip4/127.0.0.1/tcp/2".parse().unwrap();
         relay.handle_established_inbound_connection(conn(9), peer, &circuit, &remote).unwrap();
         relay.set_members(HashSet::from([peer]));
-        relay.set(true, DEFAULT_DAILY_CAP_MB);
+        relay.set(true, DEFAULT_DAILY_CAP_MB, false);
         assert!(drain(&mut relay).is_empty());
     }
 }

@@ -65,7 +65,7 @@ describe('device link: the new device', () => {
     ['expired', undefined, 'The code expired. You can make a new one.'],
     ['failed', 'refused', "The other device didn't approve it."],
     ['failed', 'network', "Couldn't reach the other device. You can try again."],
-    ['failed', 'keyring', "This computer's keychain couldn't save your account. Check that your system keyring is unlocked, then try again."],
+    ['failed', 'keyring', "This computer's system keyring couldn't save your account. Check that it's unlocked, then try again."],
   ] as const)('%s (%s) says why, and "New code" starts again', async (state, reason, text) => {
     const { core } = await newDevice();
     act(() => core.simulateDeviceLink(state, reason));

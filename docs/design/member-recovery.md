@@ -15,16 +15,17 @@
 When I turn it on, one of my signed-in devices makes:
 - **`s`**, 32 random bytes, the member part. It's split **3-of-5** with Shamir over GF(2^8), byte by byte, so share *i* is `(x_i, y_i[32])` with `x_i` in 1..=5. No two holders get the same `x`. Fewer than 3 shares reveal nothing about `s`.
 - **`r_m`**, 32 random bytes, the mailer part. It's sent to the mailer **sealed to the mailer's public key**, which is pinned in the app.
-- **`h`**, a random 32-byte **recovery handle**. It names this recovery everywhere: shares, the mailer record, the rendezvous, notices. It's unlinkable to my identity key and my email.
+- **`h`**, the **recovery handle**, `derive_key("mvs/member-recovery-handle/v1", w_r_pub)`, where `w_r` is my **recovery write key** (`Identity::recovery_write_key`, its own HKDF label from the words, not the backup write key). It names this recovery everywhere: shares, the mailer record, the rendezvous, notices. Every device has it with nothing to sync, it stays the same across re-shares, and it is unlinkable to my identity key, my backup and my email. Binding it to `w_r` means nobody can store a record under my handle first (Tech Lead and Security Lead on #431).
 - **`k_mr = HKDF-SHA256(s ‖ r_m, info "mvs/member-recovery/v1" ‖ h)`**.
 - **The envelope:** `XChaCha20-Poly1305(k_mr, { seed, profile, birthDate, birthDateTrusted, country, v })`. It's stored at the backup holders under `tag_mr = derive_key("mvs/member-recovery-tag/v1", h)`, with the highest `v` kept, like `/mvs/backup/1`.
 
 So the mailer alone has `r_m` but no `s`, and k colluding holders have `s` but no `r_m`. Each side needs the other.
 
-**What a holder stores** is a share record, signed by my backup write key `w`, so a holder can check later instructions came from the account:
+**What a holder stores** is a share record, signed by my recovery write key `w_r`, so a holder can check later instructions came from the account:
 ```
-{ v: 1, h, version, x, y (32 bytes), w_pub, created, sig_w }
+{ v: 1, h, version, x, y (32 bytes), w_r_pub, created, sig_w_r }
 ```
+Holders refuse a record or order unless `h == derive_key("mvs/member-recovery-handle/v1", w_r_pub)`. A cancel or delete counts only while fresh: its `at` within 10 minutes of the holder's clock, not older than the pending's first sighting minus 10 minutes, and later than the last one taken, so an old one replayed can't block a real recovery. A holder's hold is for one new device: a pending for another device restarts the clock, and a release goes only to the device the hold ran for (Tech Lead and Security Lead on #431).
 - Holders keep it in their core database, per handle. It's at most 1 record per handle and at most 64 handles per holder, so storage is bounded. The newest `version` wins.
 - `y` is in the clear at the holder; the threshold is the protection. A holder learns my handle `h`, but not my identity, email or seed.
 
@@ -67,7 +68,7 @@ On every sync round, a signed-in device of mine checks the current holders. **An
 2. New `k_mr`.
 3. A new envelope with `version + 1`. Holders of the backup store keep only the newest, so the old envelope is gone.
 4. New shares to the new set.
-5. A `w`-signed **delete** `{ h, below_version }` to the old holders, best effort.
+5. A `w_r`-signed **delete** `{ h, below_version, at }` to the old holders, best effort.
 
 Old shares can never combine into the new key, so people who drift away don't pile up valid shares over time. `r_m` and `h` stay the same; the mailer record doesn't change.
 
@@ -84,7 +85,7 @@ Old shares can never combine into the new key, so people who drift away don't pi
 2. The mailer sends a one-time code. Its answer is the same whether or not the account exists.
 3. The user enters the code. The mailer checks it and **starts a 72-hour hold** for `h`.
 4. During the hold, the mailer publishes **pending(h, until)**, and so does every holder it can reach, as in #365 §10. Each of my devices polls by `h`, which it knows, and shows: "Someone is recovering your account by email. It completes on … Cancel?"
-5. **Cancel:** any of my devices sends a `w`-signed `cancel(h, t)` to the mailer and the holders. It voids the hold, and the holders refuse a release for 72 hours after it. A cancel also re-shares, as in §3, if the user wants.
+5. **Cancel:** any of my devices sends a `w_r`-signed `cancel(h, t)` to the mailer and the holders. It voids the hold, and the holders refuse a release for 72 hours after it. A cancel also re-shares, as in §3, if the user wants.
 6. After 72 hours with no cancel, the mailer:
    - releases `r_m` to the new device;
    - signs a **release token** `{ h, new_device_pub, hold_started, valid_until: +7 days }` with its pinned key.
@@ -93,7 +94,7 @@ Old shares can never combine into the new key, so people who drift away don't pi
    - the mailer's signature;
    - that `h` matches;
    - that the token is still valid;
-   - that there's no newer `w`-signed cancel or delete.
+   - that there's no newer `w_r`-signed cancel or delete.
 
    Then it answers with its share **sealed to `new_device_pub`**.
 9. With 3 shares, the new device rebuilds `s`, derives `k_mr`, opens the envelope and restores through `restoreIdentity`'s path, with the birth-date trust carried over, as device link does.
@@ -124,7 +125,7 @@ Holders are personal devices that come and go.
 | Whoever controls my inbox | Still needs 3 holders' release and 72 hours with no cancel from my devices (the #365 residual, now also bound to members) |
 | The mailer operator | Has `r_m` and can skip the code, but needs 3 colluding holders, and my devices see the pending notice |
 | Holders who later leave | A fresh split on re-share; old shares never open the new envelope |
-| Holders learning who I am | Only `h` and a share; no identity key, email or seed |
+| Holders learning who I am | The records hold only `h` and a share; no identity key, email or seed. But holders are my co-members and a share arrives from my device, so a holder can usually link `h` to me. It still can't get the seed without 2 other holders and the mailer |
 | Replay of an old release token | Bound to `h`, `new_device_pub` and a 7-day validity; a newer cancel or delete wins |
 | A device of mine is lost, but I still have others | My devices cancel; the words still work. This path is only for when everything is lost |
 
@@ -150,7 +151,7 @@ Holders are personal devices that come and go.
   - the hold for `h`;
   - publishing pending state;
   - the signed release token;
-  - accepting a `w`-signed cancel;
+  - accepting a `w_r`-signed cancel;
   - rotating `r_m`.
 
   It does **not** need the second bootstrap (no OPRF).
@@ -177,7 +178,7 @@ Holders are personal devices that come and go.
 ## 10. Security Lead's verdict (approved at c889e71; these replace earlier sections where they differ)
 
 - **M1, holders run their own hold:**
-  - A holder releases its share only if it has **itself seen `pending(h)` for at least 72 hours**, by its own clock from its own first sighting, with no `w`-signed cancel or delete since (as in #365 §9).
+  - A holder releases its share only if it has **itself seen `pending(h)` for at least 72 hours**, by its own clock from its own first sighting, with no `w_r`-signed cancel or delete since (as in #365 §9).
   - The mailer's release token is necessary, not sufficient. A compromised mailer can't shortcut the hold.
 - **The threshold is never below 3:**
   - 5 owner groups: 3-of-5.

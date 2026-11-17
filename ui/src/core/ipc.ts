@@ -22,8 +22,9 @@ export interface DesktopBridge {
 
 /**
  * G-74: `key` is a KeyboardEvent.code (e.g. 'KeyV', 'ControlLeft', 'F13') or
- * null; `globalMute` an Electron accelerator with a modifier (e.g.
- * 'CommandOrControl+Shift+M', or a bare F13–F24) or null.
+ * null; `globalMute` an Electron accelerator with two or three modifiers
+ * (e.g. 'CommandOrControl+Shift+M', 'Control+Alt+0'), or F13–F24 with any, or
+ * null. One-modifier shortcuts (Ctrl+C, Alt+F4…) are refused.
  */
 export interface PushToTalkSettings {
   key: string | null;

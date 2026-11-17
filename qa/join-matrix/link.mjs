@@ -38,7 +38,12 @@ async function take(name, timeout = 180_000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) {
     const f = join(RV, `${OTHER}.${name}.json`);
-    if (existsSync(f)) return JSON.parse(readFileSync(f, 'utf8'));
+    // A Windows bind mount can show the file a moment before it can be read.
+    if (existsSync(f)) {
+      try {
+        return JSON.parse(readFileSync(f, 'utf8'));
+      } catch {}
+    }
     await sleep(100);
   }
   throw new Error(`timed out waiting for ${OTHER}'s ${name}`);

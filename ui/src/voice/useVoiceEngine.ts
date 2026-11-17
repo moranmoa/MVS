@@ -35,6 +35,8 @@ export interface VoiceEngineView {
   outputId?: string;
   setInput: (id: string) => void;
   setOutput: (id: string) => void;
+  /** G-72 mic test: my microphone's level now, 0..1. */
+  inputLevel: () => number;
 }
 
 export type PeerFailure = 'failed' | 'refused';
@@ -136,5 +138,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     void engineRef.current?.setOutputDevice(id);
   }, []);
 
-  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput };
+  const inputLevel = useCallback(() => engineRef.current?.inputLevel() ?? 0, []);
+
+  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel };
 }

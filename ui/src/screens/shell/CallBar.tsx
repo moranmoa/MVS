@@ -364,8 +364,8 @@ function VoiceSettings({
                 <input
                   type="range"
                   min={0}
-                  max={100}
-                  step={5}
+                  max={200}
+                  step={10}
                   value={pct}
                   aria-valuetext={text}
                   onChange={(e) => engine.setVolume(o.id, Number(e.target.value))}

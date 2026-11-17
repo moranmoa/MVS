@@ -1135,9 +1135,9 @@ for (const [query, name, wait] of [
   await p.close();
 }
 
-// ---- 0.5.0 conversation (440-449): G-23 date divider ---------------------------
+// ---- 0.5.0 conversation (440-449): G-23 date divider, 448 ---------------------------
 for (const [query, name, opts] of [
-  ['lang=he&theme=light', '440-date-divider-he', undefined],
+  ['lang=he&theme=light', '448-date-divider-he', undefined],
 ]) {
   // Ten hours between messages, so the last screen crosses days.
   const p = await chat(`?demo=1&still=1&update=999999&gapHours=10&${query}`, 'x', opts);

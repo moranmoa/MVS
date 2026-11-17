@@ -436,6 +436,7 @@ impl Core {
             "getAppInfo" => ok(self.get_app_info()),
             "setUpdateChannel" => ok(self.set_update_channel(args::<ChannelArg>(raw)?.channel)),
             "setRelayOnly" => ok(self.set_relay_only(args::<RelayOnlyArg>(raw)?.on)),
+            "getServerRestore" => ok(Ok(self.get_server_restore())),
             "getMemberRelay" => ok(self.get_member_relay()),
             "setMemberRelay" => ok(self.set_member_relay(args::<MemberRelayArg>(raw)?.setting)),
             "setMemberRelayCap" => ok(self.set_member_relay_cap(args::<MemberRelayCapArg>(raw)?.mb)),

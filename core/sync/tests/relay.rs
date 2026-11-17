@@ -1522,3 +1522,48 @@ async fn my_other_device_fetches_a_notice_through_the_relay() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// The member-only LAN beacon (relay-down resilience, part 2): with the
+/// relay unreachable and nothing remembered (fresh data folders), two
+/// members of one server on one LAN find each other by beacon and connect
+/// directly. Without "LAN allowed" they don't.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_on_one_lan_find_each_other_by_beacon_with_no_relay() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    // A relay nobody listens on.
+    let dead = free_port();
+    let relay: Multiaddr =
+        format!("/ip4/127.0.0.1/tcp/{dead}/p2p/{}", PeerId::from(identity::Keypair::generate_ed25519().public()))
+            .parse()
+            .unwrap();
+    // Every interface: the beacon is dialled at its packet's source address.
+    let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
+    for allow_lan in [true, false] {
+        let beacon_port = free_udp_port();
+        let node = |name: String, key: u8| {
+            let (relay, listen) = (relay.clone(), listen.clone());
+            async move {
+                let gate: Arc<dyn ReadGate> = Arc::new(AcceptAll);
+                let node = bound_node_on_events(&name, &relay, key, allow_lan, gate, listen, vec![], false).await.0;
+                assert!(node.start_lan_beacon(beacon_port).await.unwrap(), "no beacon socket");
+                node
+            }
+        };
+        let a = node(format!("beacon-a-{allow_lan}"), 61).await;
+        let b = node(format!("beacon-b-{allow_lan}"), 62).await;
+        let start = Instant::now();
+        let met = loop {
+            if a.peers().await.unwrap().contains(&b.peer_id()) {
+                break true;
+            }
+            if start.elapsed() > Duration::from_secs(if allow_lan { 90 } else { 40 }) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert_eq!(met, allow_lan, "LAN allowed: {allow_lan}");
+        for node in [a, b] {
+            node.shutdown().await.unwrap();
+        }
+    }
+}

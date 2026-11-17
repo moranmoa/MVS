@@ -40,6 +40,19 @@ fn start_relay_counting(
     circuits: Arc<std::sync::Mutex<Vec<(PeerId, bool)>>>,
     circuits_only: bool,
 ) -> tokio::task::JoinHandle<()> {
+    let external = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+    start_relay_external(key, port, circuits, circuits_only, external)
+}
+
+/// [`start_relay_counting`], announcing `external` (as infra/relay does
+/// from EXTERNAL_ADDRS, e.g. a DNS name).
+fn start_relay_external(
+    key: identity::Keypair,
+    port: u16,
+    circuits: Arc<std::sync::Mutex<Vec<(PeerId, bool)>>>,
+    circuits_only: bool,
+    external: Multiaddr,
+) -> tokio::task::JoinHandle<()> {
     let mut swarm = SwarmBuilder::with_existing_identity(key)
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
@@ -76,7 +89,7 @@ fn start_relay_counting(
     swarm.listen_on(addr.clone()).unwrap();
     // Reservations carry the relay's external addresses; a client refuses
     // one without (infra/relay sets them from EXTERNAL_ADDRS).
-    swarm.add_external_address(addr);
+    swarm.add_external_address(external);
     // QUIC, reached only as a bootstrap address (the punch tests), so
     // reservations keep the TCP address alone. On its own free UDP port, not
     // the TCP port's number: on Windows runners that number can fall in a
@@ -1519,6 +1532,31 @@ async fn my_other_device_fetches_a_notice_through_the_relay() {
     a3.set_notice_signer(None).unwrap();
     assert!(a3.fetch_notices().await.unwrap().is_empty());
     for node in [a, a2, a3] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// P0 on #416: the relay named by DNS (its external address and our
+/// configured one both `/dns4/localhost/...`, as the live relay and QA's
+/// join-matrix use): two members meet through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_meet_through_a_relay_named_by_dns() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay_id = PeerId::from(relay_key.public());
+    let relay: Multiaddr = format!("/dns4/localhost/tcp/{port}/p2p/{relay_id}").parse().unwrap();
+    let external: Multiaddr = format!("/dns4/localhost/tcp/{port}").parse().unwrap();
+    let circuits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _relay = start_relay_external(relay_key, port, circuits, true, external);
+    let a = bound_node("dns-relay-a", &relay, 71, false, Arc::new(AcceptAll)).await;
+    let b = bound_node("dns-relay-b", &relay, 72, false, Arc::new(AcceptAll)).await;
+    let start = Instant::now();
+    while !a.peers().await.unwrap().contains(&b.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(60), "members never met through a DNS-named relay");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for node in [a, b] {
         node.shutdown().await.unwrap();
     }
 }

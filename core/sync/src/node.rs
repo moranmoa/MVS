@@ -2934,6 +2934,12 @@ impl Task {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                 for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
+                    // P0 on #416: our configured relay's own configured address
+                    // stays, DNS name or not (configured, not peer-learned):
+                    // without it the routing table is empty and nobody is found.
+                    if peer == self.relay_peer && is_configured_relay(addr, &self.relay_addr) {
+                        continue;
+                    }
                     // Also any DNS name a peer gave (hickory-advisories): never
                     // stored, so never resolved or served to others.
                     if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
@@ -4154,6 +4160,16 @@ pub(crate) fn via_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
     prefix == *relay
 }
 
+/// Whether `addr` is exactly our configured relay address, with or
+/// without its trailing `/p2p/<relay ID>` (Kademlia may store either).
+pub(crate) fn is_configured_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
+    if addr == relay {
+        return true;
+    }
+    let mut base = relay.clone();
+    matches!(base.pop(), Some(Protocol::P2p(_))) && *addr == base
+}
+
 /// P0 (#416 broke joins over a relay with a DNS name): a peer-learned
 /// circuit through *our configured relay*, matched by the relay's peer ID
 /// and rebuilt from our own configured `relay` address, so the
@@ -4701,6 +4717,12 @@ mod tests {
         }
         // A plain DNS address stays unreachable (#416 unchanged).
         assert!(!reachable(&a("/dns4/relay.example/tcp/4001".into()), false));
+        // Kademlia keeps our configured relay's own address (with or without
+        // its /p2p), and nothing else under that name.
+        assert!(is_configured_relay(&ours, &ours));
+        assert!(is_configured_relay(&a("/dns4/relay.example/tcp/4001".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/relay.example/tcp/443/wss".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/evil.example/tcp/4001".into()), &ours));
     }
 
     #[test]

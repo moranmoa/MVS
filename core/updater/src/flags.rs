@@ -8,6 +8,9 @@
 //! own context (`mvs/update-flags/v1`), so a manifest signature can never be
 //! replayed as flags or the other way round.
 //!
+//! Only installs that update in-app fetch this file. A Linux package, or an
+//! app too old to know it, never gets the switch.
+//!
 //! ```json
 //! { "signed": "{\"v\":1,\"issuedAt\":1800000000,\"memberRelayOff\":true}",
 //!   "signatures": [ { "key": "<hex>", "sig": "<hex>" } ] }
@@ -26,8 +29,22 @@ pub const FLAGS_FORMAT: u32 = 1;
 pub const MAX_FLAGS_BYTES: usize = 4 * 1024;
 
 /// What the owner switches for every client.
+///
+/// Unlike the envelope, the body accepts unknown fields, so a flag added
+/// later never makes older clients drop the file and stop following
+/// `memberRelayOff` (the `ManifestBody` lesson). They are covered by the
+/// signature, ignored, and never stored: a client keeps only `issuedAt` and
+/// `memberRelayOff`.
+///
+/// Rules for later fields:
+/// - Only a field that can only turn something **off** may be added under
+///   `v: 1`. Older clients ignore it, which is the safe side.
+/// - Any field that could **enable** something needs `v: 2` (older clients
+///   then reject the whole file) and a security review.
+/// - There is deliberately no expiry: an "off" that expired would silently
+///   turn relays back on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct FlagsBody {
     pub v: u32,
     /// Unix seconds. The newest wins; an older file never replaces a newer one.
@@ -185,14 +202,37 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_client_verifies_and_ignores_a_flag_it_does_not_know() {
+        let k = key();
+        let root = TrustRoot::single(k.verifying_key()).unwrap();
+        // A later v1 file with an extra (off-only) flag, signed as a whole.
+        let mut later = SignedFlags {
+            signed: r#"{"v":1,"issuedAt":1800000000,"memberRelayOff":true,"voiceRelayOff":true}"#.into(),
+            signatures: vec![],
+        };
+        later.sign(&k);
+        let v = later.verify(&root, NOW).unwrap();
+        assert!(v.member_relay_off());
+        assert_eq!(v.issued_at(), 1_800_000_000);
+        // The extra field is covered by the signature: changing it breaks it.
+        let tampered = SignedFlags { signed: later.signed.replace("voiceRelayOff\":true", "voiceRelayOff\":false"), ..later.clone() };
+        assert!(matches!(tampered.verify(&root, NOW), Err(Error::InsufficientSignatures { .. })));
+        // And it is never kept: only issuedAt and memberRelayOff are.
+        let kept = newest_flags(None, Some(later.to_json().as_bytes()), &root, NOW).unwrap();
+        assert_eq!(kept, VerifiedFlags::kept(1_800_000_000, true));
+    }
+
+    #[test]
     fn far_future_flags_unknown_fields_and_other_formats_are_refused() {
         let k = key();
         let root = TrustRoot::single(k.verifying_key()).unwrap();
         let future = flags(NOW + MAX_CLOCK_SKEW_SECS + 1, true, &k);
         assert!(matches!(future.verify(&root, NOW), Err(Error::IssuedInFuture { .. })));
-        let mut extra = SignedFlags { signed: r#"{"v":1,"issuedAt":1,"memberRelayOff":true,"x":1}"#.into(), signatures: vec![] };
-        extra.sign(&k);
-        assert!(matches!(extra.verify(&root, NOW), Err(Error::Malformed(_))));
+        // An unknown field in the envelope is still refused.
+        let f = flags(NOW, true, &k);
+        let mut envelope: serde_json::Value = serde_json::from_str(&f.to_json()).unwrap();
+        envelope["extra"] = serde_json::json!(1);
+        assert!(SignedFlags::from_json(envelope.to_string().as_bytes()).is_err());
         let mut v2 = SignedFlags { signed: r#"{"v":2,"issuedAt":1,"memberRelayOff":true}"#.into(), signatures: vec![] };
         v2.sign(&k);
         assert!(matches!(v2.verify(&root, NOW), Err(Error::Malformed(_))));

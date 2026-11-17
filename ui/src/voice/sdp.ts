@@ -58,6 +58,16 @@ export interface TurnCredentials {
   expiresAt: number;
 }
 
+/**
+ * The relay host TURN URLs must name (G-81): a DNS name or IPv4 address, at
+ * most 253 characters, no empty labels; else null. The desktop shell checks
+ * it with the same rule (desktop/src/config.js validTurnHost).
+ */
+export function cleanTurnHost(host: unknown): string | null {
+  if (typeof host !== 'string') return null;
+  return /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(host) && !host.includes('..') ? host : null;
+}
+
 /** TURN ports we accept (docs/design/voice-across-networks.md). */
 export const TURN_PORTS = [3478, 5349, 443];
 

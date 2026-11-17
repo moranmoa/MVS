@@ -253,7 +253,16 @@ jobs:
             node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
             echo "::error::a relay listed twice was accepted"; exit 1
           fi
-          echo "ok: relay, relay list, bootstrap and stun reach the config unchanged"
+          # G-81: voice TURN on, with an explicit host (off unless VOICE_TURN=1).
+          VOICE_TURN=1 TURN_HOST=turn.example.org \
+            node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
+          want='{"relay":"/dns4/relay.example.invalid/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","voiceTurn":true,"turnHost":"turn.example.org"}'
+          got=$(cat "$RUNNER_TEMP/relay-selftest.json")
+          [ "$got" = "$want" ] || { echo "::error::voice TURN config was altered on the way: $got"; exit 1; }
+          if VOICE_TURN=1 TURN_HOST=turn:turn.example.org:3478 node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
+            echo "::error::a TURN host with a scheme and port was accepted"; exit 1
+          fi
+          echo "ok: relay, relay list, bootstrap, stun and voice TURN reach the config unchanged"
       - name: Build-time config (relay)
         env:
           RELAY: ${{ github.event_name == 'push' && vars.MVS_RELAY_ADDR || '' }}
@@ -265,6 +274,11 @@ jobs:
           RELAYS_TCP: ${{ github.event_name == 'push' && vars.MVS_RELAY_TCP_ADDRS || '' }}
           # Our own STUN server for voice (stun:<host>:3478); optional.
           STUN: ${{ github.event_name == 'push' && vars.MVS_STUN_URL || '' }}
+          # G-81: TURN for voice across networks, off unless MVS_VOICE_TURN=1
+          # (set it only after QA passes the two-network e2e). MVS_TURN_HOST is
+          # optional (default: the relay's direct host).
+          VOICE_TURN: ${{ github.event_name == 'push' && vars.MVS_VOICE_TURN || '' }}
+          TURN_HOST: ${{ github.event_name == 'push' && vars.MVS_TURN_HOST || '' }}
           MSYS2_ENV_CONV_EXCL: RELAY
           MSYS_NO_PATHCONV: "1"
         run: |

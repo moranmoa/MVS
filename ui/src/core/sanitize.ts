@@ -7,7 +7,7 @@
 // look-alike names), values that reach CSS or <img>, and sizes that freeze the
 // renderer.
 
-import { cleanStunUrl } from '../voice/sdp';
+import { cleanStunUrl, cleanTurnHost } from '../voice/sdp';
 import type { CoreApi, CoreEventName, CoreEvents } from './api';
 import type {
   AgeRestriction,
@@ -535,10 +535,13 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'core.status': (s) => {
     // The STUN URL only if it is a plain stun:/stuns: one (TURN, credentials: dropped).
     const stunUrl = cleanStunUrl(s?.stunUrl);
+    // G-81: TURN only with the flag exactly true and a plain host.
+    const turnHost = s?.voiceTurn === true ? cleanTurnHost(s?.turnHost) : null;
     return {
       state: s?.state === 'up' || s?.state === 'down' ? s.state : 'starting',
       detail: (['missing', 'start-failed', 'crashed', 'crash-loop', 'keyring'] as const).find((d) => d === s?.detail),
       ...(stunUrl ? { stunUrl } : {}),
+      ...(turnHost ? { voiceTurn: true, turnHost } : {}),
     };
   },
   'update.ready': (u) => ({ version: cleanName(u.version, 32), waitingForCall: u.waitingForCall === true }),

@@ -96,7 +96,27 @@ if (tcp.length) {
   config.bootstrap = [checked("the TCP bootstrap address", process.env.RELAY_TCP)];
 }
 if (process.env.STUN) config.stun = stunUrl(process.env.STUN);
+// G-81, voice across networks: TURN stays off unless VOICE_TURN=1 (until QA
+// passes it). TURN_HOST optionally names the TURN host (a DNS name or IPv4);
+// without it the app uses the relay's direct (TCP bootstrap) host. Errors
+// never quote the value.
+if (process.env.VOICE_TURN) {
+  if (process.env.VOICE_TURN !== "1") {
+    console.error("::error::VOICE_TURN must be 1 (or unset)");
+    process.exit(1);
+  }
+  config.voiceTurn = true;
+  if (process.env.TURN_HOST) {
+    const host = process.env.TURN_HOST;
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(host) || host.includes("..")) {
+      console.error("::error::the TURN host must be a plain DNS name or IPv4 address (no scheme, port or path)");
+      process.exit(1);
+    }
+    config.turnHost = host;
+  }
+}
 writeFileSync(out, JSON.stringify(config));
 console.log(config.relays ? `${config.relays.length} relays configured` : config.relay ? "relay configured" :"::warning::no relay address in this build: the app will run offline");
 console.log(config.bootstrap ? "TCP bootstrap configured" : "no TCP bootstrap address in this build");
 console.log(config.stun ? "STUN configured" : "no STUN server in this build");
+console.log(config.voiceTurn ? `voice TURN on${config.turnHost ? " (explicit host)" : " (relay host)"}` : "voice TURN off");

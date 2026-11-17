@@ -7,7 +7,8 @@
 //     "relays": ["/dns4/<host>/…/p2p/<id>", …],                  (optional, 1-4;
 //                                     multi-relay: preferred over "relay")
 //     "bootstrap": ["/dns4/<host>/tcp/4001/p2p/<peer id>"],   (optional)
-//     "stun": "stun:<host>:3478" }                            (optional, voice)
+//     "stun": "stun:<host>:3478",                             (optional, voice)
+//     "voiceTurn": true, "turnHost": "<host>" }               (optional, G-81 TURN; off by default)
 //
 // Anything malformed is ignored with a warning: the app then runs without a
 // relay (offline) rather than handing the core something unchecked.
@@ -187,6 +188,56 @@ function stunFor({ packaged, resourcesPath, env = process.env, warn = (m) => con
   return value.trim();
 }
 
+/** A TURN host: a DNS name or IPv4 address, as the page's TURN check (ui/src/voice/sdp.ts) wants it. */
+function validTurnHost(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(value) && !value.includes('..');
+}
+
+/** mvs-config.json, parsed, or null (no file, not JSON). */
+function readConfig(resourcesPath) {
+  const file = path.join(resourcesPath, 'mvs-config.json');
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null; // relayFor already warned
+  }
+}
+
+/**
+ * G-81, voice across networks: whether the page may use TURN, and on which
+ * host. Off unless `voiceTurn: true` in mvs-config.json (MVS_VOICE_TURN=1 in
+ * a checkout): TURN stays behind this flag until QA passes it. The host is
+ * `turnHost` (MVS_TURN_HOST) if given, else the host of the first TCP
+ * bootstrap address (the relay's direct route: TURN's UDP can't pass the
+ * WSS reverse proxy), else the first relay's. The page only takes TURN
+ * credentials whose URLs name exactly this host. Null host = no TURN.
+ * @param {{ packaged: boolean, resourcesPath?: string, env?: object, relays?: string[], bootstrap?: string[], warn?: (m: string) => void }} o
+ * @returns {{ voiceTurn: boolean, turnHost: string | null }}
+ */
+function turnFor({ packaged, resourcesPath, env = process.env, relays = [], bootstrap = [], warn = (m) => console.warn(m) }) {
+  let on;
+  let explicit;
+  if (packaged) {
+    const config = readConfig(resourcesPath) ?? {};
+    on = config.voiceTurn === true;
+    explicit = config.turnHost;
+  } else {
+    on = env.MVS_VOICE_TURN === '1';
+    explicit = env.MVS_TURN_HOST;
+  }
+  if (!on) return { voiceTurn: false, turnHost: null };
+  if (explicit !== undefined && explicit !== null && explicit !== '') {
+    if (validTurnHost(explicit)) return { voiceTurn: true, turnHost: explicit };
+    warn('ignoring a malformed TURN host');
+  }
+  for (const addr of [...bootstrap, ...relays]) {
+    const host = /^\/(?:dns(?:4|6|addr)?|ip4)\/([^/]+)/.exec(addr)?.[1];
+    if (validTurnHost(host)) return { voiceTurn: true, turnHost: host };
+  }
+  return { voiceTurn: true, turnHost: null };
+}
+
 /** The host of a STUN URL (for the file log to hide), or null. */
 function stunHost(url) {
   const m = typeof url === 'string' && /^stuns?:(?:\[([^\]]+)\]|([^:]+))/i.exec(url);
@@ -203,4 +254,4 @@ function logHost(addr) {
   return m ? m[1] : null;
 }
 
-module.exports = { MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, relaysFor, bootstrapFor, logHost, validStun, stunFor, stunHost };
+module.exports = { MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, relaysFor, bootstrapFor, logHost, validStun, stunFor, stunHost, validTurnHost, turnFor };

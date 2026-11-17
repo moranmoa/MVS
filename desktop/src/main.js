@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, turnFor } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -72,7 +72,18 @@ let coreStatus = { state: 'starting' };
  */
 const STUN_URL = stunFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
 if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
-const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
+/**
+ * G-81: TURN for voice across networks, behind `voiceTurn` (off by default
+ * until QA passes it). Set in startCore from the same relay config the core
+ * gets; on core.status only when on and a host is known. The host is a relay
+ * host, already hidden from the log.
+ */
+let TURN = { voiceTurn: false, turnHost: null };
+const statusForPage = (status) => ({
+  ...status,
+  stunUrl: STUN_URL,
+  ...(TURN.voiceTurn && TURN.turnHost ? { voiceTurn: true, turnHost: TURN.turnHost } : {}),
+});
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
 
@@ -125,6 +136,8 @@ function startCore() {
     const host = logHost(addr);
     if (host) fileLog.hide(host);
   }
+  TURN = turnFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath, relays, bootstrap });
+  if (TURN.turnHost) fileLog.hide(TURN.turnHost);
   // Checkouts only (tests): Windows cannot execute a .js stand-in for the core
   // (EFTYPE), so it runs under this Electron in Node mode. Never in a packaged
   // app, where the RunAsNode fuse is off anyway.

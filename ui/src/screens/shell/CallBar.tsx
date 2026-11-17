@@ -32,8 +32,8 @@ export function useCallEngine(myId: Id): CallEngine {
   const store = useAppStore();
   const core = useCore();
   const call = useStore(store, (s) => s.call);
-  const stunUrl = useStunUrl();
-  const view = useVoiceEngine(call, myId, { stunUrl });
+  const { stunUrl, enableTurn, turnHost } = useVoiceNet();
+  const view = useVoiceEngine(call, myId, { stunUrl, enableTurn, turnHost });
   const sim = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('voiceSim') : null;
   const error = call && sim === 'noMic' ? 'no-device' : call && sim === 'rejoin' ? 'rejoin-to-talk' : view.error;
   const other = call?.participants.find((p) => p.identity !== myId)?.identity;
@@ -51,15 +51,27 @@ export function useCallEngine(myId: Id): CallEngine {
 }
 
 /**
- * Our STUN server (#222): the desktop shell puts it on every core.status (the
- * latest one reaches late listeners too). Null without one: calls then work
- * on the same network only.
+ * Our STUN server (#222) and, behind the shell's flag, TURN on the relay host
+ * (G-81): the desktop shell puts them on every core.status (the latest one
+ * reaches late listeners too). Without STUN, calls work on the same network
+ * only; without TURN, not across strict NATs.
  */
-function useStunUrl(): string | null {
+function useVoiceNet(): { stunUrl: string | null; enableTurn: boolean; turnHost: string | null } {
   const core = useCore();
-  const [url, setUrl] = useState<string | null>(null);
-  useEffect(() => core.on('core.status', (s) => setUrl(s.stunUrl ?? null)), [core]);
-  return url;
+  const [net, setNet] = useState<{ stunUrl: string | null; enableTurn: boolean; turnHost: string | null }>({
+    stunUrl: null,
+    enableTurn: false,
+    turnHost: null,
+  });
+  useEffect(
+    () =>
+      core.on('core.status', (s) => {
+        const next = { stunUrl: s.stunUrl ?? null, enableTurn: s.voiceTurn === true && !!s.turnHost, turnHost: s.voiceTurn === true ? s.turnHost ?? null : null };
+        setNet((prev) => (prev.stunUrl === next.stunUrl && prev.enableTurn === next.enableTurn && prev.turnHost === next.turnHost ? prev : next));
+      }),
+    [core],
+  );
+  return net;
 }
 
 /** The short code the app shows for someone not (yet) in the member list. */

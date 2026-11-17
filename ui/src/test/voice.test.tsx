@@ -12,9 +12,10 @@ import { cleanCall, cleanVoiceRoom, cleanVoiceRooms, guardCore } from '../core/s
 
 // jsdom has no WebRTC: the engine (piece D) has its own tests in src/voice. Here it
 // is an idle engine with a working mic; ?voiceSim drives the failure states.
-const fakeEngine = vi.hoisted(() => ({ peerFailed: {} as Record<string, 'failed' | 'refused'>, stunUrls: [] as unknown[] }));
+type EngineOptions = { stunUrl?: string | null; enableTurn?: boolean; turnHost?: string | null };
+const fakeEngine = vi.hoisted(() => ({ peerFailed: {} as Record<string, 'failed' | 'refused'>, stunUrls: [] as unknown[], options: [] as EngineOptions[] }));
 vi.mock('../voice', () => ({
-  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => (fakeEngine.stunUrls.push(options?.stunUrl), {
+  useVoiceEngine: (_call: unknown, _me: unknown, options?: EngineOptions) => (fakeEngine.stunUrls.push(options?.stunUrl), fakeEngine.options.push(options ?? {}), {
     ready: true,
     speaking: {},
     peerFailed: fakeEngine.peerFailed,
@@ -65,6 +66,52 @@ describe('STUN for the voice engine (#222)', () => {
       expect(fakeEngine.stunUrls.every((u) => u === null)).toBe(true);
     },
   );
+});
+
+describe('TURN for the voice engine (G-81, behind the shell flag)', () => {
+  const settle = () =>
+    act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+  it('passes enableTurn and the relay host when the shell turns TURN on', async () => {
+    fakeEngine.options = [];
+    await setup({ stunUrl: 'stun:stun.example.test:3478', turnHost: 'relay.example.org' });
+    await waitFor(() =>
+      expect(fakeEngine.options.at(-1)).toEqual({ stunUrl: 'stun:stun.example.test:3478', enableTurn: true, turnHost: 'relay.example.org' }),
+    );
+  });
+
+  it('keeps TURN off without the flag', async () => {
+    fakeEngine.options = [];
+    await setup({ stunUrl: 'stun:stun.example.test:3478' });
+    await settle();
+    expect(fakeEngine.options.length).toBeGreaterThan(0);
+    expect(fakeEngine.options.every((o) => o.enableTurn === false && o.turnHost === null)).toBe(true);
+  });
+
+  it.each(['turn:relay.example.org', 'relay.example.org:3478', 'a b', '-relay.example.org', 'relay..example.org'])(
+    'keeps TURN off for a malformed host (%s)',
+    async (turnHost) => {
+      fakeEngine.options = [];
+      await setup({ turnHost });
+      await settle();
+      expect(fakeEngine.options.every((o) => o.enableTurn === false && o.turnHost === null)).toBe(true);
+    },
+  );
+
+  it('sanitize: TURN only with voiceTurn exactly true and a plain host', () => {
+    const handlers = new Map<string, (p: unknown) => void>();
+    const bare = { on: (e: string, h: (p: unknown) => void) => (handlers.set(e, h), () => {}) } as unknown as Parameters<typeof guardCore>[0];
+    let last: unknown;
+    guardCore(bare).on('core.status', (st) => (last = st));
+    const status = (raw: unknown) => (handlers.get('core.status')!(raw), last);
+    expect(status({ state: 'up', voiceTurn: true, turnHost: 'relay.example.org' })).toEqual({ state: 'up', detail: undefined, voiceTurn: true, turnHost: 'relay.example.org' });
+    expect(status({ state: 'up', voiceTurn: 'true', turnHost: 'relay.example.org' })).toEqual({ state: 'up', detail: undefined });
+    expect(status({ state: 'up', turnHost: 'relay.example.org' })).toEqual({ state: 'up', detail: undefined });
+    expect(status({ state: 'up', voiceTurn: true })).toEqual({ state: 'up', detail: undefined });
+    expect(status({ state: 'up', voiceTurn: true, turnHost: 'turn:relay.example.org' })).toEqual({ state: 'up', detail: undefined });
+  });
 });
 
 /** Text without the bidi isolates the messages wrap values in. */

@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
-const { relayFor, relaysFor, bootstrapFor, validRelay, logHost, MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, stunFor, validStun, stunHost, MAX_STUN } = require('../src/config');
+const { relayFor, relaysFor, bootstrapFor, validRelay, logHost, MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, stunFor, validStun, stunHost, MAX_STUN, turnFor, validTurnHost } = require('../src/config');
 const { createLog } = require('../src/logfile');
 const { Sidecar } = require('../src/sidecar');
 
@@ -268,4 +268,44 @@ test('checkout: relay and bootstrap lists take commas and/or newlines, spaces an
   assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: `${RELAY},${RELAY}\n${RELAY2}` }, warn }), [RELAY, RELAY2]);
   assert.deepEqual(bootstrapFor({ packaged: false, env: { MVS_BOOTSTRAP: ` ${TCP} ,\n,` }, warn }), [TCP]);
   assert.ok(warnings.every((w) => !/example\.org|12D3KooW/.test(w)), 'warnings never name an address');
+});
+
+// ---- G-81: TURN behind a flag ----------------------------------------------------
+
+test('TURN is off unless voiceTurn is set (packaged) or MVS_VOICE_TURN=1 (checkout)', () => {
+  const off = { voiceTurn: false, turnHost: null };
+  const relays = [RELAY];
+  assert.deepEqual(turnFor({ packaged: true, resourcesPath: resources(JSON.stringify({ relay: RELAY })), relays }), off);
+  assert.deepEqual(turnFor({ packaged: true, resourcesPath: resources(JSON.stringify({ voiceTurn: 'true' })), relays }), off, 'only true');
+  assert.deepEqual(turnFor({ packaged: true, resourcesPath: resources(), relays }), off);
+  assert.deepEqual(turnFor({ packaged: false, env: {}, relays }), off);
+  assert.deepEqual(turnFor({ packaged: false, env: { MVS_VOICE_TURN: 'yes' }, relays }), off);
+  // The packaged app never reads the environment, a checkout never the file.
+  assert.deepEqual(turnFor({ packaged: true, resourcesPath: resources('{}'), env: { MVS_VOICE_TURN: '1' }, relays }), off);
+  assert.deepEqual(turnFor({ packaged: false, resourcesPath: resources('{"voiceTurn":true}'), env: {}, relays }), off);
+});
+
+test('the TURN host: explicit, else the first TCP bootstrap host, else the first relay host', () => {
+  const on = (o) => ({ packaged: true, resourcesPath: resources(JSON.stringify({ voiceTurn: true, ...o })) });
+  assert.deepEqual(turnFor({ ...on({ turnHost: 'turn.example.org' }), relays: [RELAY], bootstrap: [TCP] }), { voiceTurn: true, turnHost: 'turn.example.org' });
+  assert.deepEqual(turnFor({ ...on({}), relays: [RELAY], bootstrap: [TCP] }), { voiceTurn: true, turnHost: 'relay-direct.example.org' });
+  assert.deepEqual(turnFor({ ...on({}), relays: [RELAY, RELAY2] }), { voiceTurn: true, turnHost: 'relay.example.org' });
+  assert.deepEqual(turnFor({ ...on({}), relays: [`/ip4/192.0.2.7/tcp/4001/p2p/${ID}`] }), { voiceTurn: true, turnHost: '192.0.2.7' });
+  // No relay (offline) or only an IPv6 one: on, but no host, so no TURN.
+  assert.deepEqual(turnFor({ ...on({}), relays: [] }), { voiceTurn: true, turnHost: null });
+  assert.deepEqual(turnFor({ ...on({}), relays: [`/ip6/2001:db8::1/tcp/4001/p2p/${ID}`] }), { voiceTurn: true, turnHost: null });
+  // Checkout.
+  assert.deepEqual(turnFor({ packaged: false, env: { MVS_VOICE_TURN: '1', MVS_TURN_HOST: 'turn.example.org' }, relays: [RELAY] }), { voiceTurn: true, turnHost: 'turn.example.org' });
+});
+
+test('a malformed TURN host is ignored with a warning that never names it; the relay host is used', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(m);
+  for (const bad of ['turn.example.org:3478', 'turn:turn.example.org', 'a b', '-x.example.org', 'x..example.org', 'x'.repeat(300), 42, ['x']]) {
+    const res = turnFor({ packaged: true, resourcesPath: resources(JSON.stringify({ voiceTurn: true, turnHost: bad })), relays: [RELAY], warn });
+    assert.deepEqual(res, { voiceTurn: true, turnHost: 'relay.example.org' }, String(bad).slice(0, 30));
+  }
+  assert.ok(warnings.length >= 7 && warnings.every((w) => !/example\.org/.test(w)));
+  assert.equal(validTurnHost('turn.example.org'), true);
+  assert.equal(validTurnHost('turn.example.org.'), false);
 });

@@ -123,6 +123,10 @@ export interface CoreStatus {
   detail?: CoreDownDetail;
   /** Our STUN server for voice (#222), from the shell's config; absent without one. */
   stunUrl?: string;
+  /** G-81: TURN allowed for voice (off by default, behind the shell's flag). Only with turnHost. */
+  voiceTurn?: boolean;
+  /** G-81: the relay host TURN credentials must name exactly. */
+  turnHost?: string;
 }
 
 /** Commands reject with this shape; `code` maps to a translated message. */

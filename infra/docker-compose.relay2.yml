@@ -1,0 +1,11 @@
+# Relay-2 on the same PC as relay-1 (owner, 2026-11-17): its own project
+# (-p infra2), volume and key, and its own host ports. Use with
+#   docker compose -p infra2 -f infra/docker-compose.yml -f docker-compose.relay2.yml --env-file <relay2 dir>/.env up -d relay
+# The container still listens on 4001/4002 inside; only the host side moves.
+services:
+  relay:
+    ports: !override
+      - "4011:4001/tcp"
+      - "4011:4001/udp"
+      # No wss proxy for relay-2: the WebSocket port stays on this PC only.
+      - "127.0.0.1:4012:4002/tcp"

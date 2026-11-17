@@ -7,10 +7,11 @@ import { useEffect, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
-import { Dialog } from '../../components/common';
+import { Dialog, Name } from '../../components/common';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
-import { useCore, type Id } from '../../core';
+import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
+import { playTestSound } from '../../voice/devices';
 
 /**
  * The voice engine (piece D, ui/src/voice) as the call UI uses it. `peerFailed`
@@ -46,6 +47,14 @@ export function useCallEngine(myId: Id): CallEngine {
   useEffect(() => {
     if (noMic && !meMuted) void core.setMuted(true).catch(() => {});
   }, [noMic, meMuted, core]);
+  // G-72: a chosen device was unplugged: say which, once.
+  const fallback = view.deviceFallback;
+  useEffect(() => {
+    if (!fallback) return;
+    const base = fallback.kind === 'input' ? 'call.micUnplugged' : 'call.speakerUnplugged';
+    if (fallback.label) store.showFlash(base, { name: fallback.label });
+    else store.showFlash(`${base}NoName`);
+  }, [fallback, store]);
   const simFailure: PeerFailure | null = sim === 'peerFailed' ? 'failed' : sim === 'peerRefused' ? 'refused' : null;
   const peerFailed = simFailure && other ? { ...view.peerFailed, [other]: simFailure } : view.peerFailed;
   return { ...view, error, noMic, peerFailed };
@@ -62,6 +71,8 @@ function useStunUrl(): string | null {
   useEffect(() => core.on('core.status', (s) => setUrl(s.stunUrl ?? null)), [core]);
   return url;
 }
+
+const NO_MEMBERS: Member[] = [];
 
 /** The short code the app shows for someone not (yet) in the member list. */
 export function codeOf(id: Id): string {
@@ -134,6 +145,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   // The call may be in another server's room than the one on screen.
   const serverId = useStore(store, (s) => Object.entries(s.voiceRooms).find(([, rooms]) => rooms.some((r) => r.roomId === s.call?.channelId))?.[0]);
   const serverName = useStore(store, (s) => s.servers.find((x) => x.id === serverId)?.name ?? '');
+  const members = useStore(store, (s) => (serverId ? s.members[serverId] : undefined)) ?? NO_MEMBERS;
   if (!call) return null;
 
   const me = call.participants.find((p) => p.identity === myId);
@@ -234,7 +246,18 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
           <HangUpIcon />
         </button>
       </div>
-      <VoiceSettings open={settingsOpen} onClose={() => setSettingsOpen(false)} engine={engine} muted={!!me?.muted} />
+      <VoiceSettings
+        open={settingsOpen}
+        onClose={() => {
+          engine.setSelfMonitor(false); // never left on behind a closed dialog
+          setSettingsOpen(false);
+        }}
+        engine={engine}
+        muted={!!me?.muted}
+        others={call.participants
+          .filter((p) => p.identity !== myId)
+          .map((p) => ({ id: p.identity, name: members.find((m) => m.id === p.identity)?.displayName || codeOf(p.identity) }))}
+      />
     </section>
   );
 }
@@ -244,7 +267,20 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
  * the desktop shell grants the microphone (and with it the device names)
  * only during one. The choice lasts for this session.
  */
-function VoiceSettings({ open, onClose, engine, muted }: { open: boolean; onClose: () => void; engine: CallEngine; muted: boolean }) {
+function VoiceSettings({
+  open,
+  onClose,
+  engine,
+  muted,
+  others,
+}: {
+  open: boolean;
+  onClose: () => void;
+  engine: CallEngine;
+  muted: boolean;
+  /** G-73: the others in my call, for their volume. */
+  others: { id: Id; name: string }[];
+}) {
   const intl = useIntl();
   const level = useInputLevel(open && !engine.noMic && !muted, engine.inputLevel);
   const pct = Math.round(level * 100);
@@ -294,8 +330,71 @@ function VoiceSettings({ open, onClose, engine, muted }: { open: boolean; onClos
         <p className="hint">
           <FormattedMessage id={engine.noMic ? 'call.noMic' : muted ? 'call.micTestMuted' : 'call.micTestHint'} />
         </p>
+        <label className="switch-row">
+          <span>
+            <FormattedMessage id="voice.selfMonitor" />
+          </span>
+          <input
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={engine.selfMonitor}
+            disabled={engine.noMic}
+            aria-describedby="self-monitor-hint"
+            onChange={(e) => engine.setSelfMonitor(e.target.checked)}
+          />
+        </label>
+        <p id="self-monitor-hint" className="hint">
+          <FormattedMessage id="voice.selfMonitorHint" />
+        </p>
       </div>
+      <button type="button" className="secondary" onClick={() => void playTestSound(engine.outputId)}>
+        <FormattedMessage id="voice.playTest" />
+      </button>
+      {others.length > 0 && (
+        <fieldset className="call-volumes">
+          <legend>
+            <FormattedMessage id="call.volumes" />
+          </legend>
+          {others.map((o) => {
+            const pct = engine.volumes[o.id] ?? 100;
+            const text = intl.formatNumber(pct / 100, { style: 'percent' });
+            return (
+              <label key={o.id} className="field range">
+                <span>
+                  <Name>{o.name}</Name>
+                  <output>{text}</output>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={200}
+                  step={10}
+                  list={VOLUME_TICKS}
+                  value={pct}
+                  aria-valuetext={text}
+                  onChange={(e) => engine.setVolume(o.id, Number(e.target.value))}
+                />
+              </label>
+            );
+          })}
+          <p className="hint">
+            <FormattedMessage id="call.volumesHint" />
+          </p>
+          <VolumeTicks />
+        </fieldset>
+      )}
     </Dialog>
+  );
+}
+
+/** G-73: the 100% mark on the 0–200% volume sliders (a tick Chromium draws on the track). */
+export const VOLUME_TICKS = 'volume-ticks-100';
+export function VolumeTicks() {
+  return (
+    <datalist id={VOLUME_TICKS}>
+      <option value={100} />
+    </datalist>
   );
 }
 

@@ -432,7 +432,8 @@ function Composer({
             } else if (e.key === 'Escape' && (replyTo || editing)) {
               e.preventDefault();
               onCancel();
-            } else if (e.key === 'ArrowUp' && !text) {
+            } else if (e.key === 'ArrowUp' && !text && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+              // G-32: a plain ↑ only; Alt+↑ / Ctrl+Alt+↑ move between channels and servers.
               e.preventDefault();
               onEditLast();
             }

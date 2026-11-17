@@ -13,9 +13,10 @@ import { SignOutButton } from './SignOut';
 import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/notify';
 import { MemberRelaySetting } from './MemberRelay';
 import { DevicesSection } from './Devices';
+import { VoiceSection } from './Voice';
 
-type Section = 'account' | 'privacy' | 'devices' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
-const SECTIONS: Section[] = ['account', 'privacy', 'devices', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
+type Section = 'account' | 'privacy' | 'devices' | 'voice' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
+const SECTIONS: Section[] = ['account', 'privacy', 'devices', 'voice', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
 
 const GB = 1024 ** 3;
 const LIMIT_STEPS = [1, 2, 5, 10, 20, 50].map((g) => g * GB);
@@ -87,6 +88,7 @@ export function SettingsScreen({
           {section === 'diagnostics' && <DiagnosticsSection />}
           {section === 'about' && <AboutSection />}
           {section === 'devices' && <DevicesSection />}
+          {section === 'voice' && <VoiceSection />}
           {section === 'notifications' && <NotificationsSection />}
           {section === 'privacy' && <PrivacySection focus={request?.section === 'privacy' ? request.at : undefined} />}
         </section>
@@ -340,6 +342,22 @@ function NotificationsSection() {
           <FormattedMessage id="notify.settings.previewDisabled" />
         </p>
       )}
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.badge" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.badge}
+          aria-describedby="notify-badge-hint"
+          onChange={(e) => set({ badge: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-badge-hint">
+        <FormattedMessage id="notify.settings.badgeHint" />
+      </p>
     </div>
   );
 }

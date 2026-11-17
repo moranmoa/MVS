@@ -19,11 +19,16 @@ const fakeEngine = vi.hoisted(() => ({
   picked: [] as string[],
   level: 0.42,
   deafened: false,
+  selfMonitor: false,
+  fallback: null as null | { kind: 'input' | 'output'; label: string | null; at: number },
 }));
 vi.mock('../voice', () => ({
   // A hook: deafen is React state, as in the real one, so the call bar re-renders.
   useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
     const [deafened, setDeafened] = useState(false);
+    const [selfMonitor, setSelfMonitor] = useState(false);
+    fakeEngine.selfMonitor = selfMonitor;
+    const [volumes, setVolumes] = useState<Record<string, number>>({});
     fakeEngine.deafened = deafened;
     fakeEngine.stunUrls.push(options?.stunUrl);
     return {
@@ -43,6 +48,14 @@ vi.mock('../voice', () => ({
     setDeafened: (on: boolean) => {
       fakeEngine.deafened = on;
       setDeafened(on);
+    },
+    deviceFallback: fakeEngine.fallback,
+    selfMonitor,
+    setSelfMonitor,
+    volumes,
+    setVolume: (id: string, pct: number) => {
+      fakeEngine.picked.push(`vol:${id}:${pct}`);
+      setVolumes((v) => ({ ...v, [id]: pct }));
     },
     };
   },
@@ -117,7 +130,7 @@ describe('G-72: voice settings in a call', () => {
       await act(async () => {
         fireEvent.change(mic, { target: { value: 'mic-b' } });
       });
-      const speaker = within(dialog).getByRole('combobox', { name: 'Speaker' });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speakers' });
       await act(async () => {
         fireEvent.change(speaker, { target: { value: 'spk-a' } });
       });
@@ -129,6 +142,14 @@ describe('G-72: voice settings in a call', () => {
       const meter = within(dialog).getByRole('meter', { name: 'Mic test' });
       expect(meter.getAttribute('aria-valuenow')).toBe('42');
       expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
+      // Hear myself: off by default, and closing the dialog turns it off.
+      const hear = within(dialog).getByRole('switch', { name: 'Hear myself' }) as HTMLInputElement;
+      expect(hear.checked).toBe(false);
+      await click(hear);
+      expect(fakeEngine.selfMonitor).toBe(true);
+      expect(within(dialog).getByRole('button', { name: 'Play test sound' })).toBeTruthy();
+      await click(within(dialog).getByRole('button', { name: 'Close' }));
+      expect(fakeEngine.selfMonitor).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -148,6 +169,75 @@ describe('G-84b: the others see "deafened"', () => {
     await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
     expect(told).toHaveBeenLastCalledWith(false);
     await waitFor(() => expect(within(roster).queryAllByRole('img', { name: 'Deafened' })).toHaveLength(0));
+  });
+});
+
+describe('G-72 part 2: an unplugged device', () => {
+  it('says which device was unplugged and that the default is used', async () => {
+    fakeEngine.fallback = { kind: 'input', label: 'Headset mic', at: 1 };
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      await screen.findByRole('region', { name: 'Voice call' });
+      await waitFor(() => expect(screen.getByText(/Headset mic/).closest('[role=status]')?.textContent).toBe('Microphone ⁨Headset mic⁩ was unplugged. Using the system default.'));
+    } finally {
+      fakeEngine.fallback = null;
+    }
+  });
+});
+
+describe('G-73: volume per person', () => {
+  it('a slider per other person in my call, with their name and the percent', async () => {
+    const { entry } = await setup();
+    await click(entry()); // the demo room has 2 people already
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+    const group = within(screen.getByRole('dialog', { name: 'Voice settings' })).getByRole('group', { name: 'Volume for each person in the call' });
+    const sliders = within(group).getAllByRole('slider');
+    expect(sliders).toHaveLength(2);
+    expect(sliders.every((s) => s.getAttribute('aria-valuetext') === '100%')).toBe(true);
+    fakeEngine.picked = [];
+    await act(async () => {
+      fireEvent.change(sliders[0]!, { target: { value: '35' } });
+    });
+    expect(fakeEngine.picked).toHaveLength(1);
+    expect(fakeEngine.picked[0]).toMatch(/^vol:.+:35$/);
+    expect(within(group).getAllByRole('slider')[0]!.getAttribute('aria-valuetext')).toBe('35%');
+    expect(within(group).getByText(/Only you hear the change/)).toBeTruthy();
+  });
+});
+
+describe('G-73 v2: the roster menu (0–200%, mute for me)', () => {
+  it('right-click a person in my call: Volume… (0–200%) and Mute for me, which restores the volume', async () => {
+    const { entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    const others = () => within(roster).getAllByRole('listitem').filter((li) => li.getAttribute('aria-haspopup') === 'menu');
+    expect(others()).toHaveLength(2); // not me
+    const menuFor = async (li: HTMLElement) => {
+      await act(async () => {
+        fireEvent.contextMenu(li, { clientX: 10, clientY: 10 });
+      });
+      return screen.getByRole('menu');
+    };
+    // Volume…: a dialog with a 0–200% slider.
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Volume…' }));
+    const slider = within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('slider') as HTMLInputElement;
+    expect(slider.max).toBe('200');
+    expect(slider.step).toBe('10');
+    // The 100% tick, in the middle of the track.
+    expect([...(slider.list?.options ?? [])].map((o) => o.value)).toEqual(['100']);
+    await act(async () => {
+      fireEvent.change(slider, { target: { value: '160' } });
+    });
+    expect(slider.getAttribute('aria-valuetext')).toBe('160%');
+    await click(within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('button', { name: 'Close' }));
+    // Mute for me, then Unmute for me brings back 160%.
+    fakeEngine.picked = [];
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Mute for me' }));
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Unmute for me' }));
+    expect(fakeEngine.picked.map((x) => x.split(':').at(-1))).toEqual(['0', '160']);
   });
 });
 

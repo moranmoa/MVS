@@ -84,7 +84,7 @@ export function PushToTalkSection() {
         </legend>
         {(['open', 'ptt'] as const).map((m) => (
           <label key={m} className="radio-row">
-            <input type="radio" name="voice-mode" checked={prefs.mode === m} aria-describedby={unsupported ? 'ptt-desktop-only' : undefined} onChange={() => set({ mode: m })} />
+            <input type="radio" name="voice-mode" checked={prefs.mode === m} disabled={unsupported} aria-describedby={unsupported ? 'ptt-desktop-only' : undefined} onChange={() => set({ mode: m })} />
             <FormattedMessage id={m === 'open' ? 'voice.mode.open' : 'voice.mode.ptt'} />
           </label>
         ))}

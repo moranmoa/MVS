@@ -2934,6 +2934,12 @@ impl Task {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                 for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
+                    // P0 on #416: our configured relay's own configured address
+                    // stays, DNS name or not (configured, not peer-learned):
+                    // without it the routing table is empty and nobody is found.
+                    if peer == self.relay_peer && is_configured_relay(addr, &self.relay_addr) {
+                        continue;
+                    }
                     // Also any DNS name a peer gave (hickory-advisories): never
                     // stored, so never resolved or served to others.
                     if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
@@ -2953,9 +2959,24 @@ impl Task {
                     {
                         continue;
                     }
-                    // Peer-supplied addresses: never let them point us into our own LAN.
-                    let addrs: Vec<Multiaddr> =
-                        peer.addrs.into_iter().filter(|a| self.reachable(a) && (!self.relay_only || via_relay(a, &self.relay_addr))).collect();
+                    // Peer-supplied addresses: never let them point us into our
+                    // own LAN, nor at a DNS name. A circuit through our own relay
+                    // (matched by its peer ID) is rebuilt from our configured
+                    // relay address instead (P0 on #416: the relay's announced
+                    // base can be a DNS name, or another port or transport).
+                    let mut addrs: Vec<Multiaddr> = Vec::new();
+                    for a in peer.addrs {
+                        let usable = if via_relay(&a, &self.relay_addr) {
+                            Some(a)
+                        } else if let Some(rebuilt) = our_relay_circuit(&a, &self.relay_addr, &peer.peer_id) {
+                            Some(rebuilt)
+                        } else {
+                            (!self.relay_only && reachable(&a, false)).then_some(a)
+                        };
+                        if let Some(a) = usable.filter(|a| !addrs.contains(a)) {
+                            addrs.push(a);
+                        }
+                    }
                     if addrs.is_empty() {
                         continue;
                     }
@@ -4139,6 +4160,49 @@ pub(crate) fn via_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
     prefix == *relay
 }
 
+/// Whether `addr` is exactly our configured relay address, with or
+/// without its trailing `/p2p/<relay ID>` (Kademlia may store either).
+pub(crate) fn is_configured_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
+    if addr == relay {
+        return true;
+    }
+    let mut base = relay.clone();
+    matches!(base.pop(), Some(Protocol::P2p(_))) && *addr == base
+}
+
+/// P0 (#416 broke joins over a relay with a DNS name): a peer-learned
+/// circuit through *our configured relay*, matched by the relay's peer ID
+/// and rebuilt from our own configured `relay` address, so the
+/// peer-supplied base (a DNS name, another port, another transport) is
+/// never dialled (Security Lead's rules):
+/// - the shape is exactly `<base>/p2p/<relay ID>/p2p-circuit[/p2p/<target>]`:
+///   nothing else after `/p2p-circuit`, no nested circuits;
+/// - `<relay ID>` is our configured relay's (member relays get no
+///   exception);
+/// - `<target>`, when present, is `expected` (the peer being dialled).
+///
+/// The rebuilt `relay/p2p-circuit/p2p/<expected>`, or None.
+pub(crate) fn our_relay_circuit(addr: &Multiaddr, relay: &Multiaddr, expected: &PeerId) -> Option<Multiaddr> {
+    let relay_id = match relay.iter().last() {
+        Some(Protocol::P2p(id)) => id,
+        _ => return None,
+    };
+    let parts: Vec<Protocol<'_>> = addr.iter().collect();
+    let circuit = parts.iter().position(|p| *p == Protocol::P2pCircuit)?;
+    if circuit == 0 || parts[circuit - 1] != Protocol::P2p(relay_id) {
+        return None;
+    }
+    if parts[..circuit - 1].iter().any(|p| matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit)) {
+        return None;
+    }
+    match &parts[circuit + 1..] {
+        [] => {}
+        [Protocol::P2p(target)] if target == expected => {}
+        _ => return None,
+    }
+    Some(relay.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(*expected)))
+}
+
 /// Like [`dialable`], but a relay circuit is fine (it is how peers behind
 /// NAT are reached) as long as the relay's own address is global. Used for
 /// addresses learned from peers (Kademlia, identify, member answers) before
@@ -4609,6 +4673,56 @@ mod tests {
             // Nor does the general rule let the LAN ones through without allow_lan.
             assert!(!reachable(&bad, false) || bad.iter().all(|p| !matches!(p, Protocol::Ip4(ip) if ip.is_private())));
         }
+    }
+
+    #[test]
+    fn a_circuit_through_our_dns_relay_is_rebuilt_from_our_own_address() {
+        // P0 on #416: the relay announces itself under a DNS name (or another
+        // port or transport) than ours; matched by its peer ID, the circuit
+        // is rebuilt from our configured address (Security Lead's rules).
+        let relay_id = PeerId::random();
+        let target = PeerId::random();
+        let ours: Multiaddr = format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}").parse().unwrap();
+        let want: Multiaddr = format!("{ours}/p2p-circuit/p2p/{target}").parse().unwrap();
+        let a = |s: String| s.parse::<Multiaddr>().unwrap();
+        // Our relay's ID with the configured base passes, and so do another
+        // name, port or transport for it: all rewritten to ours.
+        for base in [
+            "/dns4/relay.example/tcp/4001",
+            "/dns4/relay.example/tcp/443/wss",
+            "/dns4/other.example/udp/4001/quic-v1",
+            "/ip4/192.168.1.5/tcp/4001",
+        ] {
+            for tail in [format!("/p2p-circuit/p2p/{target}"), "/p2p-circuit".to_owned()] {
+                let got = our_relay_circuit(&a(format!("{base}/p2p/{relay_id}{tail}")), &ours, &target);
+                assert_eq!(got.as_ref(), Some(&want), "{base}{tail}");
+            }
+        }
+        // The same host with another peer ID: refused (a member relay too).
+        let member_relay = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{member_relay}/p2p-circuit/p2p/{target}")), &ours, &target).is_none());
+        // Another target than the peer being dialled.
+        let other = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}")), &ours, &target).is_none());
+        // Extra protocols after /p2p-circuit, nested circuits, a peer ID in the base.
+        for bad in [
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}/tcp/1"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/ip4/1.2.3.4/tcp/1/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/1.2.3.4/tcp/1/p2p/{other}/p2p-circuit/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}"),
+            format!("/p2p/{relay_id}/p2p-circuit/p2p/{target}/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}"),
+        ] {
+            assert!(our_relay_circuit(&a(bad.clone()), &ours, &target).is_none(), "{bad}");
+        }
+        // A plain DNS address stays unreachable (#416 unchanged).
+        assert!(!reachable(&a("/dns4/relay.example/tcp/4001".into()), false));
+        // Kademlia keeps our configured relay's own address (with or without
+        // its /p2p), and nothing else under that name.
+        assert!(is_configured_relay(&ours, &ours));
+        assert!(is_configured_relay(&a("/dns4/relay.example/tcp/4001".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/relay.example/tcp/443/wss".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/evil.example/tcp/4001".into()), &ours));
     }
 
     #[test]

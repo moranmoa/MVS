@@ -261,3 +261,53 @@ mod tests {
         assert!(may_read(&store, &owner));
     }
 }
+
+/// The notice write key `w_n`, from unlock to lock, for notice fetches only
+/// (`sync::NoticeSigner`): it signs only `mvs/notice-fetch/v1` messages.
+#[derive(Default)]
+pub struct NoticeKey {
+    key: RwLock<Option<SigningKey>>,
+}
+
+impl NoticeKey {
+    pub fn unlock(&self, key: &SigningKey) {
+        *self.key.write().expect("not poisoned") = Some(key.clone());
+    }
+
+    pub fn lock(&self) {
+        *self.key.write().expect("not poisoned") = None;
+    }
+}
+
+impl sync::NoticeSigner for NoticeKey {
+    fn key(&self) -> Option<[u8; 32]> {
+        self.key.read().expect("not poisoned").as_ref().map(|key| key.verifying_key().to_bytes())
+    }
+
+    fn sign_fetch(&self, message: &[u8]) -> Option<[u8; 64]> {
+        if !message.starts_with(sync::NOTICE_FETCH_CONTEXT) {
+            return None;
+        }
+        self.key.read().expect("not poisoned").as_ref().map(|key| key.sign(message).to_bytes())
+    }
+}
+
+#[cfg(test)]
+mod notice_key_tests {
+    use super::*;
+    use sync::NoticeSigner;
+
+    #[test]
+    fn the_notice_key_signs_only_fetches_and_only_while_unlocked() {
+        let notice_key = NoticeKey::default();
+        let fetch = [sync::NOTICE_FETCH_CONTEXT, b"rest"].concat();
+        assert!(notice_key.key().is_none() && notice_key.sign_fetch(&fetch).is_none());
+        let w_n = SigningKey::from_bytes(&[4; 32]);
+        notice_key.unlock(&w_n);
+        assert_eq!(notice_key.key(), Some(w_n.verifying_key().to_bytes()));
+        assert!(notice_key.sign_fetch(&fetch).is_some());
+        assert!(notice_key.sign_fetch(b"mvs/peer-binding/v1 anything").is_none());
+        notice_key.lock();
+        assert!(notice_key.sign_fetch(&fetch).is_none());
+    }
+}

@@ -238,6 +238,14 @@ impl Store {
                  version    INTEGER NOT NULL,
                  blob       BLOB NOT NULL,
                  written_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS notices (
+                 tag      BLOB NOT NULL,
+                 hash     BLOB NOT NULL,
+                 at       INTEGER NOT NULL,
+                 received INTEGER NOT NULL,
+                 blob     BLOB NOT NULL,
+                 PRIMARY KEY (tag, hash)
              );",
         )?;
         // Stores made before stubs (B6-p) lack the column.
@@ -311,6 +319,59 @@ impl Store {
             "DELETE FROM backups WHERE owner IS NOT NULL AND written_at < ?1",
             [now.saturating_sub(retention) as i64],
         )
+    }
+
+    /// Holder notice slot: keeps a checked notice (`notice::check`) under
+    /// `tag`, received at `now`. Per tag only the
+    /// [`crate::notice::MAX_PER_TAG`] newest by (`at`, hash) stay, and a
+    /// duplicate (same hash) isn't kept twice; at most
+    /// [`crate::notice::MAX_TAGS`] tags, a new one refused past that. True
+    /// if kept.
+    pub fn put_notice(&mut self, tag: &[u8; 32], at: u64, blob: &[u8], now: u64) -> rusqlite::Result<bool> {
+        let hash = blake3::hash(blob);
+        let tx = self.conn.transaction()?;
+        let known: bool = tx.prepare("SELECT 1 FROM notices WHERE tag = ?1 LIMIT 1")?.exists([tag.as_slice()])?;
+        if !known {
+            let tags: i64 = tx.query_row("SELECT COUNT(DISTINCT tag) FROM notices", [], |row| row.get(0))?;
+            if tags as usize >= crate::notice::MAX_TAGS {
+                return Ok(false);
+            }
+        }
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO notices (tag, hash, at, received, blob) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![tag.as_slice(), hash.as_bytes().as_slice(), at as i64, now as i64, blob],
+        )?;
+        // Past the cap the oldest by (at, hash) go, possibly this one.
+        tx.execute(
+            "DELETE FROM notices WHERE tag = ?1 AND hash NOT IN
+             (SELECT hash FROM notices WHERE tag = ?1 ORDER BY at DESC, hash DESC LIMIT ?2)",
+            params![tag.as_slice(), crate::notice::MAX_PER_TAG as i64],
+        )?;
+        let kept: bool = tx
+            .prepare("SELECT 1 FROM notices WHERE tag = ?1 AND hash = ?2")?
+            .exists(params![tag.as_slice(), hash.as_bytes().as_slice()])?;
+        tx.commit()?;
+        Ok(added == 1 && kept)
+    }
+
+    /// The notices held under `tag`, newest first.
+    pub fn notices(&self, tag: &[u8; 32]) -> rusqlite::Result<Vec<Vec<u8>>> {
+        let mut stmt = self.conn.prepare("SELECT blob FROM notices WHERE tag = ?1 ORDER BY at DESC, hash DESC")?;
+        let rows = stmt.query_map([tag.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect()
+    }
+
+    /// Every tag with notices held (to announce as a provider).
+    pub fn notice_tags(&self) -> rusqlite::Result<Vec<[u8; 32]>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT tag FROM notices")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        Ok(rows.filter_map(|r| r.ok().and_then(|t| t.try_into().ok())).collect())
+    }
+
+    /// Notices received more than `retention` seconds before `now` go (by
+    /// the holder's receive time, never by `at`).
+    pub fn expire_notices(&mut self, now: u64, retention: u64) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM notices WHERE received < ?1", [now.saturating_sub(retention) as i64])
     }
 
     pub fn has(&self, id: &RecordId) -> rusqlite::Result<bool> {

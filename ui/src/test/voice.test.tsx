@@ -163,7 +163,7 @@ describe('G-73: volume per person', () => {
     await click(entry()); // the demo room has 2 people already
     const bar = await screen.findByRole('region', { name: 'Voice call' });
     await click(within(bar).getByRole('button', { name: 'Voice settings' }));
-    const group = within(screen.getByRole('dialog', { name: 'Voice settings' })).getByRole('group', { name: 'Volume per person' });
+    const group = within(screen.getByRole('dialog', { name: 'Voice settings' })).getByRole('group', { name: 'Volume for each person in the call' });
     const sliders = within(group).getAllByRole('slider');
     expect(sliders).toHaveLength(2);
     expect(sliders.every((s) => s.getAttribute('aria-valuetext') === '100%')).toBe(true);

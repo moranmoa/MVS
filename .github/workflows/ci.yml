@@ -77,6 +77,10 @@ jobs:
       # pinned) with only the edits its README lists.
       - name: vendored libp2p-dns matches crates.io
         run: bash .github/scripts/check-vendored-libp2p-dns.sh
+      # core/vendor/libp2p-gossipsub: crates.io 0.49.5 plus only upstream's
+      # RUSTSEC-2026-0534 fix (the .patch beside it).
+      - name: vendored libp2p-gossipsub matches crates.io plus its fix
+        run: bash .github/scripts/check-vendored-libp2p-gossipsub.sh
 
   advisories:
     # Informational for now: the open advisories are all in libp2p 0.54's

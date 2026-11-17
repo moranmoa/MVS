@@ -3505,3 +3505,22 @@ input.switch:disabled {
 .device-notice-body .actions {
   margin-block-start: 0.25rem;
 }
+
+/* G-23: a date divider between days (muted text, AA on every theme). */
+.date-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 1rem 0.25rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.date-divider::before,
+.date-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}

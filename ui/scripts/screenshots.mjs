@@ -1135,6 +1135,18 @@ for (const [query, name, wait] of [
   await p.close();
 }
 
+// ---- 0.5.0 conversation (440-449): G-23 date divider ---------------------------
+for (const [query, name, opts] of [
+  ['lang=he&theme=light', '440-date-divider-he', undefined],
+]) {
+  // Ten hours between messages, so the last screen crosses days.
+  const p = await chat(`?demo=1&still=1&update=999999&gapHours=10&${query}`, 'x', opts);
+  await p.locator('.date-divider').first().waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, name);
+  await p.close();
+}
+
 // Relay-only (#272): 270–271.
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&relayOnly=1&settings=privacy', 'x');

@@ -144,25 +144,56 @@ fn default_store() -> Result<(), StoreError> {
     keyring::Entry::store_status().as_ref().map(|_| ()).map_err(|e| StoreError(e.to_string()))
 }
 
-/// No entry under this name. On Linux that is only "none" when the default
-/// collection exists and is unlocked (Security Lead on #388). A locked
-/// collection, or none at all (a headless gnome-keyring that never loaded
-/// its login keyring), hides items from the search. Reporting "none" then
-/// would make the app offer sign-up over an identity it can't see, so it's
-/// an error (`keyring-unavailable`) instead.
+/// No entry under this name. On Linux that is only "none" when the keychain
+/// can see everything (Security Lead on #388). A locked collection hides
+/// its items from the search; reporting "none" then would make the app
+/// offer sign-up over an identity it can't see, so it's an error
+/// (`keyring-unavailable`) instead. See [`missing_is_none`] for the rule.
 #[cfg(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 fn no_entry() -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
     use secret_service::{blocking::SecretService, EncryptionType};
     let fail = |e: secret_service::Error| StoreError(e.to_string());
     let ss = SecretService::connect(EncryptionType::Plain).map_err(fail)?;
-    let locked = match ss.get_default_collection() {
-        Ok(collection) => collection.is_locked().map_err(fail)?,
-        Err(_) => return Err(StoreError("the keychain has no default collection".into())),
+    let default = match ss.get_default_collection() {
+        Ok(collection) => Some(collection.is_locked().map_err(fail)?),
+        Err(_) => None,
+    };
+    let all = || -> Result<Vec<bool>, StoreError> {
+        let mut locked = Vec::new();
+        for collection in ss.get_all_collections().map_err(fail)? {
+            locked.push(collection.is_locked().map_err(fail)?);
+        }
+        Ok(locked)
+    };
+    missing_is_none(default, all)?;
+    Ok(None)
+}
+
+/// Whether a missing entry may be reported as none. `default`: whether the
+/// `default` alias's collection is locked, `None` without that alias;
+/// `all`: whether each collection is locked, asked only without the alias.
+/// - With the alias: an error if that collection is locked.
+/// - Without it (KeePassXC, some KWallet bridges; Tech Lead on #392): an
+///   error if any collection is locked, or if there are none at all.
+#[cfg_attr(not(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))), allow(dead_code))]
+fn missing_is_none(
+    default: Option<bool>,
+    all: impl FnOnce() -> Result<Vec<bool>, StoreError>,
+) -> Result<(), StoreError> {
+    let locked = match default {
+        Some(locked) => locked,
+        None => {
+            let all = all()?;
+            if all.is_empty() {
+                return Err(StoreError("the keychain has no collection".into()));
+            }
+            all.contains(&true)
+        }
     };
     if locked {
-        return Err(StoreError("the default keychain collection is locked".into()));
+        return Err(StoreError("a keychain collection is locked".into()));
     }
-    Ok(None)
+    Ok(())
 }
 
 /// Windows and macOS: a missing entry is just missing.
@@ -256,12 +287,12 @@ mod late_secret_service {
     }
 }
 
-/// Security Lead on #388: a missing entry is "none" only in an unlocked
-/// default collection; once it's locked, the same lookup is an error, so
-/// the app never offers sign-up over an identity it can't see. Needs a
-/// running, unlocked gnome-keyring on the session bus; run with `--ignored`
-/// and `MVS_LOCK_KEYRING`, a shell command that locks the default
-/// collection.
+/// Security Lead on #388, Tech Lead on #392: a missing entry is "none"
+/// while every collection it could be in is unlocked; once one is locked,
+/// the same lookup is an error, so the app never offers sign-up over an
+/// identity it can't see. Needs a running, unlocked gnome-keyring on the
+/// session bus, with or without a `default` alias; run with `--ignored` and
+/// `MVS_LOCK_KEYRING`, a shell command that locks the collection in use.
 #[cfg(all(test, feature = "os-keychain", target_os = "linux"))]
 mod locked_collection {
     use super::*;
@@ -275,5 +306,28 @@ mod locked_collection {
         let status = std::process::Command::new("sh").arg("-c").arg(&lock).status().unwrap();
         assert!(status.success(), "the collection didn't lock");
         assert!(keychain.load("never-saved").is_err(), "locked: an error, not None");
+    }
+}
+
+/// Tech Lead on #392: when a missing entry counts as none, with and without
+/// a `default` alias (the real Secret Service is in `locked_collection`).
+#[cfg(test)]
+mod missing_entry_rule {
+    use super::*;
+
+    fn never() -> Result<Vec<bool>, StoreError> {
+        panic!("the alias answers; the collections aren't asked")
+    }
+
+    #[test]
+    fn a_locked_or_absent_collection_is_an_error() {
+        // With a default alias: its lock decides.
+        assert!(missing_is_none(Some(false), never).is_ok());
+        assert!(missing_is_none(Some(true), never).is_err());
+        // Without one (KeePassXC, KWallet bridges): every collection counts.
+        assert!(missing_is_none(None, || Ok(vec![false, false])).is_ok());
+        assert!(missing_is_none(None, || Ok(vec![false, true])).is_err());
+        assert!(missing_is_none(None, || Ok(Vec::new())).is_err(), "no collection at all");
+        assert!(missing_is_none(None, || Err(StoreError("bus".into()))).is_err());
     }
 }

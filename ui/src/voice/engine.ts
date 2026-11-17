@@ -353,6 +353,32 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   /** Puts this peer's volume and the deafen state on its gain or its element. */
   function applyPlayback(p: Peer) {
     const v = volumes.get(p.id) ?? 1;
+    // Web Audio only for a peer turned up above 100% (voice-d, #440): echo
+    // cancellation on that path is unverified, so everyone at 100% or less
+    // stays on the element path calls have always used. A gain exists only
+    // for a peer playPeer has started (audio and meter set), so only after
+    // the certificate check.
+    const boost = v > 1 && !!p.audio && !!p.meter && !p.closed;
+    if (boost && !p.gain) {
+      const c = playbackContext();
+      if (c && limiter && p.meter) {
+        try {
+          const g = c.createGain();
+          p.meter.source.connect(g);
+          g.connect(limiter);
+          p.gain = g;
+        } catch {
+          p.gain = null;
+        }
+      }
+    } else if (!boost && p.gain) {
+      try {
+        p.gain.disconnect();
+      } catch {
+        // already gone
+      }
+      p.gain = null;
+    }
     if (p.gain) {
       p.gain.gain.value = deafened ? 0 : v;
       if (p.audio) p.audio.muted = true;
@@ -671,18 +697,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     void audio.play?.()?.catch?.(() => {});
     peer.audio = audio;
     peer.meter = makeMeter(peer.stream);
-    // Only here, after the certificate check (verified), may a peer reach the speakers.
-    const c = peer.meter ? playbackContext() : null;
-    if (c && limiter && peer.meter) {
-      try {
-        const g = c.createGain();
-        peer.meter.source.connect(g);
-        g.connect(limiter);
-        peer.gain = g;
-      } catch {
-        peer.gain = null;
-      }
-    }
+    // Only from here on, after the certificate check (verified), may a peer reach the speakers.
     applyPlayback(peer);
   }
 

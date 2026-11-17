@@ -588,6 +588,27 @@ describe('voice engine', () => {
     expect(gain!.gain.value).toBe(2);
   });
 
+  it('G-73: at 100% or less a peer stays on the element path (no Web Audio); above, a gain; back down, the element again', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: {} });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains).toHaveLength(0); // 100%: today's path
+    expect(hx.audios[0]!.muted).toBe(false);
+    ex.setPeerVolume(B, 0.6);
+    expect(ctx.gains).toHaveLength(0);
+    expect(hx.audios[0]!.volume).toBe(0.6);
+    ex.setPeerVolume(B, 1.4);
+    expect(ctx.gains).toHaveLength(1);
+    expect(ctx.gains[0]!.gain.value).toBe(1.4);
+    expect(hx.audios[0]!.muted).toBe(true);
+    ex.setPeerVolume(B, 0.9);
+    expect(ctx.gains[0]!.out).toEqual([]); // disconnected
+    expect(hx.audios[0]!.muted).toBe(false);
+    expect(hx.audios[0]!.volume).toBe(0.9);
+  });
+
   it('G-73: a speaker the context cannot use falls back to the element path, capped at 100%', async () => {
     const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { sinkFails: true } });
     await ex.attach(cx.state(), A);

@@ -1135,6 +1135,18 @@ for (const [query, name, wait] of [
   await p.close();
 }
 
+// ---- 0.5.0 conversation (440-449): G-23 date divider, 448 ---------------------------
+for (const [query, name, opts] of [
+  ['lang=he&theme=light', '448-date-divider-he', undefined],
+]) {
+  // Ten hours between messages, so the last screen crosses days.
+  const p = await chat(`?demo=1&still=1&update=999999&gapHours=10&${query}`, 'x', opts);
+  await p.locator('.date-divider').first().waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, name);
+  await p.close();
+}
+
 // Relay-only (#272): 270–271.
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&relayOnly=1&settings=privacy', 'x');
@@ -1195,6 +1207,24 @@ for (const [query, name, wait] of [
   await p.mouse.move(1, 1);
   await shot(p, '351-muted-server-and-channel-he');
   await p.evaluate(() => localStorage.removeItem('mvs.mute.v1'));
+  await p.close();
+}
+
+// G-72 voice settings (UX spec #427 §4): 443 (Settings → קול outside a call),
+// 447 (the in-call Voice settings dialog).
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'קול', exact: true }).click();
+  await p.getByRole('combobox', { name: 'רמקולים' }).waitFor();
+  await shot(p, '443-voice-settings-he');
+  await p.keyboard.press('Escape');
+  await joinRoom(p);
+  const bar = p.getByRole('region', { name: 'שיחה קולית' });
+  await bar.waitFor();
+  await bar.getByRole('button', { name: 'הגדרות קול' }).click();
+  await p.getByRole('dialog', { name: 'הגדרות קול' }).waitFor();
+  await shot(p, '447-voice-dialog-he');
   await p.close();
 }
 

@@ -19,12 +19,15 @@ const fakeEngine = vi.hoisted(() => ({
   picked: [] as string[],
   level: 0.42,
   deafened: false,
+  selfMonitor: false,
   fallback: null as null | { kind: 'input' | 'output'; label: string | null; at: number },
 }));
 vi.mock('../voice', () => ({
   // A hook: deafen is React state, as in the real one, so the call bar re-renders.
   useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
     const [deafened, setDeafened] = useState(false);
+    const [selfMonitor, setSelfMonitor] = useState(false);
+    fakeEngine.selfMonitor = selfMonitor;
     const [volumes, setVolumes] = useState<Record<string, number>>({});
     fakeEngine.deafened = deafened;
     fakeEngine.stunUrls.push(options?.stunUrl);
@@ -47,6 +50,8 @@ vi.mock('../voice', () => ({
       setDeafened(on);
     },
     deviceFallback: fakeEngine.fallback,
+    selfMonitor,
+    setSelfMonitor,
     volumes,
     setVolume: (id: string, pct: number) => {
       fakeEngine.picked.push(`vol:${id}:${pct}`);
@@ -125,7 +130,7 @@ describe('G-72: voice settings in a call', () => {
       await act(async () => {
         fireEvent.change(mic, { target: { value: 'mic-b' } });
       });
-      const speaker = within(dialog).getByRole('combobox', { name: 'Speaker' });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speakers' });
       await act(async () => {
         fireEvent.change(speaker, { target: { value: 'spk-a' } });
       });
@@ -137,6 +142,14 @@ describe('G-72: voice settings in a call', () => {
       const meter = within(dialog).getByRole('meter', { name: 'Mic test' });
       expect(meter.getAttribute('aria-valuenow')).toBe('42');
       expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
+      // Hear myself: off by default, and closing the dialog turns it off.
+      const hear = within(dialog).getByRole('switch', { name: 'Hear myself' }) as HTMLInputElement;
+      expect(hear.checked).toBe(false);
+      await click(hear);
+      expect(fakeEngine.selfMonitor).toBe(true);
+      expect(within(dialog).getByRole('button', { name: 'Play test sound' })).toBeTruthy();
+      await click(within(dialog).getByRole('button', { name: 'Close' }));
+      expect(fakeEngine.selfMonitor).toBe(false);
     } finally {
       vi.useRealTimers();
     }

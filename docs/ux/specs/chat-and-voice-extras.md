@@ -2,7 +2,7 @@
 
 - **Gaps:** G-29 (typing), G-26 (reactions), G-27 (emoji picker), G-72 (devices), G-73 (per-person volume), G-84 (deafen), G-74 (push-to-talk). See `docs/ux/GAPS.md`.
 - **Builds on:** B25 (context menus), voice-rooms.md and #224/#239 (call bar, roster), and B17 (FSI around names).
-- **Screenshots:** 440–459.
+- **Screenshots:** 441–448, inside the 0.5.0 conversation range 440–449 (440 is the date divider, #439).
 
 ## 1. "Is typing…" (G-29)
 
@@ -138,7 +138,7 @@
 
 | # | Shot | What it shows |
 | --- | --- | --- |
-| 440 | `440-typing-he` | Typing line above the composer, one person |
+| 448 | `448-typing-he` | Typing line above the composer, one person |
 | 441 | `441-reactions-he` | A message with 3 pills, one mine highlighted, and the tooltip |
 | 442 | `442-emoji-picker-he` | The picker with search and recent |
 | 443 | `443-voice-settings-he` | Settings → קול with the meter |

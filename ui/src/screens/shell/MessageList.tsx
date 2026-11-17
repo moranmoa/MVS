@@ -35,6 +35,27 @@ interface Handlers {
   onRetry: (m: Message) => void;
 }
 
+/** A calendar day in local time, to compare two messages. */
+export const dayKey = (t: number) => new Date(t).toDateString();
+
+/** G-23 (B16, UX-12): "Today", "Yesterday", or the date ("12 November"; with the year when it isn't this year). */
+export function DateDivider({ at }: { at: number }) {
+  const intl = useIntl();
+  const now = new Date();
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const label =
+    dayKey(at) === dayKey(now.getTime())
+      ? intl.formatMessage({ id: 'chat.today' })
+      : dayKey(at) === dayKey(yesterday.getTime())
+        ? intl.formatMessage({ id: 'chat.yesterday' })
+        : intl.formatDate(at, { day: 'numeric', month: 'long', ...(new Date(at).getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}) });
+  return (
+    <div className="date-divider" role="separator" aria-label={label}>
+      <span>{label}</span>
+    </div>
+  );
+}
+
 export function MessageList({
   win,
   channelName,
@@ -293,7 +314,10 @@ export function MessageList({
               !prev.deleted &&
               !m.replyTo &&
               prev.authorId === m.authorId &&
-              m.createdAt - prev.createdAt < GROUP_GAP_MS;
+              m.createdAt - prev.createdAt < GROUP_GAP_MS &&
+              dayKey(prev.createdAt) === dayKey(m.createdAt);
+            // G-23: before the first message of each day (the very first message too).
+            const newDay = !!m && (item.index === 0 || (!!prev && dayKey(prev.createdAt) !== dayKey(m.createdAt)));
             return (
               <div
                 key={item.key}
@@ -312,6 +336,7 @@ export function MessageList({
                   ? bind(intl.formatMessage({ id: 'menu.forMessage' }, { name: authorName(m) }), () => messageItems(m))
                   : {})}
               >
+                {newDay && m && <DateDivider at={m.createdAt} />}
                 {unread && item.index === unread.first && (
                   <div className="unread-divider" role="separator" aria-label={intl.formatMessage({ id: 'unread.divider' })}>
                     <span>

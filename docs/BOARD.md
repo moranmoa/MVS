@@ -184,15 +184,15 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; **servers come back after restore**: design note to tech-lead first) | #292 #317 #339 #340 #367 | – | L | 0.4.x |
 | **0.5.0** | **"Conversation" (P1)** | | | | | | |
 | G-23 | Date divider (B16, UX-12) | dev-ui | todo (dev-ui, first in 0.5.0) | – | – | S | 0.5.0 |
-| G-29 | "Is typing…" (ephemeral, not stored) | dev-sync + dev-ui | todo (dev-ui after G-23; **core spec from tech-lead first**) | – | – | M | 0.5.0 |
+| G-29 | "Is typing…" (ephemeral, not stored) | dev-typing (core, proposed session) + dev-ui | todo (core spec `g29-typing-design.md` done; dev-ui builds the UI against the mock after G-23) | – | – | M | 0.5.0 |
 | G-25 | Basic Markdown (mind direction, B17) | dev-ui | todo | – | – | M | 0.5.0 |
-| G-26 | Emoji reactions (signed record) | dev-records → dev-identity → dev-ui | todo (**tech-lead design note first**: a new record kind needs a compatibility gate; builder TBD) | – | – | M | 0.5.0 |
+| G-26 | Emoji reactions (signed record) | dev-updater (records + api) → dev-ui | in progress (design `g26-reactions-design.md` + Amendment 1, security lead OK; `reactions-v1` cap gate) | – | – | M | 0.5.0 |
 | G-27 | Emoji picker | dev-ui | todo | – | – | M | 0.5.0 |
 | G-32 | ↑ to edit the last message (check `onEditLast`) | dev-ui | built, verify only (dev-ui checks `onEditLast`) | – | – | S | 0.5.0 |
 | G-33 | Jump to latest message button | dev-ui | built, verify only (dev-ui checks the button) | – | – | S | 0.5.0 |
 | G-30 | Link to a message | dev-ui + dev-identity | todo | – | – | M | 0.5.0 |
 | G-63 | Notification sound | dev-ui | todo | – | – | S | 0.5.0 |
-| G-62 | Taskbar unread count | dev-updater | todo (dev-updater) | – | G-61 ✔ | S | 0.5.0 |
+| G-62 | Taskbar unread count | dev-voice-shell | todo (dev-voice-shell) | – | G-61 ✔ | S | 0.5.0 |
 | G-113 | Screen-reader announcement of new messages (B21, UX-38) | dev-ui | todo | – | – | S | 0.5.0 |
 | G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
@@ -209,10 +209,10 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | todo | – | – | S | 0.5.x |
 | **0.6.0** | **"Voice like Discord" (P1)** | | | | | | |
 | G-16 | Additional voice channels (record + core) | dev-records + dev-identity → dev-ui | built as voice rooms (join to create; dev-ui verifies against GAPS scope) | #355 #369 #371 #375 | – | L | 0.4.3 |
-| G-72 | Microphone/speaker choice and mic test | dev-ui | todo | – | – | M | 0.6.0 |
-| G-73 | Per-person volume | dev-ui | todo | – | – | S | 0.6.0 |
-| G-84 | Deafen | dev-ui | todo | – | – | S | 0.6.0 |
-| G-74 | Push-to-talk (global key) | dev-updater (+ dev-ui) | todo (dev-updater, after G-62) | – | – | M | 0.6.0 |
+| G-72 | Microphone/speaker choice and mic test | voice-c | todo (voice-c) | – | – | M | 0.6.0 |
+| G-73 | Per-person volume | voice-c | todo (voice-c) | – | – | S | 0.6.0 |
+| G-84 | Deafen | voice-c | todo (voice-c) | – | – | S | 0.6.0 |
+| G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | todo (dev-voice-shell, after G-62) | – | – | M | 0.6.0 |
 | G-64 | Join notification sound | dev-ui | todo | – | – | S | 0.6.0 |
 | G-83 | Participant count (check; `call.activity`, tech-lead decision in #224) | dev-identity → dev-ui | todo | – | – | S | 0.6.0 |
 | **P2** | **P2 backlog, after the closed alpha: see [`docs/ux/GAPS.md`](ux/GAPS.md)** (G-28 files, G-31 search, G-34 link previews, G-15 pins, G-42 roles, G-43, G-44, G-45 DM, G-46, G-55, G-71, G-75, G-76, G-78, G-93, G-02, G-101–G-103, G-111, G-115) | product-lead | todo | – | – | – | – |
@@ -364,15 +364,15 @@ What each agent picks up **after its current PR merges**, the lead who assigns i
 
 | Agent | Assigned by | Now | Next (in order) | Writes | Must not touch |
 | --- | --- | --- | --- | --- | --- |
-| **tech-lead** | manager | reviews #419, #425, #423, #424 | 1. G-29 core spec for dev-ui. 2. G-26 reactions design note (new record kind, compatibility gate). 3. 0.4.6 go/no-go. | – | – |
+| **tech-lead** | manager | reviews #419, #425, #423, #424 | 1. Reviews: G-26 (dev-updater), G-91 design note (dev-identity), #419 new head. 2. 0.4.6 go/no-go. 3. G-81 scope (TURN decision, owner). | – | – |
 | **dev-sync** | tech-lead → dev-identity | #425 notice slot (in review); #419 (needs main merged) | 1. **#419** remembered addresses (merge main first, 2 nits). 2. **Relay-down part 2**: LAN beacon (RD2). 3. **Multi-relay part B** (`node.rs`, MX). 4. Slice 3c later. One writer on `node.rs`. | `core/sync/**`, `core/spike-peer/**` | `core/records`, `infra/` |
 | **dev-identity** (core sub-lead) | tech-lead | – | 1. **G-91** servers come back after restore: design note to tech-lead first. 2. **Notice fetch loop** (#415/#425 follow-up: fetch once at start/unlock). 3. Member recovery design stays deferred. 4. B7-k, B23-z2, T17, T19 call. | `core/api/**`, `core/identity/**` | `ui/**` (contract changes go to dev-ui) |
 | **dev-ui** (client sub-lead) | tech-lead | 0.5.0 "Conversation" | 1. **G-23** date divider. 2. **G-29** typing indicator (after the core spec from tech-lead). 3. G-32 and G-33: already built, **verify only**. 4. Rest of 0.5.0 (G-25, G-27, G-30, G-63, G-113, G-92). 5. B12, B20, B21, B24, pill polish. | `ui/**` (sole writer, incl. `ui/src/i18n/*.json`) | `ui/src/core/ipc.ts`, `desktop/**` |
 | **voice-d** | tech-lead | multi-relay part A merged (#409 #410) | 1. **G-81 calls across networks** (engine TURN #337 is merged; needs the relay move and STUN). | `ui/src/voice/**` | `core/sync`, `infra/` |
 | **dev-voice-shell / voice-c** | tech-lead → dev-ui | 3a metered #403 merged | 1. #269 with the relay move. 2. T8-04 `MVS_DEMO` (P2). 3. V-C3 WebRTC IP policy check. | `desktop/**`, `ui/src/core/ipc.ts` | other `ui/src/**`, `release.yml` |
 | **devops** | tech-lead | #423 (in review) | 1. **#423** relay keeps DNS names out of the DHT. 2. **Relay hickory bump**. 3. **Relay drops `/dns*` from identify**. 4. Multi-relay part C and the relay move (#220, owner; live relay only from `main` with the manager OK). 5. T21 firewall rule, T12 (#69), macOS runner (R8). | `infra/**`, `.github/workflows/release.yml`, `.github/scripts/manifest-body.mjs`, `docs/release/**`, `packaging/**` | `ci.yml` (dev-updater) |
-| **dev-updater** | tech-lead → dev-identity | #424 (in review) | 1. **G-62** taskbar unread badge. 2. **G-74** push-to-talk. 3. B10 advisories blocking after the 0.57 bump. Never rename CI jobs. | `core/updater/**`, `.github/workflows/ci.yml`, `.github/scripts/npm-licenses.mjs`, `.github/scripts/install-cargo-deny.sh`, `.github/dependabot.yml`, `core/deny.toml` | `release.yml`, `.github/scripts/manifest-body.mjs` |
-| **G-26 builder** | tech-lead | TBD | Reactions record (dev-records → dev-identity → dev-ui) once tech-lead's design note and the compatibility gate are approved. | `core/records/**`, `core/authority/**` (when assigned) | `core/sync`, `core/api` |
+| **dev-updater** | tech-lead → dev-identity | #424 (in review) | 1. **G-26** reactions, records + api (design `g26-reactions-design.md`). 2. B10 advisories blocking after the 0.57 bump. Never rename CI jobs. | `core/updater/**`, `.github/workflows/ci.yml`, `.github/scripts/npm-licenses.mjs`, `.github/scripts/install-cargo-deny.sh`, `.github/dependabot.yml`, `core/deny.toml` | `release.yml`, `.github/scripts/manifest-body.mjs` |
+| **dev-voice-shell** / **voice-c** | manager | – | dev-voice-shell: G-62 taskbar badge, then G-74 push-to-talk. voice-c: G-72, G-84, G-73. | `desktop/**` (dev-voice-shell) | `ui/**` (ask dev-ui) |
 | **sec-lead** | manager | reviews #419, #423, #425 | 1. Member-recovery design review (when built). 2. LAN beacon open question (RD2). 3. 2c decision with the owner. 4. Key custody for D-sign / D23. | `docs/security/**` | crate code (findings go to owners) |
 | **qa** | manager | – | 1. **Linux metered check** for member relays (#403, #418). 2. **0.5.0 test pass** after the merges. 3. Linux keyring prerequisite in the testing docs (QA-20). 4. T7, T12 manual pass; B5 with dev-sync. | `qa/**` | `ui/**`, `ci.yml` (ask dev-updater) |
 | **product-lead** | manager | – | 1. Accept 0.5.0 items (G-23, G-29). 2. Review product/UX/business/QA/board PRs. 3. 0.4.6 notes. | `docs/spec.md`, `docs/reviews/po-*` | `ui/src/i18n/*` |

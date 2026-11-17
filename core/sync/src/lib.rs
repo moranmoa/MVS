@@ -32,6 +32,7 @@ mod limits;
 mod presence;
 mod punch;
 mod backup;
+mod notice;
 mod device_link;
 mod member_relay;
 mod invite;
@@ -43,6 +44,10 @@ pub use access::{binding_message, Binder, Handle, ReadGate, ServerSecret};
 pub use node::{Access, Node, NodeConfig, NodeEvent, PresenceState, Reachability, Via};
 pub use records::{ChannelId, Record, RecordId, Scope, ServerId, Stub};
 pub use backup::MAX_BACKUP;
+pub use notice::{
+    fetch_message as notice_fetch_message, tag_of as notice_tag, NoticeSigner, FETCH_CONTEXT as NOTICE_FETCH_CONTEXT,
+    NOTICE_BODY, NOTICE_LEN, NOTICE_TAG_CONTEXT,
+};
 pub use device_link::{
     Inbound as DeviceLinkInbound, LinkError as DeviceLinkError, DEVICE_LINK_FIND_WAIT,
     DEVICE_LINK_TTL, MAX_DEVICE_LINK,

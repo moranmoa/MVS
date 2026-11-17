@@ -346,13 +346,19 @@ enum Command {
     RelayOnly { on: bool },
     NoDirectDials,
     NoHolePunch,
+    MemberRelay { on: bool, daily_cap_mb: u32 },
     #[cfg(test)]
     Served { peer: PeerId, log: String, reply: oneshot::Sender<usize> },
     #[cfg(test)]
     RateLimited { reply: oneshot::Sender<usize> },
     #[cfg(test)]
     InboundPulls { reply: oneshot::Sender<usize> },
+    #[cfg(any(test, feature = "test-util"))]
     Dial { addr: Multiaddr },
+    #[cfg(any(test, feature = "test-util"))]
+    Listen { addr: Multiaddr },
+    #[cfg(any(test, feature = "test-util"))]
+    MemberRelayCounts { reply: oneshot::Sender<(u64, u64)> },
     #[cfg(test)]
     Disconnect { peer: PeerId },
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
@@ -432,6 +438,9 @@ struct Behaviour {
     /// order, and one asked before a refusal keeps a connection the swarm
     /// never reports closed (request-response then trips over it).
     guard: DialGuard,
+    /// Member relays (`member_relay`): circuit relay v2 for bound current
+    /// members only, off unless the core turns it on.
+    member_relay: crate::member_relay::MemberRelay,
     relay_client: relay::client::Behaviour,
     identify: crate::announce::GlobalIdentify,
     ping: ping::Behaviour,
@@ -815,6 +824,25 @@ impl Node {
     /// Tests only: dial `addr` (a node met later than its bootstrap, or a
     /// direct dial the device-link guard must refuse).
     #[doc(hidden)]
+    /// Tests only: listen on `addr` (a reservation on a member relay, until
+    /// the client side of member relays lands).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_listen(&self, addr: Multiaddr) {
+        let _ = self.send(Command::Listen { addr });
+    }
+
+    /// Tests only: reservations and circuits this node accepted as a member
+    /// relay since it started.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_member_relay_counts(&self) -> Result<(u64, u64)> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::MemberRelayCounts { reply })?;
+        Ok(rx.await?)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
     pub fn test_dial(&self, addr: Multiaddr) {
         self.send(Command::Dial { addr }).unwrap();
     }
@@ -850,6 +878,14 @@ impl Node {
     #[doc(hidden)]
     pub fn test_no_direct_dials(&self) -> Result<()> {
         self.send(Command::NoDirectDials)
+    }
+
+    /// Member relays (design #368, slice 2): relay for bound current members
+    /// of servers we share, or stop; `daily_cap_mb` is the core's
+    /// `dailyCapMb`. From `MemberRelay.effective` (#389). Never while
+    /// relay-only.
+    pub fn set_member_relay(&self, on: bool, daily_cap_mb: u32) -> Result<()> {
+        self.send(Command::MemberRelay { on, daily_cap_mb })
     }
 
     /// Tests only: no hole punching (DCUtR) from or with this node, so the
@@ -1113,6 +1149,7 @@ async fn build_swarm(
                 ),
                 limits: connection_limits::Behaviour::new(limits),
                 guard: DialGuard { backoff, link_peers: LinkPeers::default() },
+                member_relay: crate::member_relay::MemberRelay::new(peer_id),
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
                 invite_pub: crate::invite::publish_behaviour(),
@@ -1434,6 +1471,7 @@ impl Task {
                     self.pull_soon();
                     self.direct_fallback();
                     self.recheck_punch();
+                    self.recheck_member_relay();
                     self.expire_fetches();
                     self.link_tick();
                     let gone = self.presence.expire(Instant::now());
@@ -1525,6 +1563,16 @@ impl Task {
             Command::InboundPulls { reply } => {
                 let _ = reply.send(self.pulls_received);
             }
+    #[cfg(any(test, feature = "test-util"))]
+            Command::Listen { addr } => {
+                let _ = self.swarm.listen_on(addr);
+            }
+    #[cfg(any(test, feature = "test-util"))]
+            Command::MemberRelayCounts { reply } => {
+                let relay = &self.swarm.behaviour().member_relay;
+                let _ = reply.send((relay.reservations, relay.circuits));
+            }
+    #[cfg(any(test, feature = "test-util"))]
             Command::Dial { addr } => {
                 let _ = self.swarm.dial(addr);
             }
@@ -1556,6 +1604,12 @@ impl Task {
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
+            Command::MemberRelay { on, daily_cap_mb } => {
+                // Relay-only users never relay (design §1), whatever the core says.
+                let on = on && !self.relay_only;
+                self.swarm.behaviour_mut().member_relay.set(on, daily_cap_mb);
+                self.recheck_member_relay();
+            }
             Command::ListenAddrs { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
@@ -2055,6 +2109,9 @@ impl Task {
         // No hole punching either way while relay-only (GAP-6).
         self.swarm.behaviour_mut().punch.set_enabled(!on);
         if on {
+            // Relay-only users never relay for members (design #368 §1); the
+            // core turns it on again, if it should be, once this is off.
+            self.swarm.behaviour_mut().member_relay.stop();
             for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
                 self.swarm.remove_listener(id);
             }
@@ -2104,6 +2161,17 @@ impl Task {
 
     /// Every second: close the punch gate of a peer that stopped being a
     /// member (kicked, or our read gate changed) since we opened it.
+    /// Every second: the member relay's gates follow who is a bound current
+    /// member now (design #368 §1 rule 1). Never while relay-only.
+    fn recheck_member_relay(&mut self) {
+        if !self.swarm.behaviour().member_relay.enabled() {
+            return;
+        }
+        let peers: Vec<PeerId> = self.swarm.behaviour().member_relay.connected().copied().collect();
+        let members = if self.relay_only { HashSet::new() } else { peers.into_iter().filter(|p| self.is_member(*p)).collect() };
+        self.swarm.behaviour_mut().member_relay.set_members(members);
+    }
+
     fn recheck_punch(&mut self) {
         for peer in self.swarm.behaviour().punch.open_peers() {
             if !self.is_member(peer) {

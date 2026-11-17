@@ -1266,3 +1266,79 @@ async fn a_device_link_is_found_by_its_code_and_stays_on_the_relay_circuit() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// Member relays (#368 slice 2, the relaying side): a member relay takes a
+/// reservation and carries a circuit for bound members only. Off, it offers
+/// nothing; on, a stranger (unbound) still gets no reservation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_relay_serves_bound_members_only() {
+    use libp2p::multiaddr::Protocol;
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let id = |n: u8| records::PublicKey::from_bytes(SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes());
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let _relay = start_relay(relay_key, port);
+    let a = bound_node("mr-a", &relay, 21, false, Arc::new(AcceptAll)).await;
+    let b = bound_node("mr-b", &relay, 22, false, Arc::new(AcceptAll)).await;
+    let c = bound_node("mr-c", &relay, 23, false, Arc::new(AcceptAll)).await;
+    let (stranger, _) = node_events("mr-stranger", &relay).await;
+    let a_direct = direct_addr(&a).await;
+    let via_a = a_direct.clone().with(Protocol::P2pCircuit);
+    for node in [&b, &c, &stranger] {
+        node.test_dial(a_direct.clone());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let online = a.presence(test_server().0).await.unwrap().online;
+        if online.contains(&id(22)) && online.contains(&id(23)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the members never bound to A: {online:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Off: nobody gets a reservation.
+    b.test_listen(via_a.clone());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!reserved_via(&b, &via_a).await, "a node that doesn't relay took a reservation");
+    assert_eq!(a.test_member_relay_counts().await.unwrap(), (0, 0));
+
+    // On: a member reserves (retrying while the gate opens), a stranger never.
+    a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !reserved_via(&b, &via_a).await {
+        assert!(Instant::now() < deadline, "a member never reserved on the member relay");
+        b.test_listen(via_a.clone());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for _ in 0..4 {
+        stranger.test_listen(via_a.clone());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(!reserved_via(&stranger, &via_a).await, "a stranger reserved on a member relay");
+    assert_eq!(a.test_member_relay_counts().await.unwrap().0, 1, "only the member's reservation");
+
+    // A circuit through A from member C to member B.
+    c.test_dial(via_a.clone().with(Protocol::P2p(b.peer_id())));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while a.test_member_relay_counts().await.unwrap().1 == 0 {
+        assert!(Instant::now() < deadline, "no circuit through the member relay");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The stranger can't use it to reach B either.
+    let before = a.test_member_relay_counts().await.unwrap().1;
+    stranger.test_dial(via_a.clone().with(Protocol::P2p(b.peer_id())));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(a.test_member_relay_counts().await.unwrap().1, before, "a stranger got a circuit");
+
+    for node in [a, b, c, stranger] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Whether `node` listens through the relay at `via` (holds a reservation).
+async fn reserved_via(node: &Node, via: &Multiaddr) -> bool {
+    let via = via.to_string();
+    node.listen_addrs().await.unwrap().iter().any(|l| l.to_string().starts_with(&via))
+}

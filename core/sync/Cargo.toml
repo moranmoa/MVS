@@ -63,3 +63,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
 ] }
+
+[features]
+# Test hooks (`Node::test_dial`, `test_listen`, the member relay counts, the
+# device-link rendezvous helper) for this crate's integration tests only;
+# never in a build the app ships.
+test-util = []
+
+[dev-dependencies]
+# Turns `test-util` on for `tests/` (the crate's own integration tests).
+sync = { path = ".", features = ["test-util"] }

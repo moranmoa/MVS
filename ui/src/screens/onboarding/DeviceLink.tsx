@@ -47,6 +47,7 @@ export function DeviceLinkScreen({ onLinked, onCancel }: { onLinked: () => void;
 
   const start = async () => {
     setStartFailed(false);
+    setMatched(false);
     setOffer(null);
     setState({ state: 'waiting' });
     try {
@@ -68,6 +69,19 @@ export function DeviceLinkScreen({ onLinked, onCancel }: { onLinked: () => void;
     setState(s);
     if (s.state === 'done') onLinked();
   });
+  const [matched, setMatched] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const answer = async (match: boolean) => {
+    setBusy(true);
+    try {
+      await core.confirmDeviceLink(match);
+      if (match) setMatched(true);
+    } catch {
+      setState({ state: 'failed', reason: 'network' });
+    } finally {
+      setBusy(false);
+    }
+  };
   const cancel = () => {
     void core.cancelDeviceLink().catch(() => {});
     onCancel();
@@ -111,9 +125,21 @@ export function DeviceLinkScreen({ onLinked, onCancel }: { onLinked: () => void;
           <p className="device-link-sas" aria-label={intl.formatMessage({ id: 'deviceLink.sasLabel' }, { sas: state.sas.split('').join(' ') })}>
             <bdi dir="ltr">{groupSas(state.sas)}</bdi>
           </p>
-          <p className="muted small" role="status">
-            <FormattedMessage id="deviceLink.confirmWaiting" />
-          </p>
+          {matched ? (
+            <p className="muted small" role="status">
+              <FormattedMessage id="deviceLink.confirmWaiting" />
+            </p>
+          ) : (
+            <div className="actions">
+              {/* Security Lead: confirmed here too before anything is applied; the safe answer has the focus. */}
+              <button type="button" className="primary" disabled={busy} onClick={() => void answer(true)}>
+                <FormattedMessage id="deviceLink.match" />
+              </button>
+              <button type="button" className="secondary" autoFocus disabled={busy} onClick={() => void answer(false)}>
+                <FormattedMessage id="deviceLink.noMatch" />
+              </button>
+            </div>
+          )}
         </>
       )}
       {state.state === 'done' && (

@@ -3456,3 +3456,11 @@ input.switch:disabled {
   margin: 0;
   font-weight: 600;
 }
+
+.device-full-access {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border-inline-start: 3px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  font-size: 0.875rem;
+}

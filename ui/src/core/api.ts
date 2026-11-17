@@ -144,6 +144,8 @@ export interface CoreCommands {
   /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
   startDeviceLink(): Promise<DeviceLinkOffer>;
   cancelDeviceLink(): Promise<null>;
+  /** New device, on "confirm": the digits match the other device (Security Lead: nothing is applied before true). false fails the link. */
+  confirmDeviceLink(match: boolean): Promise<null>;
   /** Signed-in device: reach the new device by its QR payload or code. Rejects not-found (no such link, or expired), rate-limited. */
   beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
   /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */

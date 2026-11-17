@@ -25,6 +25,7 @@ export function DevicesSection() {
   const inputRef = useRef<HTMLInputElement>(null);
   const errorId = useId();
   const warnId = useId();
+  const fullId = useId();
 
   const begin = async () => {
     const value = normalize(code);
@@ -39,12 +40,13 @@ export function DevicesSection() {
       setApproval(await core.beginDeviceApproval(CODE.test(value) ? value : code.trim()));
       setStep('compare');
     } catch (e) {
-      setError(isCoreError(e) && e.code === 'not-found' ? 'devices.error.notFound' : isCoreError(e) && e.code === 'rate-limited' ? 'devices.error.rateLimited' : 'devices.error.other');
+      setError(isCoreError(e) && e.code === 'not-found' ? 'devices.error.notFound' : isCoreError(e) && e.code === 'rate-limited' ? 'devices.error.rateLimited' : isCoreError(e) && e.code === 'locked-out' ? 'devices.error.lockedOut' : 'devices.error.other');
       inputRef.current?.focus();
     } finally {
       setBusy(false);
     }
   };
+  // Security Lead on #391: the account is sent only after this explicit choice; nothing calls it on its own.
   const decide = async (approve: boolean) => {
     setBusy(true);
     setError(null);
@@ -138,9 +140,12 @@ export function DevicesSection() {
         </form>
       )}
       {step === 'compare' && approval && (
-        <div className="stack device-compare" role="group" aria-labelledby={warnId}>
+        <div className="stack device-compare" role="group" aria-labelledby={warnId} aria-describedby={fullId}>
           <p id={warnId} className="device-warning">
             <FormattedMessage id="devices.compareQuestion" />
+          </p>
+          <p id={fullId} className="device-full-access" role="note">
+            <FormattedMessage id="devices.fullAccess" />
           </p>
           <p className="device-link-sas" aria-label={intl.formatMessage({ id: 'deviceLink.sasLabel' }, { sas: approval.sas.split('').join(' ') })}>
             <bdi dir="ltr">{groupSas(approval.sas)}</bdi>

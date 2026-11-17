@@ -51,6 +51,7 @@ const COMMANDS = Object.freeze({
   // Device link (device-link-slice.md)
   startDeviceLink: [],
   cancelDeviceLink: [],
+  confirmDeviceLink: ['match'],
   beginDeviceApproval: ['qrOrCode'],
   confirmDeviceApproval: ['approve'],
   // Voice (#223); voice rooms (0.4.3)

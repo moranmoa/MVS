@@ -747,6 +747,7 @@ export class MockCore implements CoreApi {
     await this.wait(100);
     const code = 'K7QX2MZRF4';
     this.deviceLinkCode = code;
+    this.deviceLinkConfirmed = false;
     const expiresAt = Date.now() + 5 * 60_000;
     this.emit('deviceLink.state', { state: 'waiting' });
     const then = this.options.deviceLink;
@@ -760,6 +761,19 @@ export class MockCore implements CoreApi {
     return { qr: `mvs-link:v1:${code.toLowerCase()}:demo`, code, expiresAt };
   }
 
+  private deviceLinkConfirmed = false;
+
+  async confirmDeviceLink(match: boolean): Promise<null> {
+    await this.wait(100);
+    if (!this.deviceLinkCode) throw err({ code: 'not-found' });
+    this.deviceLinkConfirmed = match;
+    if (!match) {
+      this.deviceLinkCode = null;
+      this.emit('deviceLink.state', { state: 'failed', reason: 'refused' });
+    }
+    return null;
+  }
+
   async cancelDeviceLink(): Promise<null> {
     this.deviceLinkCode = null;
     return null;
@@ -771,6 +785,8 @@ export class MockCore implements CoreApi {
    */
   simulateDeviceLink(state: 'confirm' | 'done' | 'expired' | 'failed', reason?: 'refused' | 'network' | 'timeout'): void {
     if (state === 'done') {
+      // As the core: nothing is applied before this device confirmed the digits.
+      if (!this.deviceLinkConfirmed) return;
       this.identity = { ...this.makeIdentity('me-linked', { locale: 'he', country: 'IL', birthDate: '1998-04-12' }), displayName: 'מורן', recoveryChecked: true };
       this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
       this.save();
@@ -788,6 +804,7 @@ export class MockCore implements CoreApi {
     if (!/^[A-Z2-7]{10}$/.test(code) && !qrOrCode.startsWith('mvs-link:v1:')) throw err({ code: 'not-found' });
     if (code === 'ZZZZZZZZZZ') throw err({ code: 'not-found' });
     if (code === 'RRRRRRRRRR') throw err({ code: 'rate-limited' });
+    if (code === 'LLLLLLLLLL') throw err({ code: 'locked-out' });
     this.approval = { sas: '482913', expiresAt: Date.now() + 5 * 60_000 };
     return this.approval;
   }

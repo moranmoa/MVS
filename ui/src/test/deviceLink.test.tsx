@@ -41,6 +41,16 @@ describe('device link: the new device', () => {
     expect(screen.getByText('482 913').closest('bdi')?.getAttribute('dir')).toBe('ltr');
     expect(plain(digits.getAttribute('aria-label'))).toBe('Digits to compare: 4 8 2 9 1 3');
     expect(screen.queryByRole('img', { name: 'QR code to link this device' })).toBeNull();
+    // Security Lead: the new device confirms the digits too, before anything is applied.
+    const match = vi.spyOn(core, 'confirmDeviceLink');
+    expect(match).not.toHaveBeenCalled();
+    expect(document.activeElement?.textContent).toBe("They don't match");
+    // Even if the account arrived, nothing is applied before this confirm.
+    act(() => core.simulateDeviceLink('done'));
+    expect(await core.getIdentity()).toBeNull();
+    await click(screen.getByRole('button', { name: 'The digits match' }));
+    expect(match).toHaveBeenCalledWith(true);
+    expect(screen.getByText('Waiting for approval on the other device.')).toBeTruthy();
     act(() => core.simulateDeviceLink('done'));
     // The same account: no country, birth date or words; only the agreement.
     const accept = await screen.findByRole('checkbox');
@@ -62,6 +72,16 @@ describe('device link: the new device', () => {
     await click(screen.getByRole('button', { name: 'New code' }));
     await screen.findByRole('img', { name: 'QR code to link this device' });
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it("\"They don't match\" on the new device ends the link and says it wasn't approved", async () => {
+    const { core } = await newDevice();
+    act(() => core.simulateDeviceLink('confirm'));
+    const match = vi.spyOn(core, 'confirmDeviceLink');
+    await click(await screen.findByRole('button', { name: "They don't match" }));
+    expect(match).toHaveBeenCalledWith(false);
+    expect((await screen.findByRole('alert')).textContent).toBe("The other device didn't approve it.");
+    expect(await core.getIdentity()).toBeNull();
   });
 
   it('Cancel goes back to the first screen and cancels the link', async () => {
@@ -98,6 +118,9 @@ describe('device link: the signed-in device', () => {
     expect(screen.getByRole('alert').textContent).toContain('No device with this code');
     await submit('RRRRR-RRRRR');
     expect(screen.getByRole('alert').textContent).toContain('Too many tries');
+    // Security Lead: locked out → someone else may be trying.
+    await submit('LLLLL LLLLL');
+    expect(screen.getByRole('alert').textContent).toBe('Someone else may be trying; start again.');
     const begin = vi.spyOn(core, 'beginDeviceApproval');
     await submit('k7qx2-mzrf4');
     expect(begin).toHaveBeenCalledWith('K7QX2MZRF4');
@@ -109,6 +132,24 @@ describe('device link: the signed-in device', () => {
     await click(within(group).getByRole('button', { name: 'They match, sign it in' }));
     expect(confirm).toHaveBeenCalledWith(true);
     expect(screen.getByRole('status').textContent).toBe('The new device was added to your account.');
+  });
+
+  it('Security Lead: nothing is approved or sent before the explicit "They match" (and the screen says full access)', async () => {
+    const { core, submit } = await openDevices();
+    const confirm = vi.spyOn(core, 'confirmDeviceApproval');
+    await submit('K7QX2MZRF4');
+    const group = screen.getByRole('group', { name: /full access/ });
+    // (b) Said plainly, as its own line.
+    expect(within(group).getByRole('note').textContent).toContain('FULL access to your account');
+    // (a) The digits are on screen; time passes; Enter on the focused (safe) button: no approval.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalledWith(true);
+    await click(within(group).getByRole('button', { name: 'They match, sign it in' }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm).toHaveBeenCalledWith(true);
   });
 
   it("\"They don't match\" declines it", async () => {

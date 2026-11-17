@@ -153,6 +153,8 @@ export interface CoreError {
     | 'in-call-elsewhere'
     /** Device link: too many approval attempts. */
     | 'rate-limited'
+    /** Device link: the link is locked (too many tries, or another session holds it): someone else may be trying. */
+    | 'locked-out'
     /** Voice rooms (0.4.3): this server already has 10 live rooms. */
     | 'room-cap'
     // In-app update (core/api CONFORMANCE "Updates")

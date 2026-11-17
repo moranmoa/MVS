@@ -6,6 +6,7 @@
 // containing "offline" finds nobody online; one containing "adult" is 18+.
 
 import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
+import { normalizeEmoji } from './emoji';
 import type {
   CallState,
   VoiceRoom,
@@ -1074,9 +1075,11 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
+    // As the core: only cap names it knows.
+    if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
   }
 
@@ -1193,6 +1196,29 @@ export class MockCore implements CoreApi {
     const mine = m.authorId === this.identity?.id;
     if (!mine && s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
     this.put(ch, { ...m, body: '', deleted: true, replyTo: undefined }, false);
+  }
+
+  /** G-26, as the core: the same emoji check, gate and per-author cap (no fold, no rate). */
+  async react(messageId: Id, emoji: string, on: boolean): Promise<void> {
+    const e = normalizeEmoji(emoji);
+    if (e === null) throw err({ code: 'bad-request' });
+    const { ch, index } = this.parseId(messageId);
+    const m = this.messageAt(ch, index);
+    if (m.deleted) throw err({ code: 'not-found' });
+    this.lifecycleGate(this.serverOf(ch));
+    const chips = [...(m.reactions ?? [])];
+    const at = chips.findIndex((c) => c.emoji === e);
+    if ((at >= 0 && chips[at].mine) === on) return;
+    if (on) {
+      if (chips.filter((c) => c.mine).length >= 10) throw err({ code: 'bad-request' });
+      if (at >= 0) chips[at] = { ...chips[at], count: chips[at].count + 1, mine: true };
+      else chips.push({ emoji: e, count: 1, mine: true });
+    } else {
+      const count = chips[at].count - 1;
+      if (count > 0) chips[at] = { ...chips[at], count, mine: false };
+      else chips.splice(at, 1);
+    }
+    this.put(ch, { ...m, reactions: chips.length ? chips : undefined }, false);
   }
 
   async discardMessage(messageId: Id): Promise<null> {

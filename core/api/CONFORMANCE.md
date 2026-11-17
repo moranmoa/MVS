@@ -101,6 +101,41 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `Channel.mentions` and `ServerSummary.mentions` count unread messages that mention me (after the read marker, not mine). `markRead` resets them. `ServerSummary.unread` is set when any channel has unread messages; both come from `listServers`.
   - No authority or sync change: mentions are read from the message body.
 
+- Emoji reactions (G-26; design `g26-reactions-design.md` with Amendment 1):
+  - `react(messageId, emoji, on: boolean)` returns `null` and fires `message.updated` for the message. Nothing is signed when it's already so (an add of an emoji I have on, or a removal of one I don't).
+  - `Message.reactions?: { emoji, count, mine }[]` (additive) lists at most 20 emoji: the 20 with the most members, ties going to the one that appeared first. They're listed in the order they first appeared, and the field is absent when there are none. A deleted message has none.
+  - A change from anyone brings one `message.updated` for the message in that sync round. Reactions are never unread, never a mention, and never notify.
+  - **The emoji check** (core on write and on fold; the UI's sanitizer must match it):
+    - One trailing U+FE0F is dropped first, so 👍 and 👍+FE0F are the same chip. The stored form never ends in FE0F.
+    - 1–32 bytes and at most 10 scalars, made of elements joined by single ZWJs (U+200D: never first, never last, never doubled).
+    - An element is one of:
+      - an emoji base (the pictographic blocks U+1F000–1FAFF, plus the older emoji symbols listed in `src/reaction.rs`), with at most one VS16 or skin tone (U+1F3FB–1F3FF) straight after it;
+      - a pair of regional indicators;
+      - a keycap `[0-9#*] FE0F? 20E3`.
+    - Never a control, bidi, whitespace or tag character (U+E0020–E007F, so no subdivision flags in v1), and no custom emoji.
+  - Errors, with nothing signed:
+    - `bad-request`: the emoji fails the check, or it would be my 11th emoji on this message.
+    - `not-found`: no such message I can see, or it is deleted.
+    - `not-allowed`: I can't write in that channel now (the same rule as a message).
+    - `update-needed`: a current member's latest profile post lacks `reactions-v1`. `getUpdateNeeded(serverId, "reactions-v1")` says who.
+    - `rate-limited`: 30 reaction records of mine in this channel within a minute.
+  - **Record:** `Kind::Reaction = 21`, channel scope, at most 256 bytes. Authority judges it like a `Message` (any member; a kick's cut voids it the same way). The body is sealed with the channel key over a fixed 66-byte plaintext, so its length doesn't give the emoji away. The plaintext is `target (32) ‖ op (1 = add, 0 = remove) ‖ len u8 ‖ emoji ‖ zero padding`. On open, it's refused when:
+    - `len` is over 32;
+    - the emoji isn't valid UTF-8, or fails the check, or ends in FE0F;
+    - the op isn't 0 or 1;
+    - the padding isn't all zero.
+
+    The design said 64 bytes, but 32 + 1 + 1 + 32 needs 66, so 66 keeps the 32-byte emoji limit.
+  - **The fold** (deterministic in every core):
+    - The channel's records go in causal order: deps first, and (claimed time, ID) only between records that are concurrent.
+    - The rate is counted first: an author's record is ignored when 30 of theirs are already counted within a minute of its claimed time, either way.
+    - Then a reaction counts only if it opens to a valid plaintext whose target is a shown `Message` of that channel that isn't deleted.
+    - Per (message, emoji, author), the last op wins.
+    - An add is ignored while the author already has 10 emoji on that message; a removal frees a place.
+    - There's no per-message cap in the state, so one member can't lock a message.
+  - **Known residual:** with more than 20 distinct emoji on a message, the rarest drop out of view (not out of state). One member can add at most 10.
+  - **Rollout:** a `reactions-v1` cap in profile posts (above). An older core refuses kind 21 and would stall on every channel record after one, so nobody reacts until every current member posts the cap. The release that reads kind 21 also posts it.
+
 - New-messages divider (G-21, option A):
   - `Channel.unreadCount?: number` and `Channel.firstUnreadIndex?: number` (additive) count the messages after my read marker that aren't mine, in `getMessages` order. `firstUnreadIndex` is the `getMessages` index of the first of them, and is absent when there are none. `Channel.unread` is `unreadCount > 0`. They appear in `listChannels` and `channel.updated`.
   - `markRead(channelId)` returns `null` and moves the marker to the channel's last message. It emits `channel.updated` with `unreadCount: 0` and no `firstUnreadIndex`.
@@ -349,7 +384,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - Each sync round it goes out once the rollout gate is open, and is retried until a member has it (B6 `sent`). Then the secret and subscription go too, and the others re-key.
     - If I'm kicked first, the `Leave` is dropped.
     - The leaver isn't banned, and comes back through a new invite as a plain member.
-  - `getUpdateNeeded(serverId)` returns the user IDs of members whose latest profile post lacks `server-lifecycle-v1`, or who have none: who blocks a rename or a delete. An empty list means the gate is open.
+  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). Any other cap name is `bad-request`. An empty list means the gate is open.
   - `closeServer(serverId)` returns `null`. The owner deletes the server for good: the core syncs first, then sends the close.
     - On the owner's core, and on every member's when it reads the close, the server is closed, not purged at once. `server.closed { serverId }` fires; any call there ends; its keys and sync subscription go, and it's no longer synced. It stays in `listServers`, read-only, with `ServerSummary.closed: true` (additive).
     - 30 days (`CLOSED_RETENTION_MS`) after the close was received, the rest is purged and `server.removed { serverId, reason: 'closed' }` fires. Its genesis and close record are kept forever, so the server reads as closed, never unknown.
@@ -361,7 +396,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks the cap.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

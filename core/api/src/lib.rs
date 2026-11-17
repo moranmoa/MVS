@@ -22,6 +22,7 @@ mod gate;
 pub mod invite_link;
 mod model;
 mod ports;
+pub mod reaction;
 mod rekey;
 mod service;
 pub mod sidecar;

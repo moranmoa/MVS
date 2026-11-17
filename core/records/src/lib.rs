@@ -204,6 +204,10 @@ pub enum Kind {
     KeyRotation = 19,
     /// The owner lets a kicked key join again. Body: the key.
     Unban = 20,
+    /// An emoji reaction to a message, or its removal (G-26). The body is
+    /// sealed like a `Message`'s, over a fixed-size plaintext (`core/api`),
+    /// so holders see neither the target nor the emoji.
+    Reaction = 21,
 }
 
 /// Most (channel, head) pairs a cut names, over all its channels.
@@ -228,7 +232,7 @@ pub const MAX_ROTATION_PARTS: u8 = 32;
 pub const ROTATION_HEADER_LEN: usize = ID_LEN + 2;
 
 impl Kind {
-    const ALL: [Kind; 20] = [
+    const ALL: [Kind; 21] = [
         Kind::Genesis,
         Kind::Grant,
         Kind::Revoke,
@@ -249,6 +253,7 @@ impl Kind {
         Kind::MessageDelete,
         Kind::KeyRotation,
         Kind::Unban,
+        Kind::Reaction,
     ];
 
     const LARGEST_BODY: usize = 16 * 1024;
@@ -281,6 +286,8 @@ impl Kind {
             Kind::ChannelCreate | Kind::ChannelEdit => 512,
             Kind::Post => 4 * 1024,
             Kind::Message | Kind::MessageEdit | Kind::KeyRotation => Kind::LARGEST_BODY,
+            // A sealed 64-byte plaintext (121 bytes today), with room to spare.
+            Kind::Reaction => 256,
         }
     }
 
@@ -292,9 +299,11 @@ impl Kind {
 
     fn allowed_in(self, scope: Scope) -> bool {
         match self {
-            Kind::Message | Kind::MessageEdit | Kind::MessageDelete | Kind::KeyRotation => {
-                matches!(scope, Scope::Channel(_))
-            }
+            Kind::Message
+            | Kind::MessageEdit
+            | Kind::MessageDelete
+            | Kind::KeyRotation
+            | Kind::Reaction => matches!(scope, Scope::Channel(_)),
             _ => scope == Scope::Control,
         }
     }
@@ -1016,16 +1025,28 @@ mod tests {
     }
 
     #[test]
+    fn a_reaction_is_a_small_channel_record_and_later_codes_stay_unknown() {
+        assert_eq!(Kind::from_code(21), Some(Kind::Reaction));
+        assert_eq!(Kind::Reaction.max_body(), 256);
+        assert!(!Kind::Reaction.prunable());
+        assert_eq!(Kind::from_code(22), None, "older cores still refuse what they don't know");
+    }
+
+    #[test]
     fn every_kind_has_one_scope_and_a_body_limit() {
         let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
         let codes: Vec<u16> = Kind::ALL.iter().map(|kind| kind.code()).collect();
-        assert_eq!(codes, (1..=20).collect::<Vec<u16>>(), "codes are dense and in order");
+        assert_eq!(codes, (1..=21).collect::<Vec<u16>>(), "codes are dense and in order");
         // The genesis has its own tests: its body must carry the nonce.
         for kind in Kind::ALL.into_iter().filter(|kind| *kind != Kind::Genesis) {
             assert_eq!(Kind::from_code(kind.code()), Some(kind));
             let in_channel = matches!(
                 kind,
-                Kind::Message | Kind::MessageEdit | Kind::MessageDelete | Kind::KeyRotation
+                Kind::Message
+                    | Kind::MessageEdit
+                    | Kind::MessageDelete
+                    | Kind::KeyRotation
+                    | Kind::Reaction
             );
             let (home, other) =
                 if in_channel { (channel, Scope::Control) } else { (Scope::Control, channel) };

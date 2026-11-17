@@ -3464,3 +3464,18 @@ input.switch:disabled {
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   font-size: 0.875rem;
 }
+
+/* "A new device was added to your account": stays until answered. */
+.device-notice {
+  align-items: flex-start;
+  border-inline-start: 3px solid var(--danger);
+}
+
+.device-notice-body {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.device-notice-body .actions {
+  margin-block-start: 0.25rem;
+}

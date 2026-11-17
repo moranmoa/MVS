@@ -16,6 +16,8 @@ const FAILED_TEXT = {
   timeout: 'deviceLink.failed.timeout',
   refused: 'deviceLink.failed.refused',
   network: 'deviceLink.failed.network',
+  keyring: 'deviceLink.failed.keyring',
+  restore: 'deviceLink.failed.restore',
 } as const;
 
 /** "4:59", ticking each second until `until`; read out only at each whole minute. */

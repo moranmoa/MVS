@@ -12,6 +12,7 @@ import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
 import { SettingsScreen } from '../settings/SettingsScreen';
 import { MemberRelayFirstRun } from '../settings/MemberRelay';
+import { DeviceNotices } from './DeviceNotice';
 import { ChannelDialog, type ChannelDialogMode } from './ChannelDialog';
 import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
@@ -355,6 +356,7 @@ export function Shell() {
 
       {/* Toasts stack in one column, so two at once never overlap. */}
       <div className="toasts">
+        <DeviceNotices />
         {serverGone && (
           <div className="toast" role="status" key={serverGone.at}>
             <FormattedMessage id={`server.gone.${serverGone.reason}`} values={{ name: serverGone.name }} />

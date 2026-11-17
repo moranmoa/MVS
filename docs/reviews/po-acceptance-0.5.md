@@ -37,11 +37,13 @@ Board housekeeping for pm: the 0.4.0 rows (G-01, G-11, G-21, G-24, G-05, G-61, G
 
 ## G-72 – microphone and speaker choice, mic test
 
-1. Settings → Voice lists input and output devices by their system names, with "ברירת המחדל של המערכת" first.
-2. Changing a device during a call takes effect without leaving the call.
-3. "בדיקת מיקרופון" shows a live level meter, and plays back to me only if I turn on "השמעה עצמית".
+Manager decision (UX #427, option a): outside a call, only the speaker; the microphone is chosen and tested inside a call. A mic test outside calls would add microphone-permission surface, and is deferred until testers ask for it.
+
+1. **Settings → קול (outside a call):** the output device by its system name, with "ברירת המחדל של המערכת" first, a "השמעת צליל בדיקה" button, and the line "אפשר לבדוק את המיקרופון בזמן שיחה". No microphone list and no microphone permission here.
+2. **The in-call dialog:** input and output devices by their system names, with "ברירת המחדל של המערכת" first. "בדיקת מיקרופון" shows a live level meter, and plays back to me only if I turn on "השמעה עצמית".
+3. Changing a device during a call takes effect without leaving the call.
 4. An unplugged device falls back to the system default, with a short notice naming the device.
-5. No microphone permission is requested until the Voice page or a call is opened (the rule from #224).
+5. No microphone permission is requested outside a call (the rule from #224).
 6. Remembered per computer; never synced.
 
 ## G-91 – servers come back after a restore

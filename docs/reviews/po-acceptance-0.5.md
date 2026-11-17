@@ -28,7 +28,7 @@ Board housekeeping for pm: the 0.4.0 rows (G-01, G-11, G-21, G-24, G-05, G-61, G
 
 ## G-26 – emoji reactions
 
-1. Hover or the context menu shows "הוספת תגובה". Picking an emoji adds it under the message with a count. Clicking an existing reaction toggles mine.
+1. Hover or the context menu shows "הוספת אמוג'י" (not "תגובה", which already means a reply). Picking an emoji adds it under the message with a count. Clicking an existing reaction toggles mine.
 2. Mine is visually marked (border plus `aria-pressed`), and hover or focus shows who reacted (names isolated, at most 10 plus "ועוד ⁨{n}⁩").
 3. A signed record per reaction; removing mine is a tombstone. A member sees others' reactions within the normal message delivery time.
 4. Limits: at most 20 distinct emoji per message, and only standard Unicode emoji (no custom images in this release).

@@ -1155,3 +1155,114 @@ async fn a_fresh_device_gets_the_backup_back_by_its_tag() {
         node.shutdown().await.unwrap();
     }
 }
+
+/// A node whose events the test reads itself.
+async fn node_events(name: &str, relay: &Multiaddr) -> (Node, mpsc::Receiver<NodeEvent>) {
+    let dir = std::env::temp_dir().join(format!("sync-relay-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = NodeConfig {
+        relay: relay.clone(),
+        data_dir: dir,
+        logs: vec![],
+        authorizer: Arc::new(AcceptAll),
+        listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        bootstrap: vec![],
+        allow_lan: true,
+        relay_only: false,
+    };
+    Node::start(config).await.unwrap()
+}
+
+async fn next_link_event(events: &mut mpsc::Receiver<NodeEvent>) -> sync::DeviceLinkInbound {
+    let wait = async {
+        loop {
+            if let Some(NodeEvent::DeviceLink(inbound)) = events.recv().await {
+                return inbound;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), wait).await.expect("no device link event")
+}
+
+/// The node's own direct TCP address, with its peer ID.
+async fn direct_addr(node: &Node) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let addr = node
+        .listen_addrs()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.iter().any(|p| matches!(p, Protocol::Tcp(_))) && !a.iter().any(|p| p == Protocol::P2pCircuit))
+        .expect("a direct TCP listener");
+    addr.with(Protocol::P2p(node.peer_id()))
+}
+
+/// Device link: the new device is found by its code and answers one
+/// signed-in device, through the relay circuit only. Direct dials either
+/// way are refused while the link lives, though the same kind of dial
+/// reaches a node that is no link peer; a stranger is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_link_is_found_by_its_code_and_stays_on_the_relay_circuit() {
+    use sync::{device_link_rendezvous, DeviceLinkError, DeviceLinkInbound};
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let _relay = start_relay(relay_key, port);
+    let (new, mut new_events) = node_events("link-new", &relay).await;
+    let (old, _) = node_events("link-old", &relay).await;
+    let (other, _) = node_events("link-other", &relay).await;
+
+    let rv = device_link_rendezvous("ABCDEFGHJK");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (peer, circuit) = loop {
+        if let Some(open) = new.device_link_open(rv, [7; 32]).await.unwrap() {
+            break open;
+        }
+        assert!(Instant::now() < deadline, "the link never opened (no reservation)");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(peer, new.peer_id());
+    assert!(circuit.iter().any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit), "{circuit}");
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let found = loop {
+        match old.device_link_find(rv).await {
+            Ok(found) => break found,
+            Err(err) => assert!(Instant::now() < deadline, "the code was never found: {err:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(found, new.peer_id());
+    assert_eq!(old.device_link_find(device_link_rendezvous("ZZZZZZZZZZ")).await, Err(DeviceLinkError::NotFound));
+
+    assert_eq!(old.device_link_hello(found, [1; 32]).await, Ok([7; 32]));
+    assert_eq!(next_link_event(&mut new_events).await, DeviceLinkInbound::Hello { e_old_pub: [1; 32] });
+
+    // Direct dials both ways are refused; the same dial to a node that is
+    // no link peer goes through (so the refusal is the link's).
+    old.test_dial(direct_addr(&new).await);
+    new.test_dial(direct_addr(&old).await);
+    old.test_dial(direct_addr(&other).await);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !old.direct_peers().await.unwrap().contains(&other.peer_id()) {
+        assert!(Instant::now() < deadline, "a plain direct dial never connected");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!old.direct_peers().await.unwrap().contains(&new.peer_id()), "the link went direct (old side)");
+    assert!(!new.direct_peers().await.unwrap().contains(&old.peer_id()), "the link went direct (new side)");
+
+    // One session: another device is refused, before and after the transfer.
+    assert_eq!(other.device_link_hello(new.peer_id(), [2; 32]).await, Err(DeviceLinkError::Refused));
+    assert_eq!(old.device_link_send(found, vec![9; 100]).await, Ok(()));
+    assert_eq!(next_link_event(&mut new_events).await, DeviceLinkInbound::Sealed { ciphertext: vec![9; 100] });
+    assert_eq!(old.device_link_send(found, vec![9; 100]).await, Err(DeviceLinkError::Refused));
+    assert!(old.peers().await.unwrap().contains(&new.peer_id()));
+    assert!(!old.direct_peers().await.unwrap().contains(&new.peer_id()));
+
+    new.device_link_close().unwrap();
+    for node in [new, old, other] {
+        node.shutdown().await.unwrap();
+    }
+}

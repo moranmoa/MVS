@@ -32,6 +32,7 @@ mod limits;
 mod presence;
 mod punch;
 mod backup;
+mod device_link;
 mod invite;
 mod voice;
 #[cfg(test)]
@@ -41,6 +42,10 @@ pub use access::{binding_message, Binder, Handle, ReadGate, ServerSecret};
 pub use node::{Access, Node, NodeConfig, NodeEvent, PresenceState, Reachability, Via};
 pub use records::{ChannelId, Record, RecordId, Scope, ServerId, Stub};
 pub use backup::MAX_BACKUP;
+pub use device_link::{
+    rendezvous as device_link_rendezvous, Inbound as DeviceLinkInbound, LinkError as DeviceLinkError, DEVICE_LINK_FIND_WAIT,
+    DEVICE_LINK_TTL, MAX_DEVICE_LINK,
+};
 pub use invite::{MAX_PER_SERVER as MAX_INVITES_PER_SERVER, MAX_PUBLICATION as MAX_INVITE_PUBLICATION};
 pub use voice::{VoiceError, MAX_VOICE_BLOB};
 pub use store::{Append, ChannelLog, ControlLog, Held, IngestError, Store};

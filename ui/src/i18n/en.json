@@ -413,6 +413,7 @@
   "voice.pttFocusOnly": "Works while the MVS window is active.",
   "voice.globalMute": "Global mute toggle",
   "voice.globalMuteHint": "Press to mute or unmute, even when the MVS window isn't active. Use two of Ctrl, Alt or Shift with a letter or digit, or F13–F24.",
+  "voice.globalMuteRejected": "That combination can't be used. Use two of Ctrl, Alt or Shift with a letter or digit, or F13–F24.",
   "voice.globalMuteClear": "Remove",
   "voice.shortcutTaken": "Another app already uses this shortcut. Choose another.",
   "voice.desktopOnly": "Push to talk works in the desktop app.",

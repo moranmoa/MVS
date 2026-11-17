@@ -80,6 +80,20 @@ describe('Settings → Voice (G-74)', () => {
     expect(screen.getByText('Works while the MVS window is active.')).toBeTruthy();
   });
 
+  it('a combination the shell would refuse says why at once; a good one clears it', async () => {
+    await open('ok');
+    const capture = screen.getByRole('button', { name: 'Global mute toggle' });
+    fireEvent.click(capture);
+    fireEvent.keyDown(capture, { key: 'Control', code: 'ControlLeft', ctrlKey: true });
+    expect(screen.queryByRole('alert')).toBeNull(); // a lone modifier is the start, not an answer
+    fireEvent.keyDown(capture, { key: 'c', code: 'KeyC', ctrlKey: true });
+    expect(screen.getByRole('alert').textContent).toContain("That combination can't be used");
+    expect(capture.getAttribute('aria-invalid')).toBe('true');
+    fireEvent.keyDown(capture, { key: 'M', code: 'KeyM', ctrlKey: true, shiftKey: true });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(capture.querySelector('kbd')?.textContent).toBe('Ctrl+Shift+M');
+  });
+
   it('a global shortcut another app holds is shown on its field', async () => {
     await open('shortcut-taken');
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Another app already uses this shortcut'));

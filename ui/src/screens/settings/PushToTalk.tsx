@@ -16,6 +16,7 @@ function KeyCapture({
   invalid,
   capture,
   onChange,
+  onRejected,
 }: {
   value: string | null;
   label: string;
@@ -23,6 +24,8 @@ function KeyCapture({
   invalid?: boolean;
   capture: (e: KeyboardEvent) => string | null;
   onChange: (v: string) => void;
+  /** A key (not a lone modifier) that can't be used was pressed; null once a good one is. */
+  onRejected?: (rejected: boolean) => void;
 }) {
   const [waiting, setWaiting] = useState(false);
   return (
@@ -39,7 +42,10 @@ function KeyCapture({
         e.preventDefault();
         e.stopPropagation();
         if (e.key === 'Escape') return setWaiting(false);
+        // A lone Ctrl/Alt/Shift/Meta is the start of a combination, not an answer.
+        if (/^(Control|Alt|Shift|Meta|OS)(Left|Right)?$/.test(e.code)) return;
         const v = capture(e);
+        onRejected?.(!v);
         if (v) {
           onChange(v);
           setWaiting(false);
@@ -59,6 +65,9 @@ export function PushToTalkSection() {
   const status = useStore(store, (s) => s.pttStatus);
   const set = (patch: Partial<VoicePrefs>) => update({ voice: { ...prefs, ...patch } });
   const unsupported = status === 'unsupported';
+  // The global toggle: a combination the shell would refuse was pressed (two modifiers, or F13–F24).
+  const [rejected, setRejected] = useState(false);
+  const muteError = rejected ? 'voice.globalMuteRejected' : status === 'shortcut-taken' ? 'voice.shortcutTaken' : status === 'invalid' && prefs.globalMute ? 'voice.globalMuteRejected' : null;
   return (
     <div className="stack voice-settings">
       {unsupported && (
@@ -104,9 +113,10 @@ export function PushToTalkSection() {
             value={prefs.globalMute ? acceleratorLabel(prefs.globalMute) : null}
             label={intl.formatMessage({ id: 'voice.globalMute' })}
             describedBy="global-mute-hint"
-            invalid={status === 'shortcut-taken'}
+            invalid={!!muteError}
             capture={(e) => acceleratorFrom(e)}
             onChange={(globalMute) => set({ globalMute })}
+            onRejected={setRejected}
           />
           {prefs.globalMute && (
             <button type="button" className="link small" onClick={() => set({ globalMute: null })}>
@@ -114,8 +124,8 @@ export function PushToTalkSection() {
             </button>
           )}
         </div>
-        <p id="global-mute-hint" className={status === 'shortcut-taken' ? 'error small' : 'muted small'} role={status === 'shortcut-taken' ? 'alert' : undefined}>
-          <FormattedMessage id={status === 'shortcut-taken' ? 'voice.shortcutTaken' : 'voice.globalMuteHint'} />
+        <p id="global-mute-hint" className={muteError ? 'error small' : 'muted small'} role={muteError ? 'alert' : undefined}>
+          <FormattedMessage id={muteError ?? 'voice.globalMuteHint'} />
         </p>
       </div>
     </div>

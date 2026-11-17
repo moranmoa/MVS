@@ -413,6 +413,7 @@
   "voice.pttFocusOnly": "עובד כשחלון MVS פעיל.",
   "voice.globalMute": "מקש השתקה גלובלי",
   "voice.globalMuteHint": "לחיצה משתיקה או מבטלת השתקה, גם כשחלון MVS לא פעיל. צריך צירוף של שני מקשי Ctrl, Alt או Shift עם אות או ספרה, או מקש F13–F24.",
+  "voice.globalMuteRejected": "אי אפשר להשתמש בצירוף הזה. צריך שניים מ-Ctrl, Alt או Shift יחד עם אות או ספרה, או מקש F13–F24.",
   "voice.globalMuteClear": "הסרה",
   "voice.shortcutTaken": "אפליקציה אחרת כבר משתמשת בצירוף הזה. אפשר לבחור צירוף אחר.",
   "voice.desktopOnly": "לחיצה לדיבור עובדת באפליקציה למחשב.",

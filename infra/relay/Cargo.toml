@@ -10,15 +10,18 @@ async-trait = "0.1"
 # The backup mailbox (/mvs/backup/1): the same checks as core/sync's holder.
 blake3 = "=1.8.7"
 ed25519-dalek = "2.2"
+# Directly, not as libp2p's "websocket" feature: in 0.56 that feature's
+# builder step needs "dns", which the relay leaves out.
+libp2p-websocket = "0.45.1"
 futures = "0.3"
-libp2p = { version = "0.54", features = [
+# 0.56, as core (#256). No "dns": the relay never dials a name (EXTERNAL_ADDRS
+# names are only advertised), and leaving it out drops hickory entirely.
+libp2p = { version = "0.56", features = [
     "tokio",
     "tcp",
     "quic",
     "noise",
     "yamux",
-    "dns",
-    "websocket",
     "identify",
     "ping",
     "relay",

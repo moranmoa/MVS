@@ -7,11 +7,13 @@
 
 import { useEffect, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
+import { useSettings } from '../../app/settings';
 import { listOutputs, loadDevices, playTestSound, saveDevices, type OutputDevice } from '../../voice/devices';
 import { PushToTalkSection } from './PushToTalk';
 
 export function VoiceSection() {
   const intl = useIntl();
+  const { settings, update } = useSettings();
   const [outputs, setOutputs] = useState<OutputDevice[]>([]);
   const [output, setOutput] = useState(() => loadDevices().output ?? '');
   const [playing, setPlaying] = useState(false);
@@ -68,6 +70,18 @@ export function VoiceSection() {
         <FormattedMessage id="voice.micTestInCall" />
       </p>
       <PushToTalkSection />
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="voice.callSounds" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={settings.callSounds !== false}
+          onChange={(e) => update({ callSounds: e.target.checked })}
+        />
+      </label>
     </div>
   );
 }

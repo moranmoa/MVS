@@ -1249,6 +1249,19 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
+// G-84b: a deafened member in the room roster (crossed headphones instead of the mic): 449.
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await joinRoom(p);
+  const bar = p.getByRole('region', { name: 'שיחה קולית' });
+  await bar.waitFor();
+  await bar.getByRole('button', { name: 'השתקת השמע' }).click();
+  await p.getByRole('img', { name: 'השמע כבוי' }).first().waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '449-roster-deafened-he');
+  await p.close();
+}
+
 // Our own title bar (docs/ux/specs/desktop-chrome.md): 390 (he, light), 391 (en, dark),
 // 392 (close during a call). A stand-in for the shell's window bridge, with
 // our own buttons as on Linux; on Windows the OS draws them on the overlay.

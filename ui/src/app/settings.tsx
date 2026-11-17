@@ -21,6 +21,8 @@ export interface Settings {
   notify?: NotifyPrefs;
   /** G-74: voice activity or push to talk, and the keys, on this computer only. */
   voice?: VoicePrefs;
+  /** G-64: a short sound when someone joins or leaves my call. On unless false. */
+  callSounds?: boolean;
 }
 
 export const SCALE_MIN = 0.75;
@@ -59,6 +61,7 @@ function load(): Settings {
     serverOrder: cleanOrder(stored.serverOrder),
     notify: cleanNotifyPrefs(stored.notify),
     voice: cleanVoicePrefs(stored.voice),
+    ...(stored.callSounds === false ? { callSounds: false } : {}),
     ...(LOCALES.includes(lang as Locale) ? { locale: lang as Locale } : {}),
     ...(theme === 'light' || theme === 'dark' ? { theme } : {}),
   };

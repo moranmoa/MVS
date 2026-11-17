@@ -20,7 +20,9 @@
 //! With no open link (none, expired, or its transfer done) the answer is
 //! `0x00`, which the signed-in device reports as not found. Anything else, a
 //! peer other than the first Hello's, or past the request cap gets an empty
-//! answer (refused). One session per link: the first
+//! answer (refused). So for a link's life an asker can tell "no link open"
+//! from "an open link held by another device", that is, that this peer is
+//! mid-link (Security Lead on #406: acceptable). One session per link: the first
 //! Hello locks it to that peer. A stranger who caught the code can only make
 //! the link fail (the user starts again); the SAS covers a man in the middle.
 

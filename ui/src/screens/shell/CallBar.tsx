@@ -364,8 +364,9 @@ function VoiceSettings({
                 <input
                   type="range"
                   min={0}
-                  max={100}
-                  step={5}
+                  max={200}
+                  step={10}
+                  list={VOLUME_TICKS}
                   value={pct}
                   aria-valuetext={text}
                   onChange={(e) => engine.setVolume(o.id, Number(e.target.value))}
@@ -376,9 +377,20 @@ function VoiceSettings({
           <p className="hint">
             <FormattedMessage id="call.volumesHint" />
           </p>
+          <VolumeTicks />
         </fieldset>
       )}
     </Dialog>
+  );
+}
+
+/** G-73: the 100% mark on the 0–200% volume sliders (a tick Chromium draws on the track). */
+export const VOLUME_TICKS = 'volume-ticks-100';
+export function VolumeTicks() {
+  return (
+    <datalist id={VOLUME_TICKS}>
+      <option value={100} />
+    </datalist>
   );
 }
 

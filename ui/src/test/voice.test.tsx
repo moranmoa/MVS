@@ -191,6 +191,40 @@ describe('G-73: volume per person', () => {
   });
 });
 
+describe('G-73 v2: the roster menu (0–200%, mute for me)', () => {
+  it('right-click a person in my call: Volume… (0–200%) and Mute for me, which restores the volume', async () => {
+    const { entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    const others = () => within(roster).getAllByRole('listitem').filter((li) => li.getAttribute('aria-haspopup') === 'menu');
+    expect(others()).toHaveLength(2); // not me
+    const menuFor = async (li: HTMLElement) => {
+      await act(async () => {
+        fireEvent.contextMenu(li, { clientX: 10, clientY: 10 });
+      });
+      return screen.getByRole('menu');
+    };
+    // Volume…: a dialog with a 0–200% slider.
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Volume…' }));
+    const slider = within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('slider') as HTMLInputElement;
+    expect(slider.max).toBe('200');
+    expect(slider.step).toBe('10');
+    // The 100% tick, in the middle of the track.
+    expect([...(slider.list?.options ?? [])].map((o) => o.value)).toEqual(['100']);
+    await act(async () => {
+      fireEvent.change(slider, { target: { value: '160' } });
+    });
+    expect(slider.getAttribute('aria-valuetext')).toBe('160%');
+    await click(within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('button', { name: 'Close' }));
+    // Mute for me, then Unmute for me brings back 160%.
+    fakeEngine.picked = [];
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Mute for me' }));
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Unmute for me' }));
+    expect(fakeEngine.picked.map((x) => x.split(':').at(-1))).toEqual(['0', '160']);
+  });
+});
+
 describe('G-84: deafen', () => {
   it('deafen mutes me too and undeafen unmutes me; unmuting while deafened undeafens', async () => {
     fakeEngine.deafened = false;

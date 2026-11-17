@@ -59,7 +59,10 @@ function parseLinux(out) {
 /** The query for this platform, by absolute path (no PATH lookup), or null (macOS: never metered in v1). */
 function queryFor(platform = process.platform, env = process.env, exists = fs.existsSync) {
   if (platform === 'win32') {
-    const exe = path.join(env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    // SystemRoot only if it is an absolute, existing folder; else the default.
+    const sr = env.SystemRoot;
+    const root = sr && path.win32.isAbsolute(sr) && exists(sr) ? sr : 'C:\\Windows';
+    const exe = path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     return { file: exe, args: ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_SCRIPT], parse: parseWindows };
   }
   if (platform === 'linux') {

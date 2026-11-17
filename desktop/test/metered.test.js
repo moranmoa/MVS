@@ -27,8 +27,13 @@ test('Linux: NetworkManager Metered yes (1) or guess-yes (3) is metered', () => 
 });
 
 test('the query per platform: absolute paths, no shell; macOS never metered', () => {
-  const win = m.queryFor('win32', { SystemRoot: 'C:\\Windows' });
-  assert.match(win.file, /^C:\\Windows[\\/]System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/);
+  const PS = '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+  const win = m.queryFor('win32', { SystemRoot: 'D:\\Win' }, (p) => p === 'D:\\Win');
+  assert.equal(win.file, 'D:\\Win' + PS);
+  // A relative, missing or absent SystemRoot falls back to C:\Windows.
+  for (const SystemRoot of ['Windows', 'Z:\\nope', undefined, '']) {
+    assert.equal(m.queryFor('win32', { SystemRoot }, () => false).file, 'C:\\Windows' + PS, String(SystemRoot));
+  }
   assert.deepEqual(win.args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-Command']);
   assert.equal(win.parse, m.parseWindows);
   const linux = m.queryFor('linux', {}, (p) => p === '/usr/bin/gdbus');

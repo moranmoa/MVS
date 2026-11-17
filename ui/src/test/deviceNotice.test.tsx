@@ -31,8 +31,10 @@ describe('new device added notice', () => {
     const [notice] = notices();
     expect(within(notice).getByText('A new device was added to your account')).toBeTruthy();
     // Untrusted text from the new device: quoted, never the headline.
-    expect(notice.textContent).toContain('a device that calls itself "Windows laptop"');
-    expect(within(notice).getByText('Windows laptop').tagName).toBe('BDI');
+    expect(notice.textContent?.replace(/[\u2068\u2069]/g, '')).toContain('a device that calls itself “Windows laptop”');
+    expect(within(notice).getByText('“Windows laptop”').tagName).toBe('BDI');
+    // UX: at the top, not over the composer.
+    expect(notice.parentElement?.className).toBe('device-notices');
     expect(notice.textContent).toMatch(/Nov 17/);
     // Re-sent until acknowledged: one notice per device, not two.
     act(() => core.simulateDeviceAdded('Windows laptop', at));

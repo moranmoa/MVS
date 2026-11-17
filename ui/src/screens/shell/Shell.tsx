@@ -355,8 +355,8 @@ export function Shell() {
       />
 
       {/* Toasts stack in one column, so two at once never overlap. */}
+      <DeviceNotices />
       <div className="toasts">
-        <DeviceNotices />
         {serverGone && (
           <div className="toast" role="status" key={serverGone.at}>
             <FormattedMessage id={`server.gone.${serverGone.reason}`} values={{ name: serverGone.name }} />

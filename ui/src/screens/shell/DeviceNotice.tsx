@@ -16,6 +16,8 @@ export function DeviceNotices() {
   const [help, setHelp] = useState(false);
   return (
     <>
+      {notices.length > 0 && (
+        <div className="device-notices">
       {notices.map((d) => (
         <div key={d.at} className="toast device-notice" role="alert">
           <ShieldIcon />
@@ -24,12 +26,12 @@ export function DeviceNotices() {
               <FormattedMessage id="deviceNotice.title" />
             </strong>
             <span>
-              {d.label ? <FormattedMessage id="deviceNotice.label" values={{ label: <bdi className="user-text">{d.label}</bdi> }} /> : <FormattedMessage id="deviceNotice.unknown" />}
+              {d.label ? <FormattedMessage id="deviceNotice.label" values={{ label: <bdi className="user-text">“{d.label}”</bdi> }} /> : <FormattedMessage id="deviceNotice.unknown" />}
               {' · '}
               <FormattedDate value={d.at} day="numeric" month="short" /> <FormattedTime value={d.at} />
             </span>
             <div className="actions">
-              <button type="button" className="secondary small" onClick={() => store.dismissDeviceNotice(d.at)}>
+              <button type="button" className="secondary small device-notice-me" onClick={() => store.dismissDeviceNotice(d.at)}>
                 <FormattedMessage id="deviceNotice.me" />
               </button>
               <button type="button" className="danger small" onClick={() => setHelp(true)}>
@@ -39,6 +41,8 @@ export function DeviceNotices() {
           </div>
         </div>
       ))}
+        </div>
+      )}
       <Dialog open={help} onClose={() => setHelp(false)} title={intl.formatMessage({ id: 'deviceNotice.help.title' })} className="device-notice-help">
         <p>
           <FormattedMessage id="deviceNotice.help.intro" />

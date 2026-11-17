@@ -9,10 +9,25 @@
 # Checks before uploading anything: the signed body's channel and version
 # match -Channel and -Tag, and the update zip from the tag's release matches
 # the sha256 and size in the manifest.
+#
+# Global flags (member relays slice 3b): flags.json in the same release.
+#
+#   .\.github\scripts\publish-update.ps1 -Channel alpha -MemberRelayOff true -Flags .\flags.json -Root root.json
+#   .\.github\scripts\publish-update.ps1 -Channel alpha -MemberRelayOff true -Key E:\mvs-keys\root.key -Root root.json
+#
+# -Flags: a flags.json signed on the offline machine (updater sign-flags).
+# -Key: sign here, from the key on its offline drive mounted for this run
+# only; the key itself is never copied or uploaded. Either way the file is
+# verified against -Root (and -Roots) and must say -MemberRelayOff before it
+# is uploaded. The newest issuedAt wins on every client.
+[CmdletBinding(DefaultParameterSetName = 'Manifest')]
 param(
-  [Parameter(Mandatory)][ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag,
+  [Parameter(Mandatory, ParameterSetName = 'Manifest')][ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Tag,
   [Parameter(Mandatory)][ValidateSet('alpha', 'beta')][string]$Channel,
-  [Parameter(Mandatory)][string]$Manifest,
+  [Parameter(Mandatory, ParameterSetName = 'Manifest')][string]$Manifest,
+  [Parameter(Mandatory, ParameterSetName = 'Flags')][ValidateSet('true', 'false')][string]$MemberRelayOff,
+  [Parameter(ParameterSetName = 'Flags')][string]$Flags,
+  [Parameter(ParameterSetName = 'Flags')][string]$Key,
   # The root.json the app ships (or the newest root-N.json), to verify against.
   [Parameter(Mandatory)][string]$Root,
   [string[]]$Roots = @(),
@@ -35,13 +50,56 @@ function Invoke-Native {
   } finally { $ErrorActionPreference = $old }
   return $LASTEXITCODE
 }
+
+# The fixed-tag channel release: created once, a pre-release so it never
+# shows as "Latest". A first run has no channel release yet: gh exits
+# non-zero, and we create it.
+function Confirm-ChannelRelease([string]$rel) {
+  if ((Invoke-Native gh @('release', 'view', $rel, '--repo', $Repo) -Quiet) -ne 0) {
+    "$rel does not exist yet: creating it (pre-release)"
+    $notes = "Signed update manifest for the $Channel channel, polled by the app. Not an installer."
+    if ((Invoke-Native gh @('release', 'create', $rel, '--repo', $Repo, '--prerelease', '--title', "Update channel: $Channel", '--notes', $notes)) -ne 0) {
+      throw "could not create release $rel"
+    }
+  }
+}
+
+if (-not (Get-Command $Updater -ErrorAction SilentlyContinue)) {
+  throw "updater CLI not found ('$Updater'): build it from a reviewed commit (cargo build --release -p updater) and pass -Updater <path>"
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Flags') {
+  if ([bool]$Flags -eq [bool]$Key) { throw "give exactly one of -Flags (signed offline) or -Key (sign here)" }
+  $work = Join-Path ([IO.Path]::GetTempPath()) "mvs-flags-$Channel"
+  New-Item -ItemType Directory -Force $work | Out-Null
+  $flagsCopy = Join-Path $work 'flags.json'
+  if ($Key) {
+    if ((Invoke-Native $Updater @('sign-flags', '--key', $Key, '--member-relay-off', $MemberRelayOff, '--out', $flagsCopy)) -ne 0) {
+      throw "updater sign-flags failed"
+    }
+  } else {
+    Copy-Item $Flags $flagsCopy -Force
+  }
+  # Verify with the updater itself before anything is uploaded.
+  $verifyArgs = @('verify-flags', '--flags', $flagsCopy, '--root', $Root)
+  foreach ($r in $Roots) { $verifyArgs += @('--root-update', $r) }
+  if ((Invoke-Native $Updater $verifyArgs) -ne 0) { throw "updater verify-flags failed: not publishing flags" }
+  $fb = (Get-Content -Raw $flagsCopy | ConvertFrom-Json).signed | ConvertFrom-Json
+  if ([string]$fb.memberRelayOff -ne $MemberRelayOff) { throw "flags say memberRelayOff $($fb.memberRelayOff), not $MemberRelayOff" }
+  "ok: flags verified: memberRelayOff $($fb.memberRelayOff), issuedAt $([DateTimeOffset]::FromUnixTimeSeconds($fb.issuedAt).UtcDateTime.ToString('u'))"
+  $rel = "update-$Channel"
+  Confirm-ChannelRelease $rel
+  if ((Invoke-Native gh @('release', 'upload', $rel, '--repo', $Repo, '--clobber', $flagsCopy)) -ne 0) {
+    throw "upload of flags.json to $rel failed"
+  }
+  "published to $rel : flags.json"
+  return
+}
+
 $version = $Tag.Substring(1)
 
 # Verify the signature, root chain and expiry with the updater itself, so a
 # bad or expired manifest is never published.
-if (-not (Get-Command $Updater -ErrorAction SilentlyContinue)) {
-  throw "updater CLI not found ('$Updater'): build it from a reviewed commit (cargo build --release -p updater) and pass -Updater <path>"
-}
 $verifyArgs = @('verify', '--manifest', $Manifest, '--root', $Root)
 foreach ($r in $Roots) { $verifyArgs += @('--root-update', $r) }
 if ((Invoke-Native $Updater $verifyArgs) -ne 0) { throw "updater verify failed: not publishing $Manifest" }
@@ -72,17 +130,8 @@ foreach ($p in $body.artifacts.PSObject.Properties) {
   $files += $path
 }
 
-# The fixed-tag channel release: created once, a pre-release so it never
-# shows as "Latest".
 $rel = "update-$Channel"
-# A first run has no channel release yet: gh exits non-zero, and we create it.
-if ((Invoke-Native gh @('release', 'view', $rel, '--repo', $Repo) -Quiet) -ne 0) {
-  "$rel does not exist yet: creating it (pre-release)"
-  $notes = "Signed update manifest for the $Channel channel, polled by the app. Not an installer."
-  if ((Invoke-Native gh @('release', 'create', $rel, '--repo', $Repo, '--prerelease', '--title', "Update channel: $Channel", '--notes', $notes)) -ne 0) {
-    throw "could not create release $rel"
-  }
-}
+Confirm-ChannelRelease $rel
 $manifestCopy = Join-Path $work 'manifest.json'
 Copy-Item $Manifest $manifestCopy -Force
 $upload = @($manifestCopy) + $files + $Roots

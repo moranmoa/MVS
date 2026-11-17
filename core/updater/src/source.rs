@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::manifest::is_valid_name;
 use crate::root::{MAX_ROOT_FETCH_BYTES, MAX_ROOT_UPDATES_PER_FETCH, MAX_ROOT_UPDATE_BYTES};
+use crate::flags::MAX_FLAGS_BYTES;
 use crate::{Version, MAX_MANIFEST_BYTES};
 
 /// Why a source could not deliver a file.
@@ -42,6 +43,11 @@ impl std::fmt::Display for SourceError {
 pub trait UpdateSource: Send + Sync {
     /// The signed manifest for `channel`, at most `MAX_MANIFEST_BYTES`.
     fn manifest(&self, channel: &str) -> Result<Vec<u8>, SourceError>;
+    /// The signed global flags (`flags.json`, slice 3b), at most
+    /// `MAX_FLAGS_BYTES`. A source without them answers `NotFound`.
+    fn flags(&self) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError::NotFound)
+    }
     /// Signed root rotations, oldest first. The caller applies
     /// `parse_root_fetch` (GAP-12); a source should stay inside its caps.
     fn root_updates(&self) -> Result<Vec<Vec<u8>>, SourceError>;
@@ -139,6 +145,10 @@ impl UpdateSource for HttpsSource {
     fn manifest(&self, _channel: &str) -> Result<Vec<u8>, SourceError> {
         // The channel is fixed by the release tag (`update-<channel>`).
         self.get_vec("manifest.json", MAX_MANIFEST_BYTES)
+    }
+
+    fn flags(&self) -> Result<Vec<u8>, SourceError> {
+        self.get_vec("flags.json", MAX_FLAGS_BYTES)
     }
 
     /// `root-2.json`, `root-3.json`, ... until the first missing one.

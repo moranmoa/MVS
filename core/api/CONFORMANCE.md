@@ -274,12 +274,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       - Nothing (seed, profile, birth date) is applied before `match=true`. A box that arrives earlier is held until then.
       - `match=false` ends the link (`failed`, `refused`) and wipes anything held.
       - Errors: `not-found` with no link; `bad-request` before `confirm`, when no digits are shown yet.
-    - Event `deviceLink.state`: `{ state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed', sas?, reason?: 'cancelled' | 'timeout' | 'refused' | 'network' }`. Absent fields are left out, never `null`.
+    - Event `deviceLink.state`: `{ state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed', sas?, reason?: 'cancelled' | 'timeout' | 'refused' | 'network' | 'keyring' | 'restore' }`. Absent fields are left out, never `null`.
       - `waiting` comes on start.
       - `confirm`, with `sas`, comes on the approving device's first hello.
       - `done` comes once the account has arrived and my user has confirmed the digits, followed by `identity.changed`.
       - `expired` (`timeout`) comes after 5 minutes.
-      - `failed` comes with `cancelled`, or with `refused` (`confirmDeviceLink(false)`, or a box that doesn't open), or with no reason (the restore failed).
+      - `failed` comes with `cancelled`, or with `refused` (`confirmDeviceLink(false)`, or a box that doesn't open), or, when the account arrived but couldn't be restored, with `keyring` (this computer's keychain couldn't store it) or `restore` (anything else).
   - **Approving device** (signed in):
     - `beginDeviceApproval(qrOrCode)` returns `{ sas, expiresAt }`. A code may be lowercase, with spaces or dashes. Errors:
       - `bad-request`: neither a QR nor a code;

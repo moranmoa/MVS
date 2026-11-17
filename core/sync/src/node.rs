@@ -2764,7 +2764,9 @@ impl Task {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                 for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
-                    if addr.iter().any(|p| p == Protocol::P2pCircuit) {
+                    // Also any DNS name a peer gave (hickory-advisories): never
+                    // stored, so never resolved or served to others.
+                    if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
                         self.swarm.behaviour_mut().kad.remove_address(&peer, addr);
                     }
                 }
@@ -3950,8 +3952,9 @@ pub(crate) fn via_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
 
 /// Like [`dialable`], but a relay circuit is fine (it is how peers behind
 /// NAT are reached) as long as the relay's own address is global. Used for
-/// addresses learned from peers (Kademlia, identify) before storing or
-/// dialling them.
+/// addresses learned from peers (Kademlia, identify, member answers) before
+/// storing or
+/// dialling them. A DNS name is never reachable: see below.
 pub(crate) fn reachable(addr: &Multiaddr, allow_lan: bool) -> bool {
     let mut global = true;
     for p in addr.iter() {
@@ -3959,13 +3962,20 @@ pub(crate) fn reachable(addr: &Multiaddr, allow_lan: bool) -> bool {
             Protocol::P2pCircuit => break,
             Protocol::Ip4(ip) => global &= global_v4(ip),
             Protocol::Ip6(ip) => global &= global_v6(ip),
-            Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name) | Protocol::Dnsaddr(name) => {
-                global &= global_name(&name)
-            }
+            // Never a DNS name learned from a peer: resolving it would query a
+            // server the peer may control, and a crafted answer reaches the
+            // resolver's decoding bugs (CPU, memory, panics; hickory-advisories,
+            // Tech Lead). Only configured addresses (our relays) are names.
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => return false,
             _ => {}
         }
     }
     global || allow_lan
+}
+
+/// Whether any part of `addr` is a DNS name.
+fn has_dns(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)))
 }
 
 fn global_v4(ip: std::net::Ipv4Addr) -> bool {
@@ -3991,12 +4001,6 @@ fn global_v6(ip: std::net::Ipv6Addr) -> bool {
         || ip.is_multicast()
         || (seg & 0xfe00) == 0xfc00 // unique local
         || (seg & 0xffc0) == 0xfe80) // link local
-}
-
-/// Names that only ever mean this machine or its LAN.
-fn global_name(name: &str) -> bool {
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    !(name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local"))
 }
 
 /// Why a pushed message isn't ingested: Ignore (not ours to judge) or Reject
@@ -4421,7 +4425,7 @@ mod tests {
     #[test]
     fn only_global_addresses_are_dialled_unless_lan_is_allowed() {
         let a = |s: &str| s.parse::<Multiaddr>().unwrap();
-        for global in ["/ip4/8.8.8.8/tcp/4001", "/dns4/relay.example/tcp/443", "/ip6/2001:4860::1/tcp/1"] {
+        for global in ["/ip4/8.8.8.8/tcp/4001", "/ip6/2001:4860::1/tcp/1"] {
             assert!(dialable(&a(global), false), "{global}");
         }
         for local in [
@@ -4440,12 +4444,21 @@ mod tests {
             "/ip4/224.0.0.251/udp/5353",
             "/ip6/::ffff:192.168.1.5/tcp/1",
             "/ip6/ff02::1/tcp/1",
-            "/dns4/localhost/tcp/1",
-            "/dns/printer.local/tcp/1",
-            "/dns4/app.localhost./tcp/1",
         ] {
             assert!(!dialable(&a(local), false), "{local}");
             assert!(dialable(&a(local), true), "{local} with LAN allowed");
+        }
+        // A DNS name learned from a peer is never dialled or stored, LAN or
+        // not (hickory-advisories): only configured addresses are names.
+        for name in [
+            "/dns4/relay.example/tcp/443",
+            "/dns/peer.example.org/tcp/4001",
+            "/dns6/x.example/udp/1/quic-v1",
+            "/dnsaddr/bootstrap.example",
+            "/dns4/localhost/tcp/1",
+            "/dns4/evil.example/tcp/1/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc/p2p-circuit",
+        ] {
+            assert!(!dialable(&a(name), true) && !reachable(&a(name), true), "{name}");
         }
         // Every component counts, not only the last.
         assert!(!dialable(&a("/ip4/10.0.0.1/tcp/1/ip4/8.8.8.8/tcp/2"), false));

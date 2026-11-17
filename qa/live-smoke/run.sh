@@ -71,7 +71,7 @@ docker network create "$P-b" >/dev/null
 side() { # role
   docker run -d --name "$P-$1" --network "$P-$1" -e ROLE="$1" -e ROUNDS="${ROUNDS:-10}" -e JOIN_LOG="${JOIN_LOG:-}" \
     -v "$(mount "$rv/core"):/core:ro" -v "$(mount "$rv/cfg"):/cfg:ro" -v "$(mount "$here"):/qa:ro" -v "$(mount "$rv"):/rendezvous" \
-    mvs-voice-e2e-app sh -c "chmod 777 /rendezvous 2>/dev/null; runuser -u pwuser -- dbus-run-session -- sh -c 'eval \"\$(gnome-keyring-daemon --start --components=secrets)\"; export GNOME_KEYRING_CONTROL; printf test | gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null && node /qa/live.mjs'" >/dev/null
+    mvs-voice-e2e-app sh -c "chmod 777 /rendezvous 2>/dev/null; runuser -u pwuser -- dbus-run-session -- sh -c 'eval \"\$(gnome-keyring-daemon --start --components=secrets)\"; export GNOME_KEYRING_CONTROL; printf test | gnome-keyring-daemon --replace --unlock --components=secrets >/dev/null && w=0 && until { dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.freedesktop.secrets | grep -q \"boolean true\" && dbus-send --session --print-reply --dest=org.freedesktop.secrets /org/freedesktop/secrets org.freedesktop.Secret.Service.ReadAlias string:default | grep -q collection/login; } || [ \$w -ge 150 ]; do w=\$((w+1)); sleep 0.2; done && echo keyring-wait=\$w >&2 && node /qa/live.mjs'" >/dev/null
 }
 side a
 side b

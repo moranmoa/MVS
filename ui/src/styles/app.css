@@ -3464,3 +3464,44 @@ input.switch:disabled {
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   font-size: 0.875rem;
 }
+
+/* "A new device was added to your account": stays until answered, at the top, clear of the composer. */
+.device-notices {
+  position: fixed;
+  inset-block-start: 0.75rem;
+  inset-inline: 0;
+  z-index: 41;
+  display: grid;
+  justify-items: center;
+  gap: 0.5rem;
+  padding-inline: 1rem;
+  pointer-events: none;
+}
+
+.device-notices > .toast {
+  position: static;
+  transform: none;
+  max-width: min(32rem, 100%);
+  pointer-events: auto;
+}
+
+/* The toast inverts the colours; this button keeps the normal secondary look (UX: >= 4.5:1). */
+.device-notice .device-notice-me {
+  background: var(--bg-input);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.device-notice {
+  align-items: flex-start;
+  border-inline-start: 3px solid var(--danger);
+}
+
+.device-notice-body {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.device-notice-body .actions {
+  margin-block-start: 0.25rem;
+}

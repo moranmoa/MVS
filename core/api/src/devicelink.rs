@@ -146,7 +146,8 @@ impl Target {
 #[serde(rename_all = "camelCase")]
 pub struct Payload {
     /// The 12 recovery words, space-separated.
-    pub seed: String,
+    #[serde(with = "secret_string")]
+    pub seed: Zeroizing<String>,
     pub profile: PayloadProfile,
     pub birth_date: String,
     pub birth_date_trusted: bool,
@@ -163,10 +164,19 @@ pub struct PayloadProfile {
     pub color: Option<String>,
 }
 
-impl Drop for Payload {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.seed.zeroize();
+/// The seed as a `Zeroizing<String>` in JSON: a plain string on the wire,
+/// wiped from memory when the payload is dropped (Security Lead on #407).
+/// Deserialising moves the parsed `String` into the wrapper (no copy).
+mod secret_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S: Serializer>(value: &Zeroizing<String>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(value.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Zeroizing<String>, D::Error> {
+        String::deserialize(d).map(Zeroizing::new)
     }
 }
 
@@ -199,7 +209,7 @@ mod tests {
 
     fn payload() -> Payload {
         Payload {
-            seed: "legal winner thank year wave sausage worth useful legal winner thank yellow".into(),
+            seed: Zeroizing::new("legal winner thank year wave sausage worth useful legal winner thank yellow".into()),
             profile: PayloadProfile { display_name: "Me".into(), avatar_small: None, color: Some("#123456".into()) },
             birth_date: "1990-05-01".into(),
             birth_date_trusted: true,
@@ -221,6 +231,21 @@ mod tests {
         assert_ne!(sas(&mitm.public, &old.public), digits);
         // A low-order point gives no key.
         assert!(old.transfer_key(&[0; 32], &[0; 32], &old.public).is_none());
+    }
+
+    /// Security Lead on #407: the received words are a `Zeroizing<String>`,
+    /// so they are wiped when the payload drops (this fails to compile if
+    /// the type ever goes back to a plain `String`).
+    #[test]
+    fn the_seed_is_wiped_on_drop() {
+        fn seed(p: &Payload) -> &Zeroizing<String> {
+            &p.seed
+        }
+        let p = payload();
+        assert!(seed(&p).starts_with("legal"));
+        let key = [3u8; 32];
+        let back = open(&key, &seal(&key, &p)).unwrap();
+        assert_eq!(back.seed.as_str(), p.seed.as_str(), "the same words over the wire");
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub const MAX_DEVICE_LINK: usize = 8 * 1024;
 pub const DEVICE_LINK_TTL: Duration = Duration::from_secs(300);
 /// How long a provider lookup for a code waits.
 pub const DEVICE_LINK_FIND_WAIT: Duration = Duration::from_secs(10);
+#[cfg(any(test, feature = "test-util"))]
 const RV_CONTEXT: &str = "mvs/device-link-rv/v1";
 const HELLO: u8 = 0x01;
 const SEALED: u8 = 0x02;
@@ -48,6 +49,9 @@ const MAX_PEERS: usize = 16;
 /// The rendezvous key for a short code: `blake3::derive_key(
 /// "mvs/device-link-rv/v1", code)`. The core normalises the code (as
 /// typed, upper case, no spaces or dashes) before calling.
+/// Tests only: the core (`api::devicelink`) computes the same key from the
+/// normalised code, and is the one the app uses.
+#[cfg(any(test, feature = "test-util"))]
 pub fn rendezvous(code: &str) -> [u8; 32] {
     blake3::derive_key(RV_CONTEXT, code.as_bytes())
 }

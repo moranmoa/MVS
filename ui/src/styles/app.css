@@ -2434,6 +2434,7 @@ kbd {
   height: 2.75rem;
 }
 
+.call-actions .call-deafen.muted,
 .call-actions .call-mute.muted {
   color: var(--danger);
 }

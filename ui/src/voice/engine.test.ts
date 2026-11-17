@@ -232,7 +232,7 @@ interface Harness {
   env: VoiceEnv;
   mics: FakeStream[];
   contexts: FakeAudioContext[];
-  audios: { srcObject: unknown; paused: boolean }[];
+  audios: { srcObject: unknown; paused: boolean; muted: boolean }[];
   pcs: FakePC[];
 }
 
@@ -261,7 +261,7 @@ function fakeEnv(opts: { micError?: string } = {}): Harness {
       return c as unknown as AudioContext;
     },
     createAudioElement: () => {
-      const a = { srcObject: null as unknown, paused: true, autoplay: false, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
+      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
       h.audios.push(a);
       return a as unknown as HTMLAudioElement;
     },
@@ -395,6 +395,21 @@ describe('voice engine', () => {
       { identity: A, state: 'connected' },
       { identity: B, state: 'connected' },
     ]);
+  });
+
+  it('G-84: deafen silences everyone, also audio that starts later, and undeafen plays it again', async () => {
+    const { hx, hy, cx, cy, ex, ey } = pair();
+    ex.setDeafened(true);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.audios).toHaveLength(1);
+    expect(hx.audios[0]!.muted).toBe(true); // connected while deafened
+    expect(hy.audios[0]!.muted).toBe(false); // the other side is unaffected
+    ex.setDeafened(false);
+    expect(hx.audios[0]!.muted).toBe(false);
+    ex.setDeafened(true);
+    expect(hx.audios[0]!.muted).toBe(true);
   });
 
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {

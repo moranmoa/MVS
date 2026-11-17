@@ -3,12 +3,12 @@
 // the IP notice, the join error line, the roster notes. The audio itself (microphone, WebRTC, speaking levels) is the
 // voice engine's, piece D in ui/src/voice.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Dialog } from '../../components/common';
-import { AlertIcon, GearIcon, HangUpIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
+import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
 
@@ -129,6 +129,8 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   const intl = useIntl();
   const call = useStore(store, (s) => s.call);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** G-84: deafening muted my mic, so undeafening unmutes it. */
+  const mutedByDeafen = useRef(false);
   // The call may be in another server's room than the one on screen.
   const serverId = useStore(store, (s) => Object.entries(s.voiceRooms).find(([, rooms]) => rooms.some((r) => r.roomId === s.call?.channelId))?.[0]);
   const serverName = useStore(store, (s) => s.servers.find((x) => x.id === serverId)?.name ?? '');
@@ -137,11 +139,34 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   const me = call.participants.find((p) => p.identity === myId);
   const noMic = engine.noMic;
   const noMicText = intl.formatMessage({ id: engine.error === 'rejoin-to-talk' ? 'call.rejoinToTalk' : 'call.noMic' });
+  const setMute = (muted: boolean) => {
+    engine.setMicMuted(muted);
+    void core.setMuted(muted).catch(() => {});
+  };
   const toggleMute = () => {
     if (noMic) return;
     const muted = !me?.muted;
-    engine.setMicMuted(muted);
-    void core.setMuted(muted).catch(() => {});
+    // As in Discord: unmuting while deafened undeafens too.
+    if (!muted && engine.deafened) {
+      engine.setDeafened(false);
+      mutedByDeafen.current = false;
+    }
+    setMute(muted);
+  };
+  // G-84: deafen silences everyone and mutes me (others see me muted);
+  // undeafen plays them again and unmutes me if deafening muted me.
+  const toggleDeafen = () => {
+    if (!engine.deafened) {
+      engine.setDeafened(true);
+      if (!me?.muted && !noMic) {
+        mutedByDeafen.current = true;
+        setMute(true);
+      }
+    } else {
+      engine.setDeafened(false);
+      if (mutedByDeafen.current) setMute(false);
+      mutedByDeafen.current = false;
+    }
   };
 
   return (
@@ -150,6 +175,12 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         <PhoneIcon />
         <FormattedMessage id="call.inCall" values={{ server: serverName }} />
       </p>
+      {engine.deafened && (
+        <p id="call-deafened" className="call-no-mic" role="status">
+          <HeadphonesOffIcon />
+          <FormattedMessage id="call.deafenedNote" />
+        </p>
+      )}
       {noMic && (
         <p id="call-no-mic" className="call-no-mic" role="status">
           <MicOffIcon />
@@ -168,6 +199,16 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
           onClick={toggleMute}
         >
           {me?.muted ? <MicOffIcon /> : <MicIcon />}
+        </button>
+        <button
+          type="button"
+          className={`icon-button call-deafen ${engine.deafened ? 'muted' : ''}`}
+          aria-pressed={engine.deafened}
+          aria-label={intl.formatMessage({ id: 'call.deafen' })}
+          title={intl.formatMessage({ id: 'call.deafen' })}
+          onClick={toggleDeafen}
+        >
+          {engine.deafened ? <HeadphonesOffIcon /> : <HeadphonesIcon />}
         </button>
         <button
           type="button"

@@ -3094,14 +3094,14 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     }
     // The UI can say who blocks it.
     let old_id = hex::encode(old.verifying_key().to_bytes());
-    assert_eq!(owner.core.get_update_needed(&server.id).unwrap(), [old_id]);
+    assert_eq!(owner.core.get_update_needed(&server.id, None).unwrap(), [old_id]);
     assert_eq!(world.network.fetch(server_key).len(), signed + 1, "signed past the gate");
     // It updates: the cap in its latest profile post opens the gate.
     world.network.publish(&profile(r#","caps":["server-lifecycle-v1"]"#, 3));
     for peer in [&owner, &guest, &third] {
         peer.core.sync_now().unwrap();
     }
-    assert!(owner.core.get_update_needed(&server.id).unwrap().is_empty());
+    assert!(owner.core.get_update_needed(&server.id, None).unwrap().is_empty());
 
     // Leave: not the owner; a member leaves and the server leaves their
     // device; the others see them gone.

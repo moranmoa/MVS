@@ -14,6 +14,8 @@ bash qa/voice-e2e/run.sh
 Other ways to run it:
 - `REBUILD=1` rebuilds `mvs-core` and the UI first. Otherwise `.build/` is reused.
 - `KEEP=1` leaves the containers running afterwards.
+- `EXPECT_PATH=direct` or `EXPECT_PATH=relay` makes G81.1 (below) a hard check for the two-network runs. Unset, it only reports the path.
+- `SETUP_MAX_MS` sets the G81.2 limit. The default is 10000, the PO's 10 s target (#426).
 
 The first run builds `mvs-core` in release mode, which takes several minutes. After that a run takes about 2 minutes. Exit code 0 means every check passed.
 
@@ -45,7 +47,13 @@ The network:
 3. **WebRTC checks.** The test wraps `RTCPeerConnection` to read the engine's own connections, then checks:
    - the connection reaches `connected`;
    - the certificate the peer presents (`getStats`) equals the fingerprint in the signed SDP;
-   - inbound and outbound RTP audio bytes are over 0 and growing.
+   - inbound and outbound RTP audio bytes are over 0 and growing;
+   - **G81.1, the call's path:**
+     - "direct" when both selected candidates are `host`, `srflx` or `prflx`;
+     - "relay" when either is `relay` (TURN);
+     - the report shows candidate types only, never an address, and the check fails if one gets through.
+   - **G81.2, setup time,** on the joiner (B): from its OK on the IP notice to `connected`, at most `SETUP_MAX_MS`.
+   - Diagnostics after a failed connection list each candidate's protocol and type only, never its address.
 4. **Media permissions in a call.** The microphone is granted. Camera, screen, and system audio with a screen share are refused.
 5. **Mute.** A mutes. B must see A's mic-off icon and receive no audio energy from A. Then A unmutes.
 6. **Leave.**

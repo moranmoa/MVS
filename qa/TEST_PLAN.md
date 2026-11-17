@@ -26,6 +26,7 @@ Windows, macOS ו-Linux, לפני שמזמינים בודקים. Web, קול, DM
 | מחשבים אמיתיים: Windows 11, macOS (Intel + Apple Silicon), Ubuntu / Fedora | בדיקות ידניות, התקנה, עדכון, NAT, ביצועים |
 | רשתות: סיב ביתי, נקודה חמה סלולרית, רשת עבודה עם חומת אש | חציית NAT ו-relay |
 | מחשב ייחוס לביצועים: 4 ליבות, 8GB, SSD | כל יעדי ביצועי הממשק |
+| Windows Sandbox (`qa/windows-sandbox/run.ps1`) | A packaged Windows release, started in a throwaway sandbox. A packaged build must never run on the owner's PC: it ignores `MVS_TEST_USER_DATA` and writes the identity to Credential Manager. See INS-20 |
 
 ## חומרה וסיווג באגים
 
@@ -270,6 +271,7 @@ records/authority, updater).
 | INS-17 | 1 | דיאלוג ההסרה ב-Windows | הסרה מ"אפליקציות מותקנות" עם חשבון קיים: (א) אישור בלי לשנות כלום; (ב) בחירה ב"מחיקת הנתונים שלי" ואישור; (ג) בחירה במחיקה ואז ביטול | (א) ברירת המחדל היא **שמירה**: הנתונים והזהות נשארים (INS-08). (ב) לפני המחיקה מוצגת האזהרה של INS-09, והנתונים נמחקים רק אחרי אישור. (ג) ביטול לא מוחק כלום. הדיאלוג עובד עם מקלדת וקורא מסך, ושתי האפשרויות ברורות | ידני (הבדיקות האוטומטיות של #78 לא מכסות את הדיאלוג) |
 | INS-18 | 1 | החבילה המותקנת מול ה-core האמיתי | אחרי התקנה נקייה (INS-01/02): הצטרפות, הצגת 12 המילים, בדיקת המילים (B19), ואז יצירת שרת | כל הזרימה עובדת מול ה-core האמיתי (לא mock): המילים נבדקות נכון, טעות מסמנת רק את המילים השגויות, והשרת נוצר ונשאר אחרי סגירה ופתיחה מחדש | ידני (חובה ב-Windows; ב-Linux כשיש חבילה) |
 | INS-19 | 1 | קישור `mvs://` לא מצטרף לבד | עם האפליקציה סגורה וגם פתוחה: לחיצה על קישור הזמנה `mvs://` מהדפדפן או מאפליקציה אחרת | האפליקציה נפתחת במסך ההצטרפות עם פרטי ההזמנה כבר מולאו. **אין הצטרפות** עד שהמשתמש לוחץ "הצטרפות"; ביטול או סגירה לא מצטרפים | ידני (התיקון מ-#78) |
+| INS-20 | 1 | Packaged release starts (Windows Sandbox) | On a QA PC with Windows Sandbox enabled: `run.ps1 -Tag vX.Y.Z` (or `-Zip <path>`). Networking is off unless `-Network` is given, and that needs the manager's OK | The zip matches `SHA256SUMS`. `mvs.exe` and `getAppInfo` report the tag's version. The app starts, shows a window, and starts its core, which is still the same process 15 s later. `mvs.log` has no core start failures or crashes. Nothing touches the host's profile or Credential Manager | Automatic on a QA PC (`qa/windows-sandbox`), never in CI. `-KeepOpen` leaves the sandbox open for manual INS-03/INS-18 checks |
 
 ---
 
@@ -346,6 +348,13 @@ records/authority, updater).
 (46 בדיקות, כולל שחזור של כל באג UI פתוח ב-`BUGS.md`, UX-01, פריסת טלפון ונתונים עוינים) רצים ב-Docker מול ה-UI;
 `qa/core/cli-checks.sh` בודק את ה-CLI של updater ו-spike-peer עם קלט שגוי
 ו-manifest מזויף.
+
+**Packaged Windows build: `qa/windows-sandbox/run.ps1` (INS-20).**
+- **What it does:** runs a release's Windows zip inside Windows Sandbox and checks the version, that the app starts, and that its core comes up and stays up. The sandbox and everything the app wrote are thrown away afterwards.
+- **Why:** this is the only supported way to run a packaged build on a development PC.
+- **Setup:** enabling the Windows Sandbox feature is the owner's call.
+
+See `qa/windows-sandbox/README.md`.
 
 ## סיכונים לבדיקות
 

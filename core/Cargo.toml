@@ -1,3 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["api", "authority", "groupkeys", "identity", "records", "spike-peer", "sync", "updater"]
+# Not workspace members: vendored third-party code, built only as a patch.
+exclude = ["vendor"]
+
+# hickory-proto 0.25 advisories (name-compression CPU, SVCB/zone panics,
+# header-count memory): libp2p 0.56's libp2p-dns 0.44 pins hickory 0.25,
+# and libp2p-dns 0.45 (hickory 0.26) needs libp2p 0.57, whose identity 0.3
+# would duplicate every Ed25519/X25519 crate we use. So: libp2p-dns 0.45's
+# source, built as 0.44.0 against libp2p-core 0.43 (vendor/libp2p-dns/README.md).
+# Remove with the libp2p 0.57 bump.
+[patch.crates-io]
+libp2p-dns = { path = "vendor/libp2p-dns" }

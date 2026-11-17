@@ -166,6 +166,35 @@ const MAX_FETCH_PEERS: usize = 16;
 /// Traffic on every connection at least this often, well under the 100 s a
 /// proxy like Cloudflare lets a WebSocket sit idle.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// A ping unanswered this long fails (the default is 20 s).
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Our relay's connection is closed after this many failed pings in a row.
+/// libp2p's ping no longer closes anything itself, and a connection that died
+/// silently (a NAT entry gone, a laptop lid) would otherwise sit until
+/// IDLE_TIMEOUT. Worst case [`relay_silent_for`]: within a minute, so the
+/// member relay fallback (RELAY_DOWN_AFTER) starts from a real loss.
+const RELAY_PING_MISSES: u32 = 2;
+
+/// The longest our relay can stay silent before its connection is closed.
+#[cfg(test)]
+const fn relay_silent_for() -> Duration {
+    Duration::from_secs((PING_INTERVAL.as_secs() + PING_TIMEOUT.as_secs()) * RELAY_PING_MISSES as u64)
+}
+
+/// One ping result from our relay: the misses in a row so far, and whether
+/// to close the connection now.
+fn relay_ping(misses: &mut u32, ok: bool) -> bool {
+    if ok {
+        *misses = 0;
+        return false;
+    }
+    *misses += 1;
+    if *misses >= RELAY_PING_MISSES {
+        *misses = 0;
+        return true;
+    }
+    false
+}
 /// Bytes of served pull pages: per peer, and for all peers together.
 const SERVED_BYTES_BURST: u32 = 16 * 1024 * 1024;
 const SERVED_BYTES_RATE: u32 = 2 * 1024 * 1024;
@@ -759,6 +788,7 @@ impl Node {
             relay_lost_at: Some(Instant::now()),
             member_listeners: HashMap::new(),
             member_reserved: HashSet::new(),
+            relay_ping_misses: 0,
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
@@ -1168,7 +1198,7 @@ async fn build_swarm(
                     ),
                     relay,
                 ),
-                ping: ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL)),
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL).with_timeout(PING_TIMEOUT)),
                 kad,
                 gossipsub,
                 sync: request_response::cbor::Behaviour::new(
@@ -1438,6 +1468,8 @@ struct Task {
     member_listeners: HashMap<ListenerId, PeerId>,
     /// Member relay listeners whose reservation was accepted.
     member_reserved: HashSet<ListenerId>,
+    /// Failed pings in a row to our relay (`relay_ping`).
+    relay_ping_misses: u32,
     member_relay_rest: HashMap<PeerId, Instant>,
     fallback_dialed: HashMap<(PeerId, PeerId), Instant>,
     fallback_dials: HashSet<ConnectionId>,
@@ -2701,6 +2733,14 @@ impl Task {
             // Slice 2: Kademlia also files the address a connection was dialled
             // on; a circuit through a member relay must never reach the DHT we
             // serve (design #368 §1 rule 2), so it is taken out again at once.
+            // A silently dead connection to our relay is closed after
+            // RELAY_PING_MISSES failed pings, so the fallback clock starts.
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if peer == self.relay_peer => {
+                if relay_ping(&mut self.relay_ping_misses, result.is_ok()) {
+                    info!("our relay stopped answering pings: closing its connection");
+                    self.swarm.close_connection(connection);
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                 for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
                     if addr.iter().any(|p| p == Protocol::P2pCircuit) {
@@ -2829,7 +2869,7 @@ impl Task {
                     }
                     request_response::Message::Response { request_id, response } => {
                         if let Some(reply) = self.link_out.remove(&request_id) {
-                            let _ = reply.send(if response.is_empty() { Err(LinkError::Refused) } else { Ok(response) });
+                            let _ = reply.send(crate::device_link::outcome(response));
                         }
                     }
                 }
@@ -3520,7 +3560,7 @@ impl Task {
     fn on_link_request(&mut self, peer: PeerId, request: LinkRequest, channel: ResponseChannel<Vec<u8>>) {
         let (answer, inbound) = match self.link_host.as_mut() {
             Some(host) => host.answer(peer, request, Instant::now()),
-            None => (Vec::new(), None),
+            None => (vec![crate::device_link::GONE], None),
         };
         if matches!(inbound, Some(crate::device_link::Inbound::Hello { .. })) {
             self.mark_link_peer(peer);
@@ -4768,6 +4808,20 @@ mod tests {
         for node in [a, b, c, d] {
             node.shutdown().await.unwrap();
         }
+    }
+
+    /// The Tech Lead on #399: a silently dead connection to our relay is
+    /// closed within about a minute (two failed pings in a row), so the
+    /// member relay fallback starts; one lost ping alone closes nothing.
+    #[test]
+    fn a_silent_relay_is_closed_within_a_minute() {
+        assert!(relay_silent_for() <= Duration::from_secs(60), "{:?}", relay_silent_for());
+        let mut misses = 0;
+        assert!(!relay_ping(&mut misses, false), "one miss");
+        assert!(!relay_ping(&mut misses, true), "an answer resets");
+        assert!(!relay_ping(&mut misses, false));
+        assert!(relay_ping(&mut misses, false), "two in a row close it");
+        assert_eq!(misses, 0);
     }
 
     #[test]

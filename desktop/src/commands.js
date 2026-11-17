@@ -52,6 +52,7 @@ const COMMANDS = Object.freeze({
   startDeviceLink: [],
   cancelDeviceLink: [],
   confirmDeviceLink: ['match'],
+  ackDeviceNotice: ['at'],
   beginDeviceApproval: ['qrOrCode'],
   confirmDeviceApproval: ['approve'],
   // Voice (#223); voice rooms (0.4.3)

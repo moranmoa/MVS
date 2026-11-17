@@ -32,6 +32,7 @@ import type {
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
+  DeviceAdded,
   MemberRelay,
   MemberRelaySetting,
 } from './types';
@@ -146,6 +147,8 @@ export interface CoreCommands {
   cancelDeviceLink(): Promise<null>;
   /** New device, on "confirm": the digits match the other device (Security Lead: nothing is applied before true). false fails the link. */
   confirmDeviceLink(match: boolean): Promise<null>;
+  /** The "new device added" notice was seen ("It was me"); the core stops showing it. */
+  ackDeviceNotice(at: number): Promise<null>;
   /** Signed-in device: reach the new device by its QR payload or code. Rejects not-found (no such link, or expired), rate-limited. */
   beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
   /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */
@@ -242,6 +245,8 @@ export interface CoreEvents {
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
+  /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */
+  'account.deviceAdded': DeviceAdded;
   /** Member relays: anything in it changed (role, servers, relay-only, birth date, setting). */
   'memberRelay.changed': MemberRelay;
 }

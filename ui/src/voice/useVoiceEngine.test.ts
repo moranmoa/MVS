@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Id } from '../core/types';
-import { nextPeerFailed } from './useVoiceEngine';
+import { loadVolumes, nextPeerFailed } from './useVoiceEngine';
 
 const A: Id = 'a'.repeat(64);
 const B: Id = 'b'.repeat(64);
@@ -43,5 +43,21 @@ describe('nextPeerFailed', () => {
 
   it('clears everything when the call ends', () => {
     expect(nextPeerFailed({ [B]: 'failed', [C]: 'refused' }, { participants: [] })).toEqual({});
+  });
+});
+
+describe('G-73: stored per-person volumes', () => {
+  const KEY = 'mvs.voice.volumes.v1';
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  it('keeps only 64-hex IDs with a whole percent in 0..100; anything else reads as empty', () => {
+    localStorage.setItem(KEY, JSON.stringify({ [A]: 35, [B]: 0, short: 50, [A.toUpperCase()]: 20, ['c'.repeat(64)]: 101, ['d'.repeat(64)]: 2.5, ['e'.repeat(64)]: '40' }));
+    expect(loadVolumes()).toEqual({ [A]: 35, [B]: 0 });
+    for (const raw of ['not json', '[1,2]', 'null', '7']) {
+      localStorage.setItem(KEY, raw);
+      expect(loadVolumes(), raw).toEqual({});
+    }
+    localStorage.removeItem(KEY);
+    expect(loadVolumes()).toEqual({});
   });
 });

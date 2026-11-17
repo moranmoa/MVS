@@ -3537,6 +3537,22 @@ input.switch:disabled {
   }
 }
 
+/* G-73: volume per person, in Voice settings. */
+.call-volumes {
+  margin-block-start: 1rem;
+  padding: 0;
+  border: 0;
+}
+
+.call-volumes legend {
+  font-weight: 600;
+  margin-block-end: 0.5rem;
+}
+
+.call-volumes .field + .field {
+  margin-block-start: 0.5rem;
+}
+
 /* G-23: a date divider between days (muted text, AA on every theme). */
 .date-divider {
   display: flex;

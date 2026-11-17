@@ -124,7 +124,7 @@ Holders are personal devices that come and go.
 | Whoever controls my inbox | Still needs 3 holders' release and 72 hours with no cancel from my devices (the #365 residual, now also bound to members) |
 | The mailer operator | Has `r_m` and can skip the code, but needs 3 colluding holders, and my devices see the pending notice |
 | Holders who later leave | A fresh split on re-share; old shares never open the new envelope |
-| Holders learning who I am | Only `h` and a share; no identity key, email or seed |
+| Holders learning who I am | The records hold only `h` and a share; no identity key, email or seed. But holders are my co-members and a share arrives from my device, so a holder can usually link `h` to me. It still can't get the seed without 2 other holders and the mailer |
 | Replay of an old release token | Bound to `h`, `new_device_pub` and a 7-day validity; a newer cancel or delete wins |
 | A device of mine is lost, but I still have others | My devices cancel; the words still work. This path is only for when everything is lost |
 

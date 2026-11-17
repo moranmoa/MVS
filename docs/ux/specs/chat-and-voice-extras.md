@@ -66,12 +66,12 @@
 | **רמקולים** | Output select (`setSinkId`). "השמעת צליל בדיקה" plays a short sound on that device |
 | **אופן הדיבור** | Radio: "פתוח לדיבור" (default) / "לחיצה לדיבור" (§6) |
 
-- **Labels:** device labels are only known after mic permission. Before that, the select shows "צריך לאשר גישה למיקרופון" with a "אישור גישה" button (voice-c's permission handler).
+- **Mic gate (V-C2, sec-lead): option (a).** The shell allows `getUserMedia` only during a call, so **the full controls live in the in-call Voice dialog** (call bar, #429). Settings → "קול" outside a call shows the speaker picker and "השמעת צליל בדיקה" (no mic needed), plus a line instead of the meter: "אפשר לבדוק את המיקרופון בזמן שיחה." / "You can test your microphone during a call." Device names appear once the mic has been allowed in a call. There's no separate mic-test permission window (it would need a sec-lead review).
 - **Device unplugged mid-call:** fall back to the system default, with a toast "המיקרופון התנתק. עברנו לברירת המחדל." / "Your microphone was disconnected. Switched to the default."
 
 ## 5. In-call controls
 
-**Per-person volume (G-73):** right-click a person in the room roster (B25) → a "עוצמה" slider, 0–200% in 10% steps, with the value shown as `⁨{n}⁩%`. "השתקה אצלי" sets it to 0. Local only, remembered per userId across calls. There's no slider for myself.
+**Per-person volume (G-73):** right-click a person in the room roster (B25) → a "עוצמה" slider, 0–200% in 10% steps (above 100% needs a Web Audio gain path in `ui/src/voice`, voice-d; until then 0–100% is acceptable as a first step), with the value shown as `⁨{n}⁩%`. "השתקה אצלי" sets it to 0. Local only, remembered per userId across calls. There's no slider for myself.
 
 **Deafen (G-84):** a headphones button in the call bar, between mute and hang-up, at 44px, with `aria-pressed` and the label "השתקת השמע" / "Deafen".
 - On: all incoming audio is muted and my mic is forced off.
@@ -109,6 +109,7 @@
 | `voice.playTest` | `השמעת צליל בדיקה` | `Play test sound` |
 | `voice.needPermission` | `צריך לאשר גישה למיקרופון` | `Allow microphone access` |
 | `voice.micGone` | `המיקרופון התנתק. עברנו לברירת המחדל.` | `Your microphone was disconnected. Switched to the default.` |
+| `voice.micTestInCall` | `אפשר לבדוק את המיקרופון בזמן שיחה.` | `You can test your microphone during a call.` |
 | `voice.mode` | `אופן הדיבור` | `Input mode` |
 | `voice.mode.open` | `פתוח לדיבור` | `Voice activity` |
 | `voice.mode.ptt` | `לחיצה לדיבור` | `Push to talk` |

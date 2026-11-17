@@ -173,3 +173,20 @@ Holders are personal devices that come and go.
 3. **Holder freshness:** 14 days seen to be picked, and 30 days unseen to be replaced. Are these right?
 4. **Do holders need the email code at all**, given the mailer's signed token after the hold already binds it?
 5. **Opt-in default and PO wording:** off by default, with the #365 single-device warning reused?
+
+## 10. Security Lead's verdict (approved at c889e71; these replace earlier sections where they differ)
+
+- **M1, holders run their own hold:**
+  - A holder releases its share only if it has **itself seen `pending(h)` for at least 72 hours**, by its own clock from its own first sighting, with no `w`-signed cancel or delete since (as in #365 §9).
+  - The mailer's release token is necessary, not sufficient. A compromised mailer can't shortcut the hold.
+- **The threshold is never below 3:**
+  - 5 owner groups: 3-of-5.
+  - 4 owner groups: 3-of-4.
+  - Exactly 3 owner groups: 3-of-3. The UI says availability is weak.
+  - Fewer than 3: unavailable ("not enough independent servers yet").
+
+  There's no 2-of-3 (§2 and §9.1 are replaced).
+- **Shares are sealed at holders** under the holder's local storage key (GAP-11). A stolen holder database yields nothing on its own; a share is decrypted only to answer a valid release.
+- **Freshness:** 14 days seen to be picked, 30 days unseen to be replaced. Re-share as soon as **2 or more** holders are stale.
+- **No email code at holders.** The token binds it after the hold, and with M1 the holders still enforce the hold themselves.
+- **Off by default, opt-in.** The opt-in screen reuses the #365 warning and adds: "Your account can be recovered by email plus [3] people's apps you share servers with, after 72 hours unless you cancel from one of your devices. Your 12 words always still work."

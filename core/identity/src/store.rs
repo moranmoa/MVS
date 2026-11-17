@@ -331,3 +331,39 @@ mod missing_entry_rule {
         assert!(missing_is_none(None, || Err(StoreError("bus".into()))).is_err());
     }
 }
+
+/// Timing probe for QA's slow headless start (not a check): run with
+/// `--ignored --nocapture` on a session bus with gnome-keyring.
+#[cfg(all(test, feature = "os-keychain", target_os = "linux"))]
+mod startup_timing {
+    use super::*;
+
+    #[test]
+    #[ignore = "a timing probe; needs gnome-keyring"]
+    fn time_the_startup_calls() {
+        use secret_service::{blocking::SecretService, EncryptionType};
+        let t = std::time::Instant::now();
+        let lap = |what: &str, t: &mut std::time::Instant| {
+            eprintln!("TIMING {what}: {} ms", t.elapsed().as_millis());
+            *t = std::time::Instant::now();
+        };
+        let mut t0 = t;
+        default_store().unwrap();
+        lap("store setup (connect, DH)", &mut t0);
+        let k = OsKeychain::new();
+        let e = k.entry("identity-secret-v1").unwrap();
+        lap("entry", &mut t0);
+        let r = e.get_secret();
+        lap(&format!("get_secret ({:?})", r.as_ref().err().map(|e| e.to_string())), &mut t0);
+        let ss = SecretService::connect(EncryptionType::Plain).unwrap();
+        lap("connect plain", &mut t0);
+        let d = ss.get_default_collection().map(|c| c.is_locked());
+        lap(&format!("default + is_locked ({:?})", d.as_ref().ok()), &mut t0);
+        drop(ss);
+        let r = k.load("identity-secret-v1");
+        lap(&format!("load again ({})", r.is_ok()), &mut t0);
+        let r = k.load("identity-secret-v1");
+        lap(&format!("load a third time ({})", r.is_ok()), &mut t0);
+        eprintln!("TIMING total: {} ms", t.elapsed().as_millis());
+    }
+}

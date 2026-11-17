@@ -134,7 +134,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       - A record claiming a time more than 10 minutes past the folding core's clock waits: it isn't counted, and its time doesn't count for the records built on it, until then.
     - **Rate:** an author's accepted reaction is ignored when 30 of theirs are already counted within a minute of its effective time, either way. The count uses the effective time capped at now, so the 10 minutes of lead add no room.
     - A new reaction is signed at its effective time (my clock, or its deps' time if later), so a clock up to 10 minutes slow isn't ignored as backdated.
-    - **Residual (dev-sync follow-up):** a chain built on stale heads can still spread its claimed times over the minutes since those heads. The real bound is a receive-time check at sync ingest.
+    - **Accepted residual (dev-sync follow-up, GAP-25):** a hostile client whose reactions have stale deps, or no channel deps at all (only `auth_deps` is required), can still spread its claimed times freely. Only the receive-time check at sync ingest bounds that.
     - Then a reaction counts only if it opens to a valid plaintext whose target is a shown `Message` of that channel that isn't deleted.
     - Per (message, emoji, author), the last op wins.
     - An add is ignored while the author already has 10 emoji on that message; a removal frees a place.

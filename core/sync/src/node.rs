@@ -788,7 +788,7 @@ impl Node {
             relay_lost_at: Some(Instant::now()),
             member_listeners: HashMap::new(),
             member_reserved: HashSet::new(),
-            relay_ping_misses: 0,
+            relay_ping_misses: HashMap::new(),
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
@@ -1468,8 +1468,10 @@ struct Task {
     member_listeners: HashMap<ListenerId, PeerId>,
     /// Member relay listeners whose reservation was accepted.
     member_reserved: HashSet<ListenerId>,
-    /// Failed pings in a row to our relay (`relay_ping`).
-    relay_ping_misses: u32,
+    /// Failed pings in a row to our relay, per connection (`relay_ping`):
+    /// one dead connection among several (TCP and QUIC) is closed on its own
+    /// count (Security Lead, #400).
+    relay_ping_misses: HashMap<ConnectionId, u32>,
     member_relay_rest: HashMap<PeerId, Instant>,
     fallback_dialed: HashMap<(PeerId, PeerId), Instant>,
     fallback_dials: HashSet<ConnectionId>,
@@ -2367,6 +2369,22 @@ impl Task {
     /// logs in turn (a different slice each round), so a node with many
     /// servers never sends a peer more pulls than its limits take. `pull`
     /// also keeps at most [`MAX_PULLS_IN_FLIGHT`] out at once.
+    /// The channel logs of `server` we share with `peer`, pulled at once
+    /// (`peer` just bound for it).
+    fn pull_bound_channels(&mut self, peer: PeerId, server: ServerId) {
+        let logs: Vec<String> = self
+            .logs
+            .iter()
+            .filter(|log| !log.ends_with(CONTROL_SUFFIX))
+            .filter(|log| self.sealing.get(log).is_some_and(|s| s.server == server))
+            .filter(|log| self.shares(peer, log))
+            .cloned()
+            .collect();
+        for log in logs {
+            self.pull(peer, &log, "bound");
+        }
+    }
+
     fn pull_shared(&mut self, peer: PeerId, cause: &'static str, limit: usize) {
         let (mut bound, mut rest): (Vec<String>, Vec<String>) = self
             .logs
@@ -2586,6 +2604,7 @@ impl Task {
                 self.per_ip.release(connection_id);
                 self.bootstrap_conns.remove(&connection_id);
                 self.relayed_preferred.remove(&connection_id);
+                self.relay_ping_misses.remove(&connection_id);
                 let had_direct = self.direct.contains_key(&peer_id);
                 for conns in [&mut self.relayed, &mut self.direct, &mut self.parked] {
                     if let Some(set) = conns.get_mut(&peer_id) {
@@ -2736,7 +2755,9 @@ impl Task {
             // A silently dead connection to our relay is closed after
             // RELAY_PING_MISSES failed pings, so the fallback clock starts.
             SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if peer == self.relay_peer => {
-                if relay_ping(&mut self.relay_ping_misses, result.is_ok()) {
+                let misses = self.relay_ping_misses.entry(connection).or_insert(0);
+                if relay_ping(misses, result.is_ok()) {
+                    self.relay_ping_misses.remove(&connection);
                     info!("our relay stopped answering pings: closing its connection");
                     self.swarm.close_connection(connection);
                 }
@@ -3141,8 +3162,17 @@ impl Task {
         // Presence: the answerer's binding says who it is (sent to members only).
         if let (Some(binding), Some(s)) = (response.binding.clone(), self.sealing.get(&key.1)) {
             let server = s.server;
+            let newly = !self.bound.contains_key(&(key.0, server));
             if let Some(identity) = self.verify_binding(key.0, server, binding) {
                 self.mark_seen(server, identity, key.0);
+                // Newly bound: its channels of this server are pulled now. On
+                // open they were skipped (a channel goes only to a bound peer,
+                // and the binding comes with this answer), and would otherwise
+                // wait for the next anti-entropy round: a join's first messages
+                // up to 5 s late.
+                if newly {
+                    self.pull_bound_channels(key.0, server);
+                }
                 // Slice 2: a member we know, and its member relay offer (if any).
                 self.on_member_answer(key.0, response.relay.clone());
                 // A member's direct addresses (F2): try a direct connection.
@@ -4685,10 +4715,13 @@ mod tests {
         many.open_channel(server(), channel()).await.unwrap();
         many.append(message(0, &[], 0)).await.unwrap();
 
-        let start = Instant::now();
         let fresh = test_node("fresh", None, Some(port), access(0)).await;
         fresh.open_server(server(), secret).unwrap();
         fresh.open_channel(server(), channel()).await.unwrap();
+        // Timed from here: what's measured is the sync, not how long a new
+        // node takes to create its key and store (seconds on a busy disk,
+        // the flake that put this test on the board).
+        let start = Instant::now();
         eventually(&fresh, (0, 1), 15).await;
         let took = start.elapsed();
         assert!(took < Duration::from_secs(10), "the shared server's records took {took:?}");

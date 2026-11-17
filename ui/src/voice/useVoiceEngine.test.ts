@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Id } from '../core/types';
-import { loadVolumes, nextPeerFailed } from './useVoiceEngine';
+import { loadDevices, loadVolumes, nextPeerFailed } from './useVoiceEngine';
 
 const A: Id = 'a'.repeat(64);
 const B: Id = 'b'.repeat(64);
@@ -59,5 +59,22 @@ describe('G-73: stored per-person volumes', () => {
     }
     localStorage.removeItem(KEY);
     expect(loadVolumes()).toEqual({});
+  });
+});
+
+describe('G-72: the remembered devices', () => {
+  const KEY = 'mvs.voice.devices.v1';
+  it('keeps short printable IDs only; anything else reads as the default', () => {
+    localStorage.setItem(KEY, JSON.stringify({ input: 'abc123', output: 'default' }));
+    expect(loadDevices()).toEqual({ input: 'abc123', output: 'default' });
+    localStorage.setItem(KEY, JSON.stringify({ input: 'x'.repeat(257), output: 'has space' }));
+    expect(loadDevices()).toEqual({ input: undefined, output: undefined });
+    localStorage.setItem(KEY, JSON.stringify({ input: 7, output: '' }));
+    expect(loadDevices()).toEqual({ input: undefined, output: undefined });
+    for (const raw of ['not json', '[1]', 'null']) {
+      localStorage.setItem(KEY, raw);
+      expect(loadDevices(), raw).toEqual({});
+    }
+    localStorage.removeItem(KEY);
   });
 });

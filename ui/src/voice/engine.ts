@@ -66,6 +66,10 @@ export interface VoiceEvents {
   /** Who is speaking now, me included, by identity. */
   speaking: Record<Id, boolean>;
   error: VoiceError;
+  /** G-72: the chosen device is gone (unplugged); the system default is used instead. */
+  deviceFallback: { kind: 'input' | 'output'; deviceId: string };
+  /** G-72: devices were plugged in or out; lists may have changed. */
+  devicesChanged: null;
 }
 
 export interface AudioDevice {
@@ -83,6 +87,8 @@ export interface VoiceEnv {
   createAudioElement(): HTMLAudioElement;
   /** The Opus entries of the audio receive capabilities; null if unknown. */
   opusCodecs(): RTCRtpCodec[] | null;
+  /** G-72: calls back when devices are plugged in or out; returns an unsubscribe. Optional. */
+  onDeviceChange?(cb: () => void): () => void;
 }
 
 export interface VoiceEngineOptions {
@@ -182,6 +188,12 @@ export function browserEnv(): VoiceEnv {
     enumerateDevices: () => navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([]),
     createAudioContext: () => (typeof AudioContext === 'function' ? new AudioContext({ latencyHint: 'interactive' }) : null),
     createAudioElement: () => new Audio(),
+    onDeviceChange: (cb) => {
+      const md = navigator.mediaDevices;
+      if (!md?.addEventListener) return () => {};
+      md.addEventListener('devicechange', cb);
+      return () => md.removeEventListener('devicechange', cb);
+    },
     opusCodecs: () => {
       try {
         const caps = RTCRtpReceiver.getCapabilities?.('audio');
@@ -217,6 +229,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     participants: new Set(),
     speaking: new Set(),
     error: new Set(),
+    deviceFallback: new Set(),
+    devicesChanged: new Set(),
   };
   const emit = <E extends keyof VoiceEvents>(event: E, payload: VoiceEvents[E]) => {
     for (const cb of listeners[event]) {
@@ -253,6 +267,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   let speaking: Record<Id, boolean> = {};
 
   const unsubscribe = [core.onState((s) => onState(s)), core.onSignal((s) => void onSignal(s))];
+  if (env.onDeviceChange) unsubscribe.push(env.onDeviceChange(() => void onDevicesChanged()));
 
   function emitParticipants() {
     if (!active || !me) return;
@@ -275,7 +290,69 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     });
   }
 
-  function micTrack(): MediaStreamTrack | null {
+  /**
+   * G-72: the chosen microphone, or the system default when it is gone
+   * (unplugged): then the choice is dropped and deviceFallback says which.
+   */
+  async function openChosenMic(): Promise<MediaStream> {
+    try {
+      return await openMic(inputId);
+    } catch (e) {
+      const name = (e as { name?: string })?.name;
+      if (!inputId || (name !== 'OverconstrainedError' && name !== 'NotFoundError')) throw e;
+      const lost = inputId;
+      inputId = undefined;
+      emit('deviceFallback', { kind: 'input', deviceId: lost });
+      return openMic(undefined);
+    }
+  }
+
+  /** G-72: a device was plugged in or out. A chosen device that is gone falls back to the default. */
+  async function onDevicesChanged() {
+    emit('devicesChanged', null);
+    let all: MediaDeviceInfo[];
+    try {
+      all = await env.enumerateDevices();
+    } catch {
+      return;
+    }
+    const has = (kind: MediaDeviceKind, id: string) => all.some((d) => d.kind === kind && d.deviceId === id);
+    if (outputId && !has('audiooutput', outputId)) {
+      const lost = outputId;
+      outputId = undefined;
+      for (const p of peers.values()) if (p.audio && 'setSinkId' in p.audio) void p.audio.setSinkId('').catch(() => {});
+      emit('deviceFallback', { kind: 'output', deviceId: lost });
+    }
+    if (inputId && !has('audioinput', inputId)) {
+      const lost = inputId;
+      inputId = undefined;
+      emit('deviceFallback', { kind: 'input', deviceId: lost });
+      if (active && local) await switchMic();
+    }
+  }
+
+/** Opens the chosen (or default) microphone and swaps it into every connection. */
+  async function switchMic() {
+    const gen = generation;
+    const next = await openChosenMic();
+    if (gen !== generation) {
+      for (const t of next.getTracks()) t.stop();
+      return;
+    }
+    const track = next.getAudioTracks()[0] ?? null;
+    for (const p of peers.values()) {
+      for (const s of p.pc.getSenders()) if (!s.track || s.track.kind === 'audio') await s.replaceTrack(track);
+    }
+    for (const t of local?.getTracks() ?? []) t.stop();
+    dropMeter(localMeter);
+    local = next;
+    applyMute();
+    localMeter = makeMeter(next);
+    micState = 'connected';
+    emitParticipants();
+  }
+
+    function micTrack(): MediaStreamTrack | null {
     return local?.getAudioTracks()[0] ?? null;
   }
 
@@ -749,7 +826,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     speaking = {};
     const turnReady = ensureTurn(gen); // alongside the microphone
     try {
-      local = await openMic(inputId);
+      local = await openChosenMic();
       if (gen !== generation) {
         for (const t of local.getTracks()) t.stop();
         return;
@@ -829,23 +906,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
         emit('error', { code: 'rejoin-to-talk' });
         return;
       }
-      const gen = generation;
-      const next = await openMic(inputId);
-      if (gen !== generation) {
-        for (const t of next.getTracks()) t.stop();
-        return;
-      }
-      const track = next.getAudioTracks()[0] ?? null;
-      for (const p of peers.values()) {
-        for (const s of p.pc.getSenders()) if (!s.track || s.track.kind === 'audio') await s.replaceTrack(track);
-      }
-      for (const t of local?.getTracks() ?? []) t.stop();
-      dropMeter(localMeter);
-      local = next;
-      applyMute();
-      localMeter = makeMeter(next);
-      micState = 'connected';
-      emitParticipants();
+      await switchMic();
     },
     async setOutputDevice(deviceId) {
       outputId = deviceId || undefined;

@@ -364,7 +364,7 @@ export function Shell() {
         )}
         {flash && (
           <div className="toast" role="status" key={flash.at}>
-            <FormattedMessage id={flash.id} />
+            <FormattedMessage id={flash.id} values={flash.values} />
           </div>
         )}
         {channelGone && (

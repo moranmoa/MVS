@@ -19,6 +19,7 @@ const fakeEngine = vi.hoisted(() => ({
   picked: [] as string[],
   level: 0.42,
   deafened: false,
+  fallback: null as null | { kind: 'input' | 'output'; label: string | null; at: number },
 }));
 vi.mock('../voice', () => ({
   // A hook: deafen is React state, as in the real one, so the call bar re-renders.
@@ -45,6 +46,7 @@ vi.mock('../voice', () => ({
       fakeEngine.deafened = on;
       setDeafened(on);
     },
+    deviceFallback: fakeEngine.fallback,
     volumes,
     setVolume: (id: string, pct: number) => {
       fakeEngine.picked.push(`vol:${id}:${pct}`);
@@ -137,6 +139,20 @@ describe('G-72: voice settings in a call', () => {
       expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+describe('G-72 part 2: an unplugged device', () => {
+  it('says which device was unplugged and that the default is used', async () => {
+    fakeEngine.fallback = { kind: 'input', label: 'Headset mic', at: 1 };
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      await screen.findByRole('region', { name: 'Voice call' });
+      await waitFor(() => expect(screen.getByText(/Headset mic/).closest('[role=status]')?.textContent).toBe('Microphone ⁨Headset mic⁩ was unplugged. Using the system default.'));
+    } finally {
+      fakeEngine.fallback = null;
     }
   });
 });

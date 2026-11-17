@@ -234,27 +234,57 @@ interface Harness {
   contexts: FakeAudioContext[];
   audios: { srcObject: unknown; paused: boolean; muted: boolean; volume: number }[];
   pcs: FakePC[];
+  /** G-72: the devices on the computer; a chosen ID not in it fails like an unplugged device. */
+  devices: MediaDeviceInfo[];
+  /** The deviceId each getUserMedia asked for (undefined: the default). */
+  asked: (string | undefined)[];
+  /** Plugs devices in or out, then fires devicechange. */
+  changeDevices: (list: MediaDeviceInfo[]) => Promise<void>;
 }
 
 function fakeEnv(opts: { micError?: string } = {}): Harness {
-  const h: Harness = { mics: [], contexts: [], audios: [], pcs: [], env: null as unknown as VoiceEnv };
+  let onChange: (() => void) | null = null;
+  const h: Harness = {
+    mics: [],
+    contexts: [],
+    audios: [],
+    pcs: [],
+    env: null as unknown as VoiceEnv,
+    devices: [
+      { kind: 'audioinput', deviceId: 'mic1', label: 'Mic' },
+      { kind: 'audiooutput', deviceId: 'spk1', label: '' },
+    ] as MediaDeviceInfo[],
+    asked: [],
+    changeDevices: async (list) => {
+      h.devices = list;
+      onChange?.();
+      await flush();
+    },
+  };
   h.env = {
     createPeerConnection: (config) => {
       const pc = new FakePC(config);
       h.pcs.push(pc);
       return pc as unknown as RTCPeerConnection;
     },
-    getUserMedia: async () => {
+    getUserMedia: async (c) => {
       if (opts.micError) throw Object.assign(new Error('no'), { name: opts.micError });
+      const wanted = ((c.audio as MediaTrackConstraints | undefined)?.deviceId as { exact?: string } | undefined)?.exact;
+      h.asked.push(wanted);
+      if (wanted && !h.devices.some((d) => d.kind === 'audioinput' && d.deviceId === wanted)) {
+        throw Object.assign(new Error('gone'), { name: 'OverconstrainedError' });
+      }
       const s = new FakeStream();
       h.mics.push(s);
       return s as unknown as MediaStream;
     },
-    enumerateDevices: async () =>
-      [
-        { kind: 'audioinput', deviceId: 'mic1', label: 'Mic' },
-        { kind: 'audiooutput', deviceId: 'spk1', label: '' },
-      ] as MediaDeviceInfo[],
+    enumerateDevices: async () => h.devices,
+    onDeviceChange: (cb) => {
+      onChange = cb;
+      return () => {
+        onChange = null;
+      };
+    },
     createAudioContext: () => {
       const c = new FakeAudioContext();
       h.contexts.push(c);
@@ -427,6 +457,41 @@ describe('voice engine', () => {
     expect(hx.audios[0]!.volume).toBe(0);
     ex.setPeerVolume(B, Number.NaN);
     expect(hx.audios[0]!.volume).toBe(1);
+  });
+
+  it('G-72: a chosen mic that is gone at the start falls back to the default, once, and says which', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    const fallbacks = record<{ kind: string; deviceId: string }>((cb) => ex.on('deviceFallback', cb));
+    await ex.setInputDevice('mic-gone'); // remembered from an earlier run
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.asked).toEqual(['mic-gone', undefined]);
+    expect(fallbacks).toEqual([{ kind: 'input', deviceId: 'mic-gone' }]);
+    expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics[0]!.tracks[0]); // still talking
+  });
+
+  it('G-72: unplugging the chosen mic or speaker mid-call switches to the default and says which', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    const fallbacks = record<{ kind: string; deviceId: string }>((cb) => ex.on('deviceFallback', cb));
+    const changed = record<null>((cb) => ex.on('devicesChanged', cb));
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    await ex.setInputDevice('mic1');
+    await ex.setOutputDevice('spk1');
+    // A headset plugged in: nothing chosen is gone, only the lists changed.
+    await hx.changeDevices([...hx.devices, { kind: 'audioinput', deviceId: 'mic2', label: 'Headset' } as MediaDeviceInfo]);
+    expect(changed).toHaveLength(1);
+    expect(fallbacks).toEqual([]);
+    // Both chosen devices unplugged.
+    await hx.changeDevices([{ kind: 'audioinput', deviceId: 'mic2', label: 'Headset' } as MediaDeviceInfo]);
+    expect(fallbacks).toEqual([
+      { kind: 'output', deviceId: 'spk1' },
+      { kind: 'input', deviceId: 'mic1' },
+    ]);
+    expect(hx.asked.at(-1)).toBeUndefined(); // the default mic
+    expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics.at(-1)!.tracks[0]);
   });
 
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {

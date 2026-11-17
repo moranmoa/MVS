@@ -354,7 +354,12 @@ export function cleanCall(c: CallState): CallState {
     channelId: cleanHexId(c?.channelId),
     participants: participants
       .slice(0, 5)
-      .map((p) => ({ identity: cleanHexId(p?.identity), muted: p?.muted === true }))
+      .map((p) => ({
+        identity: cleanHexId(p?.identity),
+        muted: p?.muted === true,
+        // G-84b: shown only together with muted.
+        ...(p?.deafened === true && p?.muted === true ? { deafened: true } : {}),
+      }))
       .filter((p) => p.identity),
     full: c?.full === true,
     ...(c?.relayOnly === true ? { relayOnly: true } : {}),
@@ -392,10 +397,11 @@ export function cleanVoiceRoom(r: unknown): VoiceRoom | null {
   if (relayOnly !== undefined && typeof relayOnly !== 'boolean') return null;
   const out: VoiceRoom['members'] = [];
   for (const p of members as unknown[]) {
-    if (!p || typeof p !== 'object' || !onlyKeys(p, ['userId', 'muted', 'joinedAt'])) return null;
-    const { userId, muted, joinedAt } = p as Record<string, unknown>;
+    if (!p || typeof p !== 'object' || !onlyKeys(p, ['userId', 'muted', 'deafened', 'joinedAt'])) return null;
+    const { userId, muted, deafened, joinedAt } = p as Record<string, unknown>;
     if (!isRoomId(userId) || typeof muted !== 'boolean' || !isTime(joinedAt) || out.some((x) => x.userId === userId)) return null;
-    out.push({ userId, muted, joinedAt });
+    if (deafened !== undefined && typeof deafened !== 'boolean') return null;
+    out.push({ userId, muted, ...(deafened === true && muted ? { deafened: true } : {}), joinedAt });
   }
   if (!out.some((p) => p.userId === masterId)) return null;
   const clean = cleanName(name, VOICE_ROOM_NAME_MAX);

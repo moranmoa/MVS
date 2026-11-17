@@ -35,6 +35,41 @@ export interface VoiceEngineView {
   outputId?: string;
   setInput: (id: string) => void;
   setOutput: (id: string) => void;
+  /** G-72 mic test: my microphone's level now, 0..1. */
+  inputLevel: () => number;
+  /** G-84: I hear no one. Back to false when the call ends. */
+  deafened: boolean;
+  setDeafened: (deafened: boolean) => void;
+  /** G-73: per-person volume in percent (0..100), remembered on this computer; 100 when not set. */
+  volumes: Record<Id, number>;
+  setVolume: (id: Id, percent: number) => void;
+}
+
+/** G-73: per-person volumes, kept on this computer only. */
+const VOLUMES_KEY = 'mvs.voice.volumes.v1';
+const MAX_VOLUMES = 500;
+
+/** The stored volumes, keeping only 64-hex IDs with a whole percent in 0..100. */
+export function loadVolumes(): Record<Id, number> {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(VOLUMES_KEY) ?? '{}');
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const out: Record<Id, number> = {};
+    for (const [id, v] of Object.entries(raw).slice(0, MAX_VOLUMES)) {
+      if (/^[0-9a-f]{64}$/.test(id) && Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 100) out[id] = v as number;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveVolumes(v: Record<Id, number>): void {
+  try {
+    localStorage.setItem(VOLUMES_KEY, JSON.stringify(v));
+  } catch {
+    // Not remembered; it still applies to this call.
+  }
 }
 
 export type PeerFailure = 'failed' | 'refused';
@@ -77,6 +112,10 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   const [outputs, setOutputs] = useState<AudioDevice[]>([]);
   const [inputId, setInputId] = useState<string>();
   const [outputId, setOutputId] = useState<string>();
+  const [deafened, setDeafenedState] = useState(false);
+  const [volumes, setVolumes] = useState<Record<Id, number>>(loadVolumes);
+  const volumesRef = useRef(volumes);
+  volumesRef.current = volumes;
 
   const stunUrl = options.stunUrl ?? null;
   const enableTurn = options.enableTurn === true;
@@ -84,6 +123,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   useEffect(() => {
     const engine = createVoiceEngine(fromCoreApi(core), { stunUrl, enableTurn, turnHost });
     engineRef.current = engine;
+    for (const [id, pct] of Object.entries(volumesRef.current)) engine.setPeerVolume(id, pct / 100);
     const offs = [
       engine.on('speaking', setSpeaking),
       engine.on('participants', (participants) => setPeerFailed((prev) => nextPeerFailed(prev, { participants }))),
@@ -117,6 +157,8 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     });
     return () => {
       live = false;
+      engine.setDeafened(false);
+      setDeafenedState(false);
       engine.detach();
       setReady(false);
       setSpeaking({});
@@ -136,5 +178,21 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     void engineRef.current?.setOutputDevice(id);
   }, []);
 
-  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput };
+  const inputLevel = useCallback(() => engineRef.current?.inputLevel() ?? 0, []);
+  const setVolume = useCallback((id: Id, percent: number) => {
+    const pct = Math.round(Math.min(100, Math.max(0, percent)));
+    engineRef.current?.setPeerVolume(id, pct / 100);
+    setVolumes((prev) => {
+      const next = { ...prev, [id]: pct };
+      if (pct === 100) delete next[id]; // the default: nothing to remember
+      saveVolumes(next);
+      return next;
+    });
+  }, []);
+  const setDeafened = useCallback((on: boolean) => {
+    setDeafenedState(on);
+    engineRef.current?.setDeafened(on);
+  }, []);
+
+  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel, deafened, setDeafened, volumes, setVolume };
 }

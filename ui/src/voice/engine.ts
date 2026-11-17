@@ -125,6 +125,12 @@ export interface VoiceEngine {
   setOutputDevice(deviceId: string): Promise<void>;
   listInputDevices(): Promise<AudioDevice[]>;
   listOutputDevices(): Promise<AudioDevice[]>;
+  /** G-72 mic test: my microphone's level now, 0..1 (0 without a mic or while muted). */
+  inputLevel(): number;
+  /** G-84 deafen: silences everyone's audio (also people who connect later); false plays it again. */
+  setDeafened(deafened: boolean): void;
+  /** G-73: one person's playback volume, 0..1 (clamped); kept for when they connect. */
+  setPeerVolume(id: Id, volume: number): void;
   on<E extends keyof VoiceEvents>(event: E, cb: (payload: VoiceEvents[E]) => void): () => void;
   /** Leaves the audio and unsubscribes from the core for good. */
   dispose(): void;
@@ -234,6 +240,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const refused = new Set<Id>();
   let local: MediaStream | null = null;
   let micMuted = false;
+  /** G-84: everyone's audio silenced. */
+  let deafened = false;
+  /** G-73: per-person playback volume, 0..1; 1 when not set. */
+  const volumes = new Map<Id, number>();
   let micState: PeerConnectionState = 'connecting';
   let inputId: string | undefined;
   let outputId: string | undefined;
@@ -470,6 +480,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     audio.srcObject = peer.stream;
     if (outputId && 'setSinkId' in audio) void audio.setSinkId(outputId).catch(() => {});
     void audio.play?.()?.catch?.(() => {});
+    audio.muted = deafened;
+    audio.volume = volumes.get(peer.id) ?? 1;
     peer.audio = audio;
     peer.meter = makeMeter(peer.stream);
   }
@@ -845,6 +857,28 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     listInputDevices: () => listDevices('audioinput'),
     listOutputDevices: () => listDevices('audiooutput'),
+    setPeerVolume(id, volume) {
+      const v = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 1;
+      volumes.set(id, v);
+      const p = peers.get(id);
+      if (p?.audio) p.audio.volume = v;
+    },
+    setDeafened(on) {
+      deafened = on;
+      for (const p of peers.values()) if (p.audio) p.audio.muted = on;
+    },
+    inputLevel() {
+      if (!active || micMuted || !localMeter) return 0;
+      try {
+        localMeter.analyser.getFloatTimeDomainData(localMeter.buffer);
+        let sum = 0;
+        for (const v of localMeter.buffer) sum += v * v;
+        // Speech RMS sits around 0.02..0.2: scale so a normal voice fills most of the bar.
+        return Math.min(1, Math.sqrt(sum / localMeter.buffer.length) * 5);
+      } catch {
+        return 0;
+      }
+    },
     on(event, cb) {
       listeners[event].add(cb);
       return () => listeners[event].delete(cb);

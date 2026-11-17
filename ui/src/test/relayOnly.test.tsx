@@ -11,7 +11,7 @@ import { MockCore, type MockOptions } from '../core/mock';
 
 // jsdom has no WebRTC: an idle engine, as in voice.test.tsx.
 vi.mock('../voice', () => ({
-  useVoiceEngine: () => ({ ready: true, speaking: {}, peerFailed: {}, setMicMuted: () => {}, inputs: [], outputs: [], setInput: () => {}, setOutput: () => {} }),
+  useVoiceEngine: () => ({ ready: true, speaking: {}, peerFailed: {}, setMicMuted: () => {}, inputs: [], outputs: [], setInput: () => {}, setOutput: () => {}, inputLevel: () => 0, deafened: false, setDeafened: () => {}, volumes: {}, setVolume: () => {} }),
 }));
 
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };

@@ -280,8 +280,8 @@ impl Network for SyncNetwork {
         }
     }
 
-    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
-        if let Err(e) = self.node.set_member_relay(on, daily_cap_mb) {
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        if let Err(e) = self.node.set_member_relay(on, daily_cap_mb, role) {
             tracing::warn!(%e, "member relay setting not applied");
         }
     }

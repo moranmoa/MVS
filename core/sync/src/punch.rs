@@ -308,7 +308,7 @@ impl NetworkBehaviour for MemberPunch {
         role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
         if self.dials.contains_key(&id) && !self.may_dial(peer, addresses) {
-            tracing::debug!(?peer, ?addresses, "hole punch dial refused");
+            tracing::debug!(?peer, addresses = addresses.len(), "hole punch dial refused");
             return Err(ConnectionDenied::new("hole punch refused: not a member, relay only, or bad addresses"));
         }
         self.inner.handle_pending_outbound_connection(id, peer, addresses, role)

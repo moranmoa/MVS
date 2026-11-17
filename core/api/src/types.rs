@@ -175,6 +175,21 @@ pub struct Message {
     /// G-24: the body mentions me.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mentions_me: Option<bool>,
+    /// G-26: up to 20 emoji, the most popular, listed in the order they
+    /// first appeared; absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Vec<ReactionCount>>,
+}
+
+/// G-26: one emoji under a message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionCount {
+    pub emoji: String,
+    /// How many members have it on.
+    pub count: u32,
+    /// I have it on.
+    pub mine: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,7 +321,8 @@ pub enum ErrorCode {
     CheckClock,
     NothingToDownload,
     NothingStaged,
-    /// Device link: too many attempts at this link.
+    /// Device link: too many attempts at this link. Reactions (G-26): 30
+    /// of mine in one channel within a minute.
     RateLimited,
     /// Device link: another device holds this link (someone else may be
     /// trying).
@@ -598,6 +614,9 @@ pub struct CallParticipant {
     /// A user ID.
     pub identity: Id,
     pub muted: bool,
+    /// G-84b: hears no one (only with `muted`; false from cores before 0.6.0).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
 }
 
 /// Why `server.removed` fired (server lifecycle).
@@ -644,6 +663,9 @@ pub struct VoiceMember {
     pub user_id: Id,
     /// A display hint only.
     pub muted: bool,
+    /// G-84b: a display hint only, with `muted`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
     /// ms since the epoch: its claim, checked within 2 minutes and frozen.
     pub joined_at: u64,
 }

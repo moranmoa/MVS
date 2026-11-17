@@ -1,6 +1,6 @@
 //! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -19,6 +19,7 @@ use crate::avatar;
 use crate::backup;
 use crate::devicelink::{self, OneTimeKey, Target};
 use crate::chat;
+use crate::reaction;
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
 use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
@@ -260,6 +261,8 @@ struct Approval {
 
 struct Inner {
     db: Db,
+    /// The core clock (G-26: the reaction fold skips records from the future).
+    clock: Arc<dyn crate::ports::Clock>,
     vault: Vault<SharedSecrets>,
     me: Option<Me>,
     /// The OS keychain failed at startup (QA-20).
@@ -327,6 +330,7 @@ impl KeyPending {
             replaces: None,
             mentions: None,
             mentions_me: None,
+            reactions: None,
         }
     }
 }
@@ -446,16 +450,11 @@ fn parse_server(id: &str) -> CoreResult<ServerId> {
     model::parse_hex32(id).map(ServerId::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
 
-/// Server lifecycle's rollout gate (#229): every current, non-kicked member
-/// but `me` has `server-lifecycle-v1` in their latest profile post (none
-/// counts as needing an update).
-fn gate_open(view: &ServerView, me: PublicKey) -> bool {
-    let caps = view.lifecycle_caps();
-    view.state
-        .members
-        .iter()
-        .filter(|m| **m != me && !view.state.kicked.contains(m))
-        .all(|m| caps.get(m) == Some(&true))
+/// A rollout gate (#229, G-26): every current, non-kicked member but `me`
+/// has `cap` in their latest profile post (none counts as needing an
+/// update).
+fn gate_open(view: &ServerView, me: PublicKey, cap: &str) -> bool {
+    view.lacking(cap, me).is_empty()
 }
 
 impl Core {
@@ -464,6 +463,7 @@ impl Core {
         let vault = Vault::new(SharedSecrets(ports.secrets.clone()));
         let mut inner = Inner {
             db,
+            clock: ports.clock.clone(),
             vault,
             me: None,
             keyring_unavailable: false,
@@ -1319,7 +1319,7 @@ impl Core {
         self.run(|inner, ports, events| {
             inner.load_mine(server)?;
             inner.lifecycle_role(server, authority::Role::Admin)?;
-            inner.lifecycle_gate(server)?;
+            inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP)?;
             inner.publish_control(ports, server, &Action::ServerEdit { name: name.to_owned() })?;
             let summary = inner.counted_summary(&*ports.cipher, server)?;
             events.push(Event::ServerUpdated(summary.clone()));
@@ -1346,7 +1346,7 @@ impl Core {
             let leave =
                 inner.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
             inner.db.set_leave(server, &leave)?;
-            if inner.lifecycle_gate(server).is_ok() {
+            if inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
                 ports.network.publish(&leave);
             }
             // Gone from the UI at once; only the sync secret and the control
@@ -1385,25 +1385,22 @@ impl Core {
         }
     }
 
-    /// `getUpdateNeeded`: the members whose latest profile post lacks
-    /// `server-lifecycle-v1` (or who have none), so the UI can say who
-    /// blocks a rename or a delete (`update-needed`). Empty: the gate is
-    /// open.
-    pub fn get_update_needed(&self, server_id: &str) -> CoreResult<Vec<Id>> {
+    /// `getUpdateNeeded`: the members whose latest profile post lacks `cap`
+    /// (or who have none), so the UI can say who blocks it
+    /// (`update-needed`). No cap: `server-lifecycle-v1` (a rename or a
+    /// delete); `"reactions-v1"`: reactions (G-26). Any other name is
+    /// `bad-request`. Empty: the gate is open.
+    pub fn get_update_needed(&self, server_id: &str, cap: Option<&str>) -> CoreResult<Vec<Id>> {
+        let cap = match cap {
+            None => model::SERVER_LIFECYCLE_CAP,
+            Some(cap) => *model::CAPS.iter().find(|c| **c == cap).ok_or(ErrorCode::BadRequest)?,
+        };
         let server = parse_server(server_id)?;
         self.run(|inner, _, _| {
             inner.load_mine(server)?;
             let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
             let view = inner.view(server)?;
-            let caps = view.lifecycle_caps();
-            Ok(view
-                .state
-                .members
-                .iter()
-                .filter(|m| **m != me && !view.state.kicked.contains(m))
-                .filter(|m| caps.get(m) != Some(&true))
-                .map(|m| model::hex_id(m.as_bytes()))
-                .collect())
+            Ok(view.lacking(cap, me).iter().map(|m| model::hex_id(m.as_bytes())).collect())
         })
     }
 
@@ -1417,7 +1414,7 @@ impl Core {
         self.run(|inner, ports, events| {
             inner.load_mine(server)?;
             inner.lifecycle_role(server, authority::Role::Owner)?;
-            inner.lifecycle_gate(server)?;
+            inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP)?;
             inner.publish_control(ports, server, &Action::ServerClose)?;
             inner.close_locally(ports, server, events)
         })
@@ -1808,6 +1805,11 @@ impl Core {
         self.voice(|calls, ctx, inner| calls.set_muted(ctx, inner, muted))
     }
 
+    /// G-84b `setDeafened`: shown to the others in my call (with mute).
+    pub fn set_deafened(&self, deafened: bool) -> CoreResult<()> {
+        self.voice(|calls, ctx, inner| calls.set_deafened(ctx, inner, deafened))
+    }
+
     /// `sendSignal`: to a participant of my call.
     pub fn send_signal(&self, to: &str, kind: SignalKind, payload: String) -> CoreResult<()> {
         let to = parse_user(to)?;
@@ -1963,7 +1965,7 @@ impl Core {
         }
         let message = self.run(|inner, ports, events| {
             let (server, channel) = inner.find_channel(channel_id)?;
-            let sealed = match inner.seal(ports, server, channel, body) {
+            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
                     let message = inner.hold_for_key(ports, server, channel, body)?;
@@ -1995,7 +1997,7 @@ impl Core {
         }
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
-            let sealed = inner.seal(ports, server, channel, body)?;
+            let sealed = inner.seal(ports, server, channel, body.as_bytes())?;
             let body = [target.as_bytes().as_slice(), &sealed].concat();
             inner.tombstone_or_edit(ports, events, server, channel, target, Kind::MessageEdit, body)
         })
@@ -2028,6 +2030,77 @@ impl Core {
                 Kind::MessageDelete,
                 body,
             )
+        })
+    }
+
+    /// G-26: turns my `emoji` on or off under a message, as a sealed
+    /// `Reaction` record (`crate::reaction` has the rules every core folds
+    /// by). Nothing is signed when it is already so.
+    /// - `bad-request`: not an emoji `reaction::normalize` accepts, or an
+    ///   11th emoji of mine on this message;
+    /// - `not-found`: no such message I can see, or it is deleted;
+    /// - `not-allowed`: I may not write in that channel now;
+    /// - `update-needed`: another member's version can't read reactions
+    ///   (`getUpdateNeeded(serverId, "reactions-v1")` says who);
+    /// - `rate-limited`: 30 reactions of mine in this channel within a
+    ///   minute.
+    pub fn react(&self, message_id: &str, emoji: &str, on: bool) -> CoreResult<()> {
+        let emoji = reaction::normalize(emoji).ok_or(ErrorCode::BadRequest)?;
+        self.run(|inner, ports, events| {
+            let (server, channel, target, _) = inner.find_message(message_id)?;
+            // 18+ channels only with an accepted 18+ claim (B7).
+            if !inner.visible(server)?.contains(&channel) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+            let view = inner.view(server)?;
+            if !view.state.is_member(me) || view.is_kicked(&me) || view.state.closed.is_some() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.cap_gate(server, model::REACTIONS_CAP)?;
+            let cipher = &*ports.cipher;
+            let shown = inner.shown(cipher, server, channel)?;
+            let live: HashSet<RecordId> =
+                shown.iter().filter(|s| !s.deleted).map(|s| s.record.id()).collect();
+            if !live.contains(&target) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let now = ports.clock.now_ms();
+            let folded = chat::reactions(cipher, server, channel, log, &live, now);
+            let mine = folded.on.get(&target);
+            if mine.is_some_and(|m| m.is_on(&emoji, me)) == on {
+                return Ok(());
+            }
+            if on && mine.is_some_and(|m| m.count_of(me) >= reaction::PER_AUTHOR) {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            // Counted the way every core will count the record I'd sign.
+            if folded.gate.near(me) >= reaction::RATE_LIMIT {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            let plaintext =
+                reaction::Reaction::encode(target, &emoji, on).ok_or(ErrorCode::BadRequest)?;
+            let sealed = inner.seal(ports, server, channel, &plaintext)?;
+            // Signed at its effective time, never before its deps: a clock
+            // that runs behind the others' must not make every core ignore
+            // it as backdated. (Sealing may have added a key rotation.)
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let deps = chat::channel_deps(log, channel);
+            let ts = folded.gate.sign_at(&deps);
+            let seq = chat::channel_seq(log, channel, &me);
+            let auth = auth_deps(&inner.view(server)?);
+            let record =
+                inner.sign_channel(server, channel, seq, deps, auth, ts, Kind::Reaction, sealed)?;
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            if !chat::would_accept(log, &record) {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.store(server, record.clone())?;
+            ports.network.publish(&record);
+            let message = inner.message(cipher, server, channel, target)?;
+            events.push(Event::MessageUpdated(message));
+            Ok(())
         })
     }
 
@@ -3337,7 +3410,7 @@ impl Inner {
             let seen = self.announced.entry(server).or_default();
             for (index, s) in shown.iter().enumerate() {
                 let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
-                let event = match seen.insert(s.record.id(), state) {
+                let event = match seen.insert(s.record.id(), state.clone()) {
                     None if Some(s.record.author()) != me && !fresh.contains(&channel) => {
                         fresh.push(channel);
                         Event::MessageAdded(message_json(
@@ -3450,7 +3523,7 @@ impl Inner {
             let body = self.key_pending[i].body.clone();
             let waiting = self.db.has_server(server)? && {
                 self.load(server)?;
-                match self.seal(ports, server, channel, &body) {
+                match self.seal(ports, server, channel, body.as_bytes()) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
                         let record =
@@ -3508,7 +3581,7 @@ impl Inner {
         ports: &Ports,
         server: ServerId,
         channel: ChannelId,
-        text: &str,
+        plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
@@ -3518,12 +3591,12 @@ impl Inner {
         let auth_deps = auth_deps(&view);
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        match cipher.encrypt(server, channel, text.as_bytes()) {
+        match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).
                 self.rotate_channel(ports, server, channel, &members, &auth_deps)
                     .map_err(|_| CoreError::from(ErrorCode::NotAllowed))?;
-                cipher.encrypt(server, channel, text.as_bytes()).map_err(cipher_error)
+                cipher.encrypt(server, channel, plaintext).map_err(cipher_error)
             }
             other => other.map_err(cipher_error),
         }
@@ -3803,11 +3876,12 @@ impl Inner {
         server: ServerId,
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
+        let now = self.clock.now_ms();
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log))
+        Ok(chat::messages(cipher, server, channel, log, now))
     }
 
     /// G-21: my read marker in `channel`: the last message I read, as
@@ -4104,7 +4178,7 @@ impl Inner {
         if matches!(state, Some(SendState::Sent | SendState::Received)) {
             return finish(&self.db);
         }
-        if !gate_open(&view, me) || state == Some(SendState::Pending) {
+        if !gate_open(&view, me, model::SERVER_LIFECYCLE_CAP) || state == Some(SendState::Pending) {
             return Ok(());
         }
         ports.network.publish(leave);
@@ -4126,20 +4200,21 @@ impl Inner {
         Ok(())
     }
 
-    /// Server lifecycle's rollout gate (#229): `update-needed` unless every
-    /// other current member's latest profile post carries
-    /// `server-lifecycle-v1` (no profile post counts as needing an update).
+    /// A rollout gate (server lifecycle #229, reactions G-26):
+    /// `update-needed` unless every other current member's latest profile
+    /// post carries `cap` (no profile post counts as needing an update).
     /// This version reads them itself. Checked before anything is signed.
-    fn lifecycle_gate(&self, server: ServerId) -> CoreResult<()> {
+    fn cap_gate(&self, server: ServerId, cap: &str) -> CoreResult<()> {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
-        if !gate_open(&self.view(server)?, me) {
+        if !gate_open(&self.view(server)?, me, cap) {
             return Err(ErrorCode::UpdateNeeded.into());
         }
         Ok(())
     }
 
-    /// Release N of server lifecycle: my latest profile post in `server`
-    /// lacks the cap (posted by an older version), so post it again, once.
+    /// The release that adds a cap: my latest profile post in `server` lacks
+    /// one of [`model::CAPS`] (posted by an older version), so post it
+    /// again, once.
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());
@@ -4147,8 +4222,8 @@ impl Inner {
         let (me_small, me_color) = (me.profile.avatar_small.clone(), me.profile.color.clone());
         let view = self.view(server)?;
         let member = view.state.is_member(key) && !view.state.kicked.contains(&key);
-        if !member || view.state.closed.is_some() || view.lifecycle_caps().get(&key) == Some(&true)
-        {
+        let has_all = model::CAPS.iter().all(|cap| view.caps(cap).get(&key) == Some(&true));
+        if !member || view.state.closed.is_some() || has_all {
             return Ok(());
         }
         let (small, color) = (me_small, me_color);
@@ -4536,8 +4611,9 @@ fn auth_deps(view: &ServerView) -> Vec<RecordId> {
     heads[heads.len().saturating_sub(records::MAX_AUTH_DEPS)..].to_vec()
 }
 
-/// What was last announced of a message: edit time, deleted, my send state.
-type Announced = (Option<u64>, bool, Option<SendState>);
+/// What `message.updated` compares: the edit, the deletion, the send state
+/// and (G-26) the reactions shown.
+type Announced = (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>);
 
 /// Where my messages' send states come from: the network's live state and
 /// the last one stored, so a restart doesn't lose it.
@@ -4547,7 +4623,7 @@ struct Status<'a> {
 }
 
 fn announced(s: &chat::Shown, me: Option<PublicKey>, st: &Status) -> Announced {
-    (s.edited_at, s.deleted, send_state(s, me, st))
+    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone())
 }
 
 /// B6, on my own messages only: `pending` until it left this device,
@@ -4611,7 +4687,21 @@ fn message_json(
         replaces: None,
         mentions: (!listed.is_empty()).then_some(listed),
         mentions_me: me.filter(|me| tokens.contains(me)).map(|_| true),
+        reactions: reactions_json(&s.reactions, me),
     }
+}
+
+/// G-26: `Message.reactions`, absent when there are none.
+fn reactions_json(shown: &[(String, Vec<PublicKey>)], me: Option<PublicKey>) -> Option<Vec<ReactionCount>> {
+    let list: Vec<ReactionCount> = shown
+        .iter()
+        .map(|(emoji, authors)| ReactionCount {
+            emoji: emoji.clone(),
+            count: authors.len() as u32,
+            mine: me.is_some_and(|me| authors.contains(&me)),
+        })
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 /// Can't write yet (no key, or a rotation only a moderator can make):
 /// `not-allowed`. No group encryption: `not-implemented`.

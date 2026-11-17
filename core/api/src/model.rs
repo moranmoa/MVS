@@ -165,6 +165,13 @@ pub(crate) const FIRST_INVITE: Action = Action::Invite { expires_ms: 0, max_uses
 /// Server lifecycle (#229): what a profile post says this version can read.
 /// Old versions ignore the field (`ProfileBody` takes unknown fields).
 pub(crate) const SERVER_LIFECYCLE_CAP: &str = "server-lifecycle-v1";
+/// G-26: this version reads `Reaction` records (kind 21). Older cores
+/// refuse an unknown kind and stall the channel behind it, so nobody
+/// reacts until every member posts this.
+pub(crate) const REACTIONS_CAP: &str = "reactions-v1";
+/// Every cap this version posts, and the only names `getUpdateNeeded`
+/// takes.
+pub(crate) const CAPS: [&str; 2] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {
@@ -190,7 +197,7 @@ pub(crate) fn profile_action_with(display_name: &str, avatar: Option<&str>, colo
     let body = ProfileBody {
         mvs: PROFILE_TAG.to_owned(),
         display_name: display_name.to_owned(),
-        caps: vec![SERVER_LIFECYCLE_CAP.to_owned()],
+        caps: CAPS.iter().map(|c| (*c).to_owned()).collect(),
         avatar: avatar.map(str::to_owned),
         color: color.map(str::to_owned),
     };
@@ -429,20 +436,33 @@ impl<'a> ServerView<'a> {
         names
     }
 
-    /// Server lifecycle's rollout gate (#229): whether each author's latest
-    /// profile post carries [`SERVER_LIFECYCLE_CAP`]. Members with no
-    /// profile post are absent (they count as needing an update).
-    pub fn lifecycle_caps(&self) -> BTreeMap<PublicKey, bool> {
+    /// A rollout gate (#229, G-26): whether each author's latest profile
+    /// post carries `cap` (one of [`CAPS`]). Members with no profile post
+    /// are absent (they count as needing an update).
+    pub fn caps(&self, cap: &str) -> BTreeMap<PublicKey, bool> {
         let by_id: HashMap<RecordId, &Record> = self.records.iter().map(|r| (r.id(), r)).collect();
         let mut caps = BTreeMap::new();
         for id in &self.state.posts {
             let Some(record) = by_id.get(id) else { continue };
             if let Some(profile) = parse_profile(record) {
-                let ready = profile.caps.iter().any(|c| c == SERVER_LIFECYCLE_CAP);
+                let ready = profile.caps.iter().any(|c| c == cap);
                 caps.insert(record.author(), ready);
             }
         }
         caps
+    }
+
+    /// The other current, non-kicked members whose latest profile post
+    /// lacks `cap` (or who have none): who keeps that gate shut.
+    pub fn lacking(&self, cap: &str, me: PublicKey) -> Vec<PublicKey> {
+        let caps = self.caps(cap);
+        self.state
+            .members
+            .iter()
+            .filter(|m| **m != me && !self.state.kicked.contains(m))
+            .filter(|m| caps.get(m) != Some(&true))
+            .copied()
+            .collect()
     }
 
     pub fn members(&self) -> Vec<MemberInfo> {

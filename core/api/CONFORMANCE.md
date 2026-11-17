@@ -101,6 +101,51 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `Channel.mentions` and `ServerSummary.mentions` count unread messages that mention me (after the read marker, not mine). `markRead` resets them. `ServerSummary.unread` is set when any channel has unread messages; both come from `listServers`.
   - No authority or sync change: mentions are read from the message body.
 
+- Emoji reactions (G-26; design `g26-reactions-design.md` with Amendment 1):
+  - `react(messageId, emoji, on: boolean)` returns `null` and fires `message.updated` for the message. Nothing is signed when it's already so (an add of an emoji I have on, or a removal of one I don't).
+  - `Message.reactions?: { emoji, count, mine }[]` (additive) lists at most 20 emoji: the 20 with the most members, ties going to the one that appeared first. They're listed in the order they first appeared, and the field is absent when there are none. A deleted message has none.
+  - A change from anyone brings one `message.updated` for the message in that sync round. Reactions are never unread, never a mention, and never notify.
+  - **The emoji check** (core on write and on fold; the UI's sanitizer must match it):
+    - One trailing U+FE0F is dropped first, so 👍 and 👍+FE0F are the same chip. The stored form never ends in FE0F.
+    - 1–32 bytes and at most 10 scalars, made of elements joined by single ZWJs (U+200D: never first, never last, never doubled).
+    - An element is one of:
+      - an emoji base (the pictographic blocks U+1F000–1FAFF, plus the older emoji symbols listed in `src/reaction.rs`), with at most one VS16 or skin tone (U+1F3FB–1F3FF) straight after it;
+      - a pair of regional indicators;
+      - a keycap `[0-9#*] FE0F? 20E3`.
+    - Never a control, bidi, whitespace or tag character (U+E0020–E007F, so no subdivision flags in v1), and no custom emoji.
+  - Errors, with nothing signed:
+    - `bad-request`: the emoji fails the check, or it would be my 11th emoji on this message.
+    - `not-found`: no such message I can see, or it is deleted.
+    - `not-allowed`: I can't write in that channel now (the same rule as a message).
+    - `update-needed`: a current member's latest profile post lacks `reactions-v1`. `getUpdateNeeded(serverId, "reactions-v1")` says who.
+    - `rate-limited`: 30 reaction records of mine in this channel within a minute.
+  - **Record:** `Kind::Reaction = 21`, channel scope, at most 256 bytes. Authority judges it like a `Message` (any member; a kick's cut voids it the same way). The body is sealed with the channel key over a fixed 66-byte plaintext, so its length doesn't give the emoji away. The plaintext is `target (32) ‖ op (1 = add, 0 = remove) ‖ len u8 ‖ emoji ‖ zero padding`. On open, it's refused when:
+    - `len` is over 32;
+    - the emoji isn't valid UTF-8, or fails the check, or ends in FE0F;
+    - the op isn't 0 or 1;
+    - the padding isn't all zero.
+
+    The design said 64 bytes, but 32 + 1 + 1 + 32 needs 66, so 66 keeps the 32-byte emoji limit.
+  - **The fold** (deterministic in every core):
+    - The channel's records go in causal order: deps first, and (claimed time, ID) only between records that are concurrent.
+    - **Time bounds** (the security lead's fix: claimed times are the author's own):
+      - A record's effective time is the later of its claimed time and its deps' effective times.
+      - A reaction claiming a time more than 10 minutes before its deps' effective time is ignored.
+      - A record claiming a time more than 10 minutes past the folding core's clock waits: it isn't counted, and its time doesn't count for the records built on it, until then.
+    - **Rate:** an author's accepted reaction is ignored when 30 of theirs are already counted within a minute of its effective time, either way. The count uses the effective time capped at now, so the 10 minutes of lead add no room.
+    - A new reaction is signed at its effective time (my clock, or its deps' time if later), so a clock up to 10 minutes slow isn't ignored as backdated.
+    - **Accepted residual (dev-sync follow-up, GAP-25):** a hostile client whose reactions have stale deps, or no channel deps at all (only `auth_deps` is required), can still spread its claimed times freely. Only the receive-time check at sync ingest bounds that.
+    - Then a reaction counts only if it opens to a valid plaintext whose target is a shown `Message` of that channel that isn't deleted.
+    - Per (message, emoji, author), the last op wins.
+    - An add is ignored while the author already has 10 emoji on that message; a removal frees a place.
+    - There's no per-message cap in the state, so one member can't lock a message.
+  - **Known residual:** with more than 20 distinct emoji on a message, the rarest drop out of view (not out of state). One member can add at most 10.
+  - **Rollout:** a `reactions-v1` cap in profile posts (above). An older core refuses kind 21 and would stall on every channel record after one, so nobody reacts until every current member posts the cap. The release that reads kind 21 also posts it.
+  - **Known residual: late joiners on an old version.** Someone who joins later with a pre-reactions build meets the kind-21 records already there and stalls on that channel's log, as with lifecycle records (#229). The gate can't see them before they join, since their caps arrive only with their first profile post. A join can't be refused on version either: the core has no version field to check. So:
+    - the release notes say reactions need everyone on that version;
+    - the in-app updater (hourly check) narrows the window;
+    - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
+
 - New-messages divider (G-21, option A):
   - `Channel.unreadCount?: number` and `Channel.firstUnreadIndex?: number` (additive) count the messages after my read marker that aren't mine, in `getMessages` order. `firstUnreadIndex` is the `getMessages` index of the first of them, and is absent when there are none. `Channel.unread` is `unreadCount > 0`. They appear in `listChannels` and `channel.updated`.
   - `markRead(channelId)` returns `null` and moves the marker to the channel's last message. It emits `channel.updated` with `unreadCount: 0` and no `firstUnreadIndex`.
@@ -198,6 +243,15 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       - `not-implemented`: no voice transport (sync's piece A).
   - `leaveCall()` returns `null` and is idempotent. The app lock and quitting leave too.
   - `setMuted(muted: boolean)` returns `null`. `not-allowed` outside a call.
+  - `setDeafened(deafened: boolean)` returns `null` (G-84b). `not-allowed` outside a call. The others see it only together with mute, and only from cores that understand it:
+    - `CallParticipant` and the voice room members gain `deafened`. It's present only when true, and only together with `muted`.
+    - On the wire, every hello's `payload` advertises caps: `{"caps":["deafen"]}`, as JSON with no other keys.
+      - At most 128 bytes and 8 caps, each 1–16 characters of `[a-z0-9-]`. Unknown caps are ignored, and anything malformed means no caps.
+      - Cores before 0.6.0 never read a hello's payload.
+    - Caps are remembered per signer, up to 1024; when full, the stalest goes. They expire with the roster's hello timeout.
+    - A hello carries `deafened: true` only to signers that advertised `deafen`, because older cores refuse unknown fields.
+      - A broadcast hello is sealed twice, with a fresh nonce each time. Everyone else, my own other computers included, gets the plain one.
+    - A received `deafened` counts only with `muted`.
   - `sendSignal(to, kind: 'offer' | 'answer' | 'ice', payload: string)` returns `null`.
     - Errors:
       - `not-allowed`: not in a call, or `to` isn't in it.
@@ -349,7 +403,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - Each sync round it goes out once the rollout gate is open, and is retried until a member has it (B6 `sent`). Then the secret and subscription go too, and the others re-key.
     - If I'm kicked first, the `Leave` is dropped.
     - The leaver isn't banned, and comes back through a new invite as a plain member.
-  - `getUpdateNeeded(serverId)` returns the user IDs of members whose latest profile post lacks `server-lifecycle-v1`, or who have none: who blocks a rename or a delete. An empty list means the gate is open.
+  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). Any other cap name is `bad-request`. An empty list means the gate is open.
   - `closeServer(serverId)` returns `null`. The owner deletes the server for good: the core syncs first, then sends the close.
     - On the owner's core, and on every member's when it reads the close, the server is closed, not purged at once. `server.closed { serverId }` fires; any call there ends; its keys and sync subscription go, and it's no longer synced. It stays in `listServers`, read-only, with `ServerSummary.closed: true` (additive).
     - 30 days (`CLOSED_RETENTION_MS`) after the close was received, the rest is purged and `server.removed { serverId, reason: 'closed' }` fires. Its genesis and close record are kept forever, so the server reads as closed, never unknown.
@@ -361,7 +415,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks the cap.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

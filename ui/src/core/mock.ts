@@ -6,6 +6,7 @@
 // containing "offline" finds nobody online; one containing "adult" is 18+.
 
 import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
+import { normalizeEmoji } from './emoji';
 import type {
   CallState,
   VoiceRoom,
@@ -88,6 +89,8 @@ export interface MockOptions {
   deviceLinked?: string;
   /** Device link, new device: the state to reach after starting (for screenshots). */
   deviceLink?: 'confirm' | 'expired' | 'failed';
+  /** Time between demo messages (default 47 s); hours make the last screen cross days (G-23). */
+  messageGapMs?: number;
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -192,6 +195,10 @@ interface MockRoom {
 }
 
 export class MockCore implements CoreApi {
+  private get gapMs(): number {
+    return this.options.messageGapMs ?? MESSAGE_GAP_MS;
+  }
+
   private listeners = new Map<CoreEventName, Set<(p: unknown) => void>>();
   private servers = new Map<Id, ServerState>();
   // Invites per server, made on first use from the server's current link.
@@ -481,7 +488,7 @@ export class MockCore implements CoreApi {
       const ch: ChannelState = {
         channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0 },
         baseCount: c.count,
-        baseStart: now - 3_600_000 - c.count * MESSAGE_GAP_MS,
+        baseStart: now - 3_600_000 - c.count * this.gapMs,
         seedOffset: hashString(c.id),
         memberIds: members.slice(1).map((m) => m.id),
         overrides: new Map(),
@@ -579,7 +586,7 @@ export class MockCore implements CoreApi {
       index,
       authorId,
       body,
-      createdAt: ch.baseStart + index * MESSAGE_GAP_MS + (h % 20_000),
+      createdAt: ch.baseStart + index * this.gapMs + (h % 20_000),
     };
     if (index > 3 && h % 11 === 0) {
       const target = index - 1 - (h % 3);
@@ -1074,9 +1081,11 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
+    // As the core: only cap names it knows.
+    if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
   }
 
@@ -1193,6 +1202,29 @@ export class MockCore implements CoreApi {
     const mine = m.authorId === this.identity?.id;
     if (!mine && s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
     this.put(ch, { ...m, body: '', deleted: true, replyTo: undefined }, false);
+  }
+
+  /** G-26, as the core: the same emoji check, gate and per-author cap (no fold, no rate). */
+  async react(messageId: Id, emoji: string, on: boolean): Promise<void> {
+    const e = normalizeEmoji(emoji);
+    if (e === null) throw err({ code: 'bad-request' });
+    const { ch, index } = this.parseId(messageId);
+    const m = this.messageAt(ch, index);
+    if (m.deleted) throw err({ code: 'not-found' });
+    this.lifecycleGate(this.serverOf(ch));
+    const chips = [...(m.reactions ?? [])];
+    const at = chips.findIndex((c) => c.emoji === e);
+    if ((at >= 0 && chips[at].mine) === on) return;
+    if (on) {
+      if (chips.filter((c) => c.mine).length >= 10) throw err({ code: 'bad-request' });
+      if (at >= 0) chips[at] = { ...chips[at], count: chips[at].count + 1, mine: true };
+      else chips.push({ emoji: e, count: 1, mine: true });
+    } else {
+      const count = chips[at].count - 1;
+      if (count > 0) chips[at] = { ...chips[at], count, mine: false };
+      else chips.splice(at, 1);
+    }
+    this.put(ch, { ...m, reactions: chips.length ? chips : undefined }, false);
   }
 
   async discardMessage(messageId: Id): Promise<null> {
@@ -1322,7 +1354,7 @@ export class MockCore implements CoreApi {
   private callOf(room: MockRoom): CallState {
     return {
       channelId: room.roomId,
-      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted })),
+      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted, ...(p.deafened && p.muted ? { deafened: true } : {}) })),
       full: room.members.length >= room.limit,
     };
   }
@@ -1431,6 +1463,16 @@ export class MockCore implements CoreApi {
     const here = this.callRoom();
     if (!this.call || !here) throw err({ code: 'not-allowed' });
     here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, muted } : p));
+    this.emitRooms(here.serverId);
+    this.call = this.callOf(here.room);
+    this.emitCall();
+    return null;
+  }
+
+  async setDeafened(deafened: boolean): Promise<null> {
+    const here = this.callRoom();
+    if (!this.call || !here) throw err({ code: 'not-allowed' });
+    here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, deafened } : p));
     this.emitRooms(here.serverId);
     this.call = this.callOf(here.room);
     this.emitCall();

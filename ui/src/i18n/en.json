@@ -261,6 +261,8 @@
   "call.leave": "Leave call",
   "call.voiceSettings": "Voice settings",
   "call.deafen": "Deafen",
+  "call.volumes": "Volume per person",
+  "call.volumesHint": "Only you hear the change. Remembered on this computer.",
   "call.deafenedNote": "You can't hear the call, and you're muted.",
   "call.microphone": "Microphone",
   "call.speaker": "Speaker",

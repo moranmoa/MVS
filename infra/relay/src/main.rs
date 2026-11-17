@@ -328,6 +328,11 @@ async fn run() -> Result<()> {
             // server's own store: no 12-hourly republish queries for up to
             // MAX_TAGS keys. Revisit with a second bootstrap (GAP-9).
             kad_config.set_provider_publication_interval(None);
+            // Nothing a client sends is stored as-is (Security Lead, #423):
+            // provider records go through store_client_provider (no client
+            // addresses), and values (PUT_VALUE) aren't stored at all, since
+            // clients use provider records only.
+            kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
             let store_config = kad::store::MemoryStoreConfig {
                 max_provided_keys: backup::MAX_TAGS + 1024,
                 ..Default::default()
@@ -439,6 +444,11 @@ async fn run() -> Result<()> {
         };
         match event {
             SwarmEvent::NewListenAddr { address, .. } => info!(%address, "listening"),
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::InboundRequest {
+                request: kad::InboundRequest::AddProvider { record: Some(record) },
+            })) => {
+                let _ = swarm.behaviour_mut().kademlia.store_mut().add_provider(client_provider(record));
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
@@ -529,6 +539,15 @@ async fn run() -> Result<()> {
 fn provide(swarm: &mut Swarm<Behaviour>, local_id: PeerId, tag: &backup::Tag) {
     let record = kad::ProviderRecord::new(kad::RecordKey::new(tag), local_id, Vec::new());
     let _ = swarm.behaviour_mut().kademlia.store_mut().add_provider(record);
+}
+
+/// A provider record from a client, as stored: without the addresses it
+/// carried. GET_PROVIDERS answers then take the provider's addresses from the
+/// routing table, which only holds filtered ones (dht_addr_ok), so a client
+/// can't plant DNS names or LAN addresses in backup-tag answers (Security Lead).
+fn client_provider(mut record: kad::ProviderRecord) -> kad::ProviderRecord {
+    record.addresses.clear();
+    record
 }
 
 fn forget_circuit(swarm: &mut Swarm<Behaviour>, reserved: &mut HashSet<PeerId>, peer: &PeerId) {
@@ -641,6 +660,28 @@ mod tests {
         assert!(!ok("/ip4/192.168.1.10/tcp/4001", false));
         assert!(ok("/ip4/192.168.1.10/tcp/4001", true));
         assert!(!ok("/p2p-circuit", true));
+    }
+
+    #[test]
+    fn a_client_provider_record_keeps_no_addresses() {
+        use kad::store::RecordStore as _;
+        let client = PeerId::random();
+        let planted: Vec<Multiaddr> = vec![
+            "/dns4/evil.example.org/tcp/4001".parse().unwrap(),
+            "/ip4/192.168.1.10/tcp/4001".parse().unwrap(),
+            "/ip4/8.8.8.8/tcp/4001".parse().unwrap(),
+        ];
+        let key = kad::RecordKey::new(&[7u8; 32]);
+        let stored = client_provider(kad::ProviderRecord::new(key.clone(), client, planted));
+        assert!(stored.addresses.is_empty());
+        assert_eq!((stored.provider, stored.key.clone()), (client, key.clone()));
+        // And that is what the store then serves.
+        let relay = PeerId::random();
+        let mut store = kad::store::MemoryStore::new(relay);
+        store.add_provider(stored).unwrap();
+        let held = store.providers(&key);
+        assert_eq!(held.len(), 1);
+        assert!(held[0].addresses.is_empty());
     }
 
     #[cfg(unix)]

@@ -87,8 +87,9 @@ impl DailyBudget {
             Some((parts.next()?.ok()?, parts.next()?.ok()?))
         });
         // A clock set back keeps the saved day until it has passed: never less
-        // than what was spent.
-        if let Some((since, used)) = saved {
+        // than what was spent. A day starting more than a day from now can't
+        // come from a clock set back: the file is damaged, and ignored.
+        if let Some((since, used)) = saved.filter(|(since, _)| *since <= now + DAY) {
             self.since = since;
             self.used = used;
         }
@@ -501,6 +502,11 @@ mod tests {
         let mut later = DailyBudget::new(MIN_DAILY_CAP_MB, now + DAY + 1);
         later.keep_in(file.clone(), now + DAY + 1);
         assert_eq!(later.used, 0);
+        // A day start far in the future is damaged too (the Tech Lead, #399).
+        std::fs::write(&file, format!("{} {}", now + 2 * DAY, 1u64 << 30)).unwrap();
+        let mut future = DailyBudget::new(MIN_DAILY_CAP_MB, now);
+        future.keep_in(file.clone(), now);
+        assert_eq!((future.used, future.since), (0, now));
         // A damaged file is ignored (a fresh day), not trusted.
         std::fs::write(&file, "junk").unwrap();
         let mut fresh = DailyBudget::new(MIN_DAILY_CAP_MB, now);

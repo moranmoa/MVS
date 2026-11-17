@@ -67,7 +67,7 @@
 | **אופן הדיבור** | Radio: "פתוח לדיבור" (default) / "לחיצה לדיבור" (§6) |
 
 - **Mic gate (V-C2, sec-lead): option (a).** The shell allows `getUserMedia` only during a call, so **the full controls live in the in-call Voice dialog** (call bar, #429). Settings → "קול" outside a call shows the speaker picker and "השמעת צליל בדיקה" (no mic needed), plus a line instead of the meter: "אפשר לבדוק את המיקרופון בזמן שיחה." / "You can test your microphone during a call." Device names appear once the mic has been allowed in a call. There's no separate mic-test permission window (it would need a sec-lead review).
-- **Device unplugged mid-call:** fall back to the system default, with a toast "המיקרופון התנתק. עברנו לברירת המחדל." / "Your microphone was disconnected. Switched to the default."
+- **Device unplugged mid-call:** fall back to the system default, with a toast naming the device: `call.micUnplugged` (and the speaker equivalent, plus a no-name version), as built in #436
 
 ## 5. In-call controls
 
@@ -108,7 +108,7 @@
 | `voice.micTest` | `בדיקת מיקרופון` | `Mic test` |
 | `voice.playTest` | `השמעת צליל בדיקה` | `Play test sound` |
 | `voice.needPermission` | `צריך לאשר גישה למיקרופון` | `Allow microphone access` |
-| `voice.micGone` | `המיקרופון התנתק. עברנו לברירת המחדל.` | `Your microphone was disconnected. Switched to the default.` |
+| `call.micUnplugged` | `המיקרופון ⁨{name}⁩ נותק. עוברים לברירת המחדל של המערכת.` | `Microphone ⁨{name}⁩ was unplugged. Using the system default.` |
 | `voice.micTestInCall` | `אפשר לבדוק את המיקרופון בזמן שיחה.` | `You can test your microphone during a call.` |
 | `voice.mode` | `אופן הדיבור` | `Input mode` |
 | `voice.mode.open` | `פתוח לדיבור` | `Voice activity` |
@@ -145,3 +145,4 @@
 | 444 | `444-volume-menu-he` | The roster context menu with the volume slider |
 | 445 | `445-call-bar-deafen-he` | The call bar with deafen on |
 | 446 | `446-ptt-setting-he` | The PTT mode with a captured key |
+| 447 | `447-voice-dialog-he` | The in-call Voice dialog (call bar): mic, speakers, meter, "השמעה עצמית" |

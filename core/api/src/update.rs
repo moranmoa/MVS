@@ -49,6 +49,9 @@ impl UpdateSource for DynSource {
     fn manifest(&self, channel: &str) -> Result<Vec<u8>, SourceError> {
         self.0.manifest(channel)
     }
+    fn flags(&self) -> Result<Vec<u8>, SourceError> {
+        self.0.flags()
+    }
     fn root_updates(&self) -> Result<Vec<Vec<u8>>, SourceError> {
         self.0.root_updates()
     }
@@ -194,6 +197,12 @@ impl Updates {
         events.extend(h.events);
         let committed = h.committed.map(|v| v.to_string());
         Ok(Outcome { ok: json!({ "committed": committed }), events })
+    }
+
+    /// The owner's signed global member-relay switch (slice 3b): the last
+    /// verified value, false when none was ever verified or updates are off.
+    pub fn member_relay_off(&self, ui: UpdateChannel) -> bool {
+        self.updater(ui).is_ok_and(|u| u.member_relay_off())
     }
 
     /// One background round: check and download whatever is available.

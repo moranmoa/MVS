@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::launcher::{record_snapshot, LAUNCH_ATTEMPTS};
 use crate::layout::{read_state_file, save_state, write_atomic, UpdateDirs, UpdateLock, APP_EXE};
+use crate::flags::{newest_flags, VerifiedFlags};
 use crate::manifest::notes_for;
 use crate::root::{embedded_root, parse_root_fetch};
 use crate::source::{SourceError, UpdateSource};
@@ -238,6 +239,33 @@ impl<S: UpdateSource> Updater<S> {
             .unwrap_or_else(|| self.root.clone())
     }
 
+    /// The last verified global flags, if any were ever verified.
+    fn kept_flags(&self) -> Option<VerifiedFlags> {
+        let b = read_state_file(&self.cfg.dirs.flags_file()).ok().flatten()?;
+        let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
+        Some(VerifiedFlags::kept(v["issuedAt"].as_u64()?, v["memberRelayOff"].as_bool()?))
+    }
+
+    /// Fetches `flags.json`, verifies it against `root`, and keeps it only if
+    /// it is newer than what is kept. Missing, unreachable or invalid: the
+    /// last verified value stays.
+    fn refresh_flags(&self, root: &TrustRoot, now: u64) {
+        let fetched = self.source.flags().ok();
+        let Ok(_lock) = self.lock() else { return };
+        let kept = self.kept_flags();
+        let newest = newest_flags(kept, fetched.as_deref(), root, now);
+        if let Some(f) = newest.filter(|f| Some(*f) != kept) {
+            let json = json!({ "issuedAt": f.issued_at(), "memberRelayOff": f.member_relay_off() });
+            let _ = write_atomic(&self.cfg.dirs.flags_file(), json.to_string().as_bytes());
+        }
+    }
+
+    /// The owner's global member-relay switch (slice 3b): the last verified
+    /// value, false when none was ever verified.
+    pub fn member_relay_off(&self) -> bool {
+        self.kept_flags().is_some_and(|f| f.member_relay_off())
+    }
+
     /// Fetches and verifies; the policy is updated on disk.
     fn fetch_verified(&self, now: u64) -> Result<(Option<VerifiedManifest>, CheckResult), UpdateError> {
         // Start from the newest root ever verified, so a source that withholds
@@ -253,6 +281,8 @@ impl<S: UpdateSource> Updater<S> {
             let json = serde_json::to_vec(&chain.root.to_file()).expect("root serialises");
             write_atomic(&self.cfg.dirs.root_file(), &json).map_err(io_err)?;
         }
+        // Global flags (slice 3b): best effort, never fails the check.
+        self.refresh_flags(&chain.root, now);
         let fetched = match self.source.manifest(&self.cfg.channel) {
             Ok(bytes) => Some(bytes),
             // Nothing published on this channel yet.
@@ -487,6 +517,7 @@ mod tests {
         payload: Vec<u8>,
         offline: bool,
         roots: Vec<Vec<u8>>,
+        flags: Option<Vec<u8>>,
         artifact_calls: Mutex<u32>,
     }
 
@@ -496,6 +527,9 @@ mod tests {
                 return Err(SourceError::Offline("test".into()));
             }
             self.manifest.clone().ok_or(SourceError::NotFound)
+        }
+        fn flags(&self) -> Result<Vec<u8>, SourceError> {
+            self.flags.clone().ok_or(SourceError::NotFound)
         }
         fn root_updates(&self) -> Result<Vec<Vec<u8>>, SourceError> {
             if self.offline {
@@ -699,6 +733,37 @@ mod tests {
 
         // The new key still works without root-2 being served again.
         assert!(w.updater("1.0.0", w.release_by(&new_key, zip, unpacked)).check(NOW).is_ok());
+    }
+
+    fn signed_flags(w: &World, issued_at: u64, off: bool) -> Vec<u8> {
+        let body = crate::flags::FlagsBody { v: 1, issued_at, member_relay_off: off };
+        let mut f = crate::flags::SignedFlags::new(&body).unwrap();
+        f.sign(&w.key);
+        f.to_json().into_bytes()
+    }
+
+    #[test]
+    fn global_flags_are_fetched_with_the_check_and_kept() {
+        let w = World::new("flags");
+        let with = |flags: Option<Vec<u8>>| w.updater("1.0.0", Mock { flags, ..Mock::default() });
+        // Never verified: off.
+        assert!(!with(None).member_relay_off());
+        // Fetched beside the (missing) manifest, verified, kept.
+        with(Some(signed_flags(&w, NOW, true))).check(NOW).unwrap();
+        assert!(with(None).member_relay_off());
+        // A later check without the file, with an older one, or with a forged
+        // one keeps the last verified value.
+        with(None).check(NOW).unwrap();
+        with(Some(signed_flags(&w, NOW - 60, false))).check(NOW).unwrap();
+        let forged = World::new("flags-forger");
+        with(Some(signed_flags(&forged, NOW + 60, false))).check(NOW).unwrap();
+        assert!(with(None).member_relay_off());
+        // A newer one from the owner wins.
+        with(Some(signed_flags(&w, NOW + 60, false))).check(NOW).unwrap();
+        assert!(!with(None).member_relay_off());
+        // Offline: the check fails, the value stays.
+        assert!(w.updater("1.0.0", Mock { offline: true, ..Mock::default() }).check(NOW).is_err());
+        assert!(!with(None).member_relay_off());
     }
 
     #[test]

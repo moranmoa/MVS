@@ -74,7 +74,7 @@ export function PushToTalkSection() {
   return (
     <div className="stack voice-settings">
       {unsupported && (
-        <p className="muted small" role="note" id="ptt-desktop-only">
+        <p className="muted small" id="ptt-desktop-only">
           <FormattedMessage id="voice.desktopOnly" />
         </p>
       )}

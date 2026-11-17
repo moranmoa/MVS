@@ -102,7 +102,7 @@ describe('Settings → Voice (G-74)', () => {
 
   it('outside the desktop app it says so and the controls are off', async () => {
     await open(null);
-    await waitFor(() => expect(screen.getByRole('note').textContent).toBe('Push to talk works in the desktop app.'));
+    await waitFor(() => expect(document.getElementById('ptt-desktop-only')?.textContent).toBe('Push to talk works in the desktop app.'));
     expect((screen.getByRole('radio', { name: 'Push to talk' }) as HTMLInputElement).disabled).toBe(true);
     // UX: the line explains the disabled controls.
     expect(screen.getByRole('radio', { name: 'Push to talk' }).getAttribute('aria-describedby')).toBe('ptt-desktop-only');

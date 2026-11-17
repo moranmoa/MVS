@@ -13,7 +13,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, ipcMain, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, ipcMain, nativeImage, protocol, session, shell } = require('electron');
 const sec = require('./security');
 const { toRequest } = require('./commands');
 const signout = require('./signout');
@@ -24,6 +24,7 @@ const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
 const { createNotifier } = require('./notify');
+const badge = require('./badge');
 
 // Tests only, and only in a checkout (never a release build): a throwaway
 // profile, so a test run never shares the installed app's profile
@@ -240,6 +241,22 @@ function serveCoreIpc() {
   ipcMain.handle('notify:show', (event, notice) => {
     if (!fromUs(event)) return false;
     return notifier.show(notice);
+  });
+  // G-62: the unread count on the taskbar (Windows: our overlay icon) or
+  // the dock / launcher. Only a checked whole number reaches the OS.
+  const unread = badge.createBadge({
+    apply: (n) => {
+      if (process.platform === 'win32') {
+        const img = n > 0 ? nativeImage.createFromBitmap(badge.drawBadge(badge.label(n)), { width: badge.SIZE, height: badge.SIZE, scaleFactor: 2 }) : null;
+        for (const win of BrowserWindow.getAllWindows()) win.setOverlayIcon(img, n > 0 ? `${n} unread` : '');
+      } else {
+        app.setBadgeCount(n);
+      }
+    },
+  });
+  ipcMain.handle('badge:set', (event, count) => {
+    if (!fromUs(event)) return false;
+    return unread.set(count);
   });
   ipcMain.handle('logs:open', async (event) => {
     if (!fromUs(event)) return false;

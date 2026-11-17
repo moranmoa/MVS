@@ -14,6 +14,49 @@ import type { CoreError } from './types';
 export interface DesktopBridge {
   invoke(cmd: string, args: unknown[]): Promise<{ ok?: unknown; error?: CoreError | { code: string } }>;
   onEvent(callback: (event: string, payload: unknown) => void): () => void;
+  /** G-74: push-to-talk settings (desktop only). */
+  setPushToTalk?(settings: PushToTalkSettings): Promise<PushToTalkResult>;
+}
+
+/**
+ * G-74: `key` is a KeyboardEvent.code (e.g. 'KeyV', 'ControlLeft', 'F13') or
+ * null; `globalMute` an Electron accelerator with a modifier (e.g.
+ * 'CommandOrControl+Shift+M', or a bare F13–F24) or null.
+ */
+export interface PushToTalkSettings {
+  key: string | null;
+  globalMute: string | null;
+}
+/** `shortcut-taken`: the key is set, but another app holds the global shortcut. */
+export type PushToTalkResult = 'ok' | 'invalid' | 'shortcut-taken' | 'unsupported';
+/** What the shell sends: talk (key held), stop (200 ms after release or focus loss), toggleMute (global shortcut). */
+export type PushToTalkSignal = 'down' | 'up' | 'toggleMute';
+
+/** G-74: hands the push-to-talk settings to the shell; 'unsupported' outside the desktop app. */
+export async function setPushToTalk(
+  settings: PushToTalkSettings,
+  bridge: DesktopBridge | undefined = typeof window === 'undefined' ? undefined : window.mvs,
+): Promise<PushToTalkResult> {
+  if (typeof bridge?.setPushToTalk !== 'function') return 'unsupported';
+  try {
+    const res = await bridge.setPushToTalk(settings);
+    return res === 'ok' || res === 'shortcut-taken' ? res : 'invalid';
+  } catch {
+    return 'invalid';
+  }
+}
+
+/** G-74: calls back with the shell's push-to-talk signals. Returns an unsubscribe (a no-op outside the desktop app). */
+export function onPushToTalk(
+  callback: (signal: PushToTalkSignal) => void,
+  bridge: DesktopBridge | undefined = typeof window === 'undefined' ? undefined : window.mvs,
+): () => void {
+  if (typeof bridge?.onEvent !== 'function') return () => {};
+  return bridge.onEvent((event) => {
+    if (event === 'ptt.down') callback('down');
+    else if (event === 'ptt.up') callback('up');
+    else if (event === 'ptt.toggleMute') callback('toggleMute');
+  });
 }
 
 declare global {

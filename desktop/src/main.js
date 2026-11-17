@@ -13,7 +13,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, ipcMain, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Notification, clipboard, crashReporter, dialog, globalShortcut, ipcMain, protocol, session, shell } = require('electron');
 const sec = require('./security');
 const { toRequest } = require('./commands');
 const signout = require('./signout');
@@ -24,6 +24,7 @@ const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
 const { createNotifier } = require('./notify');
+const ptt = require('./ptt');
 
 // Tests only, and only in a checkout (never a release build): a throwaway
 // profile, so a test run never shares the installed app's profile
@@ -75,6 +76,13 @@ if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
 const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
+/**
+ * G-74: push-to-talk on our focused window (ptt.js). Only the one key the
+ * page chose, only during a call; the page gets ptt.down / ptt.up.
+ */
+const pushToTalk = ptt.createPtt({ emit: (name) => toPages(name, {}), active: () => callGate.inCall });
+/** G-74: the optional global "toggle mute" accelerator we registered, or null. */
+let globalMute = null;
 
 /** Sends a shell event (not from the core) to our own windows. */
 function toPages(name, payload) {
@@ -139,6 +147,7 @@ function startCore() {
     extraArgs: update.coreArgs(UPDATE),
     onEvent: (name, payload) => {
       callGate.onEvent(name, payload);
+      if (!callGate.inCall) pushToTalk.reset();
       toPages(name, payload);
     },
     onStatus: setCoreStatus,
@@ -240,6 +249,32 @@ function serveCoreIpc() {
   ipcMain.handle('notify:show', (event, notice) => {
     if (!fromUs(event)) return false;
     return notifier.show(notice);
+  });
+  // G-74: the page's push-to-talk settings { key, globalMute }: a
+  // KeyboardEvent.code (or null) and an accelerator (or null), both checked
+  // here. 'ok', 'invalid' (nothing changed) or 'shortcut-taken' (the key is
+  // set; the global shortcut isn't: another app has it).
+  ipcMain.handle('ptt:set', (event, settings) => {
+    if (!fromUs(event)) return 'invalid';
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return 'invalid';
+    const key = ptt.cleanKey(settings.key ?? null);
+    const accel = ptt.cleanAccelerator(settings.globalMute ?? null);
+    if (key === undefined || accel === undefined) return 'invalid';
+    pushToTalk.setKey(key);
+    if (accel === globalMute) return 'ok';
+    if (globalMute) globalShortcut.unregister(globalMute);
+    globalMute = null;
+    if (!accel) return 'ok';
+    let ok = false;
+    try {
+      // The page hears only that it was pressed, and only during a call.
+      ok = globalShortcut.register(accel, () => callGate.inCall && toPages('ptt.toggleMute', {}));
+    } catch {
+      ok = false;
+    }
+    if (!ok) return 'shortcut-taken';
+    globalMute = accel;
+    return 'ok';
   });
   ipcMain.handle('logs:open', async (event) => {
     if (!fromUs(event)) return false;
@@ -444,9 +479,14 @@ function createWindow() {
   // A second close within 10 s closes whatever the page does.
   // Only a live, answering page is asked: a quit, a crashed or killed
   // renderer, or a hung one closes at once (a dead page never answers).
+  // G-74: push-to-talk sees our own window's keys only (never the OS's), and
+  // losing focus counts as letting go of the key.
+  win.webContents.on('before-input-event', (_e, input) => pushToTalk.onInput(input));
+  win.on('blur', () => pushToTalk.onBlur());
   win.on('unresponsive', () => unresponsive.add(win));
   win.on('responsive', () => unresponsive.delete(win));
   win.webContents.on('render-process-gone', () => {
+    pushToTalk.reset();
     // The page held the call's audio; the call ends with it.
     if (callGate.inCall) {
       callGate.end();
@@ -517,6 +557,7 @@ app.on('second-instance', (_event, argv) => {
 });
 
 app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
   meteredWatch?.stop();
   callGate.end();
   core?.stop();

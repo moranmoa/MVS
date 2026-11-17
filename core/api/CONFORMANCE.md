@@ -290,7 +290,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       - `offline`.
       A retry from the same device reuses its one-time key, so it's the same session with the same digits.
     - `confirmDeviceApproval(approve: boolean)` returns `null`. `true` sends the account and emits `account.deviceAdded { at, label? }`. `false` ends this attempt, and nothing is sent. Errors: `bad-request` with no approval in progress, `not-found` once expired.
-    - `account.deviceAdded { at, label? }`: `label` is plain text, at most 64 characters, and left out when unknown (today always). The notice is kept in the core database until `ackDeviceNotice(at)` (which returns `null`; an unknown `at` is fine). It's announced again at the first sync round after each start until acknowledged, so a client may see the same `at` twice and should key notices by it. The cross-device notice will feed the same store.
+    - `account.deviceAdded { at, label? }`: `label` is plain text, at most 64 characters, with no control characters and no invisible format or direction marks (zero-width, bidi embeddings, overrides and isolates, word joiner, line and paragraph separators, BOM), and left out when unknown (today always). The notice is kept in the core database until `ackDeviceNotice(at)` (which returns `null`; an unknown `at` is fine). It's announced again at the first sync round after each start until acknowledged, so a client may see the same `at` twice and should key notices by it. The cross-device notice will feed the same store.
   - **Crypto:**
     - one-time X25519 keys;
     - the SAS is `derive_key("mvs/device-link-sas/v1", e_new_pub ‖ e_old_pub)`, its first 4 bytes little-endian, mod 10^6, as 6 digits;

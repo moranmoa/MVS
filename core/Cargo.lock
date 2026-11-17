@@ -1735,6 +1735,7 @@ dependencies = [
  "keyring-core",
  "rand_core 0.6.4",
  "records",
+ "secret-service",
  "sha2 0.10.9",
  "strsim",
  "unicode-normalization",

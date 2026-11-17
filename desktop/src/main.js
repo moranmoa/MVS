@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relayFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -115,11 +115,13 @@ function startCore() {
   const dataDir = path.join(app.getPath('userData'), 'core');
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   if (process.platform !== 'win32') fs.chmodSync(dataDir, 0o700);
-  const relay = relayFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
-  // The relay's host (DNS name or IP) must never reach the log, not even
-  // bare; nor its direct addresses (#219).
+  // Multi-relay part A: the list, in order (the core uses the first until
+  // sync takes several).
+  const relays = relaysFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+  // No relay's host (DNS name or IP) may reach the log, not even bare; nor
+  // their direct addresses (#219).
   const bootstrap = bootstrapFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
-  for (const addr of [relay, ...bootstrap]) {
+  for (const addr of [...relays, ...bootstrap]) {
     const host = logHost(addr);
     if (host) fileLog.hide(host);
   }
@@ -132,7 +134,7 @@ function startCore() {
     script: jsCore ? CORE_EXE : null,
     dataDir,
     // Without a relay the core runs offline (no invites, no chat with others).
-    relay,
+    relays,
     bootstrap,
     extraArgs: update.coreArgs(UPDATE),
     onEvent: (name, payload) => {

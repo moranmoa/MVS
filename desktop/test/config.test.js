@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
-const { relayFor, bootstrapFor, validRelay, logHost, MAX_RELAY, MAX_BOOTSTRAP, stunFor, validStun, stunHost, MAX_STUN } = require('../src/config');
+const { relayFor, relaysFor, bootstrapFor, validRelay, logHost, MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, stunFor, validStun, stunHost, MAX_STUN } = require('../src/config');
 const { createLog } = require('../src/logfile');
 const { Sidecar } = require('../src/sidecar');
 
@@ -197,4 +197,75 @@ test('relay and bootstrap hosts, DNS or IP, never reach the file log', () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- multi-relay part A ------------------------------------------------------
+
+const ID2 = '12D3KooW' + 'B'.repeat(44);
+const ID3 = '12D3KooW' + 'C'.repeat(44);
+const RELAY2 = `/dns4/relay2.example.org/tcp/443/wss/p2p/${ID2}`;
+const RELAY3 = `/dns4/relay3.example.org/tcp/443/wss/p2p/${ID3}`;
+
+test('packaged: the relay list comes from mvs-config.json "relays", in order', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(m);
+  const cfg = (o) => ({ packaged: true, resourcesPath: resources(JSON.stringify(o)), warn });
+  assert.deepEqual(relaysFor(cfg({ relays: [RELAY, RELAY2], relay: RELAY3 })), [RELAY, RELAY2]);
+  assert.deepEqual(warnings, []);
+});
+
+test('the relay list drops bad entries and repeats of a relay, keeps at most 4, never naming them', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(m);
+  const cfg = (o) => ({ packaged: true, resourcesPath: resources(JSON.stringify(o)), warn });
+  // A bad entry and a second address for the same relay (peer ID).
+  const sameId = `/dns4/relay-direct.example.org/tcp/4001/p2p/${ID}`;
+  assert.deepEqual(relaysFor(cfg({ relays: [RELAY, '/dns4/x/tcp/443', sameId, `${RELAY2} --inspect`, RELAY2] })), [RELAY, RELAY2]);
+  // More than four.
+  const five = Array.from({ length: MAX_RELAYS + 1 }, (_, i) => `/dns4/r${i}.example.org/tcp/443/wss/p2p/12D3KooW${String.fromCharCode(68 + i).repeat(44)}`);
+  assert.equal(relaysFor(cfg({ relays: five })).length, MAX_RELAYS);
+  assert.ok(warnings.length >= 3);
+  assert.ok(warnings.every((w) => !/example\.org|12D3KooW/.test(w)), 'warnings never name an address');
+});
+
+test('the single relay is the fallback: no list, an empty one, a malformed one, or nothing usable', () => {
+  const warn = () => {};
+  const cfg = (o) => ({ packaged: true, resourcesPath: resources(typeof o === 'string' ? o : JSON.stringify(o)), warn });
+  assert.deepEqual(relaysFor(cfg({ relay: RELAY })), [RELAY]);
+  assert.deepEqual(relaysFor(cfg({ relays: [], relay: RELAY })), [RELAY]);
+  assert.deepEqual(relaysFor(cfg({ relays: RELAY2, relay: RELAY })), [RELAY], 'a string is not a list');
+  assert.deepEqual(relaysFor(cfg({ relays: ['/bad'], relay: RELAY })), [RELAY]);
+  assert.deepEqual(relaysFor(cfg({})), []);
+  assert.deepEqual(relaysFor(cfg('{relays')), []);
+  assert.deepEqual(relaysFor({ packaged: true, resourcesPath: resources(), warn }), []);
+});
+
+test('checkout: MVS_RELAYS (lines or commas), else MVS_RELAY; never the packaged file', () => {
+  const warn = () => {};
+  const dir = resources(JSON.stringify({ relays: [RELAY3] }));
+  assert.deepEqual(relaysFor({ packaged: false, resourcesPath: dir, env: { MVS_RELAYS: `${RELAY}\n${RELAY2}\n` }, warn }), [RELAY, RELAY2]);
+  assert.deepEqual(relaysFor({ packaged: false, resourcesPath: dir, env: { MVS_RELAYS: `${RELAY}, ${RELAY2}` }, warn }), [RELAY, RELAY2]);
+  assert.deepEqual(relaysFor({ packaged: false, resourcesPath: dir, env: { MVS_RELAYS: ' ', MVS_RELAY: RELAY }, warn }), [RELAY]);
+  assert.deepEqual(relaysFor({ packaged: false, resourcesPath: dir, env: {}, warn }), []);
+});
+
+test('mvs-core gets one --relay per relay, in order, then --bootstrap', () => {
+  const data = path.resolve('/data');
+  assert.deepEqual(spawnedArgs({ relays: [RELAY, RELAY2], bootstrap: [TCP] }), ['--data-dir', data, '--relay', RELAY, '--relay', RELAY2, '--bootstrap', TCP]);
+  // One relay: exactly the arguments of a single-relay build.
+  assert.deepEqual(spawnedArgs({ relays: [RELAY], bootstrap: [TCP] }), spawnedArgs({ relay: RELAY, bootstrap: [TCP] }));
+  assert.deepEqual(spawnedArgs({ relays: [], bootstrap: [TCP] }), ['--data-dir', data]);
+  assert.throws(() => spawnedArgs({ relays: RELAY }), /strings/);
+  assert.throws(() => spawnedArgs({ relays: [42] }), /strings/);
+});
+
+test('checkout: relay and bootstrap lists take commas and/or newlines, spaces and empty entries ignored', () => {
+  const warnings = [];
+  const warn = (m) => warnings.push(m);
+  assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: ` ${RELAY} ,, ${RELAY2},` }, warn }), [RELAY, RELAY2]);
+  assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: `${RELAY},\r\n${RELAY2}\r\n` }, warn }), [RELAY, RELAY2]);
+  // The same relay twice, once per separator: dropped, not named.
+  assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: `${RELAY},${RELAY}\n${RELAY2}` }, warn }), [RELAY, RELAY2]);
+  assert.deepEqual(bootstrapFor({ packaged: false, env: { MVS_BOOTSTRAP: ` ${TCP} ,\n,` }, warn }), [TCP]);
+  assert.ok(warnings.every((w) => !/example\.org|12D3KooW/.test(w)), 'warnings never name an address');
 });

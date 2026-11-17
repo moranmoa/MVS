@@ -5,7 +5,7 @@
 
 import { useSyncExternalStore } from 'react';
 import type { CoreApi } from '../core/api';
-import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom, MemberRelay } from '../core/types';
+import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom, MemberRelay, DeviceAdded } from '../core/types';
 import { liveMutes, loadMutes, MUTE_DURATIONS, MUTE_FOREVER, nextExpiry, saveMutes, type MuteDuration, type MuteKey, type Mutes } from './mute';
 
 const PAGE = 100;
@@ -118,6 +118,8 @@ export interface StoreState {
   notice: { kind: 'encryption-renewed'; serverId: Id; at: number } | null;
   /** Shown once: a new version was installed, or the previous one is back. */
   updateNote: UpdateNote | null;
+  /** "A new device was added to your account", until answered. */
+  deviceNotices: DeviceAdded[];
   /** My current call (voice v1), or null. */
   call: CallState | null;
   /** Why the last joinCall failed, until the next try or dismissal. */
@@ -149,6 +151,7 @@ export class Store {
     update: null,
     notice: null,
     updateNote: null,
+    deviceNotices: [],
     call: null,
     callError: null,
     voiceRooms: {},
@@ -234,6 +237,9 @@ export class Store {
       }),
       on('voice.rooms', (p) => this.setRooms(p.serverId, p.rooms)),
       on('memberRelay.changed', (r) => this.setMemberRelay(r)),
+      on('account.deviceAdded', (d) =>
+        this.set({ deviceNotices: [...this.state.deviceNotices.filter((x) => x.at !== d.at), d].sort((a, b) => a.at - b.at) }),
+      ),
       on('update.rolledBack', (u) => this.set({ updateNote: { kind: 'rolledBack', ...u } })),
       // rekey-waiting: the failed message's own line says why; no toast (UX, #289).
       on('notice', (n) => n.kind !== 'rekey-waiting' && this.set({ notice: { ...n, kind: n.kind, at: Date.now() } })),
@@ -332,6 +338,12 @@ export class Store {
 
   setIdentity(identity: Identity | null): void {
     this.set({ identity });
+  }
+
+  /** "It was me": the core stops re-sending it. */
+  dismissDeviceNotice(at: number): void {
+    this.set({ deviceNotices: this.state.deviceNotices.filter((d) => d.at !== at) });
+    void this.core.ackDeviceNotice(at).catch(() => {});
   }
 
   clearNotice(): void {

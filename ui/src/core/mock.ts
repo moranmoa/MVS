@@ -84,6 +84,8 @@ export interface MockOptions {
   memberRelayReason?: 'minor' | 'metered' | 'global-off';
   /** Member relays: the one-time disclosure not seen yet (shows at start for an owner). */
   memberRelayUnseen?: boolean;
+  /** Shortly after start: "a new device was added to your account" (label; '' = none). */
+  deviceLinked?: string;
   /** Device link, new device: the state to reach after starting (for screenshots). */
   deviceLink?: 'confirm' | 'expired' | 'failed';
   /** Start with relay-only on (#272): no direct connections, calls off. */
@@ -215,6 +217,10 @@ export class MockCore implements CoreApi {
     if (options.simulateActivity) {
       this.timers.push(setInterval(() => this.simulateIncoming(), 4500));
       this.timers.push(setInterval(() => this.simulatePresence(), 9000));
+    }
+    if (options.deviceLinked !== undefined) {
+      const label = options.deviceLinked;
+      this.timers.push(setTimeout(() => this.simulateDeviceAdded(label, Date.now() - 2 * 60_000), 50));
     }
     if (options.updateInstalled) {
       this.timers.push(
@@ -774,6 +780,15 @@ export class MockCore implements CoreApi {
     return null;
   }
 
+  /** Mock only: a device was linked to this account elsewhere. */
+  simulateDeviceAdded(label: string, at = Date.now()): void {
+    this.emit('account.deviceAdded', { at, ...(label ? { label } : {}) });
+  }
+
+  async ackDeviceNotice(): Promise<null> {
+    return null;
+  }
+
   async cancelDeviceLink(): Promise<null> {
     this.deviceLinkCode = null;
     return null;
@@ -783,7 +798,7 @@ export class MockCore implements CoreApi {
    * Mock only, for tests and demos: the other device's side of a link. "confirm"
    * shows the digits; "done" signs this device in as a linked account.
    */
-  simulateDeviceLink(state: 'confirm' | 'done' | 'expired' | 'failed', reason?: 'refused' | 'network' | 'timeout'): void {
+  simulateDeviceLink(state: 'confirm' | 'done' | 'expired' | 'failed', reason?: 'refused' | 'network' | 'timeout' | 'keyring' | 'restore'): void {
     if (state === 'done') {
       // As the core: nothing is applied before this device confirmed the digits.
       if (!this.deviceLinkConfirmed) return;

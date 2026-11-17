@@ -2434,6 +2434,7 @@ kbd {
   height: 2.75rem;
 }
 
+.call-actions .call-deafen.muted,
 .call-actions .call-mute.muted {
   color: var(--danger);
 }
@@ -3534,4 +3535,20 @@ input.switch:disabled {
   .mic-level-fill {
     transition: none;
   }
+}
+
+/* G-73: volume per person, in Voice settings. */
+.call-volumes {
+  margin-block-start: 1rem;
+  padding: 0;
+  border: 0;
+}
+
+.call-volumes legend {
+  font-weight: 600;
+  margin-block-end: 0.5rem;
+}
+
+.call-volumes .field + .field {
+  margin-block-start: 0.5rem;
 }

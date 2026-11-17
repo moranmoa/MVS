@@ -3,13 +3,13 @@
 // the IP notice, the join error line, the roster notes. The audio itself (microphone, WebRTC, speaking levels) is the
 // voice engine's, piece D in ui/src/voice.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
-import { Dialog } from '../../components/common';
-import { AlertIcon, GearIcon, HangUpIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
-import { useCore, type Id } from '../../core';
+import { Dialog, Name } from '../../components/common';
+import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
+import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
 
 /**
@@ -62,6 +62,8 @@ function useStunUrl(): string | null {
   useEffect(() => core.on('core.status', (s) => setUrl(s.stunUrl ?? null)), [core]);
   return url;
 }
+
+const NO_MEMBERS: Member[] = [];
 
 /** The short code the app shows for someone not (yet) in the member list. */
 export function codeOf(id: Id): string {
@@ -129,19 +131,45 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   const intl = useIntl();
   const call = useStore(store, (s) => s.call);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** G-84: deafening muted my mic, so undeafening unmutes it. */
+  const mutedByDeafen = useRef(false);
   // The call may be in another server's room than the one on screen.
   const serverId = useStore(store, (s) => Object.entries(s.voiceRooms).find(([, rooms]) => rooms.some((r) => r.roomId === s.call?.channelId))?.[0]);
   const serverName = useStore(store, (s) => s.servers.find((x) => x.id === serverId)?.name ?? '');
+  const members = useStore(store, (s) => (serverId ? s.members[serverId] : undefined)) ?? NO_MEMBERS;
   if (!call) return null;
 
   const me = call.participants.find((p) => p.identity === myId);
   const noMic = engine.noMic;
   const noMicText = intl.formatMessage({ id: engine.error === 'rejoin-to-talk' ? 'call.rejoinToTalk' : 'call.noMic' });
+  const setMute = (muted: boolean) => {
+    engine.setMicMuted(muted);
+    void core.setMuted(muted).catch(() => {});
+  };
   const toggleMute = () => {
     if (noMic) return;
     const muted = !me?.muted;
-    engine.setMicMuted(muted);
-    void core.setMuted(muted).catch(() => {});
+    // As in Discord: unmuting while deafened undeafens too.
+    if (!muted && engine.deafened) {
+      engine.setDeafened(false);
+      mutedByDeafen.current = false;
+    }
+    setMute(muted);
+  };
+  // G-84: deafen silences everyone and mutes me (others see me muted);
+  // undeafen plays them again and unmutes me if deafening muted me.
+  const toggleDeafen = () => {
+    if (!engine.deafened) {
+      engine.setDeafened(true);
+      if (!me?.muted && !noMic) {
+        mutedByDeafen.current = true;
+        setMute(true);
+      }
+    } else {
+      engine.setDeafened(false);
+      if (mutedByDeafen.current) setMute(false);
+      mutedByDeafen.current = false;
+    }
   };
 
   return (
@@ -150,6 +178,12 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         <PhoneIcon />
         <FormattedMessage id="call.inCall" values={{ server: serverName }} />
       </p>
+      {engine.deafened && (
+        <p id="call-deafened" className="call-no-mic" role="status">
+          <HeadphonesOffIcon />
+          <FormattedMessage id="call.deafenedNote" />
+        </p>
+      )}
       {noMic && (
         <p id="call-no-mic" className="call-no-mic" role="status">
           <MicOffIcon />
@@ -171,6 +205,16 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         </button>
         <button
           type="button"
+          className={`icon-button call-deafen ${engine.deafened ? 'muted' : ''}`}
+          aria-pressed={engine.deafened}
+          aria-label={intl.formatMessage({ id: 'call.deafen' })}
+          title={intl.formatMessage({ id: 'call.deafen' })}
+          onClick={toggleDeafen}
+        >
+          {engine.deafened ? <HeadphonesOffIcon /> : <HeadphonesIcon />}
+        </button>
+        <button
+          type="button"
           className="icon-button call-settings"
           aria-haspopup="dialog"
           aria-label={intl.formatMessage({ id: 'call.voiceSettings' })}
@@ -189,7 +233,15 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
           <HangUpIcon />
         </button>
       </div>
-      <VoiceSettings open={settingsOpen} onClose={() => setSettingsOpen(false)} engine={engine} muted={!!me?.muted} />
+      <VoiceSettings
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        engine={engine}
+        muted={!!me?.muted}
+        others={call.participants
+          .filter((p) => p.identity !== myId)
+          .map((p) => ({ id: p.identity, name: members.find((m) => m.id === p.identity)?.displayName || codeOf(p.identity) }))}
+      />
     </section>
   );
 }
@@ -199,7 +251,20 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
  * the desktop shell grants the microphone (and with it the device names)
  * only during one. The choice lasts for this session.
  */
-function VoiceSettings({ open, onClose, engine, muted }: { open: boolean; onClose: () => void; engine: CallEngine; muted: boolean }) {
+function VoiceSettings({
+  open,
+  onClose,
+  engine,
+  muted,
+  others,
+}: {
+  open: boolean;
+  onClose: () => void;
+  engine: CallEngine;
+  muted: boolean;
+  /** G-73: the others in my call, for their volume. */
+  others: { id: Id; name: string }[];
+}) {
   const intl = useIntl();
   const level = useInputLevel(open && !engine.noMic && !muted, engine.inputLevel);
   const pct = Math.round(level * 100);
@@ -250,6 +315,37 @@ function VoiceSettings({ open, onClose, engine, muted }: { open: boolean; onClos
           <FormattedMessage id={engine.noMic ? 'call.noMic' : muted ? 'call.micTestMuted' : 'call.micTestHint'} />
         </p>
       </div>
+      {others.length > 0 && (
+        <fieldset className="call-volumes">
+          <legend>
+            <FormattedMessage id="call.volumes" />
+          </legend>
+          {others.map((o) => {
+            const pct = engine.volumes[o.id] ?? 100;
+            const text = intl.formatNumber(pct / 100, { style: 'percent' });
+            return (
+              <label key={o.id} className="field range">
+                <span>
+                  <Name>{o.name}</Name>
+                  <output>{text}</output>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={pct}
+                  aria-valuetext={text}
+                  onChange={(e) => engine.setVolume(o.id, Number(e.target.value))}
+                />
+              </label>
+            );
+          })}
+          <p className="hint">
+            <FormattedMessage id="call.volumesHint" />
+          </p>
+        </fieldset>
+      )}
     </Dialog>
   );
 }

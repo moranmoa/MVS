@@ -576,7 +576,7 @@
   "notify.settings.desktopHint": "Shown when the MVS window isn't in front. Each server and channel can be set from its menu (right-click).",
   "notify.settings.preview": "Show message preview in notifications",
   "notify.settings.previewHint": "Off: notifications say \"New message in #channel\" without the text.",
-  "notify.settings.badgeHint": "Shown on the taskbar or dock. Muted servers and channels aren't counted.",
+  "notify.settings.badgeHint": "Your mentions, plus channels with new messages, on the taskbar icon. Muted servers and channels aren't counted.",
   "notify.settings.badge": "Unread count on the app icon",
   "notify.settings.desktopOnly": "Notifications work in the desktop app.",
   "notify.hidden": "New message in \u2068#{channel}\u2069",

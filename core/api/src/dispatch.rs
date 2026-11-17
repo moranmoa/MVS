@@ -261,6 +261,12 @@ struct RelayOnlyArg {
     on: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeteredArg {
+    metered: bool,
+}
+
 fn args<T: DeserializeOwned>(value: Value) -> CoreResult<T> {
     serde_json::from_value(value).map_err(|_| ErrorCode::BadRequest.into())
 }
@@ -399,6 +405,8 @@ impl Core {
             "setMemberRelay" => ok(self.set_member_relay(args::<MemberRelayArg>(raw)?.setting)),
             "setMemberRelayCap" => ok(self.set_member_relay_cap(args::<MemberRelayCapArg>(raw)?.mb)),
             "markMemberRelayDisclosureSeen" => ok(self.mark_member_relay_disclosure_seen()),
+            // The desktop shell only (not in the page's allow-list).
+            "setMetered" => ok(self.set_metered(args::<MeteredArg>(raw)?.metered)),
             "startDeviceLink" => ok(self.start_device_link()),
             "cancelDeviceLink" => ok(self.cancel_device_link()),
             "beginDeviceApproval" => ok(self.begin_device_approval(&args::<QrOrCodeArg>(raw)?.qr_or_code)),

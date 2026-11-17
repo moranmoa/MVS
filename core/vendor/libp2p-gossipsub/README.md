@@ -39,3 +39,11 @@ proves it:
 
 Remove this folder and its `[patch.crates-io]` line with the libp2p 0.57
 upgrade, together with `../libp2p-dns`.
+
+Until then, cargo-deny can't see this path crate's advisories.
+`.github/scripts/check-vendored-advisories.py` (CI, advisories job) checks
+RustSec for `libp2p-gossipsub` 0.49.5 instead, with RUSTSEC-2026-0534
+accepted as fixed by the patch. Remove it with this folder.
+
+Any change to the `.patch` file needs a review against upstream: the CI
+check trusts it.

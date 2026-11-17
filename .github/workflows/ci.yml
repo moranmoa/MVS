@@ -95,6 +95,13 @@ jobs:
       - name: Install cargo-deny (checksum verified)
         run: .github/scripts/install-cargo-deny.sh
       - run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
+      # cargo-deny can't see path crates: check core/vendor/* by their
+      # crates.io names and upstream versions. Remove with libp2p 0.57.
+      - name: vendored crates (libp2p-dns, libp2p-gossipsub)
+        if: ${{ !cancelled() }}
+        run: |
+          git clone --quiet --depth 1 https://github.com/rustsec/advisory-db "$RUNNER_TEMP/advisory-db"
+          python3 .github/scripts/check-vendored-advisories.py "$RUNNER_TEMP/advisory-db"
 
   ui:
     name: ui build, tests and licences

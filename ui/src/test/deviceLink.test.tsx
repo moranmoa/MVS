@@ -32,10 +32,13 @@ async function newDevice() {
 describe('device link: the new device', () => {
   it('shows the QR and the grouped code, then the digits, then asks only the agreement', async () => {
     const { core } = await newDevice();
-    expect(screen.getByText('K7QX2 MZRF4')).toBeTruthy();
+    // UX: the code and the digits stay left-to-right in RTL; the code counts down.
+    expect(screen.getByText('K7QX2 MZRF4').closest('bdi')?.getAttribute('dir')).toBe('ltr');
+    expect(plain(document.querySelector('.device-link-countdown')?.textContent)).toMatch(/^The code works for [45]:[0-9][0-9] more/);
     expect(document.querySelector('.qr-code path')?.getAttribute('d')).toMatch(/^M\d/);
     act(() => core.simulateDeviceLink('confirm'));
-    const digits = await screen.findByText('482 913');
+    const digits = (await screen.findByText('482 913')).closest('p')!;
+    expect(screen.getByText('482 913').closest('bdi')?.getAttribute('dir')).toBe('ltr');
     expect(plain(digits.getAttribute('aria-label'))).toBe('Digits to compare: 4 8 2 9 1 3');
     expect(screen.queryByRole('img', { name: 'QR code to link this device' })).toBeNull();
     act(() => core.simulateDeviceLink('done'));
@@ -99,6 +102,8 @@ describe('device link: the signed-in device', () => {
     await submit('k7qx2-mzrf4');
     expect(begin).toHaveBeenCalledWith('K7QX2MZRF4');
     const group = screen.getByRole('group', { name: /gets full access to your account/ });
+    // UX: the safe answer has the focus.
+    expect(document.activeElement).toBe(within(group).getByRole('button', { name: "They don't match" }));
     expect(within(group).getByText('482 913')).toBeTruthy();
     const confirm = vi.spyOn(core, 'confirmDeviceApproval');
     await click(within(group).getByRole('button', { name: 'They match, sign it in' }));

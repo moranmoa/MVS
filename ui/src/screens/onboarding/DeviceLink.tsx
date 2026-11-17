@@ -18,6 +18,25 @@ const FAILED_TEXT = {
   network: 'deviceLink.failed.network',
 } as const;
 
+/** "4:59", ticking each second until `until`; read out only at each whole minute. */
+function Countdown({ until }: { until: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const left = Math.max(0, Math.ceil((until - now) / 1000));
+  const time = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+  return (
+    <p className="device-link-countdown muted small">
+      <FormattedMessage id="deviceLink.expiresIn" values={{ time: <bdi dir="ltr">{time}</bdi> }} />
+      <span className="visually-hidden" aria-live="polite">
+        {left % 60 === 0 && left > 0 ? <FormattedMessage id="deviceLink.minutesLeft" values={{ count: left / 60 }} /> : null}
+      </span>
+    </p>
+  );
+}
+
 export function DeviceLinkScreen({ onLinked, onCancel }: { onLinked: () => void; onCancel: () => void }) {
   const core = useCore();
   const intl = useIntl();
@@ -71,14 +90,15 @@ export function DeviceLinkScreen({ onLinked, onCancel }: { onLinked: () => void;
               <p className="device-link-code-label muted small">
                 <FormattedMessage id="deviceLink.codeLabel" />
               </p>
-              <p className="device-link-code" dir="ltr">
-                <bdi>{groupCode(offer.code)}</bdi>
+              <p className="device-link-code">
+                <bdi dir="ltr">{groupCode(offer.code)}</bdi>
               </p>
+              <Countdown until={offer.expiresAt} />
             </div>
           ) : (
             <span className="spinner" role="status" aria-label={intl.formatMessage({ id: 'deviceLink.preparing' })} />
           )}
-          <p className="muted small" role="status">
+          <p className="muted small">
             <FormattedMessage id="deviceLink.waiting" />
           </p>
         </>
@@ -88,8 +108,8 @@ export function DeviceLinkScreen({ onLinked, onCancel }: { onLinked: () => void;
           <p>
             <FormattedMessage id="deviceLink.confirmHint" />
           </p>
-          <p className="device-link-sas" dir="ltr" aria-label={intl.formatMessage({ id: 'deviceLink.sasLabel' }, { sas: state.sas.split('').join(' ') })}>
-            {groupSas(state.sas)}
+          <p className="device-link-sas" aria-label={intl.formatMessage({ id: 'deviceLink.sasLabel' }, { sas: state.sas.split('').join(' ') })}>
+            <bdi dir="ltr">{groupSas(state.sas)}</bdi>
           </p>
           <p className="muted small" role="status">
             <FormattedMessage id="deviceLink.confirmWaiting" />

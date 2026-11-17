@@ -142,8 +142,8 @@ export function DevicesSection() {
           <p id={warnId} className="device-warning">
             <FormattedMessage id="devices.compareQuestion" />
           </p>
-          <p className="device-link-sas" dir="ltr" aria-label={intl.formatMessage({ id: 'deviceLink.sasLabel' }, { sas: approval.sas.split('').join(' ') })}>
-            {groupSas(approval.sas)}
+          <p className="device-link-sas" aria-label={intl.formatMessage({ id: 'deviceLink.sasLabel' }, { sas: approval.sas.split('').join(' ') })}>
+            <bdi dir="ltr">{groupSas(approval.sas)}</bdi>
           </p>
           {error && (
             <p className="error small" role="alert">
@@ -154,7 +154,8 @@ export function DevicesSection() {
             <button type="button" className="danger" disabled={busy} onClick={() => void decide(true)}>
               <FormattedMessage id="devices.approve" />
             </button>
-            <button type="button" className="secondary" disabled={busy} onClick={() => void decide(false)}>
+            {/* UX: the safe answer has the focus. */}
+            <button type="button" className="secondary" autoFocus disabled={busy} onClick={() => void decide(false)}>
               <FormattedMessage id="devices.decline" />
             </button>
           </div>

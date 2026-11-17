@@ -35,6 +35,11 @@ export interface VoiceEngineView {
   outputId?: string;
   setInput: (id: string) => void;
   setOutput: (id: string) => void;
+  /** G-72 mic test: my microphone's level now, 0..1. */
+  inputLevel: () => number;
+  /** G-84: I hear no one. Back to false when the call ends. */
+  deafened: boolean;
+  setDeafened: (deafened: boolean) => void;
 }
 
 export type PeerFailure = 'failed' | 'refused';
@@ -77,6 +82,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   const [outputs, setOutputs] = useState<AudioDevice[]>([]);
   const [inputId, setInputId] = useState<string>();
   const [outputId, setOutputId] = useState<string>();
+  const [deafened, setDeafenedState] = useState(false);
 
   const stunUrl = options.stunUrl ?? null;
   const enableTurn = options.enableTurn === true;
@@ -117,6 +123,8 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     });
     return () => {
       live = false;
+      engine.setDeafened(false);
+      setDeafenedState(false);
       engine.detach();
       setReady(false);
       setSpeaking({});
@@ -136,5 +144,11 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     void engineRef.current?.setOutputDevice(id);
   }, []);
 
-  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput };
+  const inputLevel = useCallback(() => engineRef.current?.inputLevel() ?? 0, []);
+  const setDeafened = useCallback((on: boolean) => {
+    setDeafenedState(on);
+    engineRef.current?.setDeafened(on);
+  }, []);
+
+  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel, deafened, setDeafened };
 }

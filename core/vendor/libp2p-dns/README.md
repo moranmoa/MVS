@@ -51,3 +51,7 @@ first.
 Remove this folder, and the `[patch.crates-io]` entry in `core/Cargo.toml`,
 with the libp2p 0.57 upgrade. That upgrade moves our own crates to
 ed25519-dalek 3 / curve25519-dalek 5 at the same time.
+
+Until then, cargo-deny can't see this path crate's advisories.
+`.github/scripts/check-vendored-advisories.py` (CI, licence job, blocking) checks
+RustSec for `libp2p-dns` 0.45.0 instead. Remove it with this folder.

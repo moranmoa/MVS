@@ -1808,6 +1808,11 @@ impl Core {
         self.voice(|calls, ctx, inner| calls.set_muted(ctx, inner, muted))
     }
 
+    /// G-84b `setDeafened`: shown to the others in my call (with mute).
+    pub fn set_deafened(&self, deafened: bool) -> CoreResult<()> {
+        self.voice(|calls, ctx, inner| calls.set_deafened(ctx, inner, deafened))
+    }
+
     /// `sendSignal`: to a participant of my call.
     pub fn send_signal(&self, to: &str, kind: SignalKind, payload: String) -> CoreResult<()> {
         let to = parse_user(to)?;

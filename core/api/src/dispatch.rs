@@ -208,6 +208,11 @@ struct MutedArg {
 }
 
 #[derive(Deserialize)]
+struct DeafenedArg {
+    deafened: bool,
+}
+
+#[derive(Deserialize)]
 struct SignalArgs {
     to: String,
     kind: SignalKind,
@@ -442,6 +447,7 @@ impl Core {
             "joinCall" => ok(self.join_call(&args::<ChannelIdArg>(raw)?.channel_id)),
             "leaveCall" => ok(self.leave_call()),
             "setMuted" => ok(self.set_muted(args::<MutedArg>(raw)?.muted)),
+            "setDeafened" => ok(self.set_deafened(args::<DeafenedArg>(raw)?.deafened)),
             "sendSignal" => {
                 let a: SignalArgs = args(raw)?;
                 ok(self.send_signal(&a.to, a.kind, a.payload))

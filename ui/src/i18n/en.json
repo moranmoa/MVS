@@ -297,6 +297,7 @@
   "call.label": "Voice call",
   "call.inCall": "In the voice chat · \u2068{server}\u2069",
   "call.micOff": "Microphone off",
+  "call.deafened": "Deafened",
   "call.noMic": "No microphone: you can listen, and others see you as muted.",
   "call.rejoinToTalk": "To talk, leave and join again.",
   "call.ipNotice.title": "Before your first call",

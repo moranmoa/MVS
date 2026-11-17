@@ -9,7 +9,7 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Avatar, Dialog, Name } from '../../components/common';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
-import { CrownIcon, MicOffIcon, SpeakerIcon } from '../../components/icons';
+import { CrownIcon, HeadphonesOffIcon, MicOffIcon, SpeakerIcon } from '../../components/icons';
 import { isCoreError, useCore, type Id, type Member, type ServerSummary, type VoiceRoom } from '../../core';
 import { VOICE_ROOM_LIMIT_MAX, VOICE_ROOM_NAME_MAX, VOICE_ROOMS_MAX } from '../../core/sanitize';
 import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, VOLUME_TICKS, VolumeTicks, type CallEngine } from './CallBar';
@@ -263,10 +263,16 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
                             <CrownIcon />
                           </span>
                         )}
-                        {p.muted && (
-                          <span className="call-muted" role="img" aria-label={intl.formatMessage({ id: 'call.micOff' })}>
-                            <MicOffIcon />
+                        {p.muted && p.deafened ? (
+                          <span className="call-muted" role="img" aria-label={intl.formatMessage({ id: 'call.deafened' })} title={intl.formatMessage({ id: 'call.deafened' })}>
+                            <HeadphonesOffIcon />
                           </span>
+                        ) : (
+                          p.muted && (
+                            <span className="call-muted" role="img" aria-label={intl.formatMessage({ id: 'call.micOff' })}>
+                              <MicOffIcon />
+                            </span>
+                          )
                         )}
                       </li>
                     );

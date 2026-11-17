@@ -3977,6 +3977,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sync",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -280,6 +280,12 @@ impl Network for SyncNetwork {
         }
     }
 
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32) {
+        if let Err(e) = self.node.set_member_relay(on, daily_cap_mb) {
+            tracing::warn!(%e, "member relay setting not applied");
+        }
+    }
+
     /// The server must have been opened (`open_server`): logs are never
     /// opened by their plain names, which anyone could ask for (GAP-4).
     fn publish(&self, record: &Record) {

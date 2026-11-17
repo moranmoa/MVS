@@ -24,6 +24,7 @@ import type {
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
+  DeviceAdded,
   MemberRelay,
   Id,
 } from './types';
@@ -478,9 +479,18 @@ export function cleanDeviceLinkState(r: unknown): DeviceLinkState | null {
   if (!st) return null;
   if (sas !== undefined && (typeof sas !== 'string' || !SAS.test(sas) || st !== 'confirm')) return null;
   if (st === 'confirm' && sas === undefined) return null;
-  const why = (['cancelled', 'timeout', 'refused', 'network'] as const).find((x) => x === reason);
+  const why = (['cancelled', 'timeout', 'refused', 'network', 'keyring', 'restore'] as const).find((x) => x === reason);
   if (reason !== undefined && !why) return null;
   return { state: st, ...(sas !== undefined ? { sas: sas as string } : {}), ...(why ? { reason: why } : {}) };
+}
+
+/** account.deviceAdded: a time and an optional plain label (cleaned like a name, at most 64; empty = none); anything else drops it. */
+export function cleanDeviceAdded(r: unknown): DeviceAdded | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['at', 'label'])) return null;
+  const { at, label } = r as Record<string, unknown>;
+  if (!isTime(at) || (label !== undefined && typeof label !== 'string')) return null;
+  const clean = cleanName(label, 64);
+  return { at, ...(clean ? { label: clean } : {}) };
 }
 
 /** A cleaner may return null to drop the event altogether. */
@@ -509,6 +519,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'call.state': (c) => cleanCall(c),
   'memberRelay.changed': (r) => cleanMemberRelay(r),
   'deviceLink.state': (r) => cleanDeviceLinkState(r),
+  'account.deviceAdded': (r) => cleanDeviceAdded(r),
   'voice.rooms': (p) => {
     const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
     return rooms ? { serverId: p.serverId, rooms } : null;

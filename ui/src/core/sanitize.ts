@@ -21,6 +21,9 @@ import type {
   ServerSummary,
   CallState,
   VoiceRoom,
+  DeviceApproval,
+  DeviceLinkOffer,
+  DeviceLinkState,
   MemberRelay,
   Id,
 } from './types';
@@ -449,6 +452,37 @@ const mustRelay = (r: unknown): MemberRelay => {
   return clean;
 };
 
+/** Device link: base32 codes (10), 6-digit digits, a printable QR payload. */
+const LINK_CODE = /^[A-Z2-7]{10}$/;
+const SAS = /^\d{6}$/;
+const QR_PAYLOAD = /^[\x21-\x7e]{1,1024}$/;
+
+export function cleanDeviceLinkOffer(r: unknown): DeviceLinkOffer | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['qr', 'code', 'expiresAt'])) return null;
+  const { qr, code, expiresAt } = r as Record<string, unknown>;
+  if (typeof qr !== 'string' || !QR_PAYLOAD.test(qr) || typeof code !== 'string' || !LINK_CODE.test(code) || !isTime(expiresAt)) return null;
+  return { qr, code, expiresAt };
+}
+
+export function cleanDeviceApproval(r: unknown): DeviceApproval | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['sas', 'expiresAt'])) return null;
+  const { sas, expiresAt } = r as Record<string, unknown>;
+  return typeof sas === 'string' && SAS.test(sas) && isTime(expiresAt) ? { sas, expiresAt } : null;
+}
+
+/** deviceLink.state, or null to drop it: an unknown state or reason, bad digits, digits outside "confirm", unknown keys. */
+export function cleanDeviceLinkState(r: unknown): DeviceLinkState | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['state', 'sas', 'reason'])) return null;
+  const { state, sas, reason } = r as Record<string, unknown>;
+  const st = (['waiting', 'confirm', 'done', 'expired', 'failed'] as const).find((x) => x === state);
+  if (!st) return null;
+  if (sas !== undefined && (typeof sas !== 'string' || !SAS.test(sas) || st !== 'confirm')) return null;
+  if (st === 'confirm' && sas === undefined) return null;
+  const why = (['cancelled', 'timeout', 'refused', 'network'] as const).find((x) => x === reason);
+  if (reason !== undefined && !why) return null;
+  return { state: st, ...(sas !== undefined ? { sas: sas as string } : {}), ...(why ? { reason: why } : {}) };
+}
+
 /** A cleaner may return null to drop the event altogether. */
 const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[E] | null } = {
   'identity.changed': cleanIdentity,
@@ -474,6 +508,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
   'call.state': (c) => cleanCall(c),
   'memberRelay.changed': (r) => cleanMemberRelay(r),
+  'deviceLink.state': (r) => cleanDeviceLinkState(r),
   'voice.rooms': (p) => {
     const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
     return rooms ? { serverId: p.serverId, rooms } : null;
@@ -538,6 +573,18 @@ export function guardCore(core: CoreApi): CoreApi {
         return rooms;
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
+    startDeviceLink: () =>
+      core.startDeviceLink().then((r) => {
+        const clean = cleanDeviceLinkOffer(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
+    beginDeviceApproval: (qrOrCode: string) =>
+      core.beginDeviceApproval(qrOrCode).then((r) => {
+        const clean = cleanDeviceApproval(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
     getMemberRelay: () => core.getMemberRelay().then(mustRelay),
     setMemberRelay: (setting) => core.setMemberRelay(setting).then(mustRelay),
     setMemberRelayCap: (mb) => core.setMemberRelayCap(mb).then(mustRelay),

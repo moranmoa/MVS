@@ -12,11 +12,16 @@
 //!   the release rendezvous at `derive_key("mvs/member-recovery-rv/v1", h)`.
 //! - **The threshold is never below 3:** 3-of-5, 3-of-4, or 3-of-3 (weak).
 //!   Fewer than 3 owner groups: unavailable.
+//! - **Records are signed by `w_r`** (`Identity::recovery_write_key`), not
+//!   the backup write key, and the handle is bound to it:
+//!   `h = derive_key("mvs/member-recovery-handle/v1", w_r_pub)`. So a
+//!   recovery holder can't compute my backup tag, and nobody can claim my
+//!   handle first (Tech Lead on #431).
 //! - **Holders run their own 72-hour hold** (M1): the mailer's token is
-//!   necessary, not sufficient.
+//!   necessary, not sufficient. A cancel counts only while fresh.
 //!
 //! **What a holder can link.** The handle `h` is unlinkable to my identity
-//! key and email *in the records*, but holders are picked from members who
+//! key, my backup and my email *in the records*, but holders are picked from members who
 //! share servers with me, and a share arrives from one of my devices. A
 //! holder can therefore usually tell that `h` is mine. What it can't get is
 //! the seed: that needs 3 shares and the mailer's `r_m`.
@@ -50,8 +55,13 @@ pub const RESHARE_GAP_MS: u64 = DAY_MS;
 pub const TOKEN_MAX_MS: u64 = 7 * DAY_MS;
 /// Share records one holder keeps, at most one per handle.
 pub const MAX_HANDLES_PER_HOLDER: usize = 64;
+/// How far a cancel's `at` may be from the holder's clock, and how long
+/// before the pending's first sighting it may be (Tech Lead on #431): an
+/// old cancel replayed later must not block a real recovery.
+pub const CANCEL_WINDOW_MS: u64 = 10 * 60_000;
 
 const KEY_INFO: &[u8] = b"mvs/member-recovery/v1";
+const HANDLE_CONTEXT: &str = "mvs/member-recovery-handle/v1";
 const TAG_CONTEXT: &str = "mvs/member-recovery-tag/v1";
 const RV_CONTEXT: &str = "mvs/member-recovery-rv/v1";
 const ENVELOPE_AAD: &[u8] = b"mvs/member-recovery-envelope/v1";
@@ -163,7 +173,12 @@ pub fn combine(shares: &[Share]) -> Option<Zeroizing<[u8; 32]>> {
 
 // --------------------------------------------------------- keys, envelope
 
-/// 32 random bytes: `s`, `r_m` or the handle `h`.
+/// The recovery handle, bound to the recovery write key `w_r`.
+pub fn handle(w_r_pub: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(HANDLE_CONTEXT, w_r_pub)
+}
+
+/// 32 random bytes: `s` or `r_m`.
 pub fn random32() -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     OsRng.fill_bytes(out.as_mut());
@@ -228,9 +243,10 @@ pub fn open_envelope(key: &[u8; 32], h: &[u8; 32], version: u64, sealed: &[u8]) 
     serde_json::from_slice(&plain).ok()
 }
 
-// ------------------------------------------------- signed records (by `w`)
+// ----------------------------------------------- signed records (by `w_r`)
 
-/// What a holder stores per handle, signed by my backup write key `w`.
+/// What a holder stores per handle, signed by my recovery write key `w_r`
+/// (`w_pub` here is `w_r`'s public key, and `h` is derived from it).
 #[derive(Clone)]
 pub struct ShareRecord {
     pub h: [u8; 32],
@@ -254,16 +270,21 @@ impl ShareRecord {
         m
     }
 
-    pub fn sign(w: &SigningKey, h: [u8; 32], version: u64, share: &Share, created: u64) -> ShareRecord {
-        let w_pub = w.verifying_key().to_bytes();
-        let sig = w.sign(&Self::message(&h, version, share.x, &share.y, &w_pub, created)).to_bytes();
+    /// `w_r` signs; the handle is the one bound to it.
+    pub fn sign(w_r: &SigningKey, version: u64, share: &Share, created: u64) -> ShareRecord {
+        let w_pub = w_r.verifying_key().to_bytes();
+        let h = handle(&w_pub);
+        let sig = w_r.sign(&Self::message(&h, version, share.x, &share.y, &w_pub, created)).to_bytes();
         ShareRecord { h, version, x: share.x, y: share.y.clone(), w_pub, created, sig }
     }
 
-    /// The signature checks against the record's own `w_pub`, and `x` isn't 0.
+    /// `h` is the handle of `w_pub`, the signature checks against `w_pub`,
+    /// and `x` isn't 0. Since `h` is bound to the key, nobody can store a
+    /// record under someone else's handle first.
     pub fn verify(&self) -> bool {
         let Ok(key) = VerifyingKey::from_bytes(&self.w_pub) else { return false };
         self.x != 0
+            && self.h == handle(&self.w_pub)
             && key
                 .verify_strict(
                     &Self::message(&self.h, self.version, self.x, &self.y, &self.w_pub, self.created),
@@ -277,13 +298,15 @@ impl ShareRecord {
     }
 }
 
-/// A later instruction from the account to its holders, signed by `w`.
+/// A later instruction from the account to its holders, signed by `w_r`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
-    /// Void the pending recovery; refuse releases for 72 hours.
+    /// Void the pending recovery; refuse releases for 72 hours. Taken only
+    /// while fresh ([`Hold::on_cancel`]).
     Cancel { h: [u8; 32], at: u64 },
     /// Drop share records below this version (after a re-share or disable).
-    Delete { h: [u8; 32], below_version: u64 },
+    /// Taken only while fresh ([`Order::delete_is_fresh`]), like a cancel.
+    Delete { h: [u8; 32], below_version: u64, at: u64 },
 }
 
 impl Order {
@@ -295,10 +318,11 @@ impl Order {
                 m.extend_from_slice(h);
                 m.extend_from_slice(&at.to_be_bytes());
             }
-            Order::Delete { h, below_version } => {
+            Order::Delete { h, below_version, at } => {
                 m.push(2);
                 m.extend_from_slice(h);
                 m.extend_from_slice(&below_version.to_be_bytes());
+                m.extend_from_slice(&at.to_be_bytes());
             }
         }
         m
@@ -310,14 +334,29 @@ impl Order {
         }
     }
 
-    pub fn sign(&self, w: &SigningKey) -> [u8; 64] {
-        w.sign(&self.message()).to_bytes()
+    pub fn sign(&self, w_r: &SigningKey) -> [u8; 64] {
+        w_r.sign(&self.message()).to_bytes()
     }
 
-    /// True only if signed by the `w` of the stored record for the same `h`.
+    /// True only if `h` is the handle of the stored record's `w_r`, and the
+    /// order is for that handle and signed by that key.
     pub fn verify(&self, sig: &[u8; 64], stored: &ShareRecord) -> bool {
         let Ok(key) = VerifyingKey::from_bytes(&stored.w_pub) else { return false };
-        self.h() == stored.h && key.verify_strict(&self.message(), &Signature::from_bytes(sig)).is_ok()
+        self.h() == stored.h
+            && self.h() == handle(&stored.w_pub)
+            && key.verify_strict(&self.message(), &Signature::from_bytes(sig)).is_ok()
+    }
+
+    /// A delete counts only with `at` within [`CANCEL_WINDOW_MS`] of the
+    /// holder's clock and later than the last order taken for the handle
+    /// (the same freshness as a cancel, Tech Lead on #431).
+    pub fn delete_is_fresh(&self, last_taken: Option<u64>, now: u64) -> bool {
+        match self {
+            Order::Delete { at, .. } => {
+                now.abs_diff(*at) <= CANCEL_WINDOW_MS && last_taken.is_none_or(|last| *at > last)
+            }
+            Order::Cancel { .. } => false,
+        }
     }
 }
 
@@ -325,23 +364,25 @@ impl Order {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Accept {
     Store,
+    /// A bad signature, or a handle not bound to the signing key.
     BadSignature,
-    /// A record for this handle from another write key.
-    OtherWriter,
     /// Not newer than what's stored.
     Stale,
     /// This holder already keeps [`MAX_HANDLES_PER_HOLDER`] handles.
     Full,
 }
 
-/// The holder's rule for an incoming record: signed, from the same `w` as
-/// any stored record for that handle, newer, and within the handle cap.
+/// The holder's rule for an incoming record: signed with the handle bound
+/// to its key, newer than the stored record for that handle, and within
+/// the handle cap. `stored` is what the holder keeps under `incoming.h`;
+/// the binding makes it the same writer. (The per-sender cap is the
+/// wiring PR's, at the store.)
 pub fn accept_share(incoming: &ShareRecord, stored: Option<&ShareRecord>, handles_held: usize) -> Accept {
     if !incoming.verify() {
         return Accept::BadSignature;
     }
+    debug_assert!(stored.is_none_or(|old| old.h == incoming.h && old.w_pub == incoming.w_pub));
     match stored {
-        Some(old) if old.w_pub != incoming.w_pub => Accept::OtherWriter,
         Some(old) if incoming.version <= old.version => Accept::Stale,
         Some(_) => Accept::Store,
         None if handles_held >= MAX_HANDLES_PER_HOLDER => Accept::Full,
@@ -472,17 +513,19 @@ pub enum Reshare {
 }
 
 /// Why to re-share now, if at all. `possible` is how many holders a fresh
-/// pick would give. Routine re-shares wait [`RESHARE_GAP_MS`] after the
-/// last one; the caller bypasses this after a recovery or a cancel.
+/// pick would give. A gone holder or two under one owner is acted on at
+/// once; the routine reasons (stale, grow) wait [`RESHARE_GAP_MS`] after
+/// the last re-share (Tech Lead on #431 and G-91). The caller also
+/// re-shares at once after a recovery or a cancel.
 pub fn reshare_reason(holders: &[HolderStatus], possible: usize, last_reshare: u64, now: u64) -> Option<Reshare> {
-    if now.saturating_sub(last_reshare) < RESHARE_GAP_MS {
-        return None;
-    }
     if holders.iter().any(|h| h.gone) {
         return Some(Reshare::Gone);
     }
     if holders.iter().enumerate().any(|(i, a)| holders[i + 1..].iter().any(|b| b.owner == a.owner)) {
         return Some(Reshare::SharedOwner);
+    }
+    if now.saturating_sub(last_reshare) < RESHARE_GAP_MS {
+        return None;
     }
     if holders.iter().filter(|h| now.saturating_sub(h.last_seen) > STALE_MS).count() >= STALE_RESHARE {
         return Some(Reshare::Stale);
@@ -523,7 +566,8 @@ impl ReleaseToken {
     pub fn check(&self, sig: &[u8; 64], mailer: &VerifyingKey, h: &[u8; 32], now: u64) -> bool {
         self.h == *h
             && now <= self.valid_until
-            && self.valid_until.saturating_sub(self.hold_started) <= HOLD_MS + TOKEN_MAX_MS
+            && self.hold_started <= self.valid_until
+            && self.valid_until - self.hold_started <= HOLD_MS + TOKEN_MAX_MS
             && mailer.verify_strict(&self.message(), &Signature::from_bytes(sig)).is_ok()
     }
 }
@@ -533,30 +577,60 @@ impl ReleaseToken {
 pub struct Hold {
     /// When this holder first saw the current `pending(h)`.
     pub pending_since: Option<u64>,
+    /// The new device that pending is for: the hold runs for it alone
+    /// (Security Lead on #431).
+    #[serde(default)]
+    pub pending_device: Option<[u8; 32]>,
     /// When this holder last took a valid cancel.
     pub cancelled_at: Option<u64>,
+    /// The signed `at` of the last cancel taken: one cancel counts once.
+    #[serde(default)]
+    pub last_cancel: Option<u64>,
 }
 
 impl Hold {
-    /// `pending(h)` seen: the clock starts at the first sighting only.
-    pub fn on_pending(&mut self, now: u64) {
-        self.pending_since.get_or_insert(now);
+    /// `pending(h)` for `device` seen. The clock starts at the first
+    /// sighting; a pending for a *different* device restarts it, with its
+    /// own 72 hours (and the notice shows the new device).
+    pub fn on_pending(&mut self, device: [u8; 32], now: u64) {
+        if self.pending_device != Some(device) || self.pending_since.is_none() {
+            self.pending_device = Some(device);
+            self.pending_since = Some(now);
+        }
     }
 
-    /// A valid `w`-signed cancel: the pending is void, and the next one
-    /// starts a fresh clock.
-    pub fn on_cancel(&mut self, now: u64) {
-        self.pending_since = None;
-        self.cancelled_at = Some(now);
+    /// A `w_r`-signed cancel (the caller checked the signature) with its
+    /// signed time `at`. Taken only if fresh (Tech Lead on #431):
+    /// - `at` within [`CANCEL_WINDOW_MS`] of this holder's clock;
+    /// - not older than the pending's first sighting minus the window;
+    /// - later than the last cancel taken.
+    ///
+    /// So a cancel recorded earlier and replayed later can't block a real
+    /// recovery. Taken: the pending is void, and the next one starts a
+    /// fresh clock. Returns whether it was taken.
+    pub fn on_cancel(&mut self, at: u64, now: u64) -> bool {
+        let fresh = now.abs_diff(at) <= CANCEL_WINDOW_MS
+            && self.pending_since.is_none_or(|since| at.saturating_add(CANCEL_WINDOW_MS) >= since)
+            && self.last_cancel.is_none_or(|last| at > last);
+        if fresh {
+            self.pending_since = None;
+            self.pending_device = None;
+            self.cancelled_at = Some(now);
+            self.last_cancel = Some(at);
+        }
+        fresh
     }
 
-    /// Release only after this holder itself has seen the pending for
-    /// [`HOLD_MS`] and no cancel came in the last [`HOLD_MS`]. The caller
-    /// also needs a valid [`ReleaseToken`]: necessary, not sufficient.
-    pub fn may_release(&self, now: u64) -> bool {
+    /// Release only to `token_device` (the valid [`ReleaseToken`]'s
+    /// `new_device_pub`), and only if this holder itself has seen the
+    /// pending *for that device* for [`HOLD_MS`], with no cancel in the
+    /// last [`HOLD_MS`]. The token is necessary, not sufficient; the share
+    /// is then sealed to that key only.
+    pub fn may_release(&self, token_device: &[u8; 32], now: u64) -> bool {
+        let same = self.pending_device.as_ref() == Some(token_device);
         let held = self.pending_since.is_some_and(|since| now.saturating_sub(since) >= HOLD_MS);
         let quiet = self.cancelled_at.is_none_or(|at| now.saturating_sub(at) >= HOLD_MS);
-        held && quiet
+        same && held && quiet
     }
 }
 
@@ -605,6 +679,18 @@ mod tests {
         let mut all = shares.clone();
         all.reverse();
         assert_eq!(*combine(&all).unwrap(), *secret);
+    }
+
+    #[test]
+    fn shares_from_different_splits_of_one_secret_do_not_combine() {
+        // The re-share case (Security Lead on #431): same secret, new split.
+        let secret = random32();
+        let first = split(&secret, 3, 5).unwrap();
+        let second = split(&secret, 3, 5).unwrap();
+        let mixed = [first[0].clone(), first[1].clone(), second[2].clone()];
+        assert_ne!(*combine(&mixed).unwrap(), *secret);
+        let mixed = [first[0].clone(), second[1].clone(), second[2].clone()];
+        assert_ne!(*combine(&mixed).unwrap(), *secret);
     }
 
     #[test]
@@ -673,12 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn holders_take_only_signed_newer_records_from_the_same_writer() {
-        let h = [1u8; 32];
+    fn holders_take_only_signed_newer_records_bound_to_their_handle() {
         let share = split(&[3; 32], 3, 3).unwrap().remove(0);
-        let v1 = ShareRecord::sign(&w(), h, 1, &share, 100);
-        let v2 = ShareRecord::sign(&w(), h, 2, &share, 200);
+        let v1 = ShareRecord::sign(&w(), 1, &share, 100);
+        let v2 = ShareRecord::sign(&w(), 2, &share, 200);
         assert!(v1.verify());
+        assert_eq!(v1.h, handle(&w().verifying_key().to_bytes()));
         assert_eq!(accept_share(&v1, None, 0), Accept::Store);
         assert_eq!(accept_share(&v2, Some(&v1), 1), Accept::Store);
         assert_eq!(accept_share(&v1, Some(&v2), 1), Accept::Stale);
@@ -691,29 +777,72 @@ mod tests {
         moved.y[0] ^= 1;
         assert!(!moved.verify());
 
-        let other = ShareRecord::sign(&SigningKey::from_bytes(&[8; 32]), h, 5, &share, 300);
-        assert_eq!(accept_share(&other, Some(&v1), 1), Accept::OtherWriter);
+        // Squatting: another key can't put a record under my handle, even
+        // with a valid signature of its own.
+        let thief = SigningKey::from_bytes(&[8; 32]);
+        let mut squat = ShareRecord::sign(&thief, 5, &share, 300);
+        assert!(squat.verify(), "its own handle is fine");
+        squat.h = v1.h;
+        squat.sig = thief
+            .sign(&ShareRecord::message(&squat.h, 5, squat.x, &squat.y, &squat.w_pub, 300))
+            .to_bytes();
+        assert!(!squat.verify());
+        assert_eq!(accept_share(&squat, None, 0), Accept::BadSignature);
+    }
+
+    #[test]
+    fn recovery_records_use_their_own_key_not_the_backup_writer() {
+        let phrase = identity::RecoveryPhrase::parse(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        let id = phrase.identity();
+        let w_r = id.recovery_write_key();
+        let backup = id.backup_keys();
+        assert_ne!(w_r.to_bytes(), backup.write_key().to_bytes());
+        let h = handle(&w_r.verifying_key().to_bytes());
+        // The handle tells nothing about the backup tag, and vice versa.
+        assert_ne!(h, backup.tag());
+        assert_ne!(identity::backup_tag(&w_r.verifying_key().to_bytes()), backup.tag());
+        assert_eq!(phrase.identity().recovery_write_key().to_bytes(), w_r.to_bytes(), "deterministic");
     }
 
     #[test]
     fn orders_count_only_from_the_stored_writer_for_that_handle() {
-        let h = [1u8; 32];
         let share = split(&[3; 32], 3, 3).unwrap().remove(0);
-        let stored = ShareRecord::sign(&w(), h, 1, &share, 100);
+        let stored = ShareRecord::sign(&w(), 1, &share, 100);
+        let h = stored.h;
         let cancel = Order::Cancel { h, at: 500 };
         assert!(cancel.verify(&cancel.sign(&w()), &stored));
         assert!(!cancel.verify(&cancel.sign(&SigningKey::from_bytes(&[8; 32])), &stored));
-        let delete = Order::Delete { h, below_version: 2 };
+        let delete = Order::Delete { h, below_version: 2, at: 500 };
         let sig = delete.sign(&w());
         assert!(delete.verify(&sig, &stored));
         // A signature can't be moved to another order or handle.
-        assert!(!Order::Delete { h, below_version: 3 }.verify(&sig, &stored));
+        assert!(!Order::Delete { h, below_version: 3, at: 500 }.verify(&sig, &stored));
         assert!(!Order::Cancel { h, at: 2 }.verify(&sig, &stored));
-        let elsewhere = Order::Delete { h: [2; 32], below_version: 2 };
+        let elsewhere = Order::Delete { h: [2; 32], below_version: 2, at: 500 };
         assert!(!elsewhere.verify(&elsewhere.sign(&w()), &stored));
+        // A stored record whose h isn't bound to its key backs no order.
+        let mut unbound = stored.clone();
+        unbound.h = [2; 32];
+        assert!(!elsewhere.verify(&elsewhere.sign(&w()), &unbound));
+    }
+
+    #[test]
+    fn only_a_fresh_delete_counts() {
+        let h = [1u8; 32];
+        let delete = |at| Order::Delete { h, below_version: 2, at };
+        assert!(delete(NOW).delete_is_fresh(None, NOW + CANCEL_WINDOW_MS));
+        assert!(!delete(NOW).delete_is_fresh(None, NOW + CANCEL_WINDOW_MS + 1), "old, replayed");
+        assert!(!delete(NOW + CANCEL_WINDOW_MS + 1).delete_is_fresh(None, NOW), "from the future");
+        assert!(!delete(NOW).delete_is_fresh(Some(NOW), NOW), "taken once");
+        assert!(delete(NOW + 1).delete_is_fresh(Some(NOW), NOW));
+        assert!(!Order::Cancel { h, at: NOW }.delete_is_fresh(None, NOW));
     }
 
     const NOW: u64 = 1_000 * DAY_MS;
+    const DEV: [u8; 32] = [7; 32];
 
     fn cand(member: u8, owner: u8) -> Candidate {
         Candidate {
@@ -808,36 +937,84 @@ mod tests {
         let mut gone = base.clone();
         gone[0].gone = true;
         assert_eq!(reshare_reason(&gone, 5, long_ago, NOW), Some(Reshare::Gone));
-        assert_eq!(reshare_reason(&gone, 5, NOW - DAY_MS + 1, NOW), None, "at most once a day");
+        let just_now = NOW - DAY_MS + 1;
+        assert_eq!(reshare_reason(&gone, 5, just_now, NOW), Some(Reshare::Gone), "gone: at once");
 
         let mut shared = base.clone();
         shared[4].owner = [1; 32];
-        assert_eq!(reshare_reason(&shared, 5, long_ago, NOW), Some(Reshare::SharedOwner));
+        assert_eq!(reshare_reason(&shared, 5, just_now, NOW), Some(Reshare::SharedOwner), "at once");
 
         let mut stale = base.clone();
         stale[0].last_seen = NOW - STALE_MS - 1;
         assert_eq!(reshare_reason(&stale, 5, long_ago, NOW), None, "one stale holder isn't enough");
         stale[1].last_seen = NOW - STALE_MS - 1;
         assert_eq!(reshare_reason(&stale, 5, long_ago, NOW), Some(Reshare::Stale));
+        assert_eq!(reshare_reason(&stale, 5, just_now, NOW), None, "routine: at most once a day");
 
         assert_eq!(reshare_reason(&base[..3], 3, long_ago, NOW), None);
         assert_eq!(reshare_reason(&base[..3], 4, long_ago, NOW), Some(Reshare::Grow));
+        assert_eq!(reshare_reason(&base[..3], 4, just_now, NOW), None);
     }
 
     #[test]
     fn holders_keep_their_own_hold_and_a_cancel_wins() {
         let mut hold = Hold::default();
-        assert!(!hold.may_release(NOW), "nothing pending");
-        hold.on_pending(NOW);
-        hold.on_pending(NOW + DAY_MS); // seeing it again doesn't restart the clock
-        assert!(!hold.may_release(NOW + HOLD_MS - 1));
-        assert!(hold.may_release(NOW + HOLD_MS));
+        assert!(!hold.may_release(&DEV, NOW), "nothing pending");
+        hold.on_pending(DEV, NOW);
+        hold.on_pending(DEV, NOW + DAY_MS); // seeing it again doesn't restart the clock
+        assert!(!hold.may_release(&DEV, NOW + HOLD_MS - 1));
+        assert!(hold.may_release(&DEV, NOW + HOLD_MS));
 
-        hold.on_cancel(NOW + HOLD_MS);
-        assert!(!hold.may_release(NOW + 10 * HOLD_MS), "a cancel voids the pending");
-        hold.on_pending(NOW + HOLD_MS + 1);
-        assert!(!hold.may_release(NOW + 2 * HOLD_MS), "within 72 hours of the cancel");
-        assert!(hold.may_release(NOW + 2 * HOLD_MS + 1));
+        assert!(hold.on_cancel(NOW + HOLD_MS - 5_000, NOW + HOLD_MS));
+        assert!(!hold.may_release(&DEV, NOW + 10 * HOLD_MS), "a cancel voids the pending");
+        hold.on_pending(DEV, NOW + HOLD_MS + 1);
+        assert!(!hold.may_release(&DEV, NOW + 2 * HOLD_MS), "within 72 hours of the cancel");
+        assert!(hold.may_release(&DEV, NOW + 2 * HOLD_MS + 1));
+    }
+
+    #[test]
+    fn only_a_fresh_cancel_counts() {
+        let start = NOW;
+        // A cancel signed long ago, replayed during a later real recovery.
+        let old_at = start - 30 * DAY_MS;
+        let mut hold = Hold::default();
+        hold.on_pending(DEV, start);
+        assert!(!hold.on_cancel(old_at, start + DAY_MS), "far from the clock");
+        assert!(hold.may_release(&DEV, start + HOLD_MS), "the old cancel didn't block it");
+
+        // Within the clock window but from before this pending: refused.
+        let mut hold = Hold::default();
+        hold.on_pending(DEV, start);
+        let late = start + CANCEL_WINDOW_MS + 1;
+        assert!(!hold.on_cancel(start - CANCEL_WINDOW_MS - 1, start), "older than the pending");
+        assert!(hold.on_cancel(start - CANCEL_WINDOW_MS, start), "just inside the window");
+        // The same cancel again later, and an older one, count no more.
+        hold.on_pending(DEV, late);
+        assert!(!hold.on_cancel(start - CANCEL_WINDOW_MS, late));
+        assert!(!hold.on_cancel(start - CANCEL_WINDOW_MS - 2, late));
+        assert_eq!(hold.pending_since, Some(late));
+
+        // A cancel from the future beyond the window: refused.
+        let mut hold = Hold::default();
+        hold.on_pending(DEV, start);
+        assert!(!hold.on_cancel(start + CANCEL_WINDOW_MS + 1, start));
+        assert!(hold.on_cancel(start + CANCEL_WINDOW_MS, start));
+    }
+
+    #[test]
+    fn the_hold_is_for_one_device() {
+        let other = [8u8; 32];
+        let mut hold = Hold::default();
+        hold.on_pending(DEV, NOW);
+        assert!(hold.may_release(&DEV, NOW + HOLD_MS));
+        assert!(!hold.may_release(&other, NOW + HOLD_MS), "a token for another device");
+
+        // A pending for another device restarts the clock, for that device.
+        hold.on_pending(other, NOW + DAY_MS);
+        assert!(!hold.may_release(&DEV, NOW + HOLD_MS), "the first device's hold is gone");
+        assert!(!hold.may_release(&other, NOW + HOLD_MS), "a fresh 72 hours");
+        assert!(hold.may_release(&other, NOW + DAY_MS + HOLD_MS));
+        assert_eq!(hold.pending_device, Some(other));
     }
 
     #[test]
@@ -853,6 +1030,8 @@ mod tests {
         assert!(!token.check(&sig, &SigningKey::from_bytes(&[6; 32]).verifying_key(), &h, NOW), "another mailer");
         let swapped = ReleaseToken { new_device_pub: [4; 32], ..token.clone() };
         assert!(!swapped.check(&sig, &key, &h, NOW + HOLD_MS), "bound to the new device");
+        let backwards = ReleaseToken { hold_started: NOW + 2 * DAY_MS, valid_until: NOW + DAY_MS, ..token.clone() };
+        assert!(!backwards.check(&backwards.sign(&mailer), &key, &h, NOW), "ends before the hold starts");
         let long = ReleaseToken { valid_until: token.valid_until + 1, ..token };
         assert!(!long.check(&long.sign(&mailer), &key, &h, NOW), "validity too long");
     }

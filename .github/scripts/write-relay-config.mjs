@@ -5,9 +5,15 @@
 //   RELAY_TCP=/dns4/<tcp host>/tcp/4001/p2p/<peer id> \
 //   node write-relay-config.mjs <out.json>
 //
-// Output: {"relay": ..., "bootstrap": [...], "stun": ...}; each key only when its variable
-// is set ({} for neither). bootstrap is a plain-TCP route to the relay, so the
-// relay can observe clients' public addresses (DCUtR, #219).
+// Multi-relay (part A): RELAYS and RELAYS_TCP are lists, one multiaddr per
+// line, 1-4 relays, no relay (peer ID) twice; RELAYS_TCP pairs with RELAYS by
+// order. RELAYS wins over RELAY, and RELAYS_TCP over RELAY_TCP; the singles
+// stay as the fallback.
+//
+// Output: {"relay": ..., "relays": [...], "bootstrap": [...], "stun": ...}; each key
+// only when its variable is set ({} for none). With RELAYS, "relay" is its
+// first entry. bootstrap is a plain-TCP route to the relay, so the relay can
+// observe clients' public addresses (DCUtR, #219).
 //
 // On Windows runners, run it with MSYS2_ENV_CONV_EXCL=RELAY (a prefix, so it
 // covers RELAY_TCP too): Git Bash otherwise rewrites "/dns4/..." into
@@ -46,11 +52,50 @@ function stunUrl(value) {
   return value;
 }
 
+const MAX_RELAYS = 4;
+const peerId = (addr) => addr.slice(addr.lastIndexOf("/p2p/") + 5);
+
+// A list variable: one multiaddr per line (blank lines and surrounding
+// spaces ignored), each checked, at most MAX_RELAYS, no peer ID twice. Errors
+// name the line number only, never the address.
+function checkedList(name, text) {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length > MAX_RELAYS) {
+    console.error(`::error::${name}: at most ${MAX_RELAYS} entries`);
+    process.exit(1);
+  }
+  const seen = new Set();
+  return lines.map((line, i) => {
+    const addr = checked(`${name}, line ${i + 1},`, line);
+    if (seen.has(peerId(addr))) {
+      console.error(`::error::${name}, line ${i + 1}: the same relay twice`);
+      process.exit(1);
+    }
+    seen.add(peerId(addr));
+    return addr;
+  });
+}
+
 const config = {};
-if (process.env.RELAY) config.relay = checked("the relay address", process.env.RELAY);
-if (process.env.RELAY_TCP) config.bootstrap = [checked("the TCP bootstrap address", process.env.RELAY_TCP)];
+const relays = process.env.RELAYS ? checkedList("the relay list", process.env.RELAYS) : [];
+if (relays.length) {
+  config.relay = relays[0];
+  config.relays = relays;
+} else if (process.env.RELAY) {
+  config.relay = checked("the relay address", process.env.RELAY);
+}
+const tcp = process.env.RELAYS_TCP ? checkedList("the TCP bootstrap list", process.env.RELAYS_TCP) : [];
+if (tcp.length) {
+  if (relays.length && tcp.length > relays.length) {
+    console.error("::error::the TCP bootstrap list is longer than the relay list (they pair by order)");
+    process.exit(1);
+  }
+  config.bootstrap = tcp;
+} else if (process.env.RELAY_TCP) {
+  config.bootstrap = [checked("the TCP bootstrap address", process.env.RELAY_TCP)];
+}
 if (process.env.STUN) config.stun = stunUrl(process.env.STUN);
 writeFileSync(out, JSON.stringify(config));
-console.log(config.relay ? "relay configured" : "::warning::no relay address in this build: the app will run offline");
+console.log(config.relays ? `${config.relays.length} relays configured` : config.relay ? "relay configured" :"::warning::no relay address in this build: the app will run offline");
 console.log(config.bootstrap ? "TCP bootstrap configured" : "no TCP bootstrap address in this build");
 console.log(config.stun ? "STUN configured" : "no STUN server in this build");

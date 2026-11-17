@@ -494,6 +494,25 @@ describe('voice engine', () => {
     expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics.at(-1)!.tracks[0]);
   });
 
+  it('G-72: hear myself plays my mic on my speaker, follows a new mic, and stops with the call', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    ex.setSelfMonitor(true); // not in a call: nothing
+    expect(hx.audios).toHaveLength(0);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const before = hx.audios.length;
+    ex.setSelfMonitor(true);
+    expect(hx.audios).toHaveLength(before + 1);
+    const monitor = hx.audios.at(-1)!;
+    expect(monitor.srcObject).toBe(hx.mics[0]);
+    await ex.setInputDevice('mic1');
+    expect(monitor.srcObject).toBe(hx.mics.at(-1));
+    ex.detach();
+    expect(monitor.srcObject).toBeNull();
+    expect(monitor.paused).toBe(true);
+  });
+
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {
     const { hx, hy, cx, cy, ex, ey } = pair();
     await ex.attach(cx.state(), A);

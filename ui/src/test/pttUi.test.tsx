@@ -8,8 +8,7 @@ import type { Settings } from '../app/settings';
 import { acceleratorFrom, cleanVoicePrefs, defaultVoicePrefs, keyLabel, pttKeyFrom } from '../app/voicePrefs';
 import { MockCore } from '../core/mock';
 
-vi.mock('../voice', async (orig) => ({
-  ...(await orig<typeof import('../voice')>()),
+vi.mock('../voice', () => ({
   useVoiceEngine: () => ({ ready: true, speaking: {}, peerFailed: {}, setMicMuted: () => {}, inputs: [], outputs: [], setInput: () => {}, setOutput: () => {} }),
 }));
 

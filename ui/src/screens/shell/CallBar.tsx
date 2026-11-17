@@ -10,7 +10,9 @@ import { useStore } from '../../app/store';
 import { Dialog, Name } from '../../components/common';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
-import { usePushToTalk, useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
+import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
+// From its own module: tests that stub ../../voice keep push to talk working.
+import { usePushToTalk } from '../../voice/usePushToTalk';
 import { playTestSound } from '../../voice/devices';
 import { useSettings } from '../../app/settings';
 import { defaultVoicePrefs } from '../../app/voicePrefs';

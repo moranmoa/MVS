@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
+import { useUnreadBadge } from '../../app/unreadBadge';
 import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
@@ -30,6 +31,8 @@ export type ShellDialog = 'create' | 'join' | 'check' | null;
 
 export function Shell() {
   const store = useAppStore();
+  // G-62: the unread count on the app icon.
+  useUnreadBadge(store);
   const core = useCore();
   const identity = useStore(store, (s) => s.identity)!;
   const servers = useStore(store, (s) => s.servers);

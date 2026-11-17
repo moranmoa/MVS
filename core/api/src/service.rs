@@ -4839,18 +4839,18 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
 /// - `Joined`: it's back;
 /// - `Closed`: its owner closed it;
 /// - `Invalid` with the genesis in hand: kicked, or no longer a member, so
-///   authority refuses the join;
-/// - `AgeBlocked`: my known age is below its minimum (an invite link still
-///   works once that changes).
+///   authority refuses the join.
 ///
 /// Anything else waits for the next try: `NobodyOnline`, `Searching`,
+/// `AgeBlocked` (it depends on whether the log shows me as a member, which
+/// a partial log can miss: Security Lead on #457),
 /// `Invalid` without the genesis (a partial fetch), and every error
 /// (locked, network, internal). One bad round never loses a server.
 fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
     match status {
-        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. } | JoinStatus::AgeBlocked { .. }) => true,
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,
         Ok(JoinStatus::Invalid { .. }) => judged,
-        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. }) | Err(_) => false,
+        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. } | JoinStatus::AgeBlocked { .. }) | Err(_) => false,
     }
 }
 
@@ -4945,9 +4945,10 @@ mod device_notice_tests {
         let link = String::new;
         let joined = JoinStatus::Joined { link: link(), server_id: "s".into() };
         let blocked = JoinStatus::AgeBlocked { link: link(), required: AgeRestriction::Eighteen };
-        for status in [joined, JoinStatus::Closed { link: link() }, blocked] {
+        for status in [joined, JoinStatus::Closed { link: link() }] {
             assert!(restore_settles(&Ok(status.clone()), false), "{status:?}");
         }
+        assert!(!restore_settles(&Ok(blocked), true), "age-blocked waits: a partial log can miss my membership");
         let invalid = JoinStatus::Invalid { link: link() };
         assert!(restore_settles(&Ok(invalid.clone()), true), "kicked or not a member");
         assert!(!restore_settles(&Ok(invalid), false), "a partial fetch: not yet");

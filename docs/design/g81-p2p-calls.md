@@ -1,153 +1,157 @@
 # G-81: voice calls across networks over the P2P network only
 
-- **Status:** draft for review (SL, TL), with dev-sync. Supersedes the STUN/TURN path in `voice-across-networks.md` (#333) for the release plan; #433 (TURN) stays a draft.
-- **Owner's decision (2026-11-18):** "all the app needs to work without server so make it work with the decentralized network." There's no project STUN or TURN and no public STUN, so `MVS_STUN_URL` stays unset. What we have is the libp2p network the app already runs: the bootstrap/relay node, member relays (#368), and hole punching between members (DCUtR, #219/#184).
-- **Review criteria:** `sec-lead-g81-p2p-calls-criteria.md` (shared notes). §6 answers each one.
+- **Status:** draft for review (SL, TL). Written by voice-d and dev-sync. The network side is dev-sync's (`dev-sync-g81-network-side.md` in the shared notes, folded in here). It supersedes the STUN/TURN path in `voice-across-networks.md` (#333) for the release plan; #433 (TURN) stays a draft.
+- **Owner's decision (2026-11-18):** "all the app needs to work without server so make it work with the decentralized network." There's no project STUN or TURN and no public STUN, so `MVS_STUN_URL` stays unset. What we have is the libp2p network the app already runs: our relays, member relays (#368), hole punching between members (DCUtR, #219/#184), and the LAN beacon (#460).
+- **Review criteria:** `sec-lead-g81-p2p-calls-criteria.md` (shared notes). §7 answers each one.
 
 ## 1. Where we are
 
-| | Today |
-| --- | --- |
-| **Same LAN** | Works. WebRTC with host candidates (`default_public_and_private_interfaces`), DTLS pinned to the signed fingerprint, signalling over `/mvs/voice/1` (members only, rate-limited). |
-| **Different networks** | No call. Without a STUN server the browser has no server-reflexive candidate, so two homes behind NAT never find a path. The UI shows "אין חיבור קולי" after the connect timeout. |
-| **Relay-only on** | No calls at all (the core refuses them, and the engine now refuses on its own, #496 S1). |
+**Voice today:**
+- **Same LAN:** works. WebRTC with host candidates (`default_public_and_private_interfaces`), DTLS pinned to the signed fingerprint, signalling over `/mvs/voice/1`. That protocol is members only, 5/s per peer, 10/s overall, 16 KiB.
+- **Different networks:** no call. Without STUN the browser has no server-reflexive candidate, and the UI shows "אין חיבור קולי" after the connect timeout.
+- **Relay-only:** no calls (the core refuses; the engine refuses on its own too, #496 S1).
 
-The libp2p side already crosses networks for messages:
-- every node holds a connection to the relay (wss/TCP, QUIC beside it);
-- members can hole punch to each other (DCUtR over QUIC and TCP, members-only gates, `punch.rs`);
-- where punching fails, traffic goes through a circuit: the project relay (`MAX_CIRCUIT_BYTES` 32 MiB, `MAX_CIRCUIT_SECS` 3600) or a member relay (8 MiB per circuit, 120 s, renewed; a daily cap that defaults to 2 GB).
-
-Noise runs end to end over a circuit, so a relay carries ciphertext only.
+**The network side, which already crosses networks for chat:**
+- **Authenticated member connections.** Every member pair reaches each other through relay v2 circuits on up to 4 of our relays (#477), then often directly: DCUtR, members-only (`punch.rs`: GAP-4 binding + read gate), over TCP and QUIC. On one LAN, the LAN beacon finds them.
+  - Every one of these is a Noise session **end to end between the two cores**. A circuit is a transport, and the inner connection is upgraded with Noise between the endpoints, so relays see ciphertext only.
+- **Observed addresses.** identify tells each core the IP and port its relays and members see it on. They're filtered to dialable, global addresses (`announce.rs`, `punch.rs`), so this is a built-in, members-only "who am I from outside", and it's what DCUtR already uses.
+- **Path per member.** The node knows whether each peer is connected directly (punched or LAN) or only relayed.
+- **Relay limits:**
+  - **Our relays (R11):** 256 circuits, 8 per peer, **1 h and 32 MiB per circuit, both directions summed** (libp2p-relay 0.21.1 keeps one counter). New circuits: 30, then one every 2 min per peer. At the cut, the circuit closes with every stream on it, and renewing a reservation never extends an existing circuit.
+  - **Member relays:** 8 reservations, 16 circuits, **120 s and 8 MiB per circuit**. Each circuit is charged its full 8 MiB against `daily_cap_mb` (default 2,048).
+- **relay-only.** It drops direct listeners and closes the punch gate (GAP-6), so a relay-only core has no direct path to anyone.
+- **DCUtR success rate:** not measured. #219 proved it works in tests and in the 0.2.5 smoke (hotspot, relay → direct), but there's no QUIC, TCP or Windows rate. **Direct is opportunistic; nothing here is designed around a rate.** QA can log the path per call to measure it (§6).
 
 ## 2. Options
 
-### A. Peer STUN: cores answer binding requests
+### A0. No helper: synthetic srflx from libp2p-observed addresses
 
-A member's core answers STUN binding requests on a UDP port. The engine's `iceServers` become a few members or relays that are publicly reachable, learned through the core.
+The core gives the engine its public IPv4 as members and relays see it (`my_public_ipv4s()`, at most 2, global only). The engine adds, to the SDP it sends, a **remote-usable srflx candidate**: that IP with the host candidate's port (`typ srflx raddr <host> rport <port>`). Many home NATs keep the source port (endpoint-independent mapping). When both sides send ICE checks to each other's synthetic candidate, that's an ordinary UDP hole punch, with no STUN at all.
 
-- **Who can help.** A helper must receive *unsolicited* UDP from the asker's browser socket, so it needs a public, reachable UDP port: a public IP, a forwarded port or UPnP. A helper behind a NAT can't answer, and STUN can't ride on a libp2p connection, because the browser's ICE socket isn't the core's socket. In home-user servers that's rare, and nothing guarantees any member of a given server has one. The only always-reachable node is the project relay, and making it answer STUN is exactly the "project STUN" the owner ruled out.
-- **Success rate.** Given a helper, srflx↔srflx works for full-cone, restricted and port-restricted NATs on both sides: roughly 70–80% of home pairs in published measurements. It fails if either side is symmetric (many mobile and CGNAT carriers). **Without a helper, which is the common case, it's 0%.** No fallback.
-- **Work.**
-  - A STUN responder in the core: an RFC 5389 subset, hand-written, since we add no crates.
-  - Membership gating on a UDP port. Plain STUN carries no identity, so this means a short-lived token in a custom attribute, which Chromium's ICE agent won't send. In practice the gate is a source-IP allow-list fed from the members' libp2p-observed addresses, which is brittle.
-  - Helper discovery and selection, and "am I reachable" detection (AutoNAT-like).
-- **Risks.**
-  - A UDP reflector on users' machines. Even rate-limited and answering only "allowed" sources, a source-IP gate can be spoofed for reflection (STUN responses are about the same size as requests, so the amplification is small but not zero).
-  - Helpers learn the asker's IP and call times.
-  - A lying helper only causes a failed call, since DTLS pinning is unchanged.
-- **Proof in the two-NAT e2e.** Put a "public" member core on the WAN as the helper and expect G81.1 srflx↔srflx. That proves the mechanism, but it can't prove that real servers have a helper.
+- **Works:** both NATs port-preserving and endpoint-independent (common in home routers).
+- **Fails:** symmetric NAT, carrier-grade NAT, and port-changing NATs. It then falls back (C).
+- **Attack surface:** no new protocol, no reflector, nothing to abuse. The IP goes only into SDP sent to members of my call, which is the same exposure as any direct path today, covered by #497. DTLS pinning is unchanged.
+- **Relay-only:** under relay-only, no WebRTC and no candidates at all (#496 S1).
 
-### B. Media over libp2p: Opus frames on a stream the core carries
+### A. Peer STUN on cores: a member answers binding requests
 
-The renderer encodes Opus (WebCodecs `AudioEncoder`, in Electron's Chromium) and hands frames to the core. The core sends them on a new `/mvs/voice-media/1` stream to each call peer, over whatever libp2p connection exists: LAN, DCUtR-punched QUIC or TCP, or a relay circuit. The receiver decodes them with `AudioDecoder` into a jitter buffer and plays them through the existing Web Audio graph (per-peer gain, deafen, speaking meter).
+Chromium sends plain, unauthenticated STUN binding requests to a `stun:` URL. A helper member would therefore be answering raw UDP. To meet "never an open reflector", it could:
+- answer only source IPs that currently hold an authenticated libp2p connection to it as a bound member of a shared server;
+- rate-limit per IP and globally;
+- drop anything larger than a minimal binding request. The response (about 32 B, XOR-MAPPED-ADDRESS) is still up to about 1.6× the request (20 B), only toward members.
 
-- **Who can talk.** Anyone who can exchange messages, i.e. every pair of members who are both online. The path follows the libp2p connection:
-  - direct when on the same LAN or after a successful punch (about 70% of pairs is libp2p's own reported DCUtR rate, to be confirmed against our #219 data, Q1);
-  - otherwise a circuit.
-- **Success rate.** About 100% wherever signalling works today, as long as the relay budget allows (below). Quality differs by path:
-  - **Direct QUIC:** UDP, no head-of-line blocking, latency comparable to WebRTC.
-  - **Direct TCP or a circuit over TCP/wss:** reliable delivery. A lost packet stalls the stream (head-of-line), which the jitter buffer must absorb. That's fine on good links; on lossy ones it shows up as bursts of delay rather than gaps. We cap the buffer and drop late frames.
-  - **Circuit:** adds the relay's round trip.
-- **Latency budget.** About 20–40 ms frame + 20–80 ms network (direct) or + relay RTT + a 60–120 ms adaptive jitter buffer, so roughly 150 ms to 250 ms mouth-to-ear. Above WebRTC on a LAN, acceptable for chat.
-- **Relay budget (R11).** At Opus 24 kbps in 40 ms frames (25 frames/s), payload is 3 KB/s per direction, and framing adds about 44 B per frame (our header, yamux, Noise): about 4.1 KB/s, or about **14.8 MB/h per direction**.
-  - **Project relay:** one circuit is 32 MiB for at most an hour. If relay v2 counts both directions together (Q2), a two-way call uses about 30 MB/h and fits just under. A renewed circuit (or a new one each hour) is needed for long calls.
-  - **Relayed links:** drop to 16 kbps (about 9 MB/h per direction), which is ample for speech.
-  - **Member relays:** 8 MiB per 120 s circuit is plenty per circuit. But circuits end every 120 s (Q2: if renewal drops the stream, that's a reconnect every two minutes, which the stream must ride over with a sub-second gap), and each relayed call-hour costs the helper about 30 MB of its `daily_cap_mb` (2 GB default, about 65 call-hours a day).
-  - **Meshes:** each pair is its own circuit. A 5-person call with every pair relayed costs 10 pairs × about 30 MB/h of relay traffic, so 300 MB/h. Fine for the project relay at our scale; members' caps protect member relays.
-- **End to end.**
-  - Every hop is inside the Noise session between the two members. On a circuit, relay v2 carries an end-to-end Noise handshake over the relayed stream, so the relay sees ciphertext, as for messages today.
-  - There's no mixer or forwarding member (a full mesh, one stream per pair), so no plaintext audio exists outside the two endpoints, and no frame key is needed. If we ever add an SFU-like forwarder, frames get a key derived from the channel key with a new label (a design-review item then, not now).
-- **Binding and replay.**
-  - Each frame carries (call id, sequence, timestamp). The stream itself is bound to the peer's verified identity (GAP-4) and opened only to members of the call.
-  - Frames from a stream not in my current call, from a non-member, or out of the sequence window are dropped.
-  - The jitter buffer is bounded (in frames and ms), and a frame-rate cap per peer limits floods.
-- **Work.**
-  - **Core (dev-sync):** the stream protocol with the voice.rs gates, per-peer frame rate and size caps, call binding, and an IPC channel for frames between the core and the renderer (Q4).
-  - **UI (voice-d):** an AudioWorklet capture → WebCodecs Opus encode, then decode → jitter buffer → the existing gain/deafen/meter graph; a path indicator for the diagnostics panel.
-  - **Echo cancellation:** `getUserMedia`'s AEC applies to the capture. Whether Chromium cancels audio played through Web Audio (not a WebRTC track) depends on the platform. It's the biggest quality risk, and a spike must measure it on Windows before we commit.
-- **Risks.**
-  - Echo (above).
-  - TCP head-of-line delay on lossy links.
-  - IPC throughput and latency through the sidecar.
-  - Relay cost.
-  - A second media path to maintain beside WebRTC.
-- **Proof in the two-NAT e2e.**
-  - With the routers blocking UDP between the homes (today's `SCENARIO=blocked`), the call must still connect over the relay circuit, with audio energy arriving (V2.2).
-  - Without blocking, the path should be a punched direct connection.
-  - Setup time p95 (G81.2) and a new check on the frame path type: direct, circuit, or member circuit. Types only.
+**Problems:**
+- A helper behind NAT can't receive the asker's UDP until a mapping exists (chicken and egg), so only members with public UDP, which is rare, can help.
+- The helper learns when I'm about to call.
+- It's the most code and abuse surface for the least gain over A0.
 
-### C. Hybrid: WebRTC where it works, B everywhere else
+**Skipped.** We'd revisit only if A0 data (§6) showed many port-changing NATs.
 
-- **C1, "peer STUN + B":** try WebRTC with a peer STUN helper (A), and fall back to B. It inherits A's helper and reflector problems for little gain, because B already gives a direct path whenever a hole punch works.
-- **C2, "LAN WebRTC + B":** keep today's WebRTC on host candidates for peers on the same LAN, where it's best (AEC, jitter handling, no relay), and use B for everyone else. No STUN anywhere.
+### B. Media over libp2p: Opus frames on the existing connection
 
-**The downgrade rule (both):**
-- The caller's engine decides per peer.
-- It tries WebRTC (host candidates only, as today) first, for a short time: about 3 s, or right away when the peers aren't on one LAN per the core's connection info.
-- Then it switches to B on the same call.
-- The peer never chooses the path for me. A peer can offer WebRTC, but my side starts it only when allowed (relay-only off, see §4), and an offer under relay-only is ignored, as the engine does today.
+A new **`/mvs/voice-media/1`** stream between two in-call members, over whatever connection exists: direct after DCUtR, LAN, or our relay's circuit. It works whenever chat works.
+
+- **Pipeline:**
+  - The renderer encodes Opus with WebCodecs `AudioEncoder` (Electron's Chromium) from the existing capture (echo cancellation, noise suppression, gain).
+  - The core carries the frames.
+  - The receiver decodes with `AudioDecoder` into a bounded jitter buffer, then into the existing Web Audio graph (per-peer gain, deafen, speaking meter).
+- **Frame:** `call_id(16) ‖ seq(u32) ‖ ts(u32) ‖ opus`.
+  - Accepted only from a bound member who is in my current call; the api tells sync the call's member set, as for `/mvs/voice/1`.
+  - `seq` strictly increases per (call, sender), so late frames are dropped and duplicates ignored.
+  - The jitter buffer is capped at 200 ms. The stream's frame rate and size are capped.
+- **Budget (R11):**
+  - **Cost:** Opus 24 kbps in 40 ms frames is about 3 KB/s of audio plus about 1.2 KB/s of framing (yamux, Noise, header, at 25 frames/s), about 4.2 KB/s per direction. That's **about 29 MiB/h for a 1:1 call on one circuit**, both directions summed: just under R11's 32 MiB. 32 kbps doesn't fit.
+  - **Bitrate rule:** 24 kbps on relayed paths, full quality on direct ones.
+  - **Circuit refresh:** sync opens a fresh circuit before the 1 h or 32 MiB cut (make-before-break) and moves the stream.
+  - **Meshes:** one circuit per pair, so 4 per peer in a 5-person call, within 8 per peer.
+  - **Relay load:** about 0.8 MB/s each way for 100 relayed pairs, which devops should size for.
+- **Member relays are not used for media.** A 120 s circuit means a forced switch every 2 minutes, and about 240 MiB/h charged against `daily_cap_mb` for a call that uses about 29 MiB. A voice class charged by bytes actually used would be a `member_relay.rs` change with SL review: later, if ever.
+- **Path changes.** When a direct connection replaces the relayed one, the relayed one stays parked but open (#206). Sync moves the media stream to the direct one, and back if direct dies. The api sees one logical media channel per call peer.
+- **Quality:** a stream over TCP stalls on loss (head-of-line blocking), and rust-libp2p 0.56 has no QUIC datagrams, so frames ride a stream even over QUIC. QUIC to the relay (#220, `/udp/4001/quic-v1`) helps a lot. Expect latency roughly 150–250 ms mouth-to-ear relayed, and worse than WebRTC over UDP on lossy links.
+- **IPC.** 25–50 frames/s per peer is too much for the shared JSON-lines stdio, where frames would queue behind big responses. A **dedicated binary channel** is needed: a second pipe or fd from the desktop main to the core with length-prefixed frames, then a `MessagePort` to the renderer. That's a desktop and dev-identity item.
+
+### C. Hybrid
+
+1. **Every call starts on B** over whatever connection exists: at once, and it always works when chat works.
+2. **In parallel, WebRTC tries a direct path** with host candidates plus A0's synthetic srflx. That covers the same LAN, port-preserving NATs, and pairs DCUtR has already punched.
+3. **If ICE connects within 10 s,** audio moves to WebRTC and B's stream closes, which saves relay budget and gets WebRTC's UDP media. If WebRTC later fails (ICE restart gives up, #469), audio moves back to B rather than ending the call.
+4. **Downgrade rule:**
+   - Each side decides only for itself.
+   - A relay-only side never creates an RTCPeerConnection and never sends host or srflx candidates, so it never accepts a punch. The call simply stays on B over our relay, and the other side can't force a direct path.
+   - Neither side can make the other use a member relay for media.
 
 ## 3. Comparison
 
-| | A (peer STUN) | B (media over libp2p) | C2 (LAN WebRTC + B) |
-| --- | --- | --- | --- |
-| Works across NATs | Only with a reachable helper (rare); then about 75% | About 100% (direct about 70%, else circuit) | About 100% |
-| Symmetric NAT / CGNAT | No | Yes (circuit) | Yes |
-| Relay-only users can call | No | Yes, circuit only, no IP to peers | Yes (B part) |
-| New attack surface | A UDP reflector on members | A members-only stream (like voice.rs) | Same as B |
-| Quality | WebRTC | Good direct, fair relayed (TCP HOL) | Best on LAN, else B |
-| Work | Medium-high, brittle gating | High (audio pipeline + stream) | B + a small switch |
-| Server cost | None | Project relay for unpunchable pairs | Same as B |
+| | A0 alone | A (peer STUN) | B alone | **C (B + WebRTC with A0)** |
+| --- | --- | --- | --- | --- |
+| Crosses port-preserving NATs | Yes | With a reachable helper | Yes | Yes |
+| Symmetric NAT / CGNAT | No | No | Yes (circuit) | Yes (circuit) |
+| Relay-only users can call | No | No | Yes, circuit only | Yes, circuit only |
+| New attack surface | None | A UDP reflector on members | A members-only stream | Same as B |
+| Quality | WebRTC | WebRTC | Good direct, fair relayed | WebRTC whenever it connects, else B |
+| Relay cost | None | None | Every relayed pair | Only pairs WebRTC can't connect |
+| Work | Small | Medium + brittle gating | Large | B + A0 + a switch |
 
 ## 4. Relay-only
 
-- **B over circuits only** matches what relay-only means for messages: peers never learn my IP, and the relay does (as it already does).
-- **DCUtR stays off under relay-only** (`punch.rs` already refuses), so a relay-only user can't be pulled into a direct path by a peer.
-- **WebRTC is never started under relay-only.** That's the engine's S1 guard (#496), now with B as the path instead of "no call".
-- **The #497 notice gets a v3 wording later.** "In a call, computers may connect directly, so the people in it can see your IP. With relay-only on, calls go through the relay and they can't." That's a UX/PO item when B ships.
+- **Calls become possible under relay-only,** on B over our relay's circuits only. Peers never learn my IP, and our relay does, as it already does for messages.
+- **No DCUtR and no WebRTC:** `punch.rs` already refuses punches, and the engine creates no RTCPeerConnection (#496 S1).
+- **New metadata at the relay:** it sees that two peer IDs exchange a steady ~4 KB/s flow, when it starts and when it stops. That goes in the threat model, and in the notice.
+- **#497's notice needs a v3 when B ships.** Today's "relay-only turns calls off" becomes something like: "In a call, the people in it may see your IP when computers connect directly. With relay-only on, calls go through the relay: they can't see it, but the relay sees that you're in a call." That's a UX/PO item.
 
 ## 5. Recommendation
 
-**C2: LAN WebRTC plus media over libp2p (B) for everything else.** It's the only option that:
-- crosses every NAT type without a server we don't already run;
+**C: start on B, upgrade to WebRTC (host + A0) when it connects, skip A.** Of the options, it alone:
+- connects every pair that can chat, including symmetric NAT and CGNAT, with no server beyond our own relays;
+- keeps WebRTC's quality wherever a direct path exists;
+- spends relay budget only on pairs that need it;
 - lets relay-only users call;
 - adds no reflector.
 
-A depends on helpers that real servers mostly don't have.
+**Spike first (voice-d, about 1 day):**
+- WebCodecs Opus encode and decode in our Electron.
+- Echo cancellation with Web Audio playout on Windows and macOS. This is the main risk: Chromium's AEC may not see audio that isn't WebRTC playout. The fallback inside B is to play decoded audio through a `MediaStreamTrackGenerator` on a local loopback RTCPeerConnection, so the AEC sees it. Measure both.
+- Frame IPC latency through a binary pipe.
 
-**Before building, a one-day spike:**
-- WebCodecs Opus encode and decode in our Electron;
-- echo cancellation on Windows and macOS with Web Audio playout;
-- frame IPC latency through the sidecar.
+**Effort:**
 
-If AEC fails on Web Audio playout, the fallback inside B is to feed decoded audio into a `MediaStreamTrackGenerator`, then play it as a stream on a local loopback `RTCPeerConnection`, so Chromium's AEC sees it as WebRTC playout. Measure that in the spike as well.
+| Piece | Owner | Size |
+| --- | --- | --- |
+| A0: `my_public_ipv4s()` from identify, plus tests | dev-sync | S (½ day) |
+| `path_to(member) -> Direct, Lan, Relayed or None` | dev-sync | S (¼ day) |
+| B: `/mvs/voice-media/1` with the in-call member gate, frame header and seq checks, rate and size caps, make-before-break circuit refresh, relay-only rules. Tests: two cores through a test relay, a 1 h cut simulated with small limits, and a byte tap showing the relay never sees Opus in the clear. | dev-sync | M–L (3–4 days) |
+| api `media_open / media_send / on_media` and the binary IPC channel (desktop main ↔ core, MessagePort to the renderer) | dev-identity / desktop | M |
+| Engine: the Opus pipeline, jitter buffer, B ↔ WebRTC switch, A0 candidates, diagnostics path type (types only) | voice-d | L |
+| Relay sizing for media, and QUIC on #220 | devops | — |
+| Notice v3, threat-model metadata entry | UX/PO, SL | S |
 
-**Order:**
-1. The spike.
-2. dev-sync: `/mvs/voice-media/1` (gates, caps, binding, IPC).
-3. voice-d: the B pipeline behind a flag, plus the C2 switch.
-4. QA: the two-NAT e2e flips to "blocked UDP must still connect".
-5. UX: notice v3 and the path in the diagnostics panel.
+## 6. How the two-NAT e2e proves it (PR 2, #505)
 
-## 6. Security Lead criteria
+The two-router topology (MASQUERADE homes, internal Docker networks, a throwaway relay) stays. The coturn container goes, since there's no STUN in this design, and a pair of scenarios replaces it.
+
+| Scenario | Routers | Expected |
+| --- | --- | --- |
+| **N-P2P-1: port-preserving NAT** | MASQUERADE (keeps ports) | The call connects on B at once, then moves to WebRTC via A0 (G81.1 `direct (host -> srflx)` or prflx). Audio flows (V2.2). Setup p95 under 10 s (G81.2), measured to the first audio, not to WebRTC. |
+| **N-P2P-2: symmetric NAT** | MASQUERADE `--random` (random ports) | WebRTC never connects. The call stays on B over the circuit, with audio flowing and the path type `relayed`. |
+| **N-P2P-3: UDP blocked between homes** | `BLOCK_PEER_UDP=1` | The call is on B over the circuit (TCP to the relay). No direct path. |
+| **N-P2P-4: relay-only** | Either | No RTCPeerConnection on the relay-only side (QA's G81.5 hook shows no candidates). The call works on B over the circuit. |
+| **Budget** | Small relay limits (`MAX_CIRCUIT_BYTES` and `MAX_CIRCUIT_SECS`, reduced) | The circuit is refreshed make-before-break, with a gap under 300 ms in the received audio. |
+
+QA's call.mjs hooks (#500: G81.3 no-connect, G81.4 diagnostics, G81.5 candidate types) carry over. One more hook is needed: the media path (`webrtc` / `b-direct` / `b-relayed`) read from the diagnostics panel, types only.
+
+## 7. Security Lead criteria
 
 | Criterion | Answer |
 | --- | --- |
-| **Who learns which IP** | **C2 on LAN:** co-callers on the same LAN learn my LAN address (as today). **B direct (punched):** the co-caller learns my public IP and port (as with any direct libp2p connection between members today). **B circuit:** the relay (project or member) learns my IP (it already does for messages); co-callers don't. No new party learns anything. |
-| **#497 still true; relay-only = no direct path** | Yes. Direct paths exist only with relay-only off. Under relay-only, B runs on circuits only and WebRTC isn't started. #497's wording becomes stale ("relay-only turns calls off") when B ships, so v3 is planned (§4). |
-| **Members only, both ways** | `/mvs/voice-media/1` uses the voice.rs gate. The peer is bound (GAP-4) and is a current member my read gate accepts on a server we share. The stream is opened only to members of my current call, and accepted only from them. |
-| **No new crypto crates** | None. Noise (in the tree) protects frames, and WebCodecs is the browser's. A future frame key would use the existing chacha20poly1305 and blake3 derivation. |
-| **A: no open reflector, members-only, response ≤ request, rate limits, DTLS pinning** | Not recommended, because a plain-STUN port can't be gated by identity (§2 A). If it's ever built: answer only sources on a members' observed-address allow-list, send a response ≤ the request, use per-source and global rate limits, never on the relay host. DTLS pinning is unchanged. |
-| **B: Noise end to end over the circuit** | Yes. Relay v2 relays a raw stream, and the two peers run Noise over it, so the relay sees ciphertext (as `member_relay.rs` documents for member relays). |
-| **B: frame key if anyone forwards** | Nobody forwards: a full mesh, one stream per pair. A forwarder would need a frame key (SFrame-like from the channel key, a new label) and a design review. |
-| **B: relay budget (R11)** | About 14.8 MB/h per direction at 24 kbps, about 9 MB/h at 16 kbps (the relayed default). This fits the project relay's 32 MiB/h circuit for one pair (Q2: whether directions count together). Member relays: 8 MiB per 120 s circuit, charged against `daily_cap_mb`, about 30 MB per relayed call-hour. |
-| **B: frames bound to call, sender and sequence** | The sender comes from the stream's bound identity. Each frame has call id + sequence + timestamp. A wrong call, a non-member, a duplicate or an out-of-window sequence is dropped. The jitter buffer and frame rate are capped. |
-| **B: metadata** | Relays see the timing and volume of a call between two peer IDs (constant-rate small packets look like voice). Written down here; the same class as message metadata today. |
-| **C: a peer can't force a direct path under relay-only** | My engine decides. Under relay-only it never creates an RTCPeerConnection (#496 S1), DCUtR is refused (`punch.rs`), and B uses circuits only. A peer's offer is ignored. |
-
-## 7. Open questions (dev-sync)
-
-1. **Q1: punching success.** Measured DCUtR success between members, QUIC vs TCP, on Windows.
-2. **Q2: relay byte counting.** Does relay v2's `max_circuit_bytes` count both directions? Does a member-relay renewal (120 s) drop open streams?
-3. **Q3: long-lived streams.** Any obstacle in `node.rs` to a long-lived, roughly 4 KB/s stream: yamux windows, keep-alive, parking relayed connections (#206)?
-4. **Q4: the frame channel.** Renderer ↔ core: is stdio JSON through the desktop main fast enough for about 25 frames/s per peer, or is a binary side channel needed?
+| **Who learns which IP** | **WebRTC on the LAN:** co-callers on the LAN learn my LAN address (today). **WebRTC via A0, and B direct after DCUtR:** the co-caller learns my public IP, the same as today's direct paths, which #497 covers. **B over our relay:** the relay learns both IPs (it already does for chat), and co-callers learn nothing. **Member relays:** not used for media. No new party learns an IP. |
+| **#497 still true; relay-only means no direct path** | Yes. Under relay-only there's no WebRTC, no candidates, no DCUtR, and B runs on circuits only. #497's "relay-only turns calls off" becomes stale when B ships, so v3 is planned (§4), with the relay-metadata line. |
+| **Members only, both ways** | `/mvs/voice-media/1` uses the bound-member + read-gate check of `/mvs/voice/1` and `punch.rs`, plus the in-call member set, both for opening and for accepting. A0's IP goes only into SDP signalled to members of my call. |
+| **No new crypto crates** | None. Noise as today. No frame key, because nothing forwards. |
+| **A: no open reflector, members-only, response ≤ request, rate limits, DTLS pinning** | A is skipped. A0 needs no reflector. If A is ever built: the member-IP allowlist, a response ≤ about 1.6× the request and only to members, per-IP and global caps. DTLS pinning is unchanged everywhere. |
+| **B: Noise end to end over the circuit** | Yes. A relay v2 circuit is a transport, and the two cores run Noise over it. The sync tests include a test relay with a byte tap asserting that no Opus is seen in the clear. |
+| **B: frame key if anyone forwards** | Nobody forwards: a full mesh, one stream per pair. A forwarder (SFU-like) would need a frame key from the channel key with a new label, plus a design review. Refused for now. |
+| **B: relay budget (R11)** | About 29 MiB/h for 1:1 at 24 kbps (both directions summed), under 32 MiB, with make-before-break refresh before the cut. No media on member relays. Load is about 4.2 KB/s per direction per relayed pair, and devops sizes the relay. |
+| **B: frames bound to call, sender, sequence** | The sender comes from the stream's bound identity. Frames are `call_id ‖ seq ‖ ts ‖ opus`. A wrong call, a non-member, a duplicate or a stale seq is dropped. The jitter buffer is ≤ 200 ms, with rate and size caps. |
+| **B: metadata** | The relay sees two peer IDs, a steady ~4 KB/s, start and end: who calls whom and for how long. This goes into the threat model and notice v3. It's the same class as chat metadata, but more telling (calls are recognizable). |
+| **C: a peer can't force a direct path under relay-only** | Each side decides for itself. A relay-only side creates no RTCPeerConnection and sends no candidates (#496 S1), and refuses punches (`punch.rs`). The call stays on B over the relay. Nobody can steer the other onto a member relay. |
+| **What the core exposes** | `my_public_ipv4s()` (to the engine only, into SDP; never shown as text, and the UI shows types only), `path_to()`, and `media_*`. No NAT-type probe or AutoNAT service, which would probe for non-members. |

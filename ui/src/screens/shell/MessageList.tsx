@@ -250,14 +250,18 @@ export function MessageList({
   goToRef.current = goTo;
   // G-30: a link was opened for this channel: scroll there, highlight, focus the row.
   const target = useStore(store, (s) => (s.messageTarget?.channelId === win.channelId ? s.messageTarget : null));
+  // The highlight's timer lives outside the effect: clearing the target re-runs
+  // the effect, and its cleanup must not cancel the fade-out.
+  const targetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(targetTimer.current), []);
   useEffect(() => {
     if (!target || count === 0) return;
     store.clearMessageTarget();
     if (target.index >= count) return store.showFlash('msglink.notFound');
     goToRef.current(target.index, 'center');
     setTargeted(target.index);
-    const t = setTimeout(() => setTargeted((f) => (f === target.index ? null : f)), 2500);
-    return () => clearTimeout(t);
+    clearTimeout(targetTimer.current);
+    targetTimer.current = setTimeout(() => setTargeted((f) => (f === target.index ? null : f)), 2500);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target, count]);
   const jumpToReply = useCallback((index: number) => {

@@ -41,6 +41,8 @@ fn sign_up(peer: &Peer, name: &str) -> Identity {
             display_name: name.into(),
             bio: None,
             avatar_data_url: None,
+            avatar_small: None,
+            color: None,
         })
         .unwrap()
 }
@@ -68,7 +70,11 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::MessageUpdated(_) => "message.updated",
             Event::CallState(_) => "call.state",
             Event::CallSignal { .. } => "call.signal",
-            Event::VoiceRoom(_) => "voice.room",
+            Event::VoiceRooms { .. } => "voice.rooms",
+            Event::MemberRelayChanged(_) => "memberRelay.changed",
+            Event::ServerRestoreChanged(_) => "serverRestore.changed",
+            Event::DeviceLinkState(_) => "deviceLink.state",
+            Event::DeviceAdded { .. } => "account.deviceAdded",
         })
         .collect()
 }
@@ -474,6 +480,8 @@ fn profile_fields_are_capped() {
         display_name: name.into(),
         bio,
         avatar_data_url: avatar.map(String::from),
+        avatar_small: None,
+        color: None,
     };
     let ok = [
         input("נועה", Some("שורה\nשורה".into()), Some("data:image/png;base64,iVBORw0KGgo=")),
@@ -593,8 +601,11 @@ fn dispatcher_errors() {
         serde_json::from_str(&peer.core.handle(r#"{"cmd":"getAppInfo"}"#)).unwrap();
     assert_eq!(
         info["ok"],
-        serde_json::json!({ "version": "0.1.0-alpha", "updateChannel": "stable" })
+        serde_json::json!({ "version": "0.1.0-alpha", "updateChannel": "stable", "relayOnly": false })
     );
+    // A bad argument is a bad request, not a change.
+    assert_eq!(error(r#"{"cmd":"setRelayOnly","args":{"on":"yes"}}"#), "bad-request");
+    assert!(!peer.core.get_app_info().unwrap().relay_only);
     peer.core.handle(r#"{"cmd":"setUpdateChannel","args":{"channel":"beta"}}"#);
     assert_eq!(peer.core.get_app_info().unwrap().update_channel, UpdateChannel::Beta);
 }
@@ -611,6 +622,8 @@ fn diagnostics_hold_no_secrets() {
             display_name: "Secret Name".into(),
             bio: None,
             avatar_data_url: None,
+            avatar_small: None,
+            color: None,
         })
         .unwrap();
     let report = peer.core.export_diagnostics().unwrap();
@@ -635,7 +648,7 @@ fn members_chat_through_the_group_cipher() {
     let open = |words: &str, name: &str, cipher: Arc<dyn GroupCipher>| {
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -842,7 +855,7 @@ fn a_kick_re_keys_the_channel() {
     let open = |words: &str, name: &str, cipher: Arc<GroupKeysCipher>| {
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -913,10 +926,10 @@ fn a_kick_re_keys_the_channel() {
     guest.events.take();
     guest.core.sync_now().unwrap();
     assert_eq!(notices(&guest), [NoticeKind::RekeyWaiting]);
-    assert_eq!(
-        guest.core.send_message(&channel, "anyone?", None).unwrap_err().code,
-        ErrorCode::NotAllowed
-    );
+    // No key until a moderator re-keys: held, not refused (sent below).
+    let held = guest.core.send_message(&channel, "anyone?", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    assert!(held.id.starts_with(api::KEY_PENDING_PREFIX));
     // The owner reads the kick and re-keys; then the guest can write again.
     owner.events.take();
     owner.core.sync_now().unwrap();
@@ -932,7 +945,7 @@ fn a_kick_re_keys_the_channel() {
         .into_iter()
         .map(|m| m.body)
         .collect();
-    assert_eq!(bodies, ["before", "after", "still here", "back"]);
+    assert_eq!(bodies, ["before", "after", "still here", "anyone?", "back"]);
 }
 
 /// Edits (author only), deletes (author, or a higher rank) as tombstones that
@@ -947,7 +960,7 @@ fn edit_delete_and_retry_messages() {
         let cipher = Arc::new(GroupKeysCipher::locked());
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1019,7 +1032,7 @@ fn a_failed_re_key_fails_closed() {
     let open = |words: &str, name: &str, cipher: Arc<dyn GroupCipher>| {
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1081,7 +1094,7 @@ fn sync_announces_new_and_changed_messages_once() {
         let cipher = Arc::new(GroupKeysCipher::locked());
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1132,7 +1145,7 @@ fn channels_come_from_channel_create_records() {
         let cipher = Arc::new(GroupKeysCipher::locked());
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1206,7 +1219,7 @@ fn general_is_named_in_the_creators_language() {
         let answers: BTreeMap<usize, String> =
             positions.iter().map(|p| (*p, words[p - 1].clone())).collect();
         assert!(peer.core.check_recovery_words(answers).unwrap().ok);
-        let profile = ProfileInput { display_name: "X".into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: "X".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1268,7 +1281,7 @@ fn deletes_and_edits_prune_old_bodies_from_the_db() {
         let cipher = Arc::new(GroupKeysCipher::locked());
         let peer = world.peer_with(Arc::new(MemoryStore::new()), Some(db.clone()), cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         (peer, db)
     };
@@ -1359,12 +1372,12 @@ fn removed_members_age_claims_and_clean_names() {
         let answers: BTreeMap<usize, String> =
             positions.iter().map(|p| (*p, words[p - 1].clone())).collect();
         assert!(peer.core.check_recovery_words(answers).unwrap().ok);
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap().id
     };
     let owner = world.peer();
     owner.core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
-    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None };
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     owner.core.update_profile(profile).unwrap();
     let adult = world.peer();
     let adult_id = born(&adult, "1990-05-01", "Adult");
@@ -1372,7 +1385,7 @@ fn removed_members_age_claims_and_clean_names() {
     born(&minor, "2014-01-01", "Minor");
 
     // B23: names others see are clean.
-    let bidi = ProfileInput { display_name: "a\u{202E}b".into(), bio: None, avatar_data_url: None };
+    let bidi = ProfileInput { display_name: "a\u{202E}b".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     assert_eq!(adult.core.update_profile(bidi).unwrap_err().code, ErrorCode::BadRequest);
     assert_eq!(
         owner.core.create_server("x\u{200B}y", AgeRestriction::None).unwrap_err().code,
@@ -1569,7 +1582,7 @@ fn send_states_survive_a_restart() {
     };
     let core = open(Arc::new(OfflineNet::default()));
     core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
-    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None };
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     core.update_profile(profile).unwrap();
     let server = core.create_server("Offline", AgeRestriction::None).unwrap();
     let channel = core.list_channels(&server.id).unwrap().remove(0).id;
@@ -1605,6 +1618,156 @@ fn send_states_survive_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v0.3.0 smoke (QA): a joiner sends the moment the join resolves, before
+/// the owner's re-key has reached it. The send waits for the key (the
+/// owner's background sync makes it, the joiner's brings it in), and never
+/// surfaces `not-allowed` to a legit member.
+#[test]
+fn a_joiners_first_send_right_after_the_join_succeeds() {
+    use api::crypto::GroupKeysCipher;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let world = World::new();
+    let open = |words: &str, name: &str| {
+        let cipher = Arc::new(GroupKeysCipher::locked());
+        let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
+        peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+        peer.core.update_profile(profile).unwrap();
+        peer
+    };
+    let owner = open(OWNER_WORDS, "Owner");
+    let guest = open(LEGAL, "Guest");
+    let server = owner.core.create_server("Instant", AgeRestriction::None).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // Both apps' background sync loops.
+        for peer in [&owner, &guest] {
+            let stop = &stop;
+            scope.spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = peer.core.sync_now();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+        }
+        guest.core.join_server(&server.invite_link).unwrap();
+        assert!(guest.core.list_servers().unwrap().iter().any(|s| s.id == server.id));
+        let channel = guest.core.list_channels(&server.id).unwrap().remove(0).id;
+        let sent = guest.core.send_message(&channel, "typed at once", None);
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(sent.map(|m| m.body).map_err(|e| e.code), Ok("typed at once".to_owned()));
+    });
+}
+
+/// #285 follow-up (tech lead): a send before the key comes returns at once
+/// as `pending` with a provisional ID, is listed, and is sent by the sync
+/// loop when the re-key arrives (`message.updated` with `replaces`).
+#[test]
+fn a_message_held_for_its_key_is_sent_when_the_key_comes() {
+    let world = World::new();
+    let owner = keyed_peer(&world, Arc::new(MemoryStore::new()), None);
+    owner.core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
+    let guest = keyed_peer(&world, Arc::new(MemoryStore::new()), None);
+    guest.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
+    let server = owner.core.create_server("Held", AgeRestriction::None).unwrap();
+    guest.core.join_server(&server.invite_link).unwrap();
+    let channel = guest.core.list_channels(&server.id).unwrap().remove(0).id;
+
+    // The owner hasn't read the join yet: no key. Held, not refused.
+    guest.events.take();
+    let held = guest.core.send_message(&channel, "before the key", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    assert!(held.id.starts_with(api::KEY_PENDING_PREFIX), "{}", held.id);
+    assert!(guest.events.take().contains(&Event::MessageAdded(held.clone())));
+    assert_eq!(guest.core.get_message_count(&channel).unwrap(), 1);
+    assert_eq!(guest.core.get_messages(&channel, 0, 9).unwrap().messages, std::slice::from_ref(&held));
+    // Still no key at the guest's next round: still held, nothing said.
+    guest.core.sync_now().unwrap();
+    assert!(!guest.events.take().iter().any(|e| matches!(e, Event::MessageUpdated(_))));
+
+    // The owner's round re-keys; the guest's next round sends it.
+    owner.core.sync_now().unwrap();
+    guest.core.sync_now().unwrap();
+    let sent: Vec<Message> = guest
+        .events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::MessageUpdated(m) if m.replaces.is_some() => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent.len(), 1, "one replacement");
+    assert_eq!(sent[0].replaces.as_deref(), Some(held.id.as_str()));
+    assert_eq!((sent[0].body.as_str(), sent[0].send_state), ("before the key", Some(SendState::Sent)));
+    assert!(!sent[0].id.starts_with(api::KEY_PENDING_PREFIX));
+    let listed = guest.core.get_messages(&channel, 0, 9).unwrap().messages;
+    assert_eq!(listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [sent[0].id.as_str()]);
+    // The owner reads it.
+    owner.core.sync_now().unwrap();
+    let got = owner.core.get_messages(&channel, 0, 9).unwrap().messages;
+    assert_eq!(got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["before the key"]);
+}
+
+/// A message held for its key that never gets it turns `failed` after
+/// `KEY_PENDING_FOR` (`message.updated`, and `notice: rekey-waiting`).
+#[test]
+fn a_message_held_without_a_key_fails_after_two_minutes() {
+    let world = World::new();
+    let owner = keyed_peer(&world, Arc::new(MemoryStore::new()), None);
+    owner.core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
+    let guest = keyed_peer(&world, Arc::new(MemoryStore::new()), None);
+    guest.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
+    let server = owner.core.create_server("Silent", AgeRestriction::None).unwrap();
+    guest.core.join_server(&server.invite_link).unwrap();
+    let channel = guest.core.list_channels(&server.id).unwrap().remove(0).id;
+    let held = guest.core.send_message(&channel, "nobody keys me", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+
+    // The owner never comes back. Two minutes pass.
+    *world.clock.0.lock().unwrap() += api::KEY_PENDING_FOR.as_millis() as u64 + 1;
+    guest.events.take();
+    guest.core.sync_now().unwrap();
+    let events = guest.events.take();
+    let failed = Message { send_state: Some(SendState::Failed), ..held.clone() };
+    assert!(events.contains(&Event::MessageUpdated(failed.clone())), "{events:?}");
+    assert!(events.contains(&Event::Notice { kind: NoticeKind::RekeyWaiting, server_id: server.id.clone() }));
+    assert_eq!(guest.core.get_messages(&channel, 0, 9).unwrap().messages, [failed]);
+    // Said once, not every round.
+    guest.core.sync_now().unwrap();
+    assert!(!guest.events.take().iter().any(|e| matches!(e, Event::MessageUpdated(_))));
+
+    // Discarded (sec-lead): gone from the list; its text with it.
+    guest.core.discard_message(&held.id).unwrap();
+    assert!(guest.core.get_messages(&channel, 0, 9).unwrap().messages.is_empty());
+    assert_eq!(guest.core.discard_message(&held.id).unwrap_err().code, ErrorCode::NotFound);
+
+    // Bounded: at most MAX_KEY_PENDING held at once per channel (the failed
+    // one doesn't count); then the plain refusal.
+    for i in 0..api::MAX_KEY_PENDING {
+        let held = guest.core.send_message(&channel, &format!("held {i}"), None).unwrap();
+        assert_eq!(held.send_state, Some(SendState::Pending));
+    }
+    assert_eq!(
+        guest.core.send_message(&channel, "one too many", None).unwrap_err().code,
+        ErrorCode::NotAllowed
+    );
+
+    // Failed ones are bounded too: they all fail; one more fails after
+    // them; only the newest MAX_KEY_PENDING failed stay.
+    *world.clock.0.lock().unwrap() += api::KEY_PENDING_FOR.as_millis() as u64 + 1;
+    guest.core.sync_now().unwrap();
+    let last = guest.core.send_message(&channel, "the newest", None).unwrap();
+    *world.clock.0.lock().unwrap() += api::KEY_PENDING_FOR.as_millis() as u64 + 1;
+    guest.core.sync_now().unwrap();
+    let listed = guest.core.get_messages(&channel, 0, 999).unwrap().messages;
+    assert_eq!(listed.len(), api::MAX_KEY_PENDING);
+    assert!(listed.iter().all(|m| m.send_state == Some(SendState::Failed)));
+    assert_eq!(listed.last().unwrap().id, last.id, "the newest kept");
+    assert!(!listed.iter().any(|m| m.body == "held 0"), "the oldest dropped");
+}
+
 /// v0.2.0 smoke: a member who joins writes first, and the owner never
 /// sends. The owner's sync sees the join and keys the channel for the new
 /// member set, so the joiner can write (and the owner can read it).
@@ -1617,7 +1780,7 @@ fn a_joiner_can_write_first_once_the_owner_syncs() {
         let cipher = Arc::new(GroupKeysCipher::locked());
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1659,7 +1822,7 @@ fn a_failed_join_re_key_fails_closed() {
     let open = |words: &str, name: &str, cipher: Arc<dyn GroupCipher>| {
         let peer = world.peer_with(Arc::new(MemoryStore::new()), None, cipher);
         peer.core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
         peer.core.update_profile(profile).unwrap();
         peer
     };
@@ -1677,10 +1840,10 @@ fn a_failed_join_re_key_fails_closed() {
     );
     guest.core.sync_now().unwrap();
     let channel = guest.core.list_channels(&server.id).unwrap().remove(0).id;
-    assert_eq!(
-        guest.core.send_message(&channel, "x", None).unwrap_err().code,
-        ErrorCode::NotAllowed
-    );
+    // Fails closed: nothing sealed or sent without the key; only held.
+    let held = guest.core.send_message(&channel, "x", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    assert!(held.id.starts_with(api::KEY_PENDING_PREFIX));
 }
 
 /// A server, its owner (real cipher), and a counter of rotations (one
@@ -1690,7 +1853,7 @@ fn keyed_server(world: &World, name: &str) -> (Peer, ServerSummary, String) {
     let owner =
         world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
     owner.core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
-    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None };
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     owner.core.update_profile(profile).unwrap();
     let server = owner.core.create_server(name, AgeRestriction::None).unwrap();
     let channel = owner.core.list_channels(&server.id).unwrap().remove(0).id;
@@ -1753,10 +1916,9 @@ fn join_re_keys_spend_a_token_bucket() {
     assert_eq!(rotations(&world, &server), after_burst, "a 4th re-key without a token");
     for peer in [&fourth, &fifth] {
         peer.core.sync_now().unwrap();
-        assert_eq!(
-            peer.core.send_message(&channel, "too soon", None).unwrap_err().code,
-            ErrorCode::NotAllowed
-        );
+        // No key yet: held (sent once the shared re-key reaches them).
+        let held = peer.core.send_message(&channel, "too soon", None).unwrap();
+        assert_eq!(held.send_state, Some(SendState::Pending));
     }
     // Due one refill after the first token was spent (a few hundred ms of
     // test clock ago); the loop wakes exactly then.
@@ -1776,8 +1938,8 @@ fn join_re_keys_spend_a_token_bucket() {
         peer.core.send_message(&channel, "now", None).unwrap();
     }
     owner.core.sync_now().unwrap();
-    // 1 from before, 3 from the burst, 2 shared.
-    assert_eq!(owner.core.get_message_count(&channel).unwrap(), 6);
+    // 1 from before, 3 from the burst, 2 held then sent, 2 shared.
+    assert_eq!(owner.core.get_message_count(&channel).unwrap(), 8);
     // Nobody who joined opens the message from before they joined.
     first[0].core.sync_now().unwrap();
     let bodies: Vec<String> = first[0]
@@ -1937,7 +2099,7 @@ fn an_owner_without_an_adult_claim_cannot_make_adult_channels() {
     let owner = world.peer();
     // Restored: no birth date, so the age claim says "not 18+".
     owner.core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
-    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None };
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     owner.core.update_profile(profile).unwrap();
     let server = owner.core.create_server("Minors", AgeRestriction::None).unwrap();
     let server_key = ServerId::from_bytes(hex::decode(&server.id).unwrap().try_into().unwrap());
@@ -2007,7 +2169,7 @@ fn presence_shows_online_members_only() {
     )
     .unwrap();
     owner.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
-    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None };
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     owner.update_profile(profile).unwrap();
     let server = owner.create_server("Here", AgeRestriction::None).unwrap();
     let guest = world.peer();
@@ -2103,6 +2265,75 @@ fn no_keyring_is_its_own_error() {
     let reply = core.handle(r#"{"cmd":"getIdentity"}"#);
     assert_eq!(reply, r#"{"error":{"code":"keyring-unavailable"}}"#);
     assert!(core.get_app_info().is_ok(), "the rest of the core still answers");
+}
+
+/// A keychain that fails until it comes up, like a Secret Service started
+/// after the core.
+struct LateKeyring {
+    up: std::sync::atomic::AtomicBool,
+    inner: MemoryStore,
+}
+
+impl LateKeyring {
+    fn check(&self) -> Result<(), identity::StoreError> {
+        match self.up.load(std::sync::atomic::Ordering::SeqCst) {
+            true => Ok(()),
+            false => Err(identity::StoreError("no Secret Service yet".into())),
+        }
+    }
+}
+
+impl identity::SecretStore for LateKeyring {
+    fn load(&self, name: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, identity::StoreError> {
+        self.check()?;
+        self.inner.load(name)
+    }
+
+    fn save(&self, name: &str, secret: &[u8]) -> Result<(), identity::StoreError> {
+        self.check()?;
+        self.inner.save(name, secret)
+    }
+
+    fn delete(&self, name: &str) -> Result<(), identity::StoreError> {
+        self.check()?;
+        self.inner.delete(name)
+    }
+}
+
+/// QA on 0.4.5: a keychain that was unavailable when the core started and
+/// works later is used once it works: `getIdentity` and `createIdentity`
+/// stop saying `keyring-unavailable`, and an identity stored before opens.
+#[test]
+fn a_keychain_that_comes_up_after_the_core_is_used() {
+    let keyring = Arc::new(LateKeyring { up: false.into(), inner: MemoryStore::new() });
+    let open = || {
+        Core::open(
+            Config { db_path: None, app_version: "test".into() },
+            Ports {
+                secrets: keyring.clone(),
+                network: Arc::new(LoopbackNetwork::new()),
+                events: Arc::new(CollectingSink::new()),
+                clock: Arc::new(SystemClock),
+                cipher: Arc::new(PendingGroupKeys),
+            },
+        )
+        .expect("the core starts without a keychain")
+    };
+    let up = |on: bool| keyring.up.store(on, std::sync::atomic::Ordering::SeqCst);
+
+    // No identity yet: down at start, then up. Sign-up works.
+    let core = open();
+    assert_eq!(core.get_identity().unwrap_err().code, ErrorCode::KeyringUnavailable);
+    up(true);
+    assert!(core.get_identity().unwrap().is_none(), "signed out, and no error");
+    let created = core.create_identity(adult()).unwrap();
+
+    // An identity stored before: down at start, then up. It opens.
+    up(false);
+    let core = open();
+    assert_eq!(core.get_identity().unwrap_err().code, ErrorCode::KeyringUnavailable);
+    up(true);
+    assert_eq!(core.get_identity().unwrap().unwrap().id, created.identity.id);
 }
 
 /// T8-02 piece 4: a short link joins (the envelope fetched, opened and
@@ -2410,28 +2641,33 @@ fn a_call_between_members() {
     for peer in [&owner, &alice, &bob] {
         peer.core.sync_now().unwrap();
     }
-    let room = owner.core.get_voice_room(&server.id).unwrap().room_id;
     let peers = [(owner_id.as_str(), &owner), (alice_id.as_str(), &alice), (bob_id.as_str(), &bob)];
 
     // No transport yet: not-implemented. Then relay-only: calls are off.
-    assert_eq!(owner.core.join_call(&room).unwrap_err().code, ErrorCode::NotImplemented);
+    let create = |peer: &Peer| peer.core.create_voice_room(&server.id);
+    assert_eq!(create(&owner).unwrap_err().code, ErrorCode::NotImplemented);
     for (id, peer) in peers {
         hub.connect(peer, id);
     }
     hub.relay_only.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(owner.core.join_call(&room).unwrap_err().code, ErrorCode::RelayOnly);
+    assert_eq!(create(&owner).unwrap_err().code, ErrorCode::RelayOnly);
     hub.relay_only.store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(owner.core.join_call(&"ab".repeat(32)).unwrap_err().code, ErrorCode::NotFound);
-    // Calls happen only in the room: a text channel is not-allowed.
+    // Calls happen only in rooms: a text channel is not-allowed.
     let general = owner.core.list_channels(&server.id).unwrap().remove(0).id;
-    assert_ne!(general, room);
     assert_eq!(owner.core.join_call(&general).unwrap_err().code, ErrorCode::NotAllowed);
-    // Every member derives the same room; an unknown server is not-found.
-    assert_eq!(bob.core.get_voice_room(&server.id).unwrap().room_id, room);
-    assert_eq!(bob.core.get_voice_room(&"ab".repeat(32)).unwrap_err().code, ErrorCode::NotFound);
+    // No rooms yet; an unknown server is not-found.
+    assert!(bob.core.list_voice_rooms(&server.id).unwrap().is_empty());
+    assert_eq!(bob.core.list_voice_rooms(&"ab".repeat(32)).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(
+        owner.core.create_voice_room(&"ab".repeat(32)).unwrap_err().code,
+        ErrorCode::NotFound
+    );
 
-    // The owner, then Alice, join; each sees both.
-    let state = owner.core.join_call(&room).unwrap();
+    // The owner creates a room, then Alice joins it; each sees both.
+    let state = create(&owner).unwrap();
+    let room = state.channel_id.clone();
+    assert_ne!(general, room);
     assert_eq!((who(&state), state.full), (vec![owner_id.as_str()], false));
     assert!(owner.core.in_call());
     hub.pump(&peers);
@@ -2442,32 +2678,34 @@ fn a_call_between_members() {
     let seen = call_states(owner.events.take());
     assert_eq!(who(seen.last().unwrap()), [owner_id.as_str(), alice_id.as_str()]);
 
-    // Bob isn't in the call but sees who is: one voice.room at his tick,
-    // and the same from getVoiceRoom. Identity and muted only.
+    // Bob isn't in the call but sees the room: one voice.rooms at his tick,
+    // and the same from listVoiceRooms. The owner created it, joined first,
+    // and is its master; members by joinedAt.
     bob.events.take();
     bob.core.voice_tick();
-    let rooms: Vec<VoiceRoom> = bob
-        .events
-        .take()
-        .into_iter()
-        .filter_map(|e| match e {
-            Event::VoiceRoom(room) => Some(room),
-            _ => None,
-        })
-        .collect();
+    let rooms = voice_rooms(bob.events.take());
     assert_eq!(rooms.len(), 1);
-    let mut inside: Vec<&str> = rooms[0].participants.iter().map(|p| p.user_id.as_str()).collect();
-    inside.sort();
-    let mut want = [owner_id.as_str(), alice_id.as_str()];
-    want.sort();
-    assert_eq!(inside, want);
+    let inside: Vec<&str> = rooms[0].members.iter().map(|m| m.user_id.as_str()).collect();
+    assert_eq!(inside, [owner_id.as_str(), alice_id.as_str()]);
     assert_eq!(
         (rooms[0].server_id.as_str(), rooms[0].room_id.as_str()),
         (server.id.as_str(), room.as_str())
     );
-    assert_eq!(bob.core.get_voice_room(&server.id).unwrap(), rooms[0]);
+    assert_eq!((rooms[0].master_id.as_str(), rooms[0].creator_id.as_str()), (owner_id.as_str(), owner_id.as_str()));
+    assert_eq!((rooms[0].name.clone(), rooms[0].limit), (None, 5));
+    assert_eq!(bob.core.list_voice_rooms(&server.id).unwrap(), rooms);
     let json = serde_json::to_value(&rooms[0]).unwrap();
-    assert_eq!(json["participants"][0].as_object().unwrap().len(), 2, "more than id and muted");
+    assert_eq!(json["members"][0].as_object().unwrap().len(), 3, "more than id, muted and joinedAt");
+    assert!(json.get("name").is_none(), "a default name is absent");
+
+    // Only the master (or the owner) renames: Bob may not; the owner, the
+    // master here, may, and everyone sees it.
+    let code = bob.core.edit_voice_room(&room, Some("Bob's".into()), None).unwrap_err().code;
+    assert_eq!(code, ErrorCode::NotAllowed);
+    owner.core.edit_voice_room(&room, Some("Talk".into()), Some(4)).unwrap();
+    hub.pump(&peers);
+    let seen = bob.core.list_voice_rooms(&server.id).unwrap();
+    assert_eq!((seen[0].name.as_deref(), seen[0].limit), (Some("Talk"), 4));
 
     // Signalling: only to a participant, offers and answers with a fingerprint.
     assert_eq!(
@@ -2557,6 +2795,154 @@ fn a_call_between_members() {
     assert!(!owner.core.in_call());
 }
 
+/// A network that records each relay-only setting it was given.
+struct RelayOnlyNet {
+    world: Arc<LoopbackNetwork>,
+    applied: std::sync::Mutex<Vec<bool>>,
+    /// Each member relay setting (on, daily cap) it was given.
+    relays: std::sync::Mutex<Vec<(bool, u32, bool)>>,
+}
+
+impl RelayOnlyNet {
+    fn new(world: &Arc<LoopbackNetwork>) -> Arc<RelayOnlyNet> {
+        Arc::new(RelayOnlyNet { world: world.clone(), applied: Default::default(), relays: Default::default() })
+    }
+
+    fn applied(&self) -> Vec<bool> {
+        self.applied.lock().unwrap().clone()
+    }
+}
+
+impl Network for RelayOnlyNet {
+    fn publish(&self, record: &records::Record) {
+        self.world.publish(record);
+    }
+
+    fn fetch(&self, server: ServerId) -> Vec<records::Record> {
+        self.world.fetch(server)
+    }
+
+    fn set_relay_only(&self, on: bool) {
+        self.applied.lock().unwrap().push(on);
+    }
+
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        self.relays.lock().unwrap().push((on, daily_cap_mb, role));
+    }
+}
+
+/// The rooms of every `voice.rooms` event, in order.
+fn voice_rooms(events: Vec<Event>) -> Vec<VoiceRoom> {
+    events
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::VoiceRooms { rooms, .. } => Some(rooms),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// GAP-6r: `setRelayOnly` is stored, given to the network at start and on
+/// each change, ends my call (with a bye), refuses calls while on, and is
+/// shown up front on `getAppInfo`, `listVoiceRooms`, `voice.rooms` and
+/// `call.state`. It survives a restart.
+#[test]
+fn relay_only_is_stored_applied_and_turns_calls_off() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-relayonly-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("core.db");
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let net = RelayOnlyNet::new(&world.network);
+    let open = |net: Arc<RelayOnlyNet>, secrets: Arc<MemoryStore>| {
+        world.peer_on(net, secrets, Some(db.clone()), Arc::new(PendingGroupKeys))
+    };
+    let owner = open(net.clone(), Arc::new(MemoryStore::new()));
+    let owner_id = sign_up(&owner, "Owner").id;
+    let alice = world.peer();
+    let alice_id = sign_up(&alice, "Alice").id;
+    let server = owner.core.create_server("Quiet", AgeRestriction::None).unwrap();
+    alice.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    alice.core.sync_now().unwrap();
+    let peers = [(owner_id.as_str(), &owner), (alice_id.as_str(), &alice)];
+    for (id, peer) in peers {
+        hub.connect(peer, id);
+    }
+
+    // Off by default, and the network was told so at start.
+    assert_eq!(net.applied(), [false]);
+    assert!(!owner.core.get_app_info().unwrap().relay_only);
+    let state = owner.core.create_voice_room(&server.id).unwrap();
+    assert!(!state.relay_only);
+    assert!(!owner.core.list_voice_rooms(&server.id).unwrap()[0].relay_only);
+    let room = state.channel_id.clone();
+    hub.pump(&peers);
+    alice.core.join_call(&room).unwrap();
+    hub.pump(&peers);
+    assert!(owner.core.in_call());
+
+    // On, through the dispatcher: my call ends at once with a bye, and the
+    // ended call.state says why.
+    owner.events.take();
+    let answer: serde_json::Value =
+        serde_json::from_str(&owner.core.handle(r#"{"cmd":"setRelayOnly","args":{"on":true}}"#))
+            .unwrap();
+    assert_eq!(answer, serde_json::json!({ "ok": null }));
+    assert!(!owner.core.in_call());
+    let ended = call_states(owner.events.take());
+    let last = ended.last().expect("a call.state for the ended call");
+    assert_eq!((last.participants.len(), last.relay_only), (0, true));
+    let sent = hub.pump(&peers);
+    assert!(sent.iter().any(|(from, to, blob)| {
+        *from == user_key(&owner_id)
+            && *to == user_key(&alice_id)
+            && String::from_utf8_lossy(blob).contains(r#"\"kind\":\"bye\""#)
+    }));
+    assert_eq!(net.applied(), [false, true]);
+
+    // Up front: app info, the room, and one voice.room per server at the
+    // next tick. Joining is refused.
+    assert!(owner.core.get_app_info().unwrap().relay_only);
+    // Alice is still in the room, so it lives on.
+    assert!(owner.core.list_voice_rooms(&server.id).unwrap()[0].relay_only);
+    owner.core.voice_tick();
+    let rooms = voice_rooms(owner.events.take());
+    assert_eq!(rooms.len(), 1);
+    assert!(rooms[0].relay_only && rooms[0].server_id == server.id);
+    assert_eq!(owner.core.join_call(&room).unwrap_err().code, ErrorCode::RelayOnly);
+    assert_eq!(owner.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::RelayOnly);
+    // Another member's setting is theirs: Alice's room isn't relay-only.
+    assert!(!alice.core.list_voice_rooms(&server.id).unwrap()[0].relay_only);
+
+    // A restart keeps it: read before the network starts, and given to the
+    // network as the core opens.
+    let secrets = owner.secrets.clone();
+    drop(owner);
+    assert!(api::stored_relay_only(&db));
+    let net = RelayOnlyNet::new(&world.network);
+    let owner = open(net.clone(), secrets);
+    assert_eq!(net.applied(), [true]);
+    assert!(owner.core.get_app_info().unwrap().relay_only);
+    hub.connect(&owner, &owner_id);
+    assert_eq!(owner.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::RelayOnly);
+
+    // Off again: applied, stored, and calls work.
+    owner.core.set_relay_only(false).unwrap();
+    assert_eq!(net.applied(), [true, false]);
+    assert!(!api::stored_relay_only(&db));
+    assert!(!owner.core.create_voice_room(&server.id).unwrap().relay_only);
+    assert!(!owner.core.list_voice_rooms(&server.id).unwrap()[0].relay_only);
+    owner.core.leave_call().unwrap();
+
+    // A database that can't be opened: on (fails closed, see the unit test).
+    assert!(api::stored_relay_only(&dir.join("missing").join("core.db")));
+    drop(owner);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Voice B: 5 is the cap; a kicked member's hello doesn't count.
 #[test]
 fn a_call_holds_five_and_kicked_members_are_ignored() {
@@ -2576,7 +2962,6 @@ fn a_call_holds_five_and_kicked_members_are_ignored() {
     for (_, peer) in &others {
         peer.core.sync_now().unwrap();
     }
-    let room = owner.core.get_voice_room(&server.id).unwrap().room_id;
     hub.connect(&owner, &owner_id);
     for (id, peer) in &others {
         hub.connect(peer, id);
@@ -2584,7 +2969,7 @@ fn a_call_holds_five_and_kicked_members_are_ignored() {
     let mut peers: Vec<(&str, &Peer)> = vec![(owner_id.as_str(), &owner)];
     peers.extend(others.iter().map(|(id, peer)| (id.as_str(), peer)));
 
-    owner.core.join_call(&room).unwrap();
+    let room = owner.core.create_voice_room(&server.id).unwrap().channel_id;
     hub.pump(&peers);
     for (_, peer) in &others[..4] {
         peer.core.join_call(&room).unwrap();
@@ -2608,16 +2993,16 @@ fn a_call_holds_five_and_kicked_members_are_ignored() {
     hub.pump(&peers);
     let state = owner.core.join_call(&room).unwrap();
     assert!(!who(&state).contains(&kicked_id.as_str()));
-    let roster = owner.core.get_voice_room(&server.id).unwrap();
-    assert!(!roster.participants.iter().any(|p| &p.user_id == kicked_id));
-    assert!(roster.participants.len() <= 5);
+    let roster = owner.core.list_voice_rooms(&server.id).unwrap().remove(0);
+    assert!(!roster.members.iter().any(|m| &m.user_id == kicked_id));
+    assert!(roster.members.len() <= 5);
 
     // Once P0 reads its kick: no roster for it, by command or event.
     kicked.core.sync_now().unwrap();
     kicked.events.take();
     kicked.core.voice_tick();
-    assert!(!kicked.events.take().iter().any(|e| matches!(e, Event::VoiceRoom(_))));
-    let code = kicked.core.get_voice_room(&server.id).unwrap_err().code;
+    assert!(!kicked.events.take().iter().any(|e| matches!(e, Event::VoiceRooms { .. })));
+    let code = kicked.core.list_voice_rooms(&server.id).unwrap_err().code;
     assert!(matches!(code, ErrorCode::NotFound | ErrorCode::NotAllowed), "{code:?}");
 }
 
@@ -2709,14 +3094,14 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     }
     // The UI can say who blocks it.
     let old_id = hex::encode(old.verifying_key().to_bytes());
-    assert_eq!(owner.core.get_update_needed(&server.id).unwrap(), [old_id]);
+    assert_eq!(owner.core.get_update_needed(&server.id, None).unwrap(), [old_id]);
     assert_eq!(world.network.fetch(server_key).len(), signed + 1, "signed past the gate");
     // It updates: the cap in its latest profile post opens the gate.
     world.network.publish(&profile(r#","caps":["server-lifecycle-v1"]"#, 3));
     for peer in [&owner, &guest, &third] {
         peer.core.sync_now().unwrap();
     }
-    assert!(owner.core.get_update_needed(&server.id).unwrap().is_empty());
+    assert!(owner.core.get_update_needed(&server.id, None).unwrap().is_empty());
 
     // Leave: not the owner; a member leaves and the server leaves their
     // device; the others see them gone.
@@ -2954,4 +3339,2331 @@ fn a_leave_waits_in_the_outbox_until_the_gate_opens() {
     assert_eq!(leaves_by(&world, server_key, &guest_id), 1, "resent after delivery");
     drop(guest);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Records of `kind` that `who` (a user ID) wrote in `server`.
+fn records_by(world: &World, server: &str, who: &str, kind: Kind) -> usize {
+    let server = ServerId::from_bytes(hex::decode(server).unwrap().try_into().unwrap());
+    let who = PublicKey::from_bytes(hex::decode(who).unwrap().try_into().unwrap());
+    world.network.fetch(server).iter().filter(|r| r.kind() == kind && r.author() == who).count()
+}
+
+/// Owner bug (0.3.1): an owner restores their words on a new computer and
+/// rejoins their 18+ server by its invite link. They come back as the same
+/// member (no new join), still the owner, and nothing they post overwrites
+/// what the server holds: no empty name, no "not adult" claim from a
+/// birth date this device doesn't have. A member who restored and set a
+/// name posts the name, still with no claim.
+#[test]
+fn a_restored_member_rejoins_without_blanking_their_name_or_age() {
+    let world = World::new();
+    let owner = world.peer();
+    let created = owner.core.create_identity(adult()).unwrap();
+    assert!(answer(&owner, &created.words, &[]).1.unwrap().ok);
+    let owner_id = owner
+        .core
+        .update_profile(ProfileInput { display_name: "MoA".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap()
+        .id;
+    let server = owner.core.create_server("Night", AgeRestriction::Eighteen).unwrap();
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    assert!(matches!(
+        bob.core.join_server(&server.invite_link).unwrap(),
+        JoinStatus::Searching { .. }
+    ));
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    let joins = records_by(&world, &server.id, &owner_id, Kind::Join);
+    let posts = records_by(&world, &server.id, &owner_id, Kind::Post);
+    let claims = records_by(&world, &server.id, &owner_id, Kind::AgeClaim);
+
+    // A new computer: the same words, no name, no birth date.
+    let laptop = world.peer();
+    let restored = laptop.core.restore_identity(created.words.clone()).unwrap();
+    assert_eq!(restored.id, owner_id);
+    // Someone who isn't a member yet, with no birth date, is still blocked.
+    let stranger = world.peer();
+    stranger.core.restore_identity(stranger_words()).unwrap();
+    stranger.core.join_server(&server.invite_link).unwrap();
+    assert!(stranger.core.list_servers().unwrap().is_empty(), "joined an 18+ server with no birth date");
+
+    laptop.core.join_server(&server.invite_link).unwrap();
+    let listed = laptop.core.list_servers().unwrap();
+    assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), [server.id.as_str()]);
+    assert_eq!(listed[0].owner_id, owner_id);
+    // Nothing new from me: no join, no profile post, no age claim.
+    assert_eq!(records_by(&world, &server.id, &owner_id, Kind::Join), joins);
+    assert_eq!(records_by(&world, &server.id, &owner_id, Kind::Post), posts);
+    assert_eq!(records_by(&world, &server.id, &owner_id, Kind::AgeClaim), claims);
+    // Bob still sees MoA, the owner.
+    bob.core.sync_now().unwrap();
+    let me = bob
+        .core
+        .list_members(&server.id)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == owner_id)
+        .unwrap();
+    assert_eq!((me.display_name.as_str(), me.is_owner), ("MoA", true));
+
+    // A second restore that sets a name first posts it, but still no claim.
+    let other = world.peer();
+    other.core.restore_identity(created.words.clone()).unwrap();
+    other
+        .core
+        .update_profile(ProfileInput { display_name: "MoA 2".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap();
+    other.core.join_server(&server.invite_link).unwrap();
+    assert_eq!(other.core.list_servers().unwrap().len(), 1);
+    assert_eq!(records_by(&world, &server.id, &owner_id, Kind::Post), posts + 1);
+    assert_eq!(records_by(&world, &server.id, &owner_id, Kind::AgeClaim), claims);
+    bob.core.sync_now().unwrap();
+    let names: Vec<String> =
+        bob.core.list_members(&server.id).unwrap().into_iter().map(|m| m.display_name).collect();
+    assert!(names.contains(&"MoA 2".to_owned()), "{names:?}");
+}
+
+/// Words for an identity nobody else in the test uses.
+fn stranger_words() -> Vec<String> {
+    let world = World::new();
+    let peer = world.peer();
+    peer.core.create_identity(adult()).unwrap().words
+}
+
+/// Fix 1's api: `restoreIdentity(words, input)` takes the country and birth
+/// date asked again; a rejoin then posts only a claim that differs from the one the server holds.
+#[test]
+fn a_restore_takes_the_birth_date_asked_again() {
+    let world = World::new();
+    let owner = world.peer();
+    let created = owner.core.create_identity(adult()).unwrap();
+    assert!(answer(&owner, &created.words, &[]).1.unwrap().ok);
+    let owner_id = owner
+        .core
+        .update_profile(ProfileInput { display_name: "MoA".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap()
+        .id;
+    let server = owner.core.create_server("Night", AgeRestriction::Eighteen).unwrap();
+    owner.core.sync_now().unwrap();
+    let claims = records_by(&world, &server.id, &owner_id, Kind::AgeClaim);
+
+    let laptop = world.peer();
+    let request = serde_json::json!({
+        "cmd": "restoreIdentity",
+        "args": {
+            "words": created.words,
+            "input": { "locale": "he", "country": "IL", "birthDate": "1990-05-01" }
+        }
+    });
+    let answer: serde_json::Value =
+        serde_json::from_str(&laptop.core.handle(&request.to_string())).unwrap();
+    assert_eq!(answer["ok"]["id"], serde_json::json!(owner_id));
+    assert_eq!(answer["ok"]["birthDate"], serde_json::json!("1990-05-01"));
+    // Without input, the words alone still restore (as before).
+    let bare = world.peer();
+    let request = serde_json::json!({ "cmd": "restoreIdentity", "args": { "words": created.words } });
+    let answer: serde_json::Value =
+        serde_json::from_str(&bare.core.handle(&request.to_string())).unwrap();
+    assert_eq!(answer["ok"]["birthDate"], serde_json::json!(""));
+
+    laptop.core.join_server(&server.invite_link).unwrap();
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    // The same "adult" claim the server already holds: nothing new posted.
+    assert_eq!(records_by(&world, &server.id, &owner_id, Kind::AgeClaim), claims);
+}
+
+/// One side of a network partition: while cut, it sees only what the world
+/// held when it was cut, and what it publishes waits until it heals.
+struct Partition {
+    world: Arc<LoopbackNetwork>,
+    cut: std::sync::Mutex<Option<BTreeSet<records::RecordId>>>,
+    held: std::sync::Mutex<Vec<records::Record>>,
+}
+
+impl Partition {
+    fn new(world: &Arc<LoopbackNetwork>) -> Arc<Partition> {
+        Arc::new(Partition { world: world.clone(), cut: Default::default(), held: Default::default() })
+    }
+
+    fn cut(&self, server: ServerId) {
+        *self.cut.lock().unwrap() = Some(self.world.fetch(server).iter().map(|r| r.id()).collect());
+    }
+
+    fn heal(&self) {
+        *self.cut.lock().unwrap() = None;
+        for record in std::mem::take(&mut *self.held.lock().unwrap()) {
+            self.world.publish(&record);
+        }
+    }
+}
+
+impl Network for Partition {
+    fn publish(&self, record: &records::Record) {
+        if self.cut.lock().unwrap().is_some() {
+            self.held.lock().unwrap().push(record.clone());
+        } else {
+            self.world.publish(record);
+        }
+    }
+
+    fn fetch(&self, server: ServerId) -> Vec<records::Record> {
+        let all = self.world.fetch(server);
+        match &*self.cut.lock().unwrap() {
+            Some(seen) => all.into_iter().filter(|r| seen.contains(&r.id())).collect(),
+            None => all,
+        }
+    }
+
+    fn fetch_invite(&self, handle: [u8; 32]) -> Vec<Vec<u8>> {
+        self.world.fetch_invite(handle)
+    }
+}
+
+/// Tech Lead and Security Lead (restore design): one owner identity on two
+/// computers re-keys the same join concurrently, neither seeing the other's
+/// rotation. Both rotations are valid; a third member reads what each
+/// computer sealed; a later kick shuts the kicked member out of what both
+/// seal next.
+#[test]
+fn one_identity_on_two_cores_re_keys_concurrently_and_converges() {
+    use api::crypto::GroupKeysCipher;
+
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Twins");
+    let server_key = ServerId::from_bytes(hex::decode(&server.id).unwrap().try_into().unwrap());
+    let carol = joiner(&world, &server, "Carol");
+    owner.core.sync_now().unwrap();
+    // The same owner on a second computer: restored, rejoined by the link.
+    let partition = Partition::new(&world.network);
+    let laptop = world.peer_on(
+        partition.clone(),
+        Arc::new(MemoryStore::new()),
+        None,
+        Arc::new(GroupKeysCipher::locked()),
+    );
+    laptop.core.restore_identity(OWNER_WORDS.split(' ').map(String::from).collect()).unwrap();
+    laptop.core.join_server(&server.invite_link).unwrap();
+    advance(&world, JOIN_REKEY_REFILL_MS * 4);
+    for peer in [&owner, &laptop, &carol] {
+        peer.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+
+    // Dan joins; both owner cores re-key for it without seeing each other.
+    let dan_cipher = Arc::new(GroupKeysCipher::locked());
+    let dan = world.peer_with(Arc::new(MemoryStore::new()), None, dan_cipher.clone());
+    sign_up(&dan, "Dan");
+    dan.core.join_server(&server.invite_link).unwrap();
+    advance(&world, JOIN_REKEY_REFILL_MS * 4);
+    let rotation_ids = |records: &[records::Record]| -> BTreeSet<records::RecordId> {
+        records.iter().filter(|r| r.kind() == Kind::KeyRotation).map(|r| r.id()).collect()
+    };
+    let before = rotation_ids(&world.network.fetch(server_key));
+    partition.cut(server_key);
+    owner.core.sync_now().unwrap();
+    laptop.core.sync_now().unwrap();
+    owner.core.send_message(&channel, "from the PC", None).unwrap();
+    laptop.core.send_message(&channel, "from the laptop", None).unwrap();
+    // Each side rotated, neither seeing the other's rotation.
+    let from_pc: BTreeSet<_> =
+        rotation_ids(&world.network.fetch(server_key)).difference(&before).copied().collect();
+    let from_laptop = rotation_ids(&partition.held.lock().unwrap());
+    assert!(!from_pc.is_empty(), "the PC didn't re-key for the join");
+    assert!(!from_laptop.is_empty(), "the laptop didn't re-key for the join");
+    assert!(from_pc.is_disjoint(&from_laptop));
+    partition.heal();
+
+    // Everyone, Dan included, reads both.
+    for peer in [&owner, &laptop, &carol, &dan] {
+        peer.core.sync_now().unwrap();
+    }
+    let bodies = |peer: &Peer| -> Vec<String> {
+        let mut bodies: Vec<String> = peer
+            .core
+            .get_messages(&channel, 0, 50)
+            .unwrap()
+            .messages
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        bodies.sort();
+        bodies
+    };
+    for peer in [&owner, &laptop, &carol, &dan] {
+        assert_eq!(bodies(peer), ["from the PC", "from the laptop"]);
+    }
+
+    // A kick from the PC: what either computer seals next is shut to Dan.
+    let dan_id = dan.core.get_identity().unwrap().unwrap().id;
+    owner.core.kick_member(&server.id, &dan_id).unwrap();
+    let after_pc = owner.core.send_message(&channel, "PC after", None).unwrap();
+    laptop.core.sync_now().unwrap();
+    let after_laptop = laptop.core.send_message(&channel, "laptop after", None).unwrap();
+    carol.core.sync_now().unwrap();
+    let carol_bodies = bodies(&carol);
+    for body in ["PC after", "laptop after"] {
+        assert!(carol_bodies.contains(&body.to_owned()), "Carol can't read {body:?}: {carol_bodies:?}");
+    }
+    let held = world.network.fetch(server_key);
+    for record in held.iter().filter(|r| r.kind() == Kind::KeyRotation) {
+        let _ = dan_cipher.apply_rotation(record);
+    }
+    let accepted = held.iter().filter(|r| r.kind() == Kind::KeyRotation).map(|r| r.id()).collect();
+    dan_cipher.set_accepted(server_key, &accepted);
+    for sent in [&after_pc, &after_laptop] {
+        let record =
+            held.iter().find(|r| hex::encode(r.id().as_bytes()) == sent.id).expect("published");
+        let Scope::Channel(ch) = record.scope() else { panic!("a channel record") };
+        assert!(
+            dan_cipher.decrypt(server_key, ch, record.author(), record.body()).is_err(),
+            "the kicked member read {:?}",
+            sent.body
+        );
+    }
+}
+
+/// Profile posts by `who` (a user ID) in `server`.
+fn profile_posts(world: &World, server: &str, who: &str) -> usize {
+    let server = ServerId::from_bytes(hex::decode(server).unwrap().try_into().unwrap());
+    let who = PublicKey::from_bytes(hex::decode(who).unwrap().try_into().unwrap());
+    world.network.fetch(server).iter().filter(|r| r.kind() == Kind::Post && r.author() == who).count()
+}
+
+fn name_seen_by(peer: &Peer, server: &str, who: &str) -> String {
+    peer.core.list_members(server).unwrap().into_iter().find(|m| m.id == who).unwrap().display_name
+}
+
+/// TODO(profiles), done (B11e's edit-profile screen): a new name in
+/// `updateProfile` reaches every server I'm still in as a new profile post;
+/// the same name, or only a new bio or avatar, posts nothing; a server I was
+/// kicked from or one that was closed gets nothing, and neither fails the
+/// call.
+#[test]
+fn a_new_name_reaches_every_server_i_am_in() {
+    let world = World::new();
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let bob = world.peer();
+    let bob_id = sign_up(&bob, "Bob").id;
+    let one = owner.core.create_server("One", AgeRestriction::None).unwrap();
+    let two = owner.core.create_server("Two", AgeRestriction::None).unwrap();
+    let three = owner.core.create_server("Three", AgeRestriction::None).unwrap();
+    for server in [&one, &two, &three] {
+        bob.core.join_server(&server.invite_link).unwrap();
+    }
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    // Bob is kicked from Two; Three is closed.
+    owner.core.kick_member(&two.id, &bob_id).unwrap();
+    owner.core.close_server(&three.id).unwrap();
+    bob.core.sync_now().unwrap();
+    let before: Vec<usize> =
+        [&one, &two, &three].iter().map(|s| profile_posts(&world, &s.id, &bob_id)).collect();
+
+    let rename = |name: &str, bio: Option<&str>| {
+        bob.core
+            .update_profile(ProfileInput {
+                display_name: name.into(),
+                bio: bio.map(String::from),
+                avatar_data_url: None,
+                avatar_small: None,
+                color: None,
+            })
+            .unwrap()
+    };
+    assert_eq!(rename("Bobby", None).display_name, "Bobby");
+    let after: Vec<usize> =
+        [&one, &two, &three].iter().map(|s| profile_posts(&world, &s.id, &bob_id)).collect();
+    assert_eq!(after, [before[0] + 1, before[1], before[2]], "only the server Bob is still in");
+    owner.core.sync_now().unwrap();
+    assert_eq!(name_seen_by(&owner, &one.id, &bob_id), "Bobby");
+
+    // The same name (spaces trimmed), or a new bio only: nothing posted.
+    rename(" Bobby ", Some("hi"));
+    assert_eq!(profile_posts(&world, &one.id, &bob_id), after[0]);
+    // The owner renames too: seen by Bob.
+    owner
+        .core
+        .update_profile(ProfileInput { display_name: "MoA".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap();
+    bob.core.sync_now().unwrap();
+    assert_eq!(name_seen_by(&bob, &one.id, &owner_id), "MoA");
+}
+
+/// Profile save (#378, acceptance 7): `updateProfile` emits `members.changed`
+/// with my new row for each server I'm a member of (not one I was kicked
+/// from), and my own row shows my saved profile even while the post waits
+/// (past the burst).
+#[test]
+fn a_profile_save_updates_my_member_row_everywhere_at_once() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let bob = world.peer();
+    let bob_id = sign_up(&bob, "Bob").id;
+    let one = owner.core.create_server("One", AgeRestriction::None).unwrap();
+    let two = owner.core.create_server("Two", AgeRestriction::None).unwrap();
+    let gone = owner.core.create_server("Gone", AgeRestriction::None).unwrap();
+    for server in [&one, &two, &gone] {
+        bob.core.join_server(&server.invite_link).unwrap();
+    }
+    owner.core.sync_now().unwrap();
+    owner.core.kick_member(&gone.id, &bob_id).unwrap();
+    bob.core.sync_now().unwrap();
+
+    let save = |color: &str| {
+        bob.core
+            .update_profile(ProfileInput {
+                display_name: "Bob".into(),
+                bio: None,
+                avatar_data_url: None,
+                avatar_small: None,
+                color: Some(color.into()),
+            })
+            .unwrap();
+    };
+    let my_rows = |events: Vec<Event>| -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::MembersChanged { server_id, members } => {
+                    let me = members.into_iter().find(|m| m.id == bob_id).unwrap();
+                    Some((server_id, me.color))
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    // Three saves use the burst; the fourth's post waits, but my rows don't.
+    for (i, color) in ["#000001", "#000002", "#000003", "#000004"].iter().enumerate() {
+        bob.events.take();
+        save(color);
+        let mut expected = vec![(one.id.clone(), Some(color.to_string())), (two.id.clone(), Some(color.to_string()))];
+        expected.sort();
+        assert_eq!(my_rows(bob.events.take()), expected, "save {i}");
+    }
+    let row = bob.core.list_members(&one.id).unwrap().into_iter().find(|m| m.id == bob_id).unwrap();
+    assert_eq!(row.color.as_deref(), Some("#000004"), "my row, before the post goes out");
+    owner.core.sync_now().unwrap();
+    let seen = owner.core.list_members(&one.id).unwrap().into_iter().find(|m| m.id == bob_id).unwrap();
+    assert_eq!(seen.color.as_deref(), Some("#000003"), "others: the last post, until the next one");
+}
+
+/// A keychain whose deletes can be made to fail (a locked keychain):
+/// `deletes_fail` all of them, `check_delete_fails` only the
+/// recovery-check marker's.
+struct Keychain {
+    inner: MemoryStore,
+    deletes_fail: std::sync::atomic::AtomicBool,
+    check_delete_fails: std::sync::atomic::AtomicBool,
+}
+
+impl identity::SecretStore for Keychain {
+    fn load(&self, name: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, identity::StoreError> {
+        identity::SecretStore::load(&self.inner, name)
+    }
+    fn save(&self, name: &str, secret: &[u8]) -> Result<(), identity::StoreError> {
+        identity::SecretStore::save(&self.inner, name, secret)
+    }
+    fn delete(&self, name: &str) -> Result<(), identity::StoreError> {
+        let check = name == identity::ENTRY_RECOVERY_CHECK
+            && self.check_delete_fails.load(std::sync::atomic::Ordering::SeqCst);
+        if check || self.deletes_fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(identity::StoreError("locked".into()));
+        }
+        identity::SecretStore::delete(&self.inner, name)
+    }
+}
+
+/// Owner task (0.3.3): `signOut` removes this identity from this computer.
+/// It asks for the words (or an explicit "without words"); a keychain that
+/// can't delete leaves everything as it was; afterwards a restart finds no
+/// identity and no servers, and the next start deletes the files.
+#[test]
+fn sign_out_leaves_a_fresh_start() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-signout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sync")).unwrap();
+    std::fs::write(dir.join("sync").join("node.key"), b"old peer key").unwrap();
+    let db = dir.join("core.db");
+    let world = World::new();
+    let keychain = Arc::new(Keychain {
+        inner: MemoryStore::new(),
+        deletes_fail: Default::default(),
+        check_delete_fails: Default::default(),
+    });
+    let open = || {
+        Core::open(
+            Config { db_path: Some(db.clone()), app_version: "test".into() },
+            Ports {
+                secrets: keychain.clone(),
+                network: world.network.clone(),
+                events: Arc::new(CollectingSink::new()),
+                clock: world.clock.clone(),
+                cipher: Arc::new(PendingGroupKeys),
+            },
+        )
+        .unwrap()
+    };
+    let core = open();
+    let created = core.create_identity(adult()).unwrap();
+    let positions = core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(core.check_recovery_words(answers).unwrap().ok);
+    core.create_server("Mine", AgeRestriction::None).unwrap();
+    let sign_out = |args: serde_json::Value| -> serde_json::Value {
+        let request = serde_json::json!({ "cmd": "signOut", "args": args });
+        serde_json::from_str(&core.handle(&request.to_string())).unwrap()
+    };
+
+    // The words are checked first; nothing happens without them or a confirm.
+    assert_eq!(sign_out(serde_json::json!({}))["error"]["code"], "bad-request");
+    let mut wrong = created.words.clone();
+    wrong[0] = "zzzz".into();
+    assert_eq!(sign_out(serde_json::json!({ "words": wrong }))["error"]["code"], "invalid-words");
+    let other: Vec<String> = LEGAL.split(' ').map(String::from).collect();
+    assert_eq!(sign_out(serde_json::json!({ "words": other }))["error"]["code"], "not-allowed");
+    let marker = dir.join("signed-out");
+    let sync = dir.join("sync");
+    let unchanged = |core: &Core| {
+        assert!(!core.signed_out());
+        assert!(core.get_identity().unwrap().is_some());
+        assert_eq!(core.list_servers().unwrap().len(), 1);
+        assert!(!marker.exists(), "the intent stayed");
+    };
+    // The intent can't be written (a folder sits where the marker goes):
+    // refused before anything is deleted.
+    std::fs::create_dir(&marker).unwrap();
+    assert_eq!(sign_out(serde_json::json!({ "words": created.words }))["error"]["code"], "internal");
+    std::fs::remove_dir(&marker).unwrap();
+    unchanged(&core);
+    // A keychain that can't delete the secret: reported, the intent
+    // withdrawn, and nothing changed.
+    keychain.deletes_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        sign_out(serde_json::json!({ "words": created.words }))["error"]["code"],
+        "keyring-unavailable"
+    );
+    unchanged(&core);
+    keychain.deletes_fail.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Signed out with the words, though the recovery-check marker can't be
+    // deleted: the secret is gone, so the sign-out carries on.
+    keychain.check_delete_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(sign_out(serde_json::json!({ "words": created.words })), serde_json::json!({ "ok": null }));
+    keychain.check_delete_fails.store(false, std::sync::atomic::Ordering::SeqCst);
+    // The core stops serving (the shell restarts it).
+    assert!(core.signed_out());
+    assert!(identity::SecretStore::load(&keychain.inner, identity::ENTRY_SECRET).unwrap().is_none());
+    assert!(marker.exists());
+    drop(core);
+
+    // Even before the files go, a restart finds no identity and no servers.
+    let restarted = open();
+    assert_eq!(restarted.get_identity().unwrap(), None);
+    assert!(restarted.list_servers().unwrap().is_empty());
+    drop(restarted);
+    // A keychain that can't be read at the next start: nothing deleted, the
+    // intent stays (and `mvs-core` starts offline).
+    assert!(!api::finish_sign_out(&db, &sync, None).unwrap());
+    assert!(api::sign_out_pending(&db) && sync.join("node.key").exists());
+    // Readable, secret gone: the files go (SQLite's -wal and -shm too, node
+    // key included), then the marker.
+    let wal = dir.join("core.db-wal");
+    let shm = dir.join("core.db-shm");
+    std::fs::write(&wal, b"wal").unwrap();
+    std::fs::write(&shm, b"shm").unwrap();
+    assert!(api::finish_sign_out(&db, &sync, Some(false)).unwrap());
+    assert!(!db.exists() && !sync.exists() && !marker.exists());
+    assert!(!wal.exists() && !shm.exists(), "SQLite's side files stayed");
+    assert!(!api::sign_out_pending(&db));
+    assert!(!api::finish_sign_out(&db, &sync, Some(false)).unwrap(), "nothing left to do");
+    // A marker whose secret is still there (a sign-out that never deleted
+    // it): only the intent is cleared.
+    std::fs::create_dir_all(&sync).unwrap();
+    std::fs::write(&marker, b"").unwrap();
+    assert!(!api::finish_sign_out(&db, &sync, Some(true)).unwrap());
+    assert!(!marker.exists() && sync.exists());
+    // A fresh start: create or restore.
+    let fresh = open();
+    assert_eq!(fresh.get_identity().unwrap(), None);
+    fresh.restore_identity(created.words.clone()).unwrap();
+    drop(fresh);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Without the words: allowed only as an explicit choice.
+    let peer = world.peer();
+    sign_up(&peer, "Gone");
+    let request = r#"{"cmd":"signOut","args":{"withoutWords":true}}"#;
+    assert_eq!(peer.core.handle(request), r#"{"ok":null}"#);
+    assert!(peer.core.signed_out());
+    assert_eq!(peer.core.get_identity().unwrap(), None);
+}
+
+/// Security Lead (restore design): one computer per call. My identity on a
+/// second computer is in the room, so joining here answers
+/// `in-call-elsewhere` until it leaves; my own hello echoed back to me
+/// doesn't count, and the other members see me once.
+#[test]
+fn a_call_on_my_other_computer_blocks_joining_here() {
+    let world = World::new();
+    let pc = world.peer();
+    let created = pc.core.create_identity(adult()).unwrap();
+    assert!(answer(&pc, &created.words, &[]).1.unwrap().ok);
+    let me = pc
+        .core
+        .update_profile(ProfileInput { display_name: "MoA".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap()
+        .id;
+    let carol = world.peer();
+    let carol_id = sign_up(&carol, "Carol").id;
+    let server = pc.core.create_server("Talk", AgeRestriction::None).unwrap();
+    carol.core.join_server(&server.invite_link).unwrap();
+    let laptop = world.peer();
+    laptop.core.restore_identity(created.words.clone()).unwrap();
+    laptop.core.join_server(&server.invite_link).unwrap();
+    for peer in [&pc, &carol, &laptop] {
+        peer.core.sync_now().unwrap();
+    }
+    // A hub per computer: what's sent to my identity reaches both of mine.
+    let (pc_hub, laptop_hub, carol_hub) =
+        (Arc::new(VoiceHub::default()), Arc::new(VoiceHub::default()), Arc::new(VoiceHub::default()));
+    pc_hub.connect(&pc, &me);
+    laptop_hub.connect(&laptop, &me);
+    carol_hub.connect(&carol, &carol_id);
+    let deliver = |hub: &VoiceHub| {
+        for (from, to, blob) in std::mem::take(&mut *hub.queue.lock().unwrap()) {
+            if to == user_key(&me) {
+                // Both of my computers; one of them is the sender (an echo).
+                pc.core.voice_received(Some(from), &blob);
+                laptop.core.voice_received(Some(from), &blob);
+            } else if to == user_key(&carol_id) {
+                carol.core.voice_received(Some(from), &blob);
+            }
+        }
+    };
+
+    let room = pc.core.create_voice_room(&server.id).unwrap().channel_id;
+    deliver(&pc_hub);
+    // The echo didn't count on the PC: it's still in the call, can re-join.
+    assert!(pc.core.in_call());
+    pc.core.join_call(&room).unwrap();
+    // The laptop is refused: it never lists a room only my own identity is
+    // in (not-found), and creating one is in-call-elsewhere. Carol sees me once.
+    assert_eq!(laptop.core.join_call(&room).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(laptop.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::InCallElsewhere);
+    assert!(!laptop.core.in_call());
+    let seen = carol.core.list_voice_rooms(&server.id).unwrap();
+    assert_eq!(seen[0].members.iter().map(|m| m.user_id.as_str()).collect::<Vec<_>>(), [me.as_str()]);
+
+    // The PC leaves (a bye to both of mine; its room goes): the laptop may
+    // create one now, and then the PC is refused.
+    pc.core.leave_call().unwrap();
+    deliver(&pc_hub);
+    laptop.core.create_voice_room(&server.id).unwrap();
+    deliver(&laptop_hub);
+    assert_eq!(pc.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::InCallElsewhere);
+}
+
+/// The AgeClaim records `who` (a user ID) wrote in `server`, as their
+/// `adult` values.
+fn claims_by(world: &World, server: &str, who: &str) -> Vec<bool> {
+    let server = ServerId::from_bytes(hex::decode(server).unwrap().try_into().unwrap());
+    let who = PublicKey::from_bytes(hex::decode(who).unwrap().try_into().unwrap());
+    let mut claims: Vec<&records::Record> = Vec::new();
+    let fetched = world.network.fetch(server);
+    claims.extend(fetched.iter().filter(|r| r.kind() == Kind::AgeClaim && r.author() == who));
+    claims.into_iter().map(|r| r.body() == [1]).collect()
+}
+
+fn born(birth_date: &str) -> NewIdentityInput {
+    NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: birth_date.into() }
+}
+
+/// Decision 18 (B13 §3, B7 §9, PO acceptance test 4a): someone whose claim
+/// says "not adult" restores with a birth date that makes them 18. The raise
+/// waits 30 days (`pendingBirthDate`), nothing is posted, and an 18+ server
+/// stays shut; after the 30 days the sync round posts "adult" and the 18+
+/// server opens. A restore can't skip it.
+#[test]
+fn a_restore_that_raises_the_age_waits_thirty_days() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let open = owner.core.create_server("Open", AgeRestriction::None).unwrap();
+    let night = owner.core.create_server("Night", AgeRestriction::Eighteen).unwrap();
+    // Kim is 17 (NOW is 2026-11-03), joins Open: "not adult".
+    let kim = world.peer();
+    let created = kim.core.create_identity(born("2009-06-01")).unwrap();
+    let kim_id = created.identity.id.clone();
+    kim.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false]);
+
+    // A new computer, a birth date that gives 18: the raise waits.
+    let laptop = world.peer();
+    let restored = laptop.core.restore_identity_with(created.words.clone(), Some(born("2008-06-01"))).unwrap();
+    assert_eq!(restored.pending_birth_date, None, "nothing known before a server says so");
+    laptop.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false], "the raise went out at once");
+    let pending = laptop.core.get_identity().unwrap().unwrap().pending_birth_date.expect("pending");
+    assert_eq!(pending.date, "2008-06-01");
+    // 30 days from when the raise was found (the test clock ticks per read).
+    let due = common::NOW_MS + api::AGE_RAISE_DELAY_MS;
+    assert!((due..due + 1_000).contains(&pending.effective_at), "{}", pending.effective_at);
+    // Still under 18 for the core: the 18+ server stays shut.
+    laptop.core.join_server(&night.invite_link).unwrap();
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1, "joined 18+ during the wait");
+    // A sync round before the 30 days: nothing.
+    advance(&world, api::AGE_RAISE_DELAY_MS - 60_000);
+    laptop.core.sync_now().unwrap();
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false]);
+
+    // After the 30 days: "adult" goes out, the wait is cleared, 18+ opens.
+    advance(&world, 120_000);
+    laptop.events.take();
+    laptop.core.sync_now().unwrap();
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false, true]);
+    assert_eq!(laptop.core.get_identity().unwrap().unwrap().pending_birth_date, None);
+    assert!(laptop.events.take().iter().any(|e| matches!(e, Event::IdentityChanged(_))));
+    laptop.core.join_server(&night.invite_link).unwrap();
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 2);
+    assert_eq!(claims_by(&world, &night.id, &kim_id), [true]);
+    // No second wait, and no duplicate claim, on the next rounds.
+    laptop.core.sync_now().unwrap();
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false, true]);
+}
+
+/// Decision 18: a lower age counts at once. An adult restores with a birth
+/// date that makes them 17: "not adult" is posted on the rejoin, with no
+/// wait and no `pendingBirthDate`.
+#[test]
+fn a_restore_that_lowers_the_age_counts_at_once() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let open = owner.core.create_server("Open", AgeRestriction::None).unwrap();
+    let ana = world.peer();
+    let created = ana.core.create_identity(born("1990-05-01")).unwrap();
+    let ana_id = created.identity.id.clone();
+    ana.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &ana_id), [true]);
+
+    let laptop = world.peer();
+    laptop.core.restore_identity_with(created.words.clone(), Some(born("2009-06-01"))).unwrap();
+    laptop.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &ana_id), [true, false], "a lowering waits for nothing");
+    assert_eq!(laptop.core.get_identity().unwrap().unwrap().pending_birth_date, None);
+}
+
+/// Tech Lead (#306): turning 18 with the birth date given at sign-up is a
+/// birthday, not a correction: no 30 days. Kim signs up at 17, a day before
+/// her 18th birthday, and claims "not adult" in Open. After her birthday she
+/// leaves and rejoins Open: "adult" goes out at once, nothing is pending, and
+/// an 18+ server lets her in.
+#[test]
+fn turning_eighteen_with_the_same_birth_date_does_not_wait() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let open = owner.core.create_server("Open", AgeRestriction::None).unwrap();
+    let night = owner.core.create_server("Night", AgeRestriction::Eighteen).unwrap();
+    owner.core.sync_now().unwrap();
+    // NOW is 2026-11-03: born 2008-11-04, Kim is 18 tomorrow.
+    let kim = world.peer();
+    let kim_id = kim.core.create_identity(born("2008-11-04")).unwrap().identity.id;
+    kim.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false]);
+    kim.core.join_server(&night.invite_link).unwrap();
+    assert_eq!(kim.core.list_servers().unwrap().len(), 1, "joined 18+ at 17");
+
+    advance(&world, 2 * 86_400_000);
+    kim.core.leave_server(&open.id).unwrap();
+    kim.core.sync_now().unwrap();
+    assert!(kim.core.list_servers().unwrap().is_empty());
+    kim.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &kim_id), [false, true], "a birthday waited");
+    assert_eq!(kim.core.get_identity().unwrap().unwrap().pending_birth_date, None);
+    kim.core.join_server(&night.invite_link).unwrap();
+    assert_eq!(kim.core.list_servers().unwrap().len(), 2);
+}
+
+/// Security Lead (#306): a 15-year-old restores with a date that makes them
+/// 18 tomorrow. It agrees with their "not adult" claim, but that proves
+/// nothing: the day after, their "18th birthday" is a raise from a changed
+/// date, so it waits 30 days like any other.
+#[test]
+fn a_restored_date_just_under_eighteen_still_waits() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let open = owner.core.create_server("Open", AgeRestriction::None).unwrap();
+    let night = owner.core.create_server("Night", AgeRestriction::Eighteen).unwrap();
+    // Teo is 15 (NOW is 2026-11-03), claims "not adult" in Open.
+    let teo = world.peer();
+    let created = teo.core.create_identity(born("2011-06-01")).unwrap();
+    let teo_id = created.identity.id.clone();
+    teo.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &teo_id), [false]);
+
+    // Restored with 2008-11-04: 17 today, 18 tomorrow. Agrees for now.
+    let laptop = world.peer();
+    laptop.core.restore_identity_with(created.words.clone(), Some(born("2008-11-04"))).unwrap();
+    laptop.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &teo_id), [false]);
+    assert_eq!(laptop.core.get_identity().unwrap().unwrap().pending_birth_date, None);
+
+    // The "birthday": leave and rejoin. The raise waits; no "adult" goes out.
+    advance(&world, 2 * 86_400_000);
+    laptop.core.leave_server(&open.id).unwrap();
+    laptop.core.sync_now().unwrap();
+    laptop.core.join_server(&open.invite_link).unwrap();
+    assert_eq!(claims_by(&world, &open.id, &teo_id), [false], "the restored date skipped the wait");
+    assert!(laptop.core.get_identity().unwrap().unwrap().pending_birth_date.is_some());
+    laptop.core.join_server(&night.invite_link).unwrap();
+    assert!(!laptop.core.list_servers().unwrap().iter().any(|s| s.id == night.id), "18+ during the wait");
+}
+
+/// Restore servers, phase A (#291): every sync round seals my server list
+/// for the holders (here the loopback network). A restore on a clean
+/// computer fetches it and rejoins each server as the same member: no new
+/// join, profile or age claim, still the owner of mine. A server I left
+/// isn't entered again.
+#[test]
+fn a_restore_brings_my_servers_back_from_the_backup() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let my_id = me
+        .core
+        .update_profile(ProfileInput { display_name: "MoA".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap()
+        .id;
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let mine: Vec<ServerSummary> =
+        (0..3).map(|i| me.core.create_server(&format!("Mine {i}"), AgeRestriction::None).unwrap()).collect();
+    let bobs = bob.core.create_server("Bob's", AgeRestriction::None).unwrap();
+    let left = bob.core.create_server("Left", AgeRestriction::None).unwrap();
+    me.core.join_server(&bobs.invite_link).unwrap();
+    me.core.join_server(&left.invite_link).unwrap();
+    me.core.sync_now().unwrap();
+    me.core.leave_server(&left.id).unwrap();
+    me.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    let mut expected: Vec<String> = mine.iter().map(|s| s.id.clone()).chain([bobs.id.clone()]).collect();
+    expected.sort();
+    let posts = |server: &str| {
+        (records_by(&world, server, &my_id, Kind::Join), records_by(&world, server, &my_id, Kind::Post))
+    };
+    let before: Vec<_> = expected.iter().map(|s| posts(s)).collect();
+
+    // A clean computer, the same words.
+    let laptop = world.peer();
+    laptop.core.restore_identity(created.words.clone()).unwrap();
+    let mut back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    back.sort();
+    assert_eq!(back, expected, "the left server came back, or one is missing");
+    let after: Vec<_> = expected.iter().map(|s| posts(s)).collect();
+    assert_eq!(after, before, "a rejoin posted over what the servers hold");
+    for server in &mine {
+        let owner = laptop.core.list_servers().unwrap().into_iter().find(|s| s.id == server.id).unwrap().owner_id;
+        assert_eq!(owner, my_id);
+    }
+    // Nothing more to do: the next rounds don't re-add or re-post.
+    laptop.core.sync_now().unwrap();
+    assert_eq!(laptop.core.list_servers().unwrap().len(), expected.len());
+    // G-91: done, counting the live servers only (not the one I left).
+    let done = laptop.core.get_server_restore();
+    assert_eq!((done.state, done.found, done.waiting), (ServerRestoreState::Done, 4, 0));
+
+    // Another account's words find nothing of mine: still searching.
+    let stranger = world.peer();
+    stranger.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
+    assert!(stranger.core.list_servers().unwrap().is_empty());
+    assert_eq!(stranger.core.get_server_restore().state, ServerRestoreState::Searching);
+}
+
+/// A network that counts backup fetches and puts.
+struct CountingNet {
+    world: Arc<LoopbackNetwork>,
+    fetches: std::sync::atomic::AtomicUsize,
+    puts: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingNet {
+    fn counts(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.fetches.load(SeqCst), self.puts.load(SeqCst))
+    }
+}
+
+impl Network for CountingNet {
+    fn publish(&self, record: &records::Record) {
+        self.world.publish(record);
+    }
+    fn fetch(&self, server: ServerId) -> Vec<records::Record> {
+        self.world.fetch(server)
+    }
+    fn fetch_invite(&self, handle: [u8; 32]) -> Vec<Vec<u8>> {
+        self.world.fetch_invite(handle)
+    }
+    fn put_backup(&self, tag: [u8; 32], blob: &[u8]) {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.world.put_backup(tag, blob);
+    }
+    fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
+        self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.world.fetch_backup(tag)
+    }
+}
+
+/// Tech Lead (#317): the backup is fetched and put only when my server set
+/// changed, at login (the first round after start), or every 24 h. Rounds
+/// with nothing new fetch and put nothing (a real holder allows 60 fetches
+/// an hour; rounds come every 2 s).
+#[test]
+fn unchanged_rounds_neither_fetch_nor_put_the_backup() {
+    let world = World::new();
+    let secrets = Arc::new(MemoryStore::new());
+    let net = Arc::new(CountingNet {
+        world: world.network.clone(),
+        fetches: Default::default(),
+        puts: Default::default(),
+    });
+    let me = world.peer_on(net.clone(), secrets.clone(), None, Arc::new(PendingGroupKeys));
+    sign_up(&me, "MoA");
+    me.core.create_server("One", AgeRestriction::None).unwrap();
+    me.core.sync_now().unwrap();
+    assert_eq!(net.counts(), (1, 1), "login round");
+    for _ in 0..20 {
+        advance(&world, 2_000);
+        me.core.sync_now().unwrap();
+    }
+    assert_eq!(net.counts(), (1, 1), "rounds with nothing new fetched or put");
+    // A change: one fetch, one put.
+    me.core.create_server("Two", AgeRestriction::None).unwrap();
+    me.core.sync_now().unwrap();
+    me.core.sync_now().unwrap();
+    assert_eq!(net.counts(), (2, 2));
+    // 24 h later, unchanged: put again (holders keep it, copies heal).
+    advance(&world, api::BACKUP_REPUBLISH_MS);
+    me.core.sync_now().unwrap();
+    me.core.sync_now().unwrap();
+    assert_eq!(net.counts(), (3, 3));
+}
+
+/// G-91: an account with no servers and no backup anywhere fetched the
+/// backup on every 2-second round (nothing marked the empty set as
+/// checked). Now it's once, then again only when the set changes or the
+/// 24-hour republish is due.
+#[test]
+fn an_account_without_servers_fetches_the_backup_once() {
+    let world = World::new();
+    let net = Arc::new(CountingNet {
+        world: world.network.clone(),
+        fetches: Default::default(),
+        puts: Default::default(),
+    });
+    let me = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    sign_up(&me, "New");
+    for _ in 0..30 {
+        me.core.sync_now().unwrap();
+        advance(&world, 2_000);
+    }
+    assert_eq!(net.counts(), (1, 0), "one fetch, nothing to put");
+    me.core.create_server("First", AgeRestriction::None).unwrap();
+    me.core.sync_now().unwrap();
+    assert_eq!(net.counts(), (2, 1));
+}
+
+/// A channel-order post signed by `key` directly (as a client that skips
+/// the core's own role check would), on every control record so far.
+fn raw_order_post(world: &World, server: &str, key: &SigningKey, channel: &str, position: &str) {
+    let server_key = ServerId::from_bytes(hex::decode(server).unwrap().try_into().unwrap());
+    let text = format!(r#"{{"mvs":"mvs/channel-order/v1","v":1,"pos":{{"{channel}":"{position}"}}}}"#);
+    let heads =
+        world.network.fetch(server_key).iter().filter(|r| r.scope() == Scope::Control).map(|r| r.id()).collect();
+    let post = authority::sign_control(key, server_key, 900, heads, 3, &authority::Action::Post { text }).unwrap();
+    world.network.publish(&post);
+}
+
+fn channel_names(channels: &[Channel]) -> Vec<String> {
+    channels.iter().map(|c| c.name.clone()).collect()
+}
+
+/// G-11 (Tech Lead's design): the owner moves a channel and every member
+/// sees the same order; a plain member can't, and their raw post doesn't
+/// count; an admin's post counts, but not one they sign after a demotion;
+/// unplaced channels keep today's order.
+#[test]
+fn channel_order_is_shared_and_only_admins_count() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let server = owner.core.create_server("Order", AgeRestriction::None).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        owner.core.create_channel(&server.id, name, false).unwrap();
+    }
+    let bob = world.peer();
+    bob.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
+    let bob_key = identity::RecoveryPhrase::parse(LEGAL).unwrap().identity().signing_key().clone();
+    let bob_id = bob.core.get_identity().unwrap().unwrap().id;
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+
+    // Unplaced: today's order, no positions.
+    let today = owner.core.list_channels(&server.id).unwrap();
+    assert!(today.iter().all(|c| c.position.is_none()));
+    let id = |name: &str| today.iter().find(|c| c.name == name).unwrap().id.clone();
+    assert_eq!(channel_names(&bob.core.list_channels(&server.id).unwrap()), channel_names(&today));
+
+    // The owner moves gamma first: the same order everywhere, with positions.
+    owner.events.take();
+    // Before the first other channel (unplaced: the order they were made).
+    let first = today.iter().find(|c| c.name != "gamma").unwrap().id.clone();
+    let moved = owner.core.move_channel(&server.id, &id("gamma"), Some(&first), None).unwrap();
+    assert_eq!(moved[0].name, "gamma");
+    assert!(moved.iter().all(|c| c.position.is_some()), "the first move places every channel");
+    assert_eq!(channel_names(&owner.core.list_channels(&server.id).unwrap()), channel_names(&moved));
+    assert!(owner.events.take().iter().any(|e| matches!(e, Event::ChannelUpdated(c) if c.name == "gamma")));
+    bob.core.sync_now().unwrap();
+    assert_eq!(channel_names(&bob.core.list_channels(&server.id).unwrap()), channel_names(&moved));
+    // Then alpha after gamma: one key between its neighbours.
+    let order = owner.core.move_channel(&server.id, &id("alpha"), None, Some(&id("gamma"))).unwrap();
+    assert_eq!(&channel_names(&order)[..2], ["gamma", "alpha"]);
+
+    // Errors.
+    let err = |r: CoreResult<Vec<Channel>>| r.unwrap_err().code;
+    assert_eq!(err(bob.core.move_channel(&server.id, &id("beta"), None, None)), ErrorCode::NotAllowed);
+    assert_eq!(err(owner.core.move_channel(&server.id, &"ab".repeat(32), None, None)), ErrorCode::NotFound);
+    assert_eq!(err(owner.core.move_channel(&server.id, &id("beta"), Some(&"ab".repeat(32)), None)), ErrorCode::BadRequest);
+    assert_eq!(
+        err(owner.core.move_channel(&server.id, &id("beta"), Some(&id("gamma")), Some(&id("alpha")))),
+        ErrorCode::BadRequest,
+        "before and after aren't one gap"
+    );
+
+    // Bob, a plain member, signs a post himself: it doesn't count.
+    raw_order_post(&world, &server.id, &bob_key, &id("beta"), "1");
+    owner.core.sync_now().unwrap();
+    assert_eq!(channel_names(&owner.core.list_channels(&server.id).unwrap()), channel_names(&order));
+
+    // Promoted to admin, his post counts; demoted, his later one doesn't.
+    owner.core.grant_role(&server.id, &bob_id, Role::Admin).unwrap();
+    raw_order_post(&world, &server.id, &bob_key, &id("beta"), "1");
+    owner.core.sync_now().unwrap();
+    let as_admin = owner.core.list_channels(&server.id).unwrap();
+    assert_eq!(as_admin[0].name, "beta", "an admin's post didn't count");
+    owner.core.revoke_role(&server.id, &bob_id).unwrap();
+    raw_order_post(&world, &server.id, &bob_key, &id("beta"), "zz");
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    let after = owner.core.list_channels(&server.id).unwrap();
+    assert_eq!(channel_names(&after), channel_names(&as_admin), "a demoted admin's post counted");
+    assert_eq!(channel_names(&bob.core.list_channels(&server.id).unwrap()), channel_names(&after));
+}
+
+/// G-11: two admins move channels at the same time, neither seeing the
+/// other's move; once they meet, all three peers agree on one order.
+#[test]
+fn concurrent_channel_moves_converge() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let server = owner.core.create_server("Race", AgeRestriction::None).unwrap();
+    let server_key = ServerId::from_bytes(hex::decode(&server.id).unwrap().try_into().unwrap());
+    for name in ["alpha", "beta", "gamma", "delta"] {
+        owner.core.create_channel(&server.id, name, false).unwrap();
+    }
+    let partition = Partition::new(&world.network);
+    let dan = world.peer_on(partition.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    let dan_id = sign_up(&dan, "Dan").id;
+    dan.core.join_server(&server.invite_link).unwrap();
+    let carol = world.peer();
+    sign_up(&carol, "Carol");
+    carol.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    owner.core.grant_role(&server.id, &dan_id, Role::Admin).unwrap();
+    // Everyone placed once, so the next moves are single keys.
+    let list = owner.core.list_channels(&server.id).unwrap();
+    owner.core.move_channel(&server.id, &list[0].id, None, None).unwrap();
+    dan.core.sync_now().unwrap();
+    carol.core.sync_now().unwrap();
+    let id = |name: &str| list.iter().find(|c| c.name == name).unwrap().id.clone();
+
+    partition.cut(server_key);
+    // An anchor that is neither moved channel (IDs, so today's order, are random).
+    let anchor = owner.core.list_channels(&server.id).unwrap().into_iter().find(|c| c.name != "delta" && c.name != "gamma").unwrap();
+    let (first, anchor_name) = (anchor.id.clone(), anchor.name.clone());
+    owner.core.move_channel(&server.id, &id("delta"), Some(&first), None).unwrap();
+    dan.core.move_channel(&server.id, &id("gamma"), Some(&first), None).unwrap();
+    partition.heal();
+    for peer in [&owner, &dan, &carol, &owner, &dan] {
+        peer.core.sync_now().unwrap();
+    }
+    let seen: Vec<Vec<String>> =
+        [&owner, &dan, &carol].iter().map(|p| channel_names(&p.core.list_channels(&server.id).unwrap())).collect();
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0], seen[2]);
+    // Both moved channels sit right before the anchor, in one agreed order.
+    let at = seen[0].iter().position(|n| *n == anchor_name).unwrap();
+    assert!(at >= 2);
+    assert_eq!(seen[0][at - 2..at].iter().map(String::as_str).collect::<BTreeSet<_>>(), BTreeSet::from(["delta", "gamma"]));
+}
+
+/// Security Lead (#323): a plain member's channel-order spam costs nothing
+/// and changes nothing. 500 posts from someone who was never owner or admin
+/// are skipped before any resolving: listing channels stays fast and the
+/// order stays the owner's.
+#[test]
+fn channel_order_spam_from_a_member_is_cheap_and_ignored() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let server = owner.core.create_server("Spam", AgeRestriction::None).unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        owner.core.create_channel(&server.id, name, false).unwrap();
+    }
+    let bob = world.peer();
+    bob.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
+    let bob_key = identity::RecoveryPhrase::parse(LEGAL).unwrap().identity().signing_key().clone();
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    let list = owner.core.list_channels(&server.id).unwrap();
+    let last = list.last().unwrap().id.clone();
+    let order = owner.core.move_channel(&server.id, &last, Some(&list[0].id), None).unwrap();
+
+    let server_key = ServerId::from_bytes(hex::decode(&server.id).unwrap().try_into().unwrap());
+    let heads: Vec<records::RecordId> =
+        world.network.fetch(server_key).iter().filter(|r| r.scope() == Scope::Control).map(|r| r.id()).collect();
+    for i in 0..500u64 {
+        let text = format!(r#"{{"mvs":"mvs/channel-order/v1","v":1,"pos":{{"{last}":"{}"}}}}"#, i + 1);
+        let post = authority::sign_control(
+            &bob_key,
+            server_key,
+            1_000 + i,
+            heads.clone(),
+            4 + i,
+            &authority::Action::Post { text },
+        )
+        .unwrap();
+        world.network.publish(&post);
+    }
+    owner.core.sync_now().unwrap();
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        assert_eq!(channel_names(&owner.core.list_channels(&server.id).unwrap()), channel_names(&order));
+    }
+    // Resolving each post's past would take tens of seconds here.
+    assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
+}
+
+/// G-21 (new-messages divider): `unreadCount` and `firstUnreadIndex` from
+/// the local read marker, my own messages not counted; `markRead` resets
+/// both; history from before I joined isn't unread; 300 unread are counted
+/// from the stored records, quickly.
+#[test]
+fn unread_counts_follow_the_read_marker() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Unread");
+    owner.core.send_message(&channel, "before Bob joined", None).unwrap();
+    let bob = joiner(&world, &server, "Bob");
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    let unread = |peer: &Peer| -> (Option<u64>, Option<u64>, bool) {
+        let list = peer.core.list_channels(&server.id).unwrap();
+        let c = list.into_iter().find(|c| c.id == channel).unwrap();
+        (c.unread_count, c.first_unread_index, c.unread)
+    };
+    // Nothing new since Bob joined.
+    assert_eq!(unread(&bob), (Some(0), None, false));
+
+    // Bob's own message first, then the owner's and Bob's mixed.
+    bob.core.send_message(&channel, "b0", None).unwrap();
+    owner.core.sync_now().unwrap();
+    for text in ["o1", "o2"] {
+        owner.core.send_message(&channel, text, None).unwrap();
+    }
+    bob.core.sync_now().unwrap();
+    bob.core.send_message(&channel, "b1", None).unwrap();
+    owner.core.send_message(&channel, "o3", None).unwrap();
+    bob.core.sync_now().unwrap();
+    let count = bob.core.get_message_count(&channel).unwrap() as u64;
+    let (n, first, flag) = unread(&bob);
+    assert_eq!((n, flag), (Some(3), true));
+    let first = first.expect("an index") as usize;
+    let page = bob.core.get_messages(&channel, first, count as usize).unwrap().messages;
+    assert_eq!(page[0].body, "o1", "firstUnreadIndex points past Bob's own b0");
+    // The owner sees Bob's two (the owner joined first).
+    owner.core.sync_now().unwrap();
+    assert_eq!(unread(&owner).0, Some(2));
+
+    // markRead: both reset, with channel.updated.
+    bob.events.take();
+    bob.core.handle(&format!(r#"{{"id":1,"cmd":"markRead","args":{{"channelId":"{channel}"}}}}"#));
+    assert_eq!(unread(&bob), (Some(0), None, false));
+    assert!(bob.events.take().iter().any(|e| matches!(e, Event::ChannelUpdated(c) if c.id == channel && c.unread_count == Some(0))));
+
+    // 300 unread: counted from the stored records, quickly.
+    for i in 0..300 {
+        owner.core.send_message(&channel, &format!("m{i}"), None).unwrap();
+    }
+    bob.core.sync_now().unwrap();
+    let start = std::time::Instant::now();
+    let (n, first, _) = unread(&bob);
+    assert_eq!(n, Some(300));
+    assert_eq!(first, Some(count));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+}
+
+/// G-24 (@mentions): a `<@userId>` token marks the message for that member
+/// (`mentionsMe`), lists the mentioned members (`mentions`, current members
+/// only: a stranger's or a former member's token is left out), and counts in
+/// the channel's and the server's mention badge until `markRead`.
+#[test]
+fn mentions_mark_the_message_and_count_until_read() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Talk");
+    let nadav = joiner(&world, &server, "Nadav");
+    let noa = joiner(&world, &server, "Noa");
+    owner.core.sync_now().unwrap();
+    for peer in [&nadav, &noa] {
+        peer.core.sync_now().unwrap();
+    }
+    let id = |peer: &Peer| peer.core.get_identity().unwrap().unwrap().id;
+    let (nadav_id, noa_id) = (id(&nadav), id(&noa));
+    let stranger = "ab".repeat(32);
+    owner
+        .core
+        .send_message(&channel, &format!("hi <@{nadav_id}> and <@{noa_id}> and <@{stranger}>"), None)
+        .unwrap();
+    owner.core.send_message(&channel, "no mention here", None).unwrap();
+    nadav.core.sync_now().unwrap();
+
+    let count = nadav.core.get_message_count(&channel).unwrap();
+    let page = nadav.core.get_messages(&channel, 0, count).unwrap().messages;
+    let mention = page.iter().find(|m| m.body.starts_with("hi ")).unwrap();
+    assert_eq!(mention.mentions_me, Some(true));
+    assert_eq!(mention.mentions.as_deref(), Some(&[nadav_id.clone(), noa_id.clone()][..]), "a stranger listed");
+    let plain = page.iter().find(|m| m.body == "no mention here").unwrap();
+    assert_eq!((plain.mentions_me, plain.mentions.as_ref()), (None, None));
+
+    // The badge: the channel and the server count it until read.
+    let channels = nadav.core.list_channels(&server.id).unwrap();
+    let c = channels.iter().find(|c| c.id == channel).unwrap();
+    assert_eq!((c.mentions, c.unread_count), (1, Some(2)));
+    let summary = nadav.core.list_servers().unwrap().into_iter().find(|s| s.id == server.id).unwrap();
+    assert_eq!((summary.mentions, summary.unread), (1, true));
+    nadav.core.mark_read(&channel).unwrap();
+    let c = nadav.core.list_channels(&server.id).unwrap().into_iter().find(|c| c.id == channel).unwrap();
+    assert_eq!(c.mentions, 0);
+    assert_eq!(nadav.core.list_servers().unwrap()[0].mentions, 0);
+
+    // Noa leaves: her token stays in the body, but she's no longer listed.
+    noa.core.leave_server(&server.id).unwrap();
+    noa.core.sync_now().unwrap();
+    nadav.core.sync_now().unwrap();
+    let page = nadav.core.get_messages(&channel, 0, count).unwrap().messages;
+    let mention = page.iter().find(|m| m.body.starts_with("hi ")).unwrap();
+    assert!(mention.body.contains(&format!("<@{noa_id}>")));
+    assert_eq!(mention.mentions.as_deref(), Some(&[nadav_id][..]));
+}
+
+/// A network that holds backups but can't reach any server's records until
+/// `reachable` is set, and hides the backups while `hidden` is set; it
+/// counts backup fetches and server fetches.
+struct FarServers {
+    world: Arc<LoopbackNetwork>,
+    reachable: std::sync::atomic::AtomicBool,
+    hidden: std::sync::atomic::AtomicBool,
+    /// Peers answer without the genesis (a partial fetch).
+    partial: std::sync::atomic::AtomicBool,
+    /// Peers answer without this member's join records.
+    hide_joins_of: std::sync::Mutex<Option<PublicKey>>,
+    fetches: std::sync::atomic::AtomicUsize,
+    server_fetches: std::sync::atomic::AtomicUsize,
+}
+
+impl FarServers {
+    fn new(world: &World) -> Arc<FarServers> {
+        Arc::new(FarServers {
+            world: world.network.clone(),
+            reachable: Default::default(),
+            hidden: Default::default(),
+            partial: Default::default(),
+            hide_joins_of: Default::default(),
+            fetches: Default::default(),
+            server_fetches: Default::default(),
+        })
+    }
+}
+
+impl Network for FarServers {
+    fn publish(&self, record: &records::Record) {
+        self.world.publish(record);
+    }
+    fn fetch(&self, server: ServerId) -> Vec<records::Record> {
+        self.server_fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.reachable.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut records = self.world.fetch(server);
+            if self.partial.load(std::sync::atomic::Ordering::SeqCst) {
+                records.retain(|r| r.kind() != Kind::Genesis);
+            }
+            if let Some(hidden) = *self.hide_joins_of.lock().unwrap() {
+                records.retain(|r| !(r.kind() == Kind::Join && r.author() == hidden));
+            }
+            records
+        } else {
+            Vec::new()
+        }
+    }
+    fn put_backup(&self, tag: [u8; 32], blob: &[u8]) {
+        self.world.put_backup(tag, blob);
+    }
+    fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
+        self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.hidden.load(std::sync::atomic::Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            self.world.fetch_backup(tag)
+        }
+    }
+}
+
+/// The `serverRestore.changed` payloads since the last take.
+fn restore_events(peer: &Peer) -> Vec<ServerRestore> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ServerRestoreChanged(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+fn restore(state: ServerRestoreState, found: u32, waiting: u32) -> ServerRestore {
+    ServerRestore { state, found, waiting }
+}
+
+/// An identity with one server of its own, backed up.
+fn backed_up_owner(world: &World) -> Vec<String> {
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    me.core.create_server("Mine", AgeRestriction::None).unwrap();
+    me.core.sync_now().unwrap();
+    created.words
+}
+
+/// dev-sync on #339: while no backup is found, the search is retried with
+/// backoff (1 min, 2, 4, … up to 1 h), not every sync round. G-91: the
+/// state says `searching` meanwhile.
+#[test]
+fn a_restore_searches_for_its_backup_with_backoff() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    net.hidden.store(true, std::sync::atomic::Ordering::SeqCst);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::None, 0, 0));
+    laptop.core.restore_identity(words).unwrap();
+    assert_eq!(restore_events(&laptop), [restore(ServerRestoreState::Searching, 0, 0)]);
+    let fetches = || net.fetches.load(std::sync::atomic::Ordering::SeqCst);
+    laptop.core.sync_now().unwrap(); // the login backup round fetches once too
+    let base = fetches();
+    let round = |ms: u64| {
+        advance(&world, ms);
+        laptop.core.sync_now().unwrap();
+        fetches() - base
+    };
+    // Rounds every 2 s for a minute: no retry until the first minute is up.
+    for _ in 0..25 {
+        assert_eq!(round(2_000), 0);
+    }
+    assert_eq!(round(15_000), 1, "the 1-minute retry");
+    assert_eq!(round(60_000), 1, "then it waits 2 minutes");
+    assert_eq!(round(61_000), 2);
+    assert_eq!(round(4 * 60_000 + 1_000), 3, "then 4");
+    assert_eq!(round(8 * 60_000 + 1_000), 4, "then 8");
+    assert_eq!(round(16 * 60_000 + 1_000), 5, "then 16");
+    assert_eq!(round(32 * 60_000 + 1_000), 6, "then 32");
+    assert_eq!(round(30 * 60_000), 6, "not yet: the wait is an hour now");
+    assert_eq!(round(30 * 60_000 + 1_000), 7, "then at most an hour");
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Searching, 0, 0));
+    assert!(restore_events(&laptop).is_empty(), "no event without a change");
+    // The backup can be found: the next retry brings the server back, then stops.
+    net.hidden.store(false, std::sync::atomic::Ordering::SeqCst);
+    // (+1: the server set changed, so that round also writes the backup.)
+    assert_eq!(round(60 * 60_000 + 1_000), 9);
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(restore_events(&laptop), [restore(ServerRestoreState::Done, 1, 0)]);
+    assert_eq!(round(2 * 60 * 60_000), 9, "done: no more retries");
+}
+
+/// G-91 (PO criterion 3): a server I was kicked from after my last backup,
+/// or that was closed, still reads as live in that backup, but doesn't come
+/// back, and isn't left counted as waiting.
+#[test]
+fn a_restore_leaves_out_servers_i_was_kicked_from_or_that_closed() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let my_id = me.core.get_identity().unwrap().unwrap().id;
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let mine = me.core.create_server("Mine", AgeRestriction::None).unwrap();
+    let kicked = bob.core.create_server("Kicked", AgeRestriction::None).unwrap();
+    let closed = bob.core.create_server("Closed", AgeRestriction::None).unwrap();
+    me.core.join_server(&kicked.invite_link).unwrap();
+    me.core.join_server(&closed.invite_link).unwrap();
+    me.core.sync_now().unwrap(); // the backup lists all three as live
+    bob.core.sync_now().unwrap();
+    bob.core.kick_member(&kicked.id, &my_id).unwrap();
+    bob.core.close_server(&closed.id).unwrap();
+    bob.core.sync_now().unwrap();
+
+    let laptop = world.peer();
+    laptop.core.restore_identity(created.words).unwrap();
+    let back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(back, [mine.id]);
+    let done = laptop.core.get_server_restore();
+    assert_eq!((done.state, done.found, done.waiting), (ServerRestoreState::Done, 3, 0));
+}
+
+/// G-91 (PO criterion 1): once the backup is found, a server nobody can be
+/// reached for is tried again every 30 s, without fetching the backup
+/// again, so it is back within 2 minutes of a member being reachable. The
+/// state says `waiting` with the count meanwhile, then `done`.
+#[test]
+fn a_found_restore_rejoins_soon_after_a_member_is_reachable() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert!(laptop.core.list_servers().unwrap().is_empty(), "nobody online yet");
+    assert_eq!(
+        restore_events(&laptop),
+        [restore(ServerRestoreState::Searching, 0, 0), restore(ServerRestoreState::Waiting, 1, 1)]
+    );
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+    laptop.core.sync_now().unwrap();
+    let (fetches, tries) = (load(&net.fetches), load(&net.server_fetches));
+    // An hour of rounds every 2 s: one try every 30 s, and no backup fetch.
+    for _ in 0..1_800 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(load(&net.fetches), fetches, "the backup isn't fetched again");
+    let retried = load(&net.server_fetches) - tries;
+    assert!((119..=121).contains(&retried), "{retried} tries in an hour");
+    assert!(restore_events(&laptop).is_empty());
+    // A member is reachable: back within 30 s.
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut waited = 0;
+    while laptop.core.list_servers().unwrap().is_empty() {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+        waited += 2_000;
+        assert!(waited <= 30_000, "not back within 30 s");
+    }
+    assert_eq!(restore_events(&laptop), [restore(ServerRestoreState::Done, 1, 0)]);
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+    assert!(restore_events(&laptop).is_empty(), "done stays done");
+}
+
+/// Owner bug (v0.4.1): unread dots stuck at the channel or server level. The
+/// core sent no `channel.updated` when a message arrived, and no
+/// `server.updated` after `markRead`, so the UI's state drifted from the read
+/// marker. Now: a message from someone else brings `channel.updated` and a
+/// counted `server.updated` (unread, mentions); `markRead` brings both back
+/// to zero; my own messages don't count; the marker survives a restart.
+#[test]
+fn unread_dots_follow_new_messages_and_mark_read() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Dots");
+    let dir = std::env::temp_dir().join(format!("mvs-api-dots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let secrets = Arc::new(MemoryStore::new());
+    let bob = keyed_peer(&world, secrets.clone(), Some(dir.join("core.db")));
+    let bob_id = sign_up(&bob, "Bob").id;
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    let updates = |peer: &Peer| -> (Vec<Channel>, Vec<ServerSummary>) {
+        let mut channels = Vec::new();
+        let mut servers = Vec::new();
+        for e in peer.events.take() {
+            match e {
+                Event::ChannelUpdated(c) if c.id == channel => channels.push(c),
+                Event::ServerUpdated(s) if s.id == server.id => servers.push(s),
+                _ => {}
+            }
+        }
+        (channels, servers)
+    };
+    updates(&bob);
+
+    // A message mentioning Bob arrives: both levels light up, live.
+    owner.core.send_message(&channel, &format!("hey <@{bob_id}>"), None).unwrap();
+    bob.core.sync_now().unwrap();
+    let (channels, servers) = updates(&bob);
+    let c = channels.last().expect("channel.updated on a new message");
+    assert_eq!((c.unread, c.unread_count, c.mentions), (true, Some(1), 1));
+    let s = servers.last().expect("server.updated on a new message");
+    assert_eq!((s.unread, s.mentions), (true, 1));
+
+    // Read: both levels clear, with events.
+    bob.core.mark_read(&channel).unwrap();
+    let (channels, servers) = updates(&bob);
+    let c = channels.last().expect("channel.updated after markRead");
+    assert_eq!((c.unread, c.unread_count, c.mentions, c.first_unread_index), (false, Some(0), 0, None));
+    let s = servers.last().expect("server.updated after markRead");
+    assert_eq!((s.unread, s.mentions), (false, 0));
+
+    // My own message: nothing to light up.
+    bob.core.send_message(&channel, "mine", None).unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(updates(&bob).0.iter().all(|c| !c.unread));
+    assert!(!bob.core.list_servers().unwrap()[0].unread);
+
+    // The marker survives a restart.
+    drop(bob);
+    let bob = keyed_peer(&world, secrets, Some(dir.join("core.db")));
+    bob.core.sync_now().unwrap();
+    let c = bob.core.list_channels(&server.id).unwrap().into_iter().find(|c| c.id == channel).unwrap();
+    assert_eq!((c.unread, c.unread_count), (false, Some(0)));
+    owner.core.send_message(&channel, "after the restart", None).unwrap();
+    bob.core.sync_now().unwrap();
+    let c = bob.core.list_channels(&server.id).unwrap().into_iter().find(|c| c.id == channel).unwrap();
+    assert_eq!(c.unread_count, Some(1));
+    drop(bob);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 48×48 lossy WebP header (never decoded: the core reads the header),
+/// padded with an unknown chunk to `pad` extra bytes.
+fn small_webp(side: u16, pad: usize) -> String {
+    use base64::Engine;
+    let mut vp8 = vec![0, 0, 0, 0x9d, 0x01, 0x2a];
+    vp8.extend_from_slice(&side.to_le_bytes());
+    vp8.extend_from_slice(&side.to_le_bytes());
+    vp8.extend_from_slice(&[0; 8]);
+    let mut body = b"WEBP".to_vec();
+    for (kind, data) in [(b"VP8 ", vp8), (b"XTRA", vec![7u8; pad])] {
+        if kind == b"XTRA" && pad == 0 {
+            continue;
+        }
+        body.extend_from_slice(kind);
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.extend_from_slice(&data);
+        if data.len() % 2 == 1 {
+            body.push(0);
+        }
+    }
+    let mut b = b"RIFF".to_vec();
+    b.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    b.extend(body);
+    format!("data:image/webp;base64,{}", base64::engine::general_purpose::STANDARD.encode(b))
+}
+
+/// #354 (owner request): my small picture and colour reach other members
+/// through my profile post, checked on both sides; changes are coalesced to
+/// one post per 10 minutes; a post without them (an older device, a join)
+/// leaves them; "" clears them; a crafted bad picture is ignored.
+#[test]
+fn profile_picture_and_colour_reach_other_members() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let server = owner.core.create_server("Faces", AgeRestriction::None).unwrap();
+    let bob = world.peer();
+    bob.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
+    let bob_key = identity::RecoveryPhrase::parse(LEGAL).unwrap().identity().signing_key().clone();
+    let bob_id = bob.core.get_identity().unwrap().unwrap().id;
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    let seen = || {
+        owner.core.sync_now().unwrap();
+        let m = owner.core.list_members(&server.id).unwrap().into_iter().find(|m| m.id == bob_id).unwrap();
+        (m.avatar_data_url, m.color)
+    };
+    let profile = |avatar: Option<&str>, color: Option<&str>| ProfileInput {
+        display_name: "Bob".into(),
+        bio: None,
+        avatar_data_url: None,
+        avatar_small: avatar.map(String::from),
+        color: color.map(String::from),
+    };
+    let posts = || profile_posts(&world, &server.id, &bob_id);
+
+    // Set: the owner sees both.
+    let pic = small_webp(48, 0);
+    bob.core.update_profile(profile(Some(&pic), Some("#3b82f6"))).unwrap();
+    assert_eq!(seen(), (Some(pic.clone()), Some("#3b82f6".to_owned())));
+    assert_eq!(bob.core.get_identity().unwrap().unwrap().color.as_deref(), Some("#3b82f6"));
+
+    // Refused on send: an SVG, a 65×65, a bad colour, a picture over 2,560 bytes.
+    let err = |p: ProfileInput| bob.core.update_profile(p).unwrap_err().code;
+    assert_eq!(err(profile(Some("data:image/svg+xml;base64,PHN2Zy8+"), None)), ErrorCode::BadRequest);
+    assert_eq!(err(profile(Some(&small_webp(65, 0)), None)), ErrorCode::BadRequest);
+    assert_eq!(err(profile(None, Some("blue"))), ErrorCode::BadRequest);
+    assert_eq!(err(profile(Some(&small_webp(48, 2_600)), None)), ErrorCode::BadRequest);
+    // The largest valid profile (128 four-byte emoji, a 2,556-byte picture,
+    // a colour) fits one post and is published (the 4 KiB check guards it).
+    let mut largest = profile(Some(&small_webp(48, 2_512)), Some("#ffffff"));
+    largest.display_name = "🙂".repeat(128);
+    // #378: an explicit save posts at once, up to a burst of three.
+    let before = posts();
+    bob.core.update_profile(largest).unwrap();
+    assert_eq!(posts(), before + 1, "the largest profile wasn't published at once");
+    bob.core.update_profile(profile(Some(&pic), Some("#3b82f6"))).unwrap();
+    assert_eq!(posts(), before + 2, "the third save of the burst");
+
+    // Past the burst: two more changes coalesce into one post, 10 minutes on.
+    let before = posts();
+    bob.core.update_profile(profile(None, Some("#ff0000"))).unwrap();
+    bob.core.update_profile(profile(None, Some("#00ff00"))).unwrap();
+    bob.core.sync_now().unwrap();
+    assert_eq!(posts(), before, "posted past the burst");
+    advance(&world, api::PROFILE_POST_EVERY_MS);
+    bob.core.sync_now().unwrap();
+    assert_eq!(posts(), before + 1);
+    assert_eq!(seen(), (Some(pic.clone()), Some("#00ff00".to_owned())));
+
+    // A post without them (an older device) leaves them; a crafted bad
+    // picture (10k×10k) is ignored, not shown.
+    older_profile(&world, &server, &bob_key, 50, true);
+    assert_eq!(seen(), (Some(pic.clone()), Some("#00ff00".to_owned())));
+    let server_key = ServerId::from_bytes(hex::decode(&server.id).unwrap().try_into().unwrap());
+    let heads = world.network.fetch(server_key).iter().filter(|r| r.scope() == Scope::Control).map(|r| r.id()).collect();
+    let bomb = r##"{"mvs":"mvs/profile/v1","displayName":"Bob","avatar":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAJxAAACcQCAYAAAAfFcSJAAAAAElFTkSuQmCC","color":"#nothex"}"##;
+    let post = authority::sign_control(&bob_key, server_key, 60, heads, 5, &authority::Action::Post { text: bomb.into() }).unwrap();
+    world.network.publish(&post);
+    assert_eq!(seen(), (Some(pic), Some("#00ff00".to_owned())));
+
+    // "" clears both, for everyone.
+    advance(&world, api::PROFILE_POST_EVERY_MS);
+    bob.core.update_profile(profile(Some(""), Some(""))).unwrap();
+    assert_eq!(seen(), (None, None));
+}
+
+/// Tech Lead (#359): the picture and colour go with every profile post, so
+/// a server I create or join after setting them shows them too.
+#[test]
+fn a_new_server_sees_the_picture_set_before() {
+    let world = World::new();
+    let bob = world.peer();
+    let bob_id = sign_up(&bob, "Bob").id;
+    let pic = small_webp(48, 0);
+    bob.core
+        .update_profile(ProfileInput {
+            display_name: "Bob".into(),
+            bio: None,
+            avatar_data_url: None,
+            avatar_small: Some(pic.clone()),
+            color: Some("#123456".into()),
+        })
+        .unwrap();
+    let look = |peer: &Peer, server: &str| {
+        peer.core.sync_now().unwrap();
+        let m = peer.core.list_members(server).unwrap().into_iter().find(|m| m.id == bob_id).unwrap();
+        (m.avatar_data_url, m.color)
+    };
+    let expected = (Some(pic), Some("#123456".to_owned()));
+    // A server Bob creates afterwards: Carol, who joins it, sees them.
+    let mine = bob.core.create_server("Bob's", AgeRestriction::None).unwrap();
+    let carol = world.peer();
+    sign_up(&carol, "Carol");
+    carol.core.join_server(&mine.invite_link).unwrap();
+    assert_eq!(look(&carol, &mine.id), expected);
+    // A server Bob joins afterwards: its owner sees them.
+    let theirs = carol.core.create_server("Carol's", AgeRestriction::None).unwrap();
+    bob.core.join_server(&theirs.invite_link).unwrap();
+    assert_eq!(look(&carol, &theirs.id), expected);
+}
+
+/// #323 (QA on 0.4.2, 1 run in 4): unplaced channels are listed in the order
+/// they were made, not by their random IDs, so the owner's first move lands
+/// where they asked, and the member sees the same. Eight servers, so a fix
+/// that only works for some ID orders fails here: with ID order, all eight
+/// listing general, two, three by chance is (1/6)^8.
+#[test]
+fn unplaced_channels_keep_creation_order_and_the_first_move_lands() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let member = world.peer();
+    sign_up(&member, "Member");
+    for round in 0..8 {
+        let server = owner.core.create_server(&format!("Order {round}"), AgeRestriction::None).unwrap();
+        for name in ["two", "three"] {
+            owner.core.create_channel(&server.id, name, false).unwrap();
+        }
+        member.core.join_server(&server.invite_link).unwrap();
+        owner.core.sync_now().unwrap();
+        member.core.sync_now().unwrap();
+        let listed = owner.core.list_channels(&server.id).unwrap();
+        let general = listed.iter().find(|c| c.is_default).unwrap().name.clone();
+        let made = [general.as_str(), "two", "three"];
+        let after = ["three", general.as_str(), "two"];
+        assert_eq!(channel_names(&listed), made, "round {round}");
+        assert_eq!(channel_names(&member.core.list_channels(&server.id).unwrap()), made);
+
+        let id = |name: &str| listed.iter().find(|c| c.name == name).unwrap().id.clone();
+        let moved = owner.core.move_channel(&server.id, &id("three"), Some(&id(&general)), None).unwrap();
+        assert_eq!(channel_names(&moved), after, "round {round}");
+        member.core.sync_now().unwrap();
+        assert_eq!(channel_names(&member.core.list_channels(&server.id).unwrap()), after);
+    }
+}
+
+fn relay_of(peer: &Peer) -> MemberRelay {
+    peer.core.get_member_relay().unwrap()
+}
+
+/// The `memberRelay.changed` payloads since the last take.
+fn relay_events(peer: &Peer) -> Vec<MemberRelay> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::MemberRelayChanged(m) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Member relays, slice 1 (#368): `auto` is on for an owner or admin and off
+/// for a plain member; a demotion turns it off and a promotion back on (read
+/// from the log); relay-only forces it off and turning it off restores it;
+/// `memberRelay.changed` fires once per change and never without one.
+#[test]
+fn member_relay_follows_my_role_and_is_forced_off() {
+    use MemberRelaySetting::{Auto, Off};
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let bob = world.peer();
+    let bob_id = sign_up(&bob, "Bob").id;
+
+    // No server yet: auto, off, no role, the defaults.
+    let r = relay_of(&owner);
+    assert_eq!((r.setting, r.effective, r.role, r.reason, r.disclosure_seen), (Auto, false, false, None, false));
+    assert_eq!(r.daily_cap_mb, api::MEMBER_RELAY_CAP_DEFAULT_MB);
+    owner.events.take();
+
+    // An owner under auto: the role, but not relaying until the one-time
+    // disclosure is acknowledged (PO on #387); then on. One event each.
+    let server = owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(!ev[0].effective && ev[0].role && !ev[0].disclosure_seen);
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].disclosure_seen);
+
+    // A plain member: off, and joining as one changes nothing.
+    bob.events.take();
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(!relay_of(&bob).effective && !relay_of(&bob).role);
+    assert!(relay_events(&bob).is_empty(), "nothing changed for a plain member");
+    // Bob acknowledges the disclosure now (the toggle's first use).
+    bob.core.mark_member_relay_disclosure_seen().unwrap();
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // Promoted to admin (read from the log): on. Nothing new: no event.
+    owner.core.grant_role(&server.id, &bob_id, Role::Admin).unwrap();
+    bob.core.sync_now().unwrap();
+    let ev = relay_events(&bob);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].role);
+    bob.core.sync_now().unwrap();
+    assert!(relay_events(&bob).is_empty(), "no change, no event");
+
+    // Demoted: off under auto. Promoted again: back on.
+    owner.core.revoke_role(&server.id, &bob_id).unwrap();
+    bob.core.sync_now().unwrap();
+    let ev = relay_events(&bob);
+    assert_eq!(ev.len(), 1);
+    assert!(!ev[0].effective && !ev[0].role);
+    owner.core.grant_role(&server.id, &bob_id, Role::Admin).unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(relay_of(&bob).effective);
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // The setting: off wins over the role; the same setting again is no change.
+    let r = bob.core.set_member_relay(Off).unwrap();
+    assert!(!r.effective && r.role && r.reason.is_none());
+    assert_eq!(relay_events(&bob).len(), 1);
+    bob.core.set_member_relay(Off).unwrap();
+    assert!(relay_events(&bob).is_empty(), "the same setting again");
+    bob.core.set_member_relay(Auto).unwrap();
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // Relay-only forces it off, with the reason; off again restores it.
+    bob.core.set_relay_only(true).unwrap();
+    let r = relay_of(&bob);
+    assert_eq!((r.effective, r.reason), (false, Some(MemberRelayReason::RelayOnly)));
+    assert_eq!(relay_events(&bob).len(), 1);
+    bob.core.set_relay_only(false).unwrap();
+    assert!(relay_of(&bob).effective && relay_of(&bob).reason.is_none());
+    assert_eq!(relay_events(&bob).len(), 1);
+
+    // Leaving my only server: off under auto.
+    bob.core.leave_server(&server.id).unwrap();
+    bob.core.sync_now().unwrap();
+    assert!(!relay_of(&bob).effective && !relay_of(&bob).role);
+    assert_eq!(relay_events(&bob).len(), 1);
+}
+
+/// Member relays, slice 3a: the shell's metered flag (`setMetered`) forces
+/// relaying off with reason `metered`, one event each way; clearing it
+/// restores the value. Relay-only, earlier in the order, wins the reason.
+#[test]
+fn member_relay_is_off_on_a_metered_network() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    assert!(relay_of(&owner).effective);
+    owner.events.take();
+
+    owner.core.set_metered(true).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert_eq!((ev[0].effective, ev[0].reason), (false, Some(MemberRelayReason::Metered)));
+    owner.core.set_metered(true).unwrap();
+    assert!(relay_events(&owner).is_empty(), "the same flag again");
+
+    // Relay-only comes first in the order; metered shows again after it.
+    owner.core.set_relay_only(true).unwrap();
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::RelayOnly));
+    owner.core.set_relay_only(false).unwrap();
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::Metered));
+    owner.events.take();
+
+    owner.core.set_metered(false).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].reason.is_none());
+
+    // Over the wire, as the shell sends it; anything else is bad-request.
+    let wire = |args: &str| -> serde_json::Value {
+        let request = format!(r#"{{"cmd":"setMetered","args":{args}}}"#);
+        serde_json::from_str(&owner.core.handle(&request)).unwrap()
+    };
+    let reply = wire(r#"{"metered":true}"#);
+    assert_eq!(reply["ok"], serde_json::Value::Null, "{reply}");
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::Metered));
+    for bad in [r#"{"metered":"yes"}"#, r#"{}"#, r#"{"metered":true,"x":1}"#] {
+        assert_eq!(wire(bad)["error"]["code"], "bad-request", "{bad}");
+    }
+}
+
+/// Member relays: a minor (no trusted adult birth date) stays off even with
+/// "on", and even as an owner.
+#[test]
+fn member_relay_is_off_for_a_minor() {
+    let world = World::new();
+    let kid = world.peer();
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "2015-05-01".into() };
+    let created = kid.core.create_identity(input).unwrap();
+    assert!(answer(&kid, &created.words, &[]).1.unwrap().ok);
+    kid.core.create_server("Mine", AgeRestriction::None).unwrap();
+    let r = kid.core.set_member_relay(MemberRelaySetting::On).unwrap();
+    assert_eq!((r.effective, r.role, r.reason), (false, true, Some(MemberRelayReason::Minor)));
+}
+
+/// Member relays: the daily cap is 2,048 MB by default and 256..=51,200
+/// MB, else `bad-request`; it, the setting and the disclosure survive a
+/// restart.
+#[test]
+fn member_relay_cap_and_setting_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-relay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("core.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let secrets = Arc::new(MemoryStore::new());
+    let world = World::new();
+    {
+        let peer = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
+        sign_up(&peer, "Kept");
+        assert_eq!(relay_of(&peer).daily_cap_mb, 2_048);
+        for bad in [0, 255, 51_201] {
+            assert_eq!(peer.core.set_member_relay_cap(bad).unwrap_err().code, ErrorCode::BadRequest, "{bad}");
+        }
+        assert_eq!(peer.core.set_member_relay_cap(256).unwrap().daily_cap_mb, 256);
+        peer.events.take();
+        assert_eq!(peer.core.set_member_relay_cap(51_200).unwrap().daily_cap_mb, 51_200);
+        assert_eq!(relay_events(&peer).len(), 1, "a new cap is announced");
+        // An explicit "on" waits for the disclosure too (PO on #387).
+        assert!(!peer.core.set_member_relay(MemberRelaySetting::On).unwrap().effective);
+        peer.core.mark_member_relay_disclosure_seen().unwrap();
+        assert!(relay_of(&peer).effective);
+    }
+    let peer = world.peer_with(secrets, Some(db), Arc::new(PendingGroupKeys));
+    let r = relay_of(&peer);
+    assert_eq!((r.setting, r.daily_cap_mb, r.disclosure_seen), (MemberRelaySetting::On, 51_200, true));
+    assert!(r.effective, "on, for an adult with no server");
+    drop(peer);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The `deviceLink.state` payloads since the last take.
+fn link_states(peer: &Peer) -> Vec<DeviceLinkState> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::DeviceLinkState(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Device link (`device-link-slice.md`): the new device starts a link, the
+/// signed-in one reaches it by the typed code, both show the same digits,
+/// the approval sends the account sealed, and the new device is the same
+/// identity, with the birth date still trusted, the profile, and my
+/// servers back. The approving device shows "a new device was added".
+#[test]
+fn a_device_link_by_code_brings_the_account_over() {
+    let world = World::new();
+    let old = world.peer();
+    let me = sign_up(&old, "Moran");
+    old.core
+        .update_profile(ProfileInput { display_name: "Moran".into(), bio: None, avatar_data_url: None, avatar_small: None, color: Some("#3b82f6".into()) })
+        .unwrap();
+    let server = old.core.create_server("Mine", AgeRestriction::None).unwrap();
+    old.core.sync_now().unwrap(); // the server backup goes out
+
+    let new = world.peer();
+    let link = new.core.start_device_link().unwrap();
+    assert!(link.qr.starts_with("mvs-link:1:") && link.qr.len() <= 1024 && link.qr.is_ascii());
+    assert!(link.code.len() == 10 && link.code.bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)));
+    assert_eq!(link_states(&new)[0].state, DeviceLinkPhase::Waiting);
+
+    let approval = old.core.begin_device_approval(&link.code.to_lowercase()).unwrap();
+    new.core.sync_now().unwrap();
+    let states = link_states(&new);
+    assert_eq!(states.len(), 1);
+    assert_eq!((states[0].state, states[0].sas.as_deref()), (DeviceLinkPhase::Confirm, Some(approval.sas.as_str())));
+
+    // The new device shows the same digits; its user confirms the match.
+    new.core.confirm_device_link(true).unwrap();
+    old.events.take();
+    old.core.confirm_device_approval(true).unwrap();
+    assert!(old.events.take().iter().any(|e| matches!(e, Event::DeviceAdded { .. })));
+    new.events.take();
+    new.core.sync_now().unwrap();
+    let events = new.events.take();
+    let done = events.iter().position(|e| matches!(e, Event::DeviceLinkState(s) if s.state == DeviceLinkPhase::Done));
+    let changed = events.iter().position(|e| matches!(e, Event::IdentityChanged(_)));
+    assert!(done.is_some() && changed > done, "done, then identity.changed: {:?}", names(&events));
+
+    let mine = new.core.get_identity().unwrap().unwrap();
+    assert_eq!(mine.id, me.id);
+    assert_eq!((mine.display_name.as_str(), mine.color.as_deref()), ("Moran", Some("#3b82f6")));
+    assert_eq!((mine.birth_date.as_str(), mine.country.as_str()), ("1990-05-01", "IL"));
+    assert!(mine.pending_birth_date.is_none(), "trusted: no 30-day wait");
+    new.core.sync_now().unwrap();
+    assert!(new.core.list_servers().unwrap().iter().any(|s| s.id == server.id), "my servers came back");
+
+    // One use: the link is gone.
+    assert_eq!(old.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(old.core.confirm_device_approval(true).unwrap_err().code, ErrorCode::BadRequest);
+}
+
+/// Device link: the QR path; a QR whose key isn't the link's, a second
+/// approving device, 3 attempts, a refusal, expiry and cancel; and the
+/// event leaves absent fields out.
+#[test]
+fn a_device_link_holds_its_rules() {
+    let world = World::new();
+    let old = world.peer();
+    sign_up(&old, "Old");
+    let other = world.peer();
+    sign_up(&other, "Other");
+    let new = world.peer();
+
+    // Absent fields are left out, never null (dev-ui #391).
+    let link = new.core.start_device_link().unwrap();
+    let waiting = serde_json::to_string(&Event::DeviceLinkState(link_states(&new).remove(0))).unwrap();
+    assert!(!waiting.contains("null") && !waiting.contains("sas") && !waiting.contains("reason"), "{waiting}");
+
+    // Not a QR, not a code: bad-request. Signed out: can't approve.
+    assert_eq!(old.core.begin_device_approval("hello").unwrap_err().code, ErrorCode::BadRequest);
+    assert_eq!(new.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::NotAllowed);
+
+    // A QR whose key isn't the one answering (a swapped QR): not-found. Its
+    // Hello took the link's one session, so that link is spent.
+    assert_eq!(old.core.begin_device_approval(&new_key_qr(&link.qr)).unwrap_err().code, ErrorCode::NotFound);
+
+    // A new link (it replaces the last). The real QR: digits. A second
+    // approving device is refused (one session).
+    let link = new.core.start_device_link().unwrap();
+    let first = old.core.begin_device_approval(&link.qr).unwrap();
+    assert_eq!(other.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::LockedOut);
+    // The same device again (a retry): the same session, the same digits.
+    assert_eq!(old.core.begin_device_approval(&link.qr).unwrap().sas, first.sas);
+    // Refused: nothing is sent; the third attempt is the last.
+    old.core.confirm_device_approval(false).unwrap();
+    assert_eq!(old.core.confirm_device_approval(true).unwrap_err().code, ErrorCode::BadRequest);
+    old.core.begin_device_approval(&link.qr).unwrap();
+    old.core.confirm_device_approval(false).unwrap();
+    assert_eq!(old.core.begin_device_approval(&link.qr).unwrap_err().code, ErrorCode::RateLimited);
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "nothing was sent");
+
+    // Expiry: 5 minutes on, the new device's link ends.
+    link_states(&new);
+    advance(&world, 5 * 60_000);
+    new.core.sync_now().unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].reason), (DeviceLinkPhase::Expired, Some(DeviceLinkReason::Timeout)));
+
+    // Cancel: failed, cancelled; the code then finds nothing.
+    let again = new.core.start_device_link().unwrap();
+    link_states(&new);
+    new.core.cancel_device_link().unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Cancelled)));
+    assert_eq!(other.core.begin_device_approval(&again.code).unwrap_err().code, ErrorCode::NotFound);
+
+    // Signed in, a device can't start a link.
+    assert_eq!(old.core.start_device_link().unwrap_err().code, ErrorCode::NotAllowed);
+}
+
+/// The same QR with another 32-byte key in front (as a swapped QR would be).
+fn new_key_qr(qr: &str) -> String {
+    let data = qr.strip_prefix("mvs-link:1:").unwrap();
+    let mut bytes = bs58::decode(data).into_vec().unwrap();
+    bytes[0] ^= 1;
+    format!("mvs-link:1:{}", bs58::encode(bytes).into_string())
+}
+
+/// Security Lead on #394: a DHT server saw the rendezvous and races the
+/// first Hello with its own account. The new device applies nothing until
+/// its user confirms the digits; mine is then locked out (`locked-out`), and
+/// "they don't match" ends the link with nothing applied. With the right
+/// device, the account that arrived before the confirm is applied on it.
+#[test]
+fn a_racing_device_cant_sign_the_new_device_in() {
+    let world = World::new();
+    let mine = world.peer();
+    let me = sign_up(&mine, "Me");
+    let mallory = world.peer();
+    sign_up(&mallory, "Mallory");
+    let new = world.peer();
+
+    let link = new.core.start_device_link().unwrap();
+    // Before any Hello there are no digits to confirm.
+    assert_eq!(new.core.confirm_device_link(true).unwrap_err().code, ErrorCode::BadRequest);
+    // Mallory gets there first and sends her account at once.
+    let theirs = mallory.core.begin_device_approval(&link.code).unwrap();
+    assert_eq!(mine.core.begin_device_approval(&link.code).unwrap_err().code, ErrorCode::LockedOut);
+    mallory.core.confirm_device_approval(true).unwrap();
+    link_states(&new);
+    new.core.sync_now().unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].sas.as_deref()), (DeviceLinkPhase::Confirm, Some(theirs.sas.as_str())));
+    assert!(states.iter().all(|s| s.state != DeviceLinkPhase::Done));
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "nothing applied before the confirm");
+    // My digits aren't hers: "they don't match".
+    new.core.confirm_device_link(false).unwrap();
+    let states = link_states(&new);
+    assert_eq!((states[0].state, states[0].reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Refused)));
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "her account was wiped, never applied");
+    assert_eq!(new.core.confirm_device_link(true).unwrap_err().code, ErrorCode::NotFound);
+
+    // Start again with my device; this time the account arrives first and
+    // the confirm applies it.
+    let link = new.core.start_device_link().unwrap();
+    let approval = mine.core.begin_device_approval(&link.qr).unwrap();
+    mine.core.confirm_device_approval(true).unwrap();
+    new.core.sync_now().unwrap();
+    assert!(new.core.get_identity().unwrap().is_none(), "held until the confirm");
+    let states = link_states(&new);
+    assert!(states.iter().any(|s| s.sas.as_deref() == Some(approval.sas.as_str())));
+    new.core.confirm_device_link(true).unwrap();
+    assert!(link_states(&new).iter().any(|s| s.state == DeviceLinkPhase::Done));
+    assert_eq!(new.core.get_identity().unwrap().unwrap().id, me.id);
+}
+
+/// Member relays, slice 2: the network is told `effective` and the daily
+/// cap at start and on every change, and only then.
+#[test]
+fn the_network_follows_the_member_relay_setting() {
+    let world = World::new();
+    let net = RelayOnlyNet::new(&world.network);
+    let owner = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    sign_up(&owner, "Owner");
+    let relays = || net.relays.lock().unwrap().clone();
+    assert_eq!(relays(), [(false, 2_048, false)], "told at start");
+    owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    assert_eq!(relays().last(), Some(&(true, 2_048, true)));
+    owner.core.set_member_relay_cap(512).unwrap();
+    assert_eq!(relays().last(), Some(&(true, 512, true)));
+    let told = relays().len();
+    owner.core.sync_now().unwrap();
+    assert_eq!(relays().len(), told, "nothing changed, nothing told");
+    // Slice 3a: a metered network stops serving at once; unmetered resumes it.
+    owner.core.set_metered(true).unwrap();
+    assert_eq!(relays().last(), Some(&(false, 512, true)), "metered: serving stops");
+    owner.core.set_metered(false).unwrap();
+    assert_eq!(relays().last(), Some(&(true, 512, true)), "unmetered: serving resumes");
+    owner.core.set_relay_only(true).unwrap();
+    assert_eq!(relays().last(), Some(&(false, 512, true)));
+}
+
+/// dev-ui #408: "a new device was added" is kept until `ackDeviceNotice`,
+/// and announced again after each start (the first sync round) until then.
+#[test]
+fn a_device_added_notice_stays_until_acknowledged() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-notice-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("core.sqlite");
+    let _ = std::fs::remove_file(&db);
+    let secrets = Arc::new(MemoryStore::new());
+    let world = World::new();
+    let added = |events: Vec<Event>| -> Vec<u64> {
+        events.into_iter().filter_map(|e| match e { Event::DeviceAdded { at, .. } => Some(at), _ => None }).collect()
+    };
+    let at = {
+        let old = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
+        sign_up(&old, "Old");
+        old.core.sync_now().unwrap();
+        let new = world.peer();
+        let link = new.core.start_device_link().unwrap();
+        old.core.begin_device_approval(&link.code).unwrap();
+        new.core.sync_now().unwrap();
+        new.core.confirm_device_link(true).unwrap();
+        old.events.take();
+        old.core.confirm_device_approval(true).unwrap();
+        let events = old.events.take();
+        let json = serde_json::to_string(&events).unwrap();
+        assert!(!json.contains("label"), "an unknown label is left out: {json}");
+        added(events)[0]
+    };
+    // Restarted: announced again at the first sync round, once.
+    let old = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
+    old.core.sync_now().unwrap();
+    old.core.sync_now().unwrap();
+    assert_eq!(added(old.events.take()), [at]);
+    old.core.ack_device_notice(at).unwrap();
+    drop(old);
+    // Acknowledged: never again.
+    let old = world.peer_with(secrets, Some(db), Arc::new(PendingGroupKeys));
+    old.core.sync_now().unwrap();
+    assert!(added(old.events.take()).is_empty());
+    drop(old);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// QA on c12bf75: a refused link leaves nothing behind. The next good link
+/// on the same new device saves the account.
+#[test]
+fn a_refused_link_then_a_good_one_signs_in() {
+    let world = World::new();
+    let old = world.peer();
+    let me = sign_up(&old, "Me");
+    let new = world.peer();
+
+    let link = new.core.start_device_link().unwrap();
+    old.core.begin_device_approval(&link.code).unwrap();
+    new.core.sync_now().unwrap();
+    new.core.confirm_device_link(false).unwrap();
+    assert_eq!(old.core.confirm_device_approval(true).unwrap_err().code, ErrorCode::NotFound, "the link is closed");
+
+    let link = new.core.start_device_link().unwrap();
+    let approval = old.core.begin_device_approval(&link.code).unwrap();
+    new.core.sync_now().unwrap();
+    assert!(link_states(&new).iter().any(|s| s.sas.as_deref() == Some(approval.sas.as_str())));
+    new.core.confirm_device_link(true).unwrap();
+    old.core.confirm_device_approval(true).unwrap();
+    new.core.sync_now().unwrap();
+    assert!(link_states(&new).iter().any(|s| s.state == DeviceLinkPhase::Done));
+    assert_eq!(new.core.get_identity().unwrap().unwrap().id, me.id);
+}
+
+/// A keychain that reads (empty) but can't store, like a headless
+/// gnome-keyring with no login collection.
+struct NoWriteKeyring;
+
+impl identity::SecretStore for NoWriteKeyring {
+    fn load(&self, _: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, identity::StoreError> {
+        Ok(None)
+    }
+
+    fn save(&self, _: &str, _: &[u8]) -> Result<(), identity::StoreError> {
+        Err(identity::StoreError("no collection to store in".into()))
+    }
+
+    fn delete(&self, _: &str) -> Result<(), identity::StoreError> {
+        Ok(())
+    }
+}
+
+/// QA on c12bf75: when the account arrives but this computer's keychain
+/// can't store it, `failed` says so (`keyring`), not nothing.
+#[test]
+fn a_link_that_cant_be_stored_says_keyring() {
+    let world = World::new();
+    let old = world.peer();
+    sign_up(&old, "Me");
+    let events = Arc::new(CollectingSink::new());
+    let new = Core::open(
+        Config { db_path: None, app_version: "test".into() },
+        Ports {
+            secrets: Arc::new(NoWriteKeyring),
+            network: world.network.clone(),
+            events: events.clone(),
+            clock: world.clock.clone(),
+            cipher: Arc::new(PendingGroupKeys),
+        },
+    )
+    .unwrap();
+    let link = new.start_device_link().unwrap();
+    old.core.begin_device_approval(&link.code).unwrap();
+    new.sync_now().unwrap();
+    new.confirm_device_link(true).unwrap();
+    old.core.confirm_device_approval(true).unwrap();
+    new.sync_now().unwrap();
+    let last = events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::DeviceLinkState(s) => Some(s),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!((last.state, last.reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Keyring)));
+    assert!(new.get_identity().unwrap().is_none());
+}
+
+/// G-91 (Security Lead on #457): an answer that can't be judged (peers
+/// sent the log without its genesis) keeps the server waiting; the next
+/// full answer brings it back. One bad round never loses a server.
+#[test]
+fn a_partial_answer_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    net.partial.store(true, std::sync::atomic::Ordering::SeqCst);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "still waiting");
+    net.partial.store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): the app lock drops the server secrets a
+/// waiting restore holds and pauses it; after unlock the backup is fetched
+/// again and the server still comes back.
+#[test]
+fn a_waiting_restore_pauses_while_locked_and_resumes_after() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+
+    laptop.core.lock_keys();
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tries = load(&net.server_fetches);
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty(), "nothing while locked");
+    assert_eq!(load(&net.server_fetches), tries, "no tries while locked");
+
+    let fetches = load(&net.fetches);
+    laptop.core.unlock_keys();
+    laptop.core.sync_now().unwrap();
+    assert!(load(&net.fetches) > fetches, "the backup is fetched again after unlock");
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): a log that has the genesis but lacks my
+/// join makes the join look refused ("invalid"), yet proves nothing: the
+/// server keeps waiting, and comes back once a full log arrives. Only an
+/// accepted kick or leave of me (or a close) drops it.
+#[test]
+fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let server = bob.core.create_server("Bob's", AgeRestriction::None).unwrap();
+    me.core.join_server(&server.invite_link).unwrap();
+    me.core.sync_now().unwrap();
+    let my_key = peer_key(&me);
+
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    *net.hide_joins_of.lock().unwrap() = Some(my_key);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(created.words).unwrap();
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "not dropped");
+
+    *net.hide_joins_of.lock().unwrap() = None;
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    let back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(back, [server.id]);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+fn peer_key(peer: &Peer) -> PublicKey {
+    let id = peer.core.get_identity().unwrap().unwrap().id;
+    PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
 }

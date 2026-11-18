@@ -1,42 +1,87 @@
-// Voice v1: piece E (#223) and E2, the voice room amendment. Every server has
-// one voice room in the channel sidebar ("Join chat"); everyone sees who is in
-// it, can join, mute and leave; text channels don't carry calls.
+// Voice v1: piece E (#223), and voice rooms (0.4.3, docs/ux/specs/voice-rooms.md):
+// the pinned "Join chat" row opens a new room; the live rooms sit under it, with
+// who is in each and the host crowned; text channels don't carry calls.
 
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import { Store } from '../app/store';
 import type { Settings } from '../app/settings';
 import { MockCore, type MockOptions } from '../core/mock';
-import { cleanCall, cleanVoiceRoom, guardCore } from '../core/sanitize';
+import { cleanCall, cleanVoiceRoom, cleanVoiceRooms, guardCore } from '../core/sanitize';
 
 // jsdom has no WebRTC: the engine (piece D) has its own tests in src/voice. Here it
 // is an idle engine with a working mic; ?voiceSim drives the failure states.
-const fakeEngine = vi.hoisted(() => ({ peerFailed: {} as Record<string, 'failed' | 'refused'>, stunUrls: [] as unknown[] }));
+const fakeEngine = vi.hoisted(() => ({
+  peerFailed: {} as Record<string, 'failed' | 'refused'>,
+  stunUrls: [] as unknown[],
+  picked: [] as string[],
+  level: 0.42,
+  /** G-82: everyone the fake engine hears as speaking. */
+  speakingAll: false,
+  deafened: false,
+  selfMonitor: false,
+  fallback: null as null | { kind: 'input' | 'output'; label: string | null; at: number },
+}));
 vi.mock('../voice', () => ({
-  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => (fakeEngine.stunUrls.push(options?.stunUrl), {
+  // A hook: deafen is React state, as in the real one, so the call bar re-renders.
+  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
+    const [deafened, setDeafened] = useState(false);
+    const [selfMonitor, setSelfMonitor] = useState(false);
+    fakeEngine.selfMonitor = selfMonitor;
+    const [volumes, setVolumes] = useState<Record<string, number>>({});
+    fakeEngine.deafened = deafened;
+    fakeEngine.stunUrls.push(options?.stunUrl);
+    return {
     ready: true,
-    speaking: {},
+    // G-82: with speakingAll, every id the proxy is asked about is speaking.
+    speaking: fakeEngine.speakingAll ? new Proxy({}, { get: () => true }) : {},
     peerFailed: fakeEngine.peerFailed,
     setMicMuted: () => {},
-    inputs: [],
-    outputs: [],
-    setInput: () => {},
-    setOutput: () => {},
-  }),
+    inputs: [
+      { deviceId: 'mic-a', label: 'Desk mic' },
+      { deviceId: 'mic-b', label: 'Headset mic' },
+    ],
+    outputs: [{ deviceId: 'spk-a', label: 'Headphones' }],
+    setInput: (id: string) => fakeEngine.picked.push(`in:${id}`),
+    setOutput: (id: string) => fakeEngine.picked.push(`out:${id}`),
+    inputLevel: () => fakeEngine.level,
+    deafened,
+    setDeafened: (on: boolean) => {
+      fakeEngine.deafened = on;
+      setDeafened(on);
+    },
+    deviceFallback: fakeEngine.fallback,
+    selfMonitor,
+    setSelfMonitor,
+    volumes,
+    setVolume: (id: string, pct: number) => {
+      fakeEngine.picked.push(`vol:${id}:${pct}`);
+      setVolumes((v) => ({ ...v, [id]: pct }));
+    },
+    };
+  },
+}));
+
+// G-64: the join/leave cue is recorded, not played (jsdom has no Web Audio).
+vi.mock('../voice/devices', async (orig) => ({
+  ...(await orig<typeof import('../voice/devices')>()),
+  playCallCue: vi.fn(async () => {}),
 }));
 
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
 /** `ipNoticeSeen: false` starts as on a computer that never joined a call. */
-async function setup(options: MockOptions = {}, { ipNoticeSeen = true } = {}) {
+async function setup(options: MockOptions = {}, { ipNoticeSeen = true, prefs = {} as Partial<Settings> } = {}) {
   if (ipNoticeSeen) localStorage.setItem('mvs.notices.voiceIp.v1', '1');
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, ...options });
-  render(<App core={core} initialSettings={settings} />);
+  render(<App core={core} initialSettings={{ ...settings, ...prefs }} />);
   await screen.findByRole('textbox', { name: /^Message / });
-  const ENTRY = /^(Join chat|You're in the chat|The chat is full)/;
-  const entry = () => screen.getByRole('button', { name: ENTRY });
-  await screen.findByRole('button', { name: ENTRY });
+  await screen.findByRole('button', { name: 'Join chat' });
+  // The first room's row, once the rooms are read.
+  if (options.voiceRooms !== 0) await waitFor(() => expect(rows().length).toBeGreaterThan(0));
+  const entry = () => rows()[0];
   const join = async () =>
     act(async () => {
       fireEvent.click(entry());
@@ -66,52 +111,333 @@ describe('STUN for the voice engine (#222)', () => {
   );
 });
 
-describe('voice room', () => {
-  it('shows who is in the room before joining, and no Join in the channel header', async () => {
+/** Text without the bidi isolates the messages wrap values in. */
+const plain = (s: string | null | undefined) => (s ?? '').replace(/[⁨⁩]/g, '');
+/** A room row: its label is "<name>, n of max[, state]". */
+const ROW = (n: string) => /, \d of \d/.test(plain(n));
+const rows = () => screen.queryAllByRole('button', { name: ROW });
+const label = (el: Element) => plain(el.getAttribute('aria-label'));
+const root = () => screen.getByRole('button', { name: 'Join chat' });
+const rooms = async (core: MockCore) => core.listVoiceRooms((await core.listServers())[0].id);
+const click = async (el: Element) =>
+  act(async () => {
+    fireEvent.click(el);
+  });
+
+describe('G-72: voice settings in a call', () => {
+  it('picks the microphone and the speaker, and shows the mic level', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      const bar = await screen.findByRole('region', { name: 'Voice call' });
+      await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+      const dialog = screen.getByRole('dialog', { name: 'Voice settings' });
+      const mic = within(dialog).getByRole('combobox', { name: 'Microphone' }) as HTMLSelectElement;
+      expect([...mic.options].map((o) => o.text)).toEqual(['System default', 'Desk mic', 'Headset mic']);
+      fakeEngine.picked = [];
+      await act(async () => {
+        fireEvent.change(mic, { target: { value: 'mic-b' } });
+      });
+      const speaker = within(dialog).getByRole('combobox', { name: 'Speakers' });
+      await act(async () => {
+        fireEvent.change(speaker, { target: { value: 'spk-a' } });
+      });
+      expect(fakeEngine.picked).toEqual(['in:mic-b', 'out:spk-a']);
+      // The level, polled while the dialog is open.
+      await act(async () => {
+        vi.advanceTimersByTime(250);
+      });
+      const meter = within(dialog).getByRole('meter', { name: 'Mic test' });
+      expect(meter.getAttribute('aria-valuenow')).toBe('42');
+      expect(within(dialog).getByText(/the bar moves when your microphone hears you/)).toBeTruthy();
+      // Hear myself: off by default, and closing the dialog turns it off.
+      const hear = within(dialog).getByRole('switch', { name: 'Hear myself' }) as HTMLInputElement;
+      expect(hear.checked).toBe(false);
+      await click(hear);
+      expect(fakeEngine.selfMonitor).toBe(true);
+      expect(within(dialog).getByRole('button', { name: 'Play test sound' })).toBeTruthy();
+      await click(within(dialog).getByRole('button', { name: 'Close' }));
+      expect(fakeEngine.selfMonitor).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('G-84b: the others see "deafened"', () => {
+  it('deafen tells the core; my roster row shows crossed headphones instead of the mic', async () => {
+    const { core, entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const told = vi.spyOn(core, 'setDeafened');
+    await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
+    expect(told).toHaveBeenCalledWith(true);
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    await waitFor(() => expect(within(roster).getAllByRole('img', { name: 'Deafened' })).toHaveLength(1));
+    await click(within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' }));
+    expect(told).toHaveBeenLastCalledWith(false);
+    await waitFor(() => expect(within(roster).queryAllByRole('img', { name: 'Deafened' })).toHaveLength(0));
+  });
+});
+
+describe('G-72 part 2: an unplugged device', () => {
+  it('says which device was unplugged and that the default is used', async () => {
+    fakeEngine.fallback = { kind: 'input', label: 'Headset mic', at: 1 };
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      await screen.findByRole('region', { name: 'Voice call' });
+      await waitFor(() => expect(screen.getByText(/Headset mic/).closest('[role=status]')?.textContent).toBe('Microphone ⁨Headset mic⁩ was unplugged. Using the system default.'));
+    } finally {
+      fakeEngine.fallback = null;
+    }
+  });
+});
+
+describe('G-73: volume per person', () => {
+  it('a slider per other person in my call, with their name and the percent', async () => {
     const { entry } = await setup();
-    expect(entry().getAttribute('aria-label')).toBe('Join chat, 2 of 5 inside');
+    await click(entry()); // the demo room has 2 people already
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    await click(within(bar).getByRole('button', { name: 'Voice settings' }));
+    const group = within(screen.getByRole('dialog', { name: 'Voice settings' })).getByRole('group', { name: 'Volume for each person in the call' });
+    const sliders = within(group).getAllByRole('slider');
+    expect(sliders).toHaveLength(2);
+    expect(sliders.every((s) => s.getAttribute('aria-valuetext') === '100%')).toBe(true);
+    fakeEngine.picked = [];
+    await act(async () => {
+      fireEvent.change(sliders[0]!, { target: { value: '35' } });
+    });
+    expect(fakeEngine.picked).toHaveLength(1);
+    expect(fakeEngine.picked[0]).toMatch(/^vol:.+:35$/);
+    expect(within(group).getAllByRole('slider')[0]!.getAttribute('aria-valuetext')).toBe('35%');
+    expect(within(group).getByText(/Only you hear the change/)).toBeTruthy();
+  });
+});
+
+describe('G-73 v2: the roster menu (0–200%, mute for me)', () => {
+  it('right-click a person in my call: Volume… (0–200%) and Mute for me, which restores the volume', async () => {
+    const { entry } = await setup();
+    await click(entry());
+    await screen.findByRole('region', { name: 'Voice call' });
+    const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+    const others = () => within(roster).getAllByRole('listitem').filter((li) => li.getAttribute('aria-haspopup') === 'menu');
+    expect(others()).toHaveLength(2); // not me
+    const menuFor = async (li: HTMLElement) => {
+      await act(async () => {
+        fireEvent.contextMenu(li, { clientX: 10, clientY: 10 });
+      });
+      return screen.getByRole('menu');
+    };
+    // Volume…: a dialog with a 0–200% slider.
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Volume…' }));
+    const slider = within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('slider') as HTMLInputElement;
+    expect(slider.max).toBe('200');
+    expect(slider.step).toBe('10');
+    // The 100% tick, in the middle of the track.
+    expect([...(slider.list?.options ?? [])].map((o) => o.value)).toEqual(['100']);
+    await act(async () => {
+      fireEvent.change(slider, { target: { value: '160' } });
+    });
+    expect(slider.getAttribute('aria-valuetext')).toBe('160%');
+    await click(within(screen.getByRole('dialog', { name: /^Volume: / })).getByRole('button', { name: 'Close' }));
+    // Mute for me, then Unmute for me brings back 160%.
+    fakeEngine.picked = [];
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Mute for me' }));
+    await click(within(await menuFor(others()[0]!)).getByRole('menuitem', { name: 'Unmute for me' }));
+    expect(fakeEngine.picked.map((x) => x.split(':').at(-1))).toEqual(['0', '160']);
+  });
+});
+
+describe('G-64: a sound when someone joins or leaves my call', () => {
+  type Call = { channelId: string; participants: { identity: string; muted: boolean }[]; full: boolean };
+  const callOf = (core: MockCore) => (core as unknown as { call: Call }).call;
+  const emitCall = (core: MockCore, call: Call) =>
+    act(async () => {
+      (core as unknown as { emit: (e: 'call.state', c: Call) => void }).emit('call.state', call);
+    });
+  const cue = async () => vi.mocked((await import('../voice/devices')).playCallCue);
+
+  it('no sound for my own join; a join plays the rising cue and announces who, a leave the falling one', async () => {
+    const played = await cue();
+    played.mockClear();
+    const { core, entry } = await setup();
+    await click(entry());
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    expect(played).not.toHaveBeenCalled();
+    const before = callOf(core);
+    await emitCall(core, { ...before, participants: [...before.participants, { identity: 'u-99', muted: false }] });
+    expect(played).toHaveBeenLastCalledWith('join', undefined);
+    expect(bar.querySelector('[aria-live="polite"]')?.textContent).toMatch(/joined the call$/);
+    await emitCall(core, before);
+    expect(played).toHaveBeenLastCalledWith('leave', undefined);
+    expect(bar.querySelector('[aria-live="polite"]')?.textContent).toMatch(/left the call$/);
+    expect(played).toHaveBeenCalledTimes(2);
+  });
+
+  it('silent while deafened, and when turned off in Settings → Voice; still announced', async () => {
+    const played = await cue();
+    for (const [label, opts] of [
+      ['deafened', {}],
+      ['setting off', { prefs: { callSounds: false } }],
+    ] as const) {
+      played.mockClear();
+      const { core, entry } = await setup({}, opts);
+      await click(entry());
+      const bar = await screen.findByRole('region', { name: 'Voice call' });
+      if (label === 'deafened') await click(within(bar).getByRole('button', { name: 'Deafen' }));
+      const before = callOf(core);
+      await emitCall(core, { ...before, participants: [...before.participants, { identity: 'u-98', muted: false }] });
+      expect(played, label).not.toHaveBeenCalled();
+      expect(bar.querySelector('[aria-live="polite"]')?.textContent, label).toMatch(/joined the call$/);
+      cleanup();
+    }
+  });
+});
+
+describe('G-82: the speaking ring', () => {
+  it('rings who is speaking in my room, but never someone muted (or deafened)', async () => {
+    fakeEngine.speakingAll = true;
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      await screen.findByRole('region', { name: 'Voice call' });
+      const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+      const items = within(roster).getAllByRole('listitem');
+      const muted = items.filter((li) => within(li).queryByRole('img', { name: 'Microphone off' }));
+      const open = items.filter((li) => !within(li).queryByRole('img', { name: 'Microphone off' }));
+      expect(muted.length).toBeGreaterThan(0);
+      expect(open.length).toBeGreaterThan(0);
+      expect(muted.every((li) => !li.classList.contains('speaking'))).toBe(true);
+      expect(open.every((li) => li.classList.contains('speaking'))).toBe(true);
+    } finally {
+      fakeEngine.speakingAll = false;
+    }
+  });
+});
+
+describe('G-84: deafen', () => {
+  it('deafen mutes me too and undeafen unmutes me; unmuting while deafened undeafens', async () => {
+    fakeEngine.deafened = false;
+    const { entry } = await setup();
+    await click(entry());
+    const bar = await screen.findByRole('region', { name: 'Voice call' });
+    const deafen = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' });
+    const mute = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Mute' });
+    expect(deafen().getAttribute('aria-pressed')).toBe('false');
+    expect(mute().getAttribute('aria-pressed')).toBe('false');
+
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(true);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    expect(within(bar).getByRole('status').textContent).toContain("You can't hear the call");
+
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(false);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('false'));
+
+    // Unmuting while deafened undeafens.
+    await click(deafen());
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    await click(mute());
+    expect(fakeEngine.deafened).toBe(false);
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('false'));
+  });
+
+  it('undeafen leaves me muted if I was muted before deafening', async () => {
+    fakeEngine.deafened = false;
+    const { entry } = await setup();
+    await click(entry());
+    const mute = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Mute' });
+    const deafen = () => within(screen.getByRole('region', { name: 'Voice call' })).getByRole('button', { name: 'Deafen' });
+    await screen.findByRole('region', { name: 'Voice call' });
+    await click(mute());
+    await waitFor(() => expect(mute().getAttribute('aria-pressed')).toBe('true'));
+    await click(deafen());
+    await click(deafen());
+    expect(fakeEngine.deafened).toBe(false);
+    expect(mute().getAttribute('aria-pressed')).toBe('true');
+  });
+});
+
+describe('voice rooms (0.4.3)', () => {
+  it('shows the rooms before joining: name, count, who is in it, the host crowned', async () => {
+    const { entry } = await setup();
+    expect(label(entry())).toMatch(/^.+'s room, 2 of 5$/);
     expect(entry().getAttribute('aria-disabled')).toBeNull();
+    // The pinned row is there with its hint, since a room exists.
+    expect(document.getElementById(root().getAttribute('aria-describedby')!)?.textContent).toBe('Opens a new room');
     const roster = await screen.findByRole('list', { name: 'In the voice chat' });
     expect(within(roster).getAllByRole('listitem')).toHaveLength(2);
     expect(within(roster).getAllByRole('img', { name: 'Microphone off' })).toHaveLength(1);
+    expect(within(roster).getAllByRole('img', { name: 'Room host' })).toHaveLength(1);
     expect(screen.queryByRole('button', { name: 'Join call' })).toBeNull();
     expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
+  });
+
+  it('no rooms: only the pinned row, without the hint; a click opens my room with me as host', async () => {
+    const { core } = await setup({ voiceRooms: 0 });
+    expect(rows()).toHaveLength(0);
+    expect(root().getAttribute('aria-describedby')).toBeNull();
+    await click(root());
+    const [mine] = await rooms(core);
+    const me = (await core.getIdentity())!;
+    expect(mine.masterId).toBe(me.id);
+    expect(rows()).toHaveLength(1);
+    expect(label(rows()[0])).toBe(`${me.displayName}'s room, 1 of 5, You're in the chat`);
+    expect(within(screen.getByRole('list', { name: 'In the voice chat' })).getAllByRole('img', { name: 'Room host' })).toHaveLength(1);
+    expect(screen.getByRole('region', { name: 'Voice call' })).toBeTruthy();
+    expect(root().getAttribute('aria-describedby')).toBeTruthy();
+  });
+
+  it('the pinned row always opens a new room, leaving the one I was in (one room at a time)', async () => {
+    const { core, join } = await setup();
+    await join();
+    expect((await rooms(core))[0].members).toHaveLength(3);
+    await click(root());
+    const list = await rooms(core);
+    expect(list).toHaveLength(2);
+    expect(list[0].members).toHaveLength(2); // I left the first
+    expect(list[1].members).toHaveLength(1);
+    // And clicking the first room again moves me back: my room empties and goes.
+    await click(rows()[0]);
+    expect(await rooms(core)).toHaveLength(1);
+    expect((await rooms(core))[0].members).toHaveLength(3);
   });
 
   describe('the one-time IP notice (docs/ux/specs/voice-ip-notice.md)', () => {
     it('shows before the first join; joinCall waits for "Got it", which is remembered', async () => {
       const { core, join } = await setup({}, { ipNoticeSeen: false });
-      const [server] = await core.listServers();
-      const inRoom = async () => (await core.getVoiceRoom(server.id)).participants.length;
+      const inRoom = async () => (await rooms(core))[0].members.length;
       await join();
       const dialog = screen.getByRole('dialog', { name: 'Before your first call' });
       expect(document.getElementById(dialog.getAttribute('aria-describedby')!)?.textContent).toContain('can see your IP address');
       expect(document.activeElement?.textContent).toBe('Got it');
       expect(await inRoom()).toBe(2); // joinCall not called yet
-      expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
-      await act(async () => {
-        fireEvent.click(within(dialog).getByRole('button', { name: 'Got it' }));
-      });
+      await click(within(dialog).getByRole('button', { name: 'Got it' }));
       expect(await inRoom()).toBe(3);
       expect(localStorage.getItem('mvs.notices.voiceIp.v1')).toBe('1');
       const bar = screen.getByRole('region', { name: 'Voice call' });
       await waitFor(() => expect(document.activeElement).toBe(within(bar).getByRole('button', { name: 'Mute' })));
-      // Leave and join again: no notice the second time.
-      await act(async () => {
-        fireEvent.click(within(bar).getByRole('button', { name: 'Leave call' }));
-      });
-      await join();
+      // Leave and open a room: no notice the second time.
+      await click(within(bar).getByRole('button', { name: 'Leave call' }));
+      await click(root());
       expect(screen.queryByRole('dialog')).toBeNull();
-      expect(await inRoom()).toBe(3);
-      expect(screen.getByRole('region', { name: 'Voice call' })).toBeTruthy();
+      expect(await rooms(core)).toHaveLength(2);
     });
 
-    it('Cancel: no join, nothing saved, and the notice comes back next time', async () => {
+    it('also before the first create', async () => {
+      const { core } = await setup({ voiceRooms: 0 }, { ipNoticeSeen: false });
+      await click(root());
+      await click(within(screen.getByRole('dialog', { name: 'Before your first call' })).getByRole('button', { name: 'Got it' }));
+      expect(await rooms(core)).toHaveLength(1);
+    });
+
+    it('Cancel: no join, nothing saved, focus back on the row, and the notice comes back next time', async () => {
       const { join, entry } = await setup({}, { ipNoticeSeen: false });
       await join();
-      await act(async () => {
-        fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
-      });
+      await click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
       expect(screen.queryByRole('dialog')).toBeNull();
       expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
       expect(localStorage.getItem('mvs.notices.voiceIp.v1')).toBeNull();
@@ -120,21 +446,22 @@ describe('voice room', () => {
       expect(screen.getByRole('dialog', { name: 'Before your first call' })).toBeTruthy();
     });
 
-    it('a full room shows no notice: the entry is disabled', async () => {
+    it('a full room shows no notice: the row is disabled', async () => {
       const { join } = await setup({ roomFull: true }, { ipNoticeSeen: false });
       await join();
       expect(screen.queryByRole('dialog')).toBeNull();
     });
   });
 
-  it('joins from the sidebar entry: call bar, me in the roster, names shown once', async () => {
+  it('joins from a room row: call bar, me in the roster, names shown once', async () => {
     const { entry, join } = await setup();
     await join();
     const bar = screen.getByRole('region', { name: 'Voice call' });
     expect(bar.textContent).toContain('In the voice chat');
     expect(within(bar).queryAllByRole('listitem')).toHaveLength(0); // names only in the roster
-    expect(entry().getAttribute('aria-label')).toBe("You're in the chat, 3 of 5 inside");
+    expect(label(entry())).toMatch(/'s room, 3 of 5, You're in the chat$/);
     expect(entry().getAttribute('aria-disabled')).toBe('true');
+    expect(entry().className).toContain('in-room');
     expect(within(screen.getByRole('list', { name: 'In the voice chat' })).getAllByRole('listitem')).toHaveLength(3);
   });
 
@@ -146,46 +473,174 @@ describe('voice room', () => {
     const before = within(roster).queryAllByRole('img', { name: 'Microphone off' }).length;
     const mute = within(bar).getByRole('button', { name: 'Mute' });
     expect(mute.getAttribute('aria-pressed')).toBe('false');
-    await act(async () => {
-      fireEvent.click(mute);
-    });
+    await click(mute);
     expect(within(bar).getByRole('button', { name: 'Mute' }).getAttribute('aria-pressed')).toBe('true');
     // The roster everyone sees follows the mute.
     expect(within(roster).getAllByRole('img', { name: 'Microphone off' })).toHaveLength(before + 1);
-    await act(async () => {
-      fireEvent.click(within(bar).getByRole('button', { name: 'Leave call' }));
-    });
+    await click(within(bar).getByRole('button', { name: 'Leave call' }));
     expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Join chat, 2 of 5 inside' })).toBeTruthy();
+    expect(label(rows()[0])).toMatch(/'s room, 2 of 5$/);
   });
 
-  it('a full room is disabled, with the reason, and a click does nothing', async () => {
+  it('a full room is aria-disabled, says so in its name and tooltip, and a click does nothing', async () => {
     const { entry, join } = await setup({ roomFull: true });
     expect(entry().getAttribute('aria-disabled')).toBe('true');
-    expect(entry().getAttribute('aria-label')).toBe('The chat is full, 5 of 5 inside');
-    const reason = document.getElementById(entry().getAttribute('aria-describedby')!);
-    expect(reason?.textContent).toBe('The call is full: up to 5 people.');
+    expect(label(entry())).toMatch(/'s room, 5 of 5, The chat is full$/);
+    expect(entry().getAttribute('title')).toBe('The chat is full');
+    expect(entry().querySelector('.voice-room-count.full')).toBeTruthy();
     await join();
     expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
   });
 
-  it('relay-only: the refused join disables the entry and says why', async () => {
+  it('relay-only: the refused join disables the pinned row and every room, and says why', async () => {
     const { entry, join } = await setup({ callError: 'relay-only' });
     await join();
+    expect(root().getAttribute('aria-disabled')).toBe('true');
     expect(entry().getAttribute('aria-disabled')).toBe('true');
     const reason = document.getElementById(entry().getAttribute('aria-describedby')!);
     expect(reason?.textContent).toContain('Calls are off in relay-only mode: in a call, computers connect directly');
+    expect(root().getAttribute('aria-describedby')).toContain(reason!.id);
     expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
+  });
+
+  it('10 rooms: the pinned row is off with the cap reason; 8 are listed and "2 more rooms" shows the rest', async () => {
+    await setup({ voiceRooms: 10 });
+    expect(root().getAttribute('aria-disabled')).toBe('true');
+    const reason = root()
+      .getAttribute('aria-describedby')!
+      .split(' ')
+      .map((id) => document.getElementById(id)?.textContent)
+      .join(' | ');
+    expect(reason).toContain('This server already has many rooms. Join one of them.');
+    expect(rows()).toHaveLength(8);
+    const more = screen.getByRole('button', { name: (n) => plain(n) === '2 more rooms' });
+    await click(more);
+    expect(rows()).toHaveLength(10);
+    expect(screen.queryByRole('button', { name: (n) => plain(n) === '2 more rooms' })).toBeNull();
   });
 
   it.each([
     ['call-full', 'The call is full: up to 5 people.'],
     ['not-implemented', "Calls aren't available in this version yet."],
+    ['in-call-elsewhere', "You're already in this call on another computer. Leave it there to join from here."],
   ] as const)('says why a join failed: %s', async (code, text) => {
     const { join } = await setup({ callError: code });
     await join();
     expect(document.querySelector('.call-blocked')?.textContent).toContain(text);
     expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
+  });
+
+  it('a refused create (room-cap from the core) says so under the pinned row', async () => {
+    await setup({ callError: 'room-cap' });
+    await click(root());
+    expect(document.querySelector('.call-blocked')?.textContent).toContain('This server already has many rooms.');
+  });
+
+  it('a join refused with a code the UI does not know shows the generic reason, never the code', async () => {
+    const { join } = await setup({ callError: 'some-future-code' as unknown as 'call-full' });
+    await join();
+    const line = document.querySelector('.call-blocked')?.textContent ?? '';
+    expect(line).toContain("Couldn't join the call. You can try again.");
+    expect(line).not.toContain('some-future-code');
+  });
+
+  it('host hand-off: the next earliest gets the crown, the default name follows, and the room hears it', async () => {
+    const { core, join } = await setup();
+    await join();
+    const [before] = await rooms(core);
+    const [, second] = before.members;
+    const secondName = (await core.listMembers(before.serverId)).find((m) => m.id === second.userId)!.displayName;
+    act(() => core.simulateVoiceLeave(before.roomId, before.masterId));
+    const [after] = await rooms(core);
+    expect(after.masterId).toBe(second.userId);
+    await waitFor(() => expect(label(rows()[0])).toBe(`${secondName}'s room, 2 of 5, You're in the chat`));
+    const live = document.querySelector('.voice-rooms [aria-live="polite"]');
+    expect(plain(live?.textContent)).toBe(`${secondName} is now the room host`);
+  });
+
+  it('hand-off keeps a name of its own', async () => {
+    const { core, join } = await setup();
+    await join();
+    const [room] = await rooms(core);
+    // I own the first demo server, so I may rename any room in it.
+    await act(async () => {
+      await core.editVoiceRoom(room.roomId, 'Raid night');
+    });
+    act(() => core.simulateVoiceLeave(room.roomId, room.masterId));
+    await waitFor(() => expect(label(rows()[0])).toBe("Raid night, 2 of 5, You're in the chat"));
+  });
+
+  it('the last one out: the room disappears for everyone', async () => {
+    const { core } = await setup();
+    const [room] = await rooms(core);
+    act(() => room.members.forEach((p) => core.simulateVoiceLeave(room.roomId, p.userId)));
+    await waitFor(() => expect(rows()).toHaveLength(0));
+    expect(await rooms(core)).toHaveLength(0);
+  });
+
+  it('the room menu: rename and limit only for the host and the server owner', async () => {
+    const { core, entry } = await setup();
+    // First demo server: I own it, so I see them on a room I'm not in.
+    fireEvent.contextMenu(entry());
+    let menu = screen.getByRole('menu');
+    expect(within(menu).getAllByRole('menuitem').map((m) => m.textContent)).toEqual(['Join', 'Copy room name', 'Rename', 'Member limit']);
+    fireEvent.keyDown(menu, { key: 'Escape' });
+    // Another server, owned by someone else: no Rename, no Member limit (not in the DOM).
+    const [, other] = await core.listServers();
+    expect(other.ownerId).not.toBe((await core.getIdentity())!.id);
+    const rail = [...document.querySelectorAll<HTMLButtonElement>('button.rail-button')].find((b) => (b.getAttribute('aria-label') ?? '').includes(other.name))!;
+    await click(rail);
+    await waitFor(() => expect(document.querySelector('.voice-room-row')?.id).toContain(other.id));
+    fireEvent.contextMenu(rows()[0]);
+    menu = screen.getByRole('menu');
+    expect(within(menu).getAllByRole('menuitem').map((m) => m.textContent)).toEqual(['Join', 'Copy room name']);
+  });
+
+  it('the host renames inline: Enter saves, Esc cancels, empty restores the default', async () => {
+    const { core } = await setup({ voiceRooms: 0 });
+    await click(root());
+    const me = (await core.getIdentity())!;
+    const rename = async () => {
+      fireEvent.contextMenu(rows()[0]);
+      await click(within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Rename' }));
+      return screen.getByRole('textbox', { name: 'Rename' }) as HTMLInputElement;
+    };
+    let field = await rename();
+    expect(document.activeElement).toBe(field);
+    expect(field.maxLength).toBe(32);
+    fireEvent.change(field, { target: { value: 'Late night' } });
+    fireEvent.keyDown(field, { key: 'Escape' });
+    expect(screen.queryByRole('textbox', { name: 'Rename' })).toBeNull();
+    expect((await rooms(core))[0].name).toBeUndefined();
+    field = await rename();
+    fireEvent.change(field, { target: { value: '  Late night ' } });
+    await act(async () => {
+      fireEvent.keyDown(field, { key: 'Enter' });
+    });
+    expect((await rooms(core))[0].name).toBe('Late night');
+    await waitFor(() => expect(label(rows()[0])).toBe("Late night, 1 of 5, You're in the chat"));
+    field = await rename();
+    expect(field.value).toBe('Late night');
+    fireEvent.change(field, { target: { value: '' } });
+    await act(async () => {
+      fireEvent.keyDown(field, { key: 'Enter' });
+    });
+    await waitFor(() => expect(label(rows()[0])).toBe(`${me.displayName}'s room, 1 of 5, You're in the chat`));
+  });
+
+  it('the limit: 2–5, never below the people inside', async () => {
+    const { core, join } = await setup();
+    await join(); // 3 inside
+    fireEvent.contextMenu(rows()[0]);
+    await click(within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Member limit' }));
+    const dialog = screen.getByRole('dialog', { name: 'Member limit' });
+    const option = (n: number) => within(dialog).getByRole('button', { name: (x) => plain(x) === `Up to ${n}` }) as HTMLButtonElement;
+    expect(option(2).disabled).toBe(true);
+    expect(option(3).disabled).toBe(false);
+    expect(option(5).getAttribute('aria-pressed')).toBe('true');
+    await click(option(3));
+    expect((await rooms(core))[0].limit).toBe(3);
+    await waitFor(() => expect(label(rows()[0])).toMatch(/3 of 3, You're in the chat$/));
   });
 
   it('no microphone: stays in the call to listen, muted for everyone, and says so', async () => {
@@ -199,9 +654,7 @@ describe('voice room', () => {
       await waitFor(() => expect(mute.getAttribute('aria-pressed')).toBe('true'));
       expect(mute.getAttribute('aria-disabled')).toBe('true');
       expect(mute.getAttribute('title')).toMatch(/^No microphone/);
-      await act(async () => {
-        fireEvent.click(mute); // can't unmute without a microphone
-      });
+      await click(mute); // can't unmute without a microphone
       expect(within(bar).getByRole('button', { name: 'Mute' }).getAttribute('aria-pressed')).toBe('true');
       // The others see me muted in the room roster too.
       const roster = screen.getByRole('list', { name: 'In the voice chat' });
@@ -256,8 +709,7 @@ describe('voice room', () => {
 
   it('shows the per-person state the engine reports (#245), by reason', async () => {
     const { core, join } = await setup();
-    const [server] = await core.listServers();
-    const others = (await core.getVoiceRoom(server.id)).participants.map((p) => p.userId);
+    const others = (await rooms(core))[0].members.map((p) => p.userId);
     fakeEngine.peerFailed = { [others[0]]: 'refused', [others[1]]: 'failed' };
     try {
       await join();
@@ -274,16 +726,15 @@ describe('voice room', () => {
     const store = new Store(core);
     store.start();
     await store.init();
-    const [server] = await core.listServers();
-    const room = await core.getVoiceRoom(server.id);
+    const [room] = await rooms(core);
     await store.joinCall(room.roomId);
     expect(store.getState().call).not.toBeNull();
     // My own Leave isn't news.
     await store.leaveCall();
     expect(store.getState().callError).toBeNull();
     await store.joinCall(room.roomId);
-    store.setRelayOnly(true);
-    await core.leaveCall(); // as the core does when relay-only goes on
+    // The core ends my call when relay-only goes on, and says why (#272).
+    await store.setRelayOnly(true);
     expect(store.getState().call).toBeNull();
     expect(store.getState().callError).toBe('relay-only');
   });
@@ -293,7 +744,7 @@ describe('voice room', () => {
     const [server] = await core.listServers();
     const [channel] = await core.listChannels(server.id);
     await expect(core.joinCall(channel.id)).rejects.toMatchObject({ code: 'not-allowed' });
-    const room = await core.getVoiceRoom(server.id);
+    const [room] = await rooms(core);
     await expect(core.joinCall(room.roomId)).resolves.toMatchObject({ channelId: room.roomId });
   });
 
@@ -314,37 +765,83 @@ describe('voice room', () => {
     expect(c.full).toBe(false);
   });
 
-  it('cleanVoiceRoom drops a room with a bad id, too many people or unknown fields', () => {
+  describe('the voice rooms sanitizer (design §5)', () => {
     const id = (c: string) => c.repeat(64);
-    const p = (d: string, muted = false) => ({ userId: id(d), muted });
-    const ok = { serverId: id('a'), roomId: id('b'), participants: [p('1', true), p('2')] };
-    expect(cleanVoiceRoom(ok)).toEqual(ok);
-    expect(cleanVoiceRoom({ ...ok, participants: [] })).toEqual({ ...ok, participants: [] });
-    for (const bad of [
-      null,
-      'room',
-      { ...ok, roomId: 'b‮'.repeat(3) }, // not an id
-      { ...ok, serverId: id('A') }, // upper-case hex
-      { ...ok, participants: ['1', '2', '3', '4', '5', '6'].map((d) => p(d)) }, // 6 people
-      { ...ok, participants: [p('1'), p('1')] }, // twice
-      { ...ok, participants: [{ ...p('1'), muted: 'no' }] },
-      { ...ok, participants: [{ ...p('1'), addr: '10.0.0.1' }] }, // unknown field
-      { ...ok, extra: 1 }, // unknown field
-      { ...ok, participants: 'x' },
-    ]) {
-      expect(cleanVoiceRoom(bad)).toBeNull();
-    }
-  });
+    const p = (d: string, muted = false, joinedAt = 1000) => ({ userId: id(d), muted, joinedAt });
+    const ok = { serverId: id('a'), roomId: id('b'), creatorId: id('1'), createdAt: 1000, limit: 5, masterId: id('1'), members: [p('1', true), p('2', false, 2000)] };
 
-  it('a malformed voice.room event is dropped; a good one updates the roster', async () => {
-    const handlers = new Map<string, (p: unknown) => void>();
-    const bare = { on: (e: string, h: (p: unknown) => void) => (handlers.set(e, h), () => {}) } as unknown as Parameters<typeof guardCore>[0];
-    const seen: unknown[] = [];
-    guardCore(bare).on('voice.room', (r) => seen.push(r));
-    const send = handlers.get('voice.room')!;
-    send({ serverId: 'a'.repeat(64), roomId: 'b'.repeat(64), participants: [{ userId: 'c'.repeat(64), muted: false }] });
-    send({ serverId: 'a'.repeat(64), roomId: '<img>', participants: [] });
-    expect(seen).toHaveLength(1);
+    it('keeps a good room; a name is cleaned, and one that cleans to nothing is the default', () => {
+      expect(cleanVoiceRoom(ok)).toEqual(ok);
+      expect(cleanVoiceRoom({ ...ok, name: '  Raid‮ night ' })).toEqual({ ...ok, name: 'Raid night' });
+      expect(cleanVoiceRoom({ ...ok, name: '‮‏' })).toEqual(ok);
+      expect(cleanVoiceRoom({ ...ok, name: 'x'.repeat(40) })?.name).toHaveLength(32);
+      // #272: relayOnly is passed on only when true, and never gets the room dropped.
+      expect(cleanVoiceRoom({ ...ok, relayOnly: true })).toEqual({ ...ok, relayOnly: true });
+      expect(cleanVoiceRoom({ ...ok, relayOnly: false })).toEqual(ok);
+    });
+
+    it('G-84b: deafened is kept only with muted, and must be a boolean', () => {
+      const deaf = { ...ok, members: [{ ...p('1', true), deafened: true }, { ...p('2'), deafened: true }] };
+      expect(cleanVoiceRoom(deaf)?.members).toEqual([{ ...p('1', true), deafened: true }, p('2')]);
+      expect(cleanVoiceRoom({ ...ok, members: [{ ...p('1', true), deafened: 'yes' }] })).toBeNull();
+      expect(cleanCall({ channelId: id('b'), participants: [{ identity: id('1'), muted: true, deafened: true }, { identity: id('2'), muted: false, deafened: true }], full: false } as never).participants).toEqual([
+        { identity: id('1'), muted: true, deafened: true },
+        { identity: id('2'), muted: false },
+      ]);
+    });
+
+    it('drops a room with a bad id, limit, roster or host, or an unknown field', () => {
+      for (const bad of [
+        null,
+        'room',
+        { ...ok, roomId: 'b‮'.repeat(3) }, // not an id
+        { ...ok, serverId: id('A') }, // upper-case hex
+        { ...ok, masterId: id('9') }, // host not in the room
+        { ...ok, creatorId: '<img>' },
+        { ...ok, createdAt: -1 },
+        { ...ok, createdAt: '1000' },
+        { ...ok, limit: 1 },
+        { ...ok, limit: 6 },
+        { ...ok, limit: 2.5 },
+        { ...ok, limit: 2, members: [p('1'), p('2'), p('3')] }, // more than the limit
+        { ...ok, members: [] }, // an empty room is gone
+        { ...ok, members: ['1', '2', '3', '4', '5', '6'].map((d) => p(d)) }, // 6 people
+        { ...ok, members: [p('1'), p('1')] }, // twice
+        { ...ok, members: [{ ...p('1'), muted: 'no' }] },
+        { ...ok, members: [{ ...p('1'), joinedAt: Number.NaN }] },
+        { ...ok, members: [{ ...p('1'), addr: '10.0.0.1' }] }, // unknown field
+        { ...ok, name: 7 },
+        { ...ok, relayOnly: 'yes' },
+        { ...ok, extra: 1 }, // unknown field
+        { ...ok, members: 'x' },
+      ]) {
+        expect(cleanVoiceRoom(bad)).toBeNull();
+      }
+    });
+
+    it('a list: at most 10 rooms, one server, each room once; a bad room alone is left out; oldest first', () => {
+      const room = (d: string, createdAt = 1000) => ({ ...ok, roomId: id(d), createdAt });
+      expect(cleanVoiceRooms(id('a'), [room('c', 3000), room('b', 2000)])?.map((r) => r.roomId)).toEqual([id('b'), id('c')]);
+      expect(cleanVoiceRooms(id('a'), [room('b'), { ...room('c'), limit: 9 }])).toHaveLength(1);
+      expect(cleanVoiceRooms(id('a'), 'x')).toBeNull();
+      expect(cleanVoiceRooms('<x>', [])).toBeNull();
+      expect(cleanVoiceRooms(id('a'), [room('b'), room('b')])).toBeNull();
+      expect(cleanVoiceRooms(id('a'), [{ ...room('b'), serverId: id('f') }])).toBeNull();
+      expect(cleanVoiceRooms(id('a'), '0123456789a'.split('').map((d) => room(d)))).toBeNull(); // 11
+    });
+
+    it('a malformed voice.rooms event is dropped; a good one passes', () => {
+      const handlers = new Map<string, (p: unknown) => void>();
+      const bare = { on: (e: string, h: (p: unknown) => void) => (handlers.set(e, h), () => {}) } as unknown as Parameters<typeof guardCore>[0];
+      const seen: unknown[] = [];
+      guardCore(bare).on('voice.rooms', (r) => seen.push(r));
+      const send = handlers.get('voice.rooms')!;
+      send({ serverId: id('a'), rooms: [ok] });
+      send({ serverId: id('a'), rooms: [ok, ok] });
+      send({ serverId: '<img>', rooms: [] });
+      send(null);
+      expect(seen).toEqual([{ serverId: id('a'), rooms: [ok] }]);
+    });
   });
 
   it('drops a malformed call.signal instead of passing on a cleaned-up guess', () => {

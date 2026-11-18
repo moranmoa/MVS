@@ -177,6 +177,14 @@ const shot = async (p, name) => {
 {
   const p = await page('?fresh=1&lang=he&theme=light');
   await p.getByRole('button', { name: 'כבר יש לי חשבון' }).click();
+  // Since #290 the restore asks the agreement, country and birth date first.
+  await p.getByRole('checkbox').check();
+  await p.getByRole('button', { name: 'המשך' }).click();
+  await p.getByRole('button', { name: 'המשך' }).click();
+  await p.getByLabel('יום').fill('12');
+  await p.getByLabel('חודש').fill('4');
+  await p.getByLabel('שנה').fill('2001');
+  await p.getByRole('button', { name: 'המשך' }).click();
   const words = 'apple river stone cloud tiger piano lemon rockett forest candle silver garden';
   await p.getByLabel('מילה 1', { exact: true }).focus();
   await p.evaluate((text) => {
@@ -219,6 +227,7 @@ const shot = async (p, name) => {
 }
 
 // ---- chat -------------------------------------------------------------------
+const PHONE_ROOMS = { width: 375, height: 812, phone: true };
 async function chat(query, name, opts) {
   const p = await page(query, opts);
   await p.getByRole('article').first().waitFor();
@@ -288,6 +297,7 @@ for (const [section, name] of [
   ['storage', '32-settings-storage'],
   ['diagnostics', '33-settings-diagnostics'],
   ['about', '34-settings-about'],
+  ['notifications', '361-settings-notifications-he'],
 ]) {
   const p = await chat(`?demo=unchecked&still=1&lang=he&theme=light&settings=${section}`, 'x');
   await p.getByRole('button', { name: 'הגדרות' }).first().click();
@@ -383,16 +393,16 @@ for (const [detail, name] of [
 }
 
 // ---- voice v1, pieces E and E2: the voice room and the call bar (240-249) -------
-// Joining: the room entry, then the one-time IP notice (243-244, docs/ux/specs/voice-ip-notice.md).
+// Joining: the first room's row, then the one-time IP notice (243-244, docs/ux/specs/voice-ip-notice.md).
 async function joinRoom(p, ok = 'הבנתי') {
-  await p.locator('.voice-room-entry').click();
+  await p.locator('.voice-room-row').first().click();
   await p.getByRole('dialog').getByRole('button', { name: ok }).click();
 }
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
   await p.locator('.voice-room-people li').first().waitFor();
   await shot(p, '245-voice-room-he');
-  await p.locator('.voice-room-entry').click();
+  await p.locator('.voice-room-row').first().click();
   await p.getByRole('dialog').waitFor();
   await shot(p, '243-call-ip-notice-he');
   await p.getByRole('dialog').getByRole('button', { name: 'הבנתי' }).click();
@@ -412,7 +422,7 @@ async function joinRoom(p, ok = 'הבנתי') {
 }
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&roomFull=1', 'x');
-  await p.locator('.voice-room-reason').waitFor();
+  await p.locator('.voice-room-count.full').waitFor();
   await shot(p, '242-call-full-he');
   await p.close();
 }
@@ -424,7 +434,7 @@ async function joinRoom(p, ok = 'הבנתי') {
 }
 {
   const p = await chat('?demo=1&still=1&lang=en&theme=light&update=999999', 'x');
-  await p.locator('.voice-room-entry').click();
+  await p.locator('.voice-room-row').first().click();
   await p.getByRole('dialog').waitFor();
   await shot(p, '244-call-ip-notice-en-light');
   await p.close();
@@ -439,6 +449,210 @@ for (const [sim, name, wait] of [
   await p.locator(wait).waitFor();
   await p.waitForTimeout(300);
   await shot(p, name);
+  await p.close();
+}
+
+// ---- #288: messages held for the channel key (280-289) ----------------------
+for (const [mode, name, wait] of [
+  ['wait', '280-held-sending-he', '.send-state.held.pending'],
+  ['fail', '281-held-failed-he', '.send-state.held.failed'],
+]) {
+  const p = await chat(`?demo=1&still=1&lang=he&theme=light&update=999999&keyPending=${mode}`, 'x');
+  const box = p.getByRole('textbox', { name: /כתיבה ב/ });
+  await box.fill('הצטרפתי עכשיו, שלום לכולם');
+  await box.press('Enter');
+  await p.locator(wait).waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- B11e: edit my profile in Settings → Account (90-99) --------------------
+// 94 (onboarding, no Skip), 95 (profile card with bio and banner) and 96 (long
+// name at 200%) wait for the onboarding change and the banner.
+for (const [query, name, opts, steps] of [
+  ['lang=he&theme=light', '90-account-he', {}, 'open'],
+  ['lang=he&theme=light', '91-account-dirty-he', {}, 'dirty'],
+  ['lang=en&theme=light', '92-account-en-light', {}, 'open'],
+  ['lang=he&theme=light&profileError=1', '93-account-save-error-he', {}, 'error'],
+  ['lang=he&theme=light', '97-account-phone-he', { width: 375, height: 812, phone: true }, 'dirty'],
+  // #362: a light custom colour gets a dark letter; "צבע אחר" is ticked.
+  ['lang=he&theme=dark', '98-account-color-custom-dark-he', { colorScheme: 'dark' }, 'custom'],
+]) {
+  const p = opts.phone
+    ? await page(`?demo=1&still=1&update=999999&settings=account&${query}`, opts)
+    : await chat(`?demo=1&still=1&update=999999&${query}`, 'x', opts);
+  if (opts.phone) {
+    await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  } else {
+    await p.locator('.me-profile').click();
+  }
+  const dialog = p.getByRole('dialog');
+  const field = dialog.locator('.profile-editor input:not([type=file]):not([type=color])');
+  await field.waitFor();
+  if (steps !== 'open') {
+    await field.fill(name.includes('-en') ? 'Moran B' : 'מורן ב.');
+    await dialog.locator('.profile-editor textarea').fill('גיימרית בלילות, מתכנתת בימים');
+  }
+  // #362: the palette is a radio group; dirty shots pick pink, custom picks a light yellow.
+  if (steps === 'dirty') await dialog.getByRole('radio').nth(3).click();
+  if (steps === 'custom') {
+    await dialog.locator('.color-custom input').fill('#ffd43b');
+    // Show the preview (dark letter on yellow) with the picker under it.
+    await p.evaluate(() => (document.activeElement)?.blur());
+    await dialog.locator('.profile-editor').evaluate((el) => el.scrollIntoView({ block: 'start' }));
+  }
+  if (steps === 'error') {
+    await dialog.locator('.profile-actions .primary').click();
+    await dialog.locator('.profile-actions .error').waitFor();
+  }
+  await p.waitForTimeout(300);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- #304: sign out on this computer (300-309) ------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.locator('.me-profile').click();
+  const button = p.locator('.sign-out button.danger');
+  await button.scrollIntoViewIfNeeded();
+  await p.waitForTimeout(200);
+  await shot(p, '300-sign-out-button-he');
+  await button.click();
+  const dialog = p.locator('.sign-out-dialog');
+  await dialog.locator('.sign-out-facts').waitFor();
+  await shot(p, '301-sign-out-confirm-he');
+  await dialog.getByRole('button', { name: 'המשך' }).click();
+  await dialog.locator('.word-inputs').waitFor();
+  await shot(p, '302-sign-out-words-he');
+  await dialog.getByRole('button', { name: 'אין לי את המילים' }).click();
+  await dialog.locator('.field input').fill('יציאה בלי מילים');
+  await shot(p, '303-sign-out-no-words-he');
+  await dialog.getByRole('button', { name: 'יציאה בלי מילים' }).click();
+  await p.getByText('כבר יש לי חשבון').waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, '305-after-sign-out-he');
+  await p.close();
+}
+{
+  const p = await page('?demo=1&still=1&lang=he&theme=light&update=999999&settings=account', { width: 375, height: 812, phone: true });
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  const button = p.locator('.sign-out button.danger');
+  await button.scrollIntoViewIfNeeded();
+  await button.click();
+  await p.locator('.sign-out-dialog .sign-out-facts').waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, '304-sign-out-confirm-phone-he');
+  await p.close();
+}
+
+// ---- B7 / #306: a birth-date correction waiting its 30 days (310-319) -------
+for (const [name, opts] of [
+  ['310-account-dob-pending-he', {}],
+  ['311-account-dob-pending-phone-he', { width: 375, height: 812, phone: true }],
+]) {
+  const query = '?demo=1&still=1&lang=he&theme=light&update=999999&pendingDob=1&settings=account';
+  const p = opts.phone ? await page(query, opts) : await chat(query, 'x');
+  if (opts.phone) await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  else await p.locator('.me-profile').click();
+  const pending = p.locator('.dob-pending');
+  await pending.waitFor();
+  await pending.scrollIntoViewIfNeeded();
+  await p.waitForTimeout(300);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- G-01: reorder my servers in the rail (320-329) --------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const items = p.locator('.rail li[data-server-li]');
+  const third = await items.nth(2).locator('button.rail-button').boundingBox();
+  const first = await items.nth(0).locator('button.rail-button').boundingBox();
+  await p.mouse.move(third.x + third.width / 2, third.y + third.height / 2);
+  await p.mouse.down();
+  await p.mouse.move(third.x + third.width / 2, third.y + third.height / 2 - 10, { steps: 2 });
+  await p.mouse.move(first.x + first.width / 2 + 6, first.y + 6, { steps: 6 });
+  await p.locator('.rail li.drop-before').waitFor();
+  await shot(p, '320-server-order-drag-he');
+  await p.mouse.up();
+  await p.waitForTimeout(200);
+  await shot(p, '321-server-order-dropped-he');
+  await p.close();
+}
+{
+  const p = await page('?demo=1&still=1&lang=he&theme=light&update=999999', { width: 375, height: 812, phone: true });
+  const rail = p.locator('.rail');
+  await rail.locator('button[data-server-id]').first().waitFor();
+  await rail.locator('button[data-server-id]').first().dispatchEvent('contextmenu');
+  await p.getByRole('menuitem', { name: 'שינוי סדר השרתים' }).click();
+  await rail.locator('.rail-arrange').first().waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '322-server-order-phone-he');
+  await p.close();
+}
+
+// ---- G-11: the owner reorders the channels (330-339) -------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const rows = p.locator('.channel-list li.channel-row');
+  const third = rows.nth(2);
+  await third.hover();
+  const handle = await third.locator('.channel-handle').boundingBox();
+  const first = await rows.nth(0).boundingBox();
+  await p.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+  await p.mouse.down();
+  await p.mouse.move(handle.x + handle.width / 2, handle.y - 10, { steps: 2 });
+  await p.mouse.move(handle.x + 40, first.y + 6, { steps: 6 });
+  await p.locator('.channel-row.drop-before').waitFor();
+  await shot(p, '330-channel-order-drag-he');
+  await p.mouse.up();
+  await p.waitForTimeout(300);
+  await shot(p, '331-channel-order-dropped-he');
+  await p.close();
+}
+{
+  const p = await page('?demo=1&still=1&lang=he&theme=light&update=999999', { width: 375, height: 812, phone: true });
+  const row = p.locator('.channel-list li.channel-row button.channel').first();
+  await row.waitFor();
+  await row.dispatchEvent('contextmenu');
+  await p.getByRole('menuitem', { name: 'שינוי סדר הערוצים' }).click();
+  await p.locator('.channel-arrange').first().waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '332-channel-order-phone-he');
+  await p.close();
+}
+
+// ---- G-21: where the new messages start (340-349) ----------------------------
+for (const [channel, name, wait] of [
+  [/^מחפשים-קבוצה/, '340-new-messages-divider-he', '.unread-divider'],
+  [/^clips/, '341-new-messages-bar-he', '.unread-bar'],
+]) {
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('navigation', { name: 'ערוצים' }).getByRole('button', { name: channel }).click();
+  await p.locator(wait).waitFor();
+  await p.waitForTimeout(400);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- G-24: mentions (370-379) -------------------------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const box = p.getByRole('textbox', { name: /כתיבה ב/ });
+  await box.fill('');
+  await box.pressSequentially('מי בא הערב @א');
+  await p.locator('.mention-suggestions').waitFor();
+  await shot(p, '370-mention-suggestions-he');
+  await box.press('Enter');
+  await box.pressSequentially('?');
+  await box.press('Enter');
+  await box.fill(`תודה ל-<@${'b'.repeat(64)}> על המפה`);
+  await box.press('Enter');
+  await p.locator('.mention-chip.former').waitFor();
+  await p.waitForTimeout(400);
+  await shot(p, '371-mention-chips-he');
   await p.close();
 }
 
@@ -767,6 +981,333 @@ for (const [lang, t] of [
   await p.locator('.closed-banner').waitFor();
   await p.waitForTimeout(600);
   await shot(p, '256-server-closed-he');
+  await p.close();
+}
+
+
+// ---- voice rooms, 0.4.3 (380-389, docs/ux/specs/voice-rooms.md) ------------
+const ROOMS = '?demo=1&still=1&lang=he&theme=light&update=999999';
+async function sidebarShot(p, name) {
+  await p.waitForTimeout(250);
+  const box = await p.locator('nav:has(.voice-rooms)').boundingBox();
+  await p.screenshot({ path: `${OUT}/${name}.png`, clip: { x: box.x, y: box.y, width: box.width, height: Math.min(box.height, 760) } });
+  console.log('saved', name);
+}
+{
+  const p = await chat(`${ROOMS}&voiceRooms=2`, 'x');
+  await p.locator('.voice-room-row').nth(1).waitFor();
+  await sidebarShot(p, '380-voice-rooms-two-he');
+  await p.close();
+}
+{
+  const p = await chat(`${ROOMS}&voiceRooms=2&roomFull=1`, 'x');
+  await p.locator('.voice-room-count.full').waitFor();
+  await p.locator('.voice-room-row').first().hover();
+  await sidebarShot(p, '381-voice-room-full-he');
+  await p.close();
+}
+{
+  // The host's menu: open a room (IP notice first), then its menu.
+  const p = await chat(`${ROOMS}&voiceRooms=1`, 'x');
+  await p.locator('.voice-root').click();
+  await p.getByRole('dialog').getByRole('button', { name: 'הבנתי' }).click();
+  const mine = p.locator('.voice-room-row.in-room');
+  await mine.waitFor();
+  // The call bar slides in under the list; the speaking ring keeps the row from settling.
+  await p.waitForTimeout(500);
+  await mine.click({ button: 'right', force: true });
+  await p.getByRole('menu').waitFor();
+  await shot(p, '382-voice-room-menu-master-he');
+  await p.getByRole('menuitem', { name: 'שינוי שם' }).click();
+  const field = p.getByRole('textbox', { name: 'שינוי שם' });
+  await field.fill('ערב משחקים');
+  await sidebarShot(p, '383-voice-room-rename-he');
+  await p.close();
+}
+{
+  const p = await page('?demo=1&still=1&lang=he&theme=dark&update=999999&voiceRooms=2', { ...PHONE_ROOMS, colorScheme: 'dark' });
+  const row = p.locator('.voice-room-row').nth(1);
+  await row.waitFor();
+  await p.locator('.voice-rooms').scrollIntoViewIfNeeded();
+  await p.mouse.move(1, 1);
+  await shot(p, '384-voice-rooms-phone-he');
+  // Long-press (here: the context menu) opens the bottom sheet (B25 §5).
+  await row.click({ button: 'right' });
+  await p.getByRole('menu').waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, '386-voice-room-sheet-phone-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=en&theme=light&update=999999&voiceRooms=2', 'x');
+  await p.locator('.voice-room-row').nth(1).waitFor();
+  await sidebarShot(p, '385-voice-rooms-en-light');
+  await p.close();
+}
+{
+  // 10 rooms: the pinned row is off with the cap reason; 8 listed, "2 more rooms".
+  const p = await chat(`${ROOMS}&voiceRooms=10`, 'x');
+  await p.locator('.voice-rooms-more').waitFor();
+  await p.locator('.voice-root').scrollIntoViewIfNeeded();
+  await shot(p, '387-voice-rooms-cap-he');
+  await p.close();
+}
+
+// ---- profile save, 0.4.5 (400-409, docs/ux/specs/profile-save.md) ----------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.locator('.me-profile').click();
+  const dialog = p.getByRole('dialog');
+  await dialog.getByRole('radio', { name: 'ורוד' }).click();
+  await p.waitForTimeout(200);
+  // A draft: only the preview card has the new colour.
+  await shot(p, '401-profile-draft-preview-only-he');
+  await dialog.locator('.profile-actions .primary').click();
+  await dialog.locator('.profile-actions .success').waitFor();
+  await shot(p, '400-profile-saved-everywhere-he');
+  await p.close();
+}
+
+// ---- member relays, slice 1 (410-419, #368) ---------------------------------
+for (const [query, name, step] of [
+  ['lang=he&theme=light', '410-member-relay-on-he', 'privacy'],
+  ['lang=he&theme=light&memberRelay=minor', '411-member-relay-minor-he', 'privacy'],
+  ['lang=he&theme=light&relayOnly=1', '412-member-relay-relay-only-he', 'privacy'],
+  ['lang=he&theme=light&memberRelayUnseen=1', '413-member-relay-disclosure-he', 'disclosure'],
+  ['lang=en&theme=dark&memberRelayUnseen=1', '414-member-relay-disclosure-en-dark', 'disclosure'],
+]) {
+  const p = await chat(`?demo=1&still=1&update=999999&${query}`, 'x', query.includes('dark') ? { colorScheme: 'dark' } : undefined);
+  if (step === 'privacy') {
+    await p.getByRole('button', { name: 'הגדרות' }).first().click();
+    await p.getByRole('button', { name: 'פרטיות' }).click();
+    await p.locator('.member-relay').waitFor();
+  } else {
+    await p.locator('.member-relay-disclosure').waitFor();
+  }
+  await p.waitForTimeout(250);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- device link (420-429, device-link-slice.md) -----------------------------
+for (const [query, name, wait] of [
+  ['lang=he&theme=light', '420-device-link-waiting-he', '.qr-code'],
+  ['lang=he&theme=light&deviceLink=confirm', '421-device-link-digits-he', '.device-link-sas'],
+  ['lang=he&theme=light&deviceLink=expired', '422-device-link-expired-he', '.device-link .error'],
+  ['lang=en&theme=light', '425-device-link-waiting-en-light', '.qr-code'],
+]) {
+  const p = await page(`?fresh=1&${query}`);
+  await p.locator('.onb-card .actions .link').last().click();
+  await p.locator(wait).waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, name);
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'מכשירים' }).click();
+  await p.getByRole('button', { name: 'הוספת מכשיר' }).click();
+  const input = p.locator('.device-code-input');
+  await input.fill('K7QX2 MZRF4');
+  await shot(p, '423-devices-code-he');
+  await p.locator('.devices form button[type=submit]').click();
+  await p.locator('.device-compare').waitFor();
+  await shot(p, '424-devices-compare-he');
+  await p.close();
+}
+
+// ---- "a new device was added" (430-439) --------------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&deviceLinked=Windows', 'x');
+  await p.locator('.device-notice').waitFor();
+  await shot(p, '430-device-notice-he');
+  await p.locator('.device-notice .danger').click();
+  await p.locator('.device-notice-help').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '431-device-notice-help-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999&deviceLinked=', 'x', { colorScheme: 'dark' });
+  await p.locator('.device-notice').waitFor();
+  await shot(p, '432-device-notice-unknown-en-dark');
+  await p.close();
+}
+
+// ---- 0.5.0 conversation (440-449): G-23 date divider, 448 ---------------------------
+for (const [query, name, opts] of [
+  ['lang=he&theme=light', '448-date-divider-he', undefined],
+]) {
+  // Ten hours between messages, so the last screen crosses days.
+  const p = await chat(`?demo=1&still=1&update=999999&gapHours=10&${query}`, 'x', opts);
+  await p.locator('.date-divider').first().waitFor();
+  await p.waitForTimeout(300);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- G-26 reactions (441-442, chat-and-voice-extras.md §2-3) -----------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const row = p.locator('[role=article]:has(.msg:not(.skeleton))').last();
+  for (const name of ['אגודל למעלה', 'אש', 'פרצוף צוחק עם דמעות צחוק']) {
+    await row.hover();
+    await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
+    await p.getByRole('dialog').getByRole('button', { name, exact: true }).click();
+    await p.getByRole('dialog').waitFor({ state: 'detached' });
+  }
+  await row.locator('.reactions').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '441-reactions-he');
+  await row.hover();
+  await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
+  await p.getByRole('dialog').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '442-emoji-picker-he');
+  await p.close();
+}
+
+// ---- G-74 push to talk (446, chat-and-voice-extras.md §6) ----------------------
+{
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 800 }, colorScheme: 'light', locale: 'he-IL' });
+  await ctx.addInitScript(() => {
+    window.mvs = { setPushToTalk: async () => 'ok', onPushToTalk: () => () => {} };
+  });
+  const p = await ctx.newPage();
+  p.on('pageerror', (e) => problems.push(`page error: ${e.message}`));
+  await p.goto(BASE + '?demo=1&still=1&lang=he&theme=light&update=999999');
+  await p.getByRole('textbox', { name: /^כתיבה ב/ }).waitFor();
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'קול' }).click();
+  await p.getByRole('radio', { name: 'לחיצה לדיבור' }).check();
+  const key = p.getByRole('button', { name: 'מקש לדיבור' });
+  await key.click();
+  await key.press('v');
+  await p.locator('.voice-settings').scrollIntoViewIfNeeded();
+  await shot(p, '446-push-to-talk-he');
+  await p.close();
+}
+
+// Relay-only (#272): 270–271.
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&relayOnly=1&settings=privacy', 'x');
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('switch', { name: 'ממסר בלבד' }).waitFor();
+  await shot(p, '270-settings-privacy-relay-only-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&relayOnly=1', 'x');
+  await p.locator('.voice-room-reason').waitFor();
+  await shot(p, '271-voice-room-relay-only-he');
+  await p.close();
+}
+
+// Restore (#290): 290–291. The restore asks the agreement, country and birth date
+// first, then the words, the name, and ends on the servers notice.
+{
+  const p = await page('?fresh=1&lang=he&theme=light');
+  await p.getByRole('button', { name: 'כבר יש לי חשבון' }).click();
+  await p.getByRole('checkbox').check();
+  await shot(p, '290-restore-agreement-he');
+  await p.getByRole('button', { name: 'המשך' }).click();
+  await p.getByRole('button', { name: 'המשך' }).click();
+  await p.getByLabel('יום').fill('12');
+  await p.getByLabel('חודש').fill('4');
+  await p.getByLabel('שנה').fill('2001');
+  await p.getByRole('button', { name: 'המשך' }).click();
+  const words = 'apple river stone cloud tiger piano lemon rocket forest candle silver garden';
+  await p.getByLabel('מילה 1', { exact: true }).focus();
+  await p.evaluate((text) => {
+    const dt = new DataTransfer();
+    dt.setData('text', text);
+    document.activeElement.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true }));
+  }, words);
+  await p.getByRole('button', { name: 'שחזור' }).click();
+  await p.getByLabel('שם תצוגה').fill('מורן');
+  await p.getByRole('button', { name: 'סיום' }).click();
+  await p.getByRole('heading', { name: 'החשבון שוחזר' }).waitFor();
+  await shot(p, '291-restore-servers-notice-he');
+  await p.close();
+}
+
+// Notifications and mute (G-61, G-03, G-17) and mark all as read (G-04): 360, 351.
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const channels = p.getByRole('navigation', { name: 'ערוצים' });
+  await channels.getByRole('button', { name: /^clips/ }).click({ button: 'right' });
+  await p.getByRole('menuitem', { name: 'התראות' }).click();
+  await p.getByRole('dialog', { name: /^התראות של/ }).waitFor();
+  await shot(p, '360-notify-dialog-channel-he');
+  await p.getByRole('button', { name: 'עד שאבטל' }).click();
+  await p.keyboard.press('Escape');
+  await p.getByRole('button', { name: /^Minecraft IL/ }).click({ button: 'right' });
+  await p.getByRole('menuitem', { name: 'התראות' }).click();
+  await p.getByRole('button', { name: 'ל-8 שעות' }).click();
+  await p.keyboard.press('Escape');
+  await p.mouse.move(1, 1);
+  await shot(p, '351-muted-server-and-channel-he');
+  await p.evaluate(() => localStorage.removeItem('mvs.mute.v1'));
+  await p.close();
+}
+
+// G-72 voice settings (UX spec #427 §4): 443 (Settings → קול outside a call),
+// 447 (the in-call Voice settings dialog).
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'קול', exact: true }).click();
+  await p.getByRole('combobox', { name: 'רמקולים' }).waitFor();
+  await shot(p, '443-voice-settings-he');
+  await p.keyboard.press('Escape');
+  await joinRoom(p);
+  const bar = p.getByRole('region', { name: 'שיחה קולית' });
+  await bar.waitFor();
+  await bar.getByRole('button', { name: 'הגדרות קול' }).click();
+  await p.getByRole('dialog', { name: 'הגדרות קול' }).waitFor();
+  await shot(p, '447-voice-dialog-he');
+  await p.close();
+}
+
+// G-84b: a deafened member in the room roster (crossed headphones instead of the mic): 449.
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await joinRoom(p);
+  const bar = p.getByRole('region', { name: 'שיחה קולית' });
+  await bar.waitFor();
+  await bar.getByRole('button', { name: 'השתקת השמע' }).click();
+  await p.getByRole('img', { name: 'השמע כבוי' }).first().waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '449-roster-deafened-he');
+  await p.close();
+}
+
+// Our own title bar (docs/ux/specs/desktop-chrome.md): 390 (he, light), 391 (en, dark),
+// 392 (close during a call). A stand-in for the shell's window bridge, with
+// our own buttons as on Linux; on Windows the OS draws them on the overlay.
+for (const [lang, theme, name, query] of [
+  ['he', 'light', '390-title-bar-he-light', ''],
+  ['en', 'dark', '391-title-bar-en-dark', ''],
+  ['he', 'light', '392-close-in-call-he', 'call'],
+]) {
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 800 }, colorScheme: theme, locale: lang === 'he' ? 'he-IL' : 'en-US' });
+  await ctx.addInitScript(() => {
+    window.mvs = { windowFrame: 'custom', windowControl: async () => true };
+  });
+  const p = await ctx.newPage();
+  p.on('pageerror', (e) => problems.push(`page error: ${e.message}`));
+  await p.goto(`${BASE}?demo=1&still=1&lang=${lang}&theme=${theme}&update=999999`);
+  await p.locator('.titlebar').waitFor();
+  await p.getByRole('article').first().waitFor();
+  if (query === 'call') {
+    await joinRoom(p);
+    await p.getByRole('region', { name: 'שיחה קולית' }).waitFor();
+    await p.locator('.titlebar-button.close').click();
+    await p.getByRole('dialog').waitFor();
+  }
+  await p.waitForTimeout(500);
+  await shot(p, name);
   await p.close();
 }
 

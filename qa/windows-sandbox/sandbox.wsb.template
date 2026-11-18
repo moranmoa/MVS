@@ -1,0 +1,38 @@
+<!--
+  Windows Sandbox config for the MVS release check (qa/windows-sandbox).
+  run.ps1 fills the {{…}} paths (a .wsb needs absolute host paths) and writes
+  the result to .build/<run>/mvs.wsb. Don't run this template directly.
+  Networking is Disable unless run.ps1 got -Network.
+-->
+<Configuration>
+  <Networking>{{NETWORKING}}</Networking>
+  <vGPU>Default</vGPU>
+  <MemoryInMB>4096</MemoryInMB>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <MappedFolders>
+    <!-- The harness scripts: read-only. -->
+    <MappedFolder>
+      <HostFolder>{{HARNESS_DIR}}</HostFolder>
+      <SandboxFolder>C:\harness</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <!-- The release zip and options.json: read-only. -->
+    <MappedFolder>
+      <HostFolder>{{IN_DIR}}</HostFolder>
+      <SandboxFolder>C:\mvs-in</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <!-- The only writable folder: result.json and the app's log. -->
+    <MappedFolder>
+      <HostFolder>{{RESULTS_DIR}}</HostFolder>
+      <SandboxFolder>C:\results</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\harness\inside.ps1</Command>
+  </LogonCommand>
+</Configuration>

@@ -36,9 +36,19 @@ const ENV_KEEP = [
   'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME',
 ];
 
+/**
+ * MVS_DEBUG_LOG=1 (off by default; desktop/README.md): the core logs sync's
+ * debug lines and the join steps to stderr, which main.js writes to mvs.log
+ * through logfile.js (peer IDs, server IDs, IPs and hosts redacted). A fixed
+ * filter: never the user's own RUST_LOG, so never api's requests, words or
+ * identity.
+ */
+const DEBUG_LOG_FILTER = 'off,mvs::join=info,sync=debug';
+
 function minimalEnv(env = process.env) {
   const out = {};
   for (const k of ENV_KEEP) if (env[k] !== undefined) out[k] = env[k];
+  if (env.MVS_DEBUG_LOG === '1') out.RUST_LOG = DEBUG_LOG_FILTER;
   return out;
 }
 
@@ -47,20 +57,25 @@ class Sidecar {
    * @param {object} o
    * @param {string} o.exe absolute path of mvs-core
    * @param {string} o.dataDir absolute path of its data folder
-   * @param {string|null} [o.relay] relay multiaddr, already checked (config.js)
+   * @param {string|null} [o.relay] relay multiaddr, already checked (config.js); the one-relay form of `relays`
+   * @param {string[]} [o.relays] relay multiaddrs in order of preference, already checked (config.js relaysFor); one `--relay` each
    * @param {string[]} [o.bootstrap] the relay's direct multiaddrs, already checked (config.js)
    * @param {string[]} [o.extraArgs] further switches for mvs-core
+   * @param {string|null} [o.script] checkouts only: a .js stand-in for the core, run as `exe <script> ...` with ELECTRON_RUN_AS_NODE=1 (exe is then Electron itself)
    * @param {(name: string, payload: unknown) => void} o.onEvent
    * @param {(line: string) => void} [o.log] for stderr lines and lifecycle notes
    */
-  constructor({ exe, dataDir, relay = null, bootstrap = [], extraArgs = [], onEvent, onStatus = () => {}, log = () => {}, timeouts = {}, backoffBase = 500, spawnImpl = spawn }) {
+  constructor({ exe, dataDir, script = null, relay = null, relays = null, bootstrap = [], extraArgs = [], onEvent, onStatus = () => {}, log = () => {}, timeouts = {}, backoffBase = 500, spawnImpl = spawn }) {
     if (!path.isAbsolute(exe)) throw new Error('mvs-core must be given by an absolute path');
     if (!path.isAbsolute(dataDir)) throw new Error('the data folder must be an absolute path');
     this.exe = exe;
+    if (script !== null && !path.isAbsolute(script)) throw new Error('the core script must be an absolute path');
+    this.script = script;
     this.dataDir = dataDir;
     // Optional: the relay multiaddr (config.js checks it) and extra switches
     // from other parts of the shell (e.g. the updater); strings only.
-    this.relay = relay;
+    if (relays !== null && (!Array.isArray(relays) || relays.some((a) => typeof a !== 'string'))) throw new Error('relays must be strings');
+    this.relays = relays ?? (relay ? [relay] : []);
     // The relay's direct addresses (config.js checks them); only with a relay.
     if (!Array.isArray(bootstrap) || bootstrap.some((a) => typeof a !== 'string')) throw new Error('bootstrap must be strings');
     this.bootstrap = bootstrap;
@@ -103,9 +118,12 @@ class Sidecar {
   start() {
     this.stopped = false;
     const args = [
+      ...(this.script ? [this.script] : []),
       '--data-dir',
       this.dataDir,
-      ...(this.relay ? ['--relay', this.relay, ...this.bootstrap.flatMap((b) => ['--bootstrap', b])] : []),
+      ...(this.relays.length
+        ? [...this.relays.flatMap((r) => ['--relay', r]), ...this.bootstrap.flatMap((b) => ['--bootstrap', b])]
+        : []),
       ...this.extraArgs,
     ];
     let child;
@@ -114,7 +132,7 @@ class Sidecar {
         shell: false,
         windowsHide: true,
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: minimalEnv(),
+        env: this.script ? { ...minimalEnv(), ELECTRON_RUN_AS_NODE: '1' } : minimalEnv(),
       });
     } catch (e) {
       // Some failures throw instead of emitting "error" (on Windows, EFTYPE for

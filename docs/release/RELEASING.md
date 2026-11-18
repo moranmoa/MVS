@@ -109,11 +109,60 @@ domain, so it lives in a **repository variable**, never in git:
 Or with `gh` (PowerShell):
 
 ```powershell
-gh variable set MVS_RELAY_ADDR --repo moranmoa/MVP --body "/dns4/<relay-domain>/tcp/443/wss/p2p/<relay peer id>"
+gh variable set MVS_RELAY_ADDR --repo moranmoa/MVS --body "/dns4/<relay-domain>/tcp/443/wss/p2p/<relay peer id>"
 ```
 
 `mvs-core` dials wss through libp2p's `websocket` transport in `core/sync`
 (#114).
+
+### Several relays (`MVS_RELAY_ADDRS`, `MVS_RELAY_TCP_ADDRS`)
+
+With relay-1 and relay-2 (`infra/RELAY2.md`), set two list variables. They
+win over the single ones (`MVS_RELAY_ADDR`, `MVS_RELAY_TCP_ADDR`), which stay
+as the fallback. One multiaddr per line or comma-separated; real values only
+in the variables, never in git. **The manager sets them**: they hold the
+domain and ports.
+
+- **`MVS_RELAY_ADDRS`**: the relays the app connects to, 1-4, in order of
+  preference, each pinned by its own peer ID:
+  ```text
+  /dns4/<relay-domain>/tcp/443/wss/p2p/<relay-1 peer id>
+  /dns4/<p2p-host>/tcp/4011/p2p/<relay-2 peer id>
+  ```
+  Relay-2 has no wss proxy, so its entry is direct TCP (or
+  `/udp/4011/quic-v1`). That host resolves to the home IP, the same exposure
+  the bootstrap entries below already accept; relay-1 stays behind
+  Cloudflare.
+- **`MVS_RELAY_TCP_ADDRS`**: direct routes to the same relays (DCUtR and
+  QUIC hole punching), 1-4 entries (the apps take at most 4), TCP and/or QUIC,
+  at most one per relay and transport:
+  ```text
+  /dns4/<p2p-host>/tcp/4001/p2p/<relay-1 peer id>
+  /dns4/<p2p-host>/udp/4001/quic-v1/p2p/<relay-1 peer id>
+  /dns4/<p2p-host>/tcp/4011/p2p/<relay-2 peer id>
+  /dns4/<p2p-host>/udp/4011/quic-v1/p2p/<relay-2 peer id>
+  ```
+
+**The build checks them and fails the tag build** (`write-relay-config.mjs`,
+with its cases in the dry-run self-test) if:
+- an entry has the wrong form: bootstrap entries must be plain TCP or QUIC,
+  with no `ws`/`wss` and no circuit; every entry must end in `/p2p/<id>`;
+- the lists disagree: a bootstrap entry for a relay that isn't in
+  `MVS_RELAY_ADDRS`, or a relay with no bootstrap entry;
+- there are too many entries, or a relay (or a relay plus transport) twice.
+
+Errors name the entry's position, never the address.
+
+```powershell
+gh variable set MVS_RELAY_ADDRS --repo moranmoa/MVS --body "<relay-1 wss multiaddr>,<relay-2 tcp multiaddr>"
+gh variable set MVS_RELAY_TCP_ADDRS --repo moranmoa/MVS --body "<relay-1 tcp>,<relay-1 quic>,<relay-2 tcp>,<relay-2 quic>"
+```
+
+**Check before tagging:** run the release workflow by hand on `main`
+(Actions → Release → Run workflow). Its **check relay variables** job runs the
+same checks on the real variables and prints counts only, never the values.
+The rest of that run is a dry run that uses no variables. The tag build then
+runs the checks again on the values it bakes in.
 
 ### First pre-release: data may be reset
 
@@ -150,10 +199,10 @@ Or in one command (PowerShell, logged in to `gh` as the owner):
  "conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},
  "rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}],
  "bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}
-'@ | gh api repos/moranmoa/MVP/rulesets --method POST --input -
+'@ | gh api repos/moranmoa/MVS/rulesets --method POST --input -
 ```
 
-Check: `gh api repos/moranmoa/MVP/rulesets` lists `release tags`.
+Check: `gh api repos/moranmoa/MVS/rulesets` lists `release tags`.
 
 What this does and doesn't cover:
 
@@ -172,8 +221,8 @@ What this does and doesn't cover:
 PowerShell on your normal (online) PC, in the repo:
 
 0. **Write the release notes** first: a `## [X.Y.Z] - YYYY-MM-DD` section in
-   [`CHANGELOG.md`](../../CHANGELOG.md), in Hebrew and English (Fixed / New
-   / Known), merged to `main`. The draft's release notes are that section
+   [`CHANGELOG.md`](../../CHANGELOG.md), in English (New / Fixed /
+   Known; management text is English only), merged to `main`. The draft's release notes are that section
    plus the install and verify text, and **a tag without a section fails**
    at "check tag", before anything builds.
 
@@ -188,10 +237,67 @@ PowerShell on your normal (online) PC, in the repo:
 2. **Wait for the Release workflow** (Actions tab). Its summary lists the
    checksums. The release is a draft: only repo collaborators can see it.
 
-3. **Download and check** the draft's files:
+3. **Sign and publish, in one command** (steps 3–6 below, done for you):
 
    ```powershell
-   gh release download v0.1.0 --repo moranmoa/MVP --dir release-v0.1.0
+   # Dry run first: every check and the build, no key, nothing signed or uploaded.
+   .\.github\scripts\publish-release.ps1 -Tag v0.1.0 -WhatIf
+   # Then for real: signs and publishes alpha and beta, in one key-drive session.
+   .\.github\scripts\publish-release.ps1 -Tag v0.1.0 -Key E:\mvs-keys\root.key
+   ```
+
+   [`publish-release.ps1`](../../.github/scripts/publish-release.ps1) does this:
+   - It downloads the draft (or pre-release) and checks every file against
+     `SHA256SUMS`, and the channel's manifest body against both: version,
+     channel, and each payload's hash and size.
+   - It restamps the body when it is older than 2 days.
+   - It builds `updater` from the tag's own source. The tag must be on
+     `origin/main`, and the source comes from `git archive` of the tag. It
+     never uses a downloaded binary.
+   - It shows a summary (version, channel, hashes, expiry, the first lines of
+     the notes) and asks you to **type the version** to go on.
+   - Only then does it ask you to **connect the key drive**. It checks the
+     key, signs, and runs `updater verify` against the tag's
+     `core/updater/trust/root.json`, each payload included. Then it asks you
+     to **remove the drive** before anything is uploaded.
+   - It publishes the release as a pre-release, then runs
+     `publish-update.ps1` for each channel (step 6).
+
+   **Channels: both by default.** The app's **"stable"** setting reads the
+   **alpha** manifest (`core/api/src/update.rs`: `Stable` → `"alpha"`), and
+   "beta" reads beta. A release published to beta only never reaches stable
+   users, which is what happened with 0.3.2 at first. So the script signs both
+   bodies while the key drive is connected once, and publishes `update-alpha`
+   and `update-beta`, creating either on its first run. `-Channels beta`
+   publishes one channel only, and the summary warns that stable users won't
+   get it.
+   - Any failed check stops it with a message, and nothing after that step
+     runs.
+
+   **The key.** It comes from `-Key` or `$env:MVS_ROOT_KEY`, and the script
+   never prints, copies or uploads it. It reads `MVS_ROOT_KEY` once and
+   clears it from the session before running anything else, so git, gh,
+   cargo build scripts and node never see it. It refuses to run in CI. It
+   also refuses a key inside the repository or in a cloud-synced folder
+   (OneDrive, Dropbox, Google Drive, iCloud), and warns when the drive isn't
+   removable. The key path goes only to `updater sign-manifest`. With this
+   script the key is used on the online PC, which is fine for the closed
+   alpha (SECURITY.md): keep it on an **encrypted removable drive** (for
+   example a USB stick with BitLocker To Go), plugged in and unlocked only
+   when the script asks, and removed when it says so. `updater` is already
+   built by then, so the key is never present while cargo or a `build.rs`
+   runs. Never put the path in the repo, a
+   script or `$PROFILE`. If you would rather keep the key on an offline machine, do
+   steps 3–6 by hand as below.
+
+   After a root rotation, add `-Roots E:\mvs-keys\root-2.json`.
+
+   The manual steps, for reference or for offline signing:
+
+   **Download and check** the draft's files:
+
+   ```powershell
+   gh release download v0.1.0 --repo moranmoa/MVS --dir release-v0.1.0
    cd release-v0.1.0
    Get-Content SHA256SUMS | ForEach-Object {
      $sum, $file = $_ -split '\s+', 2
@@ -215,15 +321,14 @@ PowerShell on your normal (online) PC, in the repo:
 
 4. **Sign offline, one manifest per channel.** The draft carries
    `manifest-body-beta.json` and `manifest-body-alpha.json`. Both have the
-   same artifacts and the "what's new" notes from `CHANGELOG.md` (Hebrew +
-   English). Every release goes to **beta**; sign **alpha** too only when the
-   release is promoted to stable. Copy only the bodies to the signing machine
+   same artifacts and the "what's new" notes from `CHANGELOG.md` (English;
+   sections up to 0.4.0 are bilingual). **Both channels are signed by
+   default** (alpha = stable and beta, #309). Copy only the bodies to the signing machine
    (USB stick). The key never comes to the online PC. There:
 
    ```powershell
    updater sign-manifest --key E:\mvs-keys\root.key --body manifest-body-beta.json --out manifest-beta.json
    updater verify --manifest manifest-beta.json --root root.json
-   # stable only:
    updater sign-manifest --key E:\mvs-keys\root.key --body manifest-body-alpha.json --out manifest-alpha.json
    ```
 
@@ -236,11 +341,11 @@ PowerShell on your normal (online) PC, in the repo:
    what makes the update reach installed apps:
 
    ```powershell
-   gh release edit v0.1.0 --draft=false --repo moranmoa/MVP
+   gh release edit v0.1.0 --draft=false --repo moranmoa/MVS
    ```
 
 6. **Publish the update** to the channel releases the app polls
-   (`https://github.com/moranmoa/MVP/releases/download/update-<channel>/manifest.json`).
+   (`https://github.com/moranmoa/MVS/releases/download/update-<channel>/manifest.json`).
    The script first runs `updater verify` (signature, root chain, expiry;
    build `updater` from a reviewed commit, or pass `-Updater <path>`). It then checks that the signed body's channel and version match, and
    that the update zip in the release matches its hash and size. It then
@@ -261,10 +366,29 @@ PowerShell on your normal (online) PC, in the repo:
    the manifests list only `windows-*`. The Linux `.tar.gz` stays a plain
    release file.
 
+   **First run on a channel:** `update-<channel>` doesn't exist yet, so the
+   script creates it ("… does not exist yet: creating it"); that is expected.
+   It works in Windows PowerShell 5.1 and in PowerShell 7: every `gh` and
+   `updater` call is judged by its exit code, not by what it writes to stderr
+   (before 0.3.3, 5.1 stopped with "release not found" on the first run).
+   Any failed download, create or upload stops the script before it prints
+   "published".
+
 ## Keeping a release alive
 
 Electron bumps follow [ELECTRON-UPGRADE.md](ELECTRON-UPGRADE.md): the Windows
 desktop e2e must be re-run green on the bump itself.
+
+The Windows binaries link the C runtime statically (`+crt-static` in
+`core/.cargo/config.toml`; release.yml fails on any VC++ runtime import). So
+Microsoft's CRT security fixes reach users **only through our rebuilds**,
+not through Windows Update. When Microsoft ships a CRT security fix, rebuild
+with the updated MSVC toolchain and release promptly.
+
+Electron updates that fix image decoders (for example libwebp) are security
+updates: ship them promptly. The app decodes avatars sent by other members,
+so a decoder bug is reachable by anyone in a shared server (Security Lead,
+A4). Follow [ELECTRON-UPGRADE.md](ELECTRON-UPGRADE.md) as usual.
 
 A manifest expires (at most 30 days, 14 by default). Clients refuse it after
 that, which stops an attacker freezing users on an old release. Before it

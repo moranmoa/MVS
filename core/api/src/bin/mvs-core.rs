@@ -1,7 +1,10 @@
 //! The core as a sidecar process: JSON lines on stdin and stdout (see
 //! `api::sidecar`). Logs go to stderr and never hold words, keys or text.
 //!
-//! Usage: `mvs-core --data-dir <dir> [--relay <multiaddr>] [--bootstrap <multiaddr>]... [--update-root <dir>]`.
+//! Usage: `mvs-core --data-dir <dir> [--relay <multiaddr>]... [--bootstrap <multiaddr>]... [--update-root <dir>]`.
+//! `--relay` is repeatable (at most `api::syncnet::MAX_RELAYS`, distinct
+//! relays, in order of preference; multi-relay part A). Until sync takes
+//! several, only the first is used.
 //! With a relay the core syncs through `sync` (its store and node key in
 //! `<dir>/sync`); without one nothing leaves this process for sync.
 //! `--bootstrap` (repeatable, at most [`MAX_BOOTSTRAP`], each pinned like
@@ -58,7 +61,7 @@ const MAX_BOOTSTRAP: usize = 4;
 #[derive(Debug)]
 struct Args {
     data_dir: PathBuf,
-    relay: Option<String>,
+    relays: Vec<String>,
     bootstrap: Vec<String>,
     update_root: Option<PathBuf>,
 }
@@ -69,27 +72,35 @@ fn args() -> Option<Args> {
 
 fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
     let mut data_dir = None;
-    let mut relay = None;
+    let mut relays = Vec::new();
     let mut bootstrap = Vec::new();
     let mut update_root = None;
     while let Some(flag) = args.next() {
         let value = args.next()?;
         match flag.to_str()? {
             "--data-dir" if data_dir.is_none() => data_dir = Some(PathBuf::from(value)),
-            "--relay" if relay.is_none() => relay = Some(value.into_string().ok()?),
+            "--relay" if relays.len() < api::syncnet::MAX_RELAYS => relays.push(value.into_string().ok()?),
             "--bootstrap" if bootstrap.len() < MAX_BOOTSTRAP => bootstrap.push(value.into_string().ok()?),
             "--update-root" if update_root.is_none() => update_root = Some(PathBuf::from(value)),
             _ => return None,
         }
     }
-    Some(Args { data_dir: data_dir?, relay, bootstrap, update_root })
+    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root })
 }
 
-/// Logs to stderr only when RUST_LOG is set (the desktop captures and
-/// redacts stderr); without it nothing is logged. A bad filter is reported
-/// and ignored. Our own lines never hold IPs or IDs below debug.
+/// What is logged without RUST_LOG (see `init_logging`).
+const DEFAULT_LOG: &str = "off,mvs::join=info";
+
+/// Logs to stderr, which the desktop captures and redacts into mvs.log:
+/// RUST_LOG if set, else [`DEFAULT_LOG`] (the join steps). A bad filter is
+/// reported and ignored. Our own lines never hold IPs or IDs below debug.
 fn init_logging() {
-    let Ok(spec) = std::env::var("RUST_LOG") else { return };
+    // Without RUST_LOG: the `mvs::join` target only, at info (EnvFilter matches
+    // by prefix, so not all of `mvs`). These are the join
+    // steps (`api::service`, target `mvs::join`), written for a user's
+    // mvs.log: counts and outcomes, never IDs, links, addresses or text.
+    let from_env = std::env::var("RUST_LOG").ok();
+    let spec = from_env.clone().unwrap_or_else(|| DEFAULT_LOG.to_owned());
     match tracing_subscriber::EnvFilter::try_new(&spec) {
         Ok(filter) => {
             tracing_subscriber::fmt()
@@ -97,7 +108,11 @@ fn init_logging() {
                 .with_writer(io::stderr)
                 .with_ansi(false)
                 .init();
-            tracing::info!(version = env!("CARGO_PKG_VERSION"), "mvs-core: logging on");
+            // Announced only for a RUST_LOG the user set; the default join
+            // log stays quiet until a join.
+            if from_env.is_some() {
+                tracing::info!(version = env!("CARGO_PKG_VERSION"), "mvs-core: logging on");
+            }
         }
         Err(_) => eprintln!("mvs-core: RUST_LOG isn't a valid filter; not logging"),
     }
@@ -107,7 +122,7 @@ fn main() -> ExitCode {
     init_logging();
     let Some(args) = args() else {
         eprintln!(
-            "usage: mvs-core --data-dir <dir> [--relay <multiaddr>] [--bootstrap <multiaddr>]... [--update-root <dir>]"
+            "usage: mvs-core --data-dir <dir> [--relay <multiaddr>]... [--bootstrap <multiaddr>]... [--update-root <dir>]"
         );
         return ExitCode::from(2);
     };
@@ -117,11 +132,36 @@ fn main() -> ExitCode {
         eprintln!("mvs-core: can't prepare the data dir: {e}");
         return ExitCode::FAILURE;
     }
-    let sync: Option<Arc<SyncNetwork>> = match args.relay {
-        None => None,
-        Some(relay) => {
-            let relay = match api::syncnet::relay_addr(&relay) {
-                Ok(relay) => relay,
+    // A sign-out: its files go before anything opens them, only once the
+    // keychain says the secret is gone. On failure stop (the shell
+    // retries): never start with the old node key.
+    let secret_present = match identity::Vault::new(OsKeychain::new()).state() {
+        Ok(identity::VaultState::Empty) => Some(false),
+        Ok(_) => Some(true),
+        Err(_) => None,
+    };
+    match api::finish_sign_out(&dir.join("core.db"), &dir.join("sync"), secret_present) {
+        Ok(true) => eprintln!("mvs-core: signed out; starting fresh"),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("mvs-core: can't finish the sign-out: {}", e.kind());
+            return ExitCode::FAILURE;
+        }
+    }
+    // A sign-out still pending (the keychain couldn't be read): offline, so
+    // the network never starts with the old node key.
+    let relays = if api::sign_out_pending(&dir.join("core.db")) {
+        eprintln!("mvs-core: a sign-out is pending; starting offline");
+        Vec::new()
+    } else {
+        args.relays
+    };
+    let sync: Option<Arc<SyncNetwork>> = if relays.is_empty() {
+        None
+    } else {
+        {
+            let relays = match api::syncnet::relay_addrs(&relays) {
+                Ok(relays) => relays,
                 Err(why) => {
                     eprintln!("mvs-core: --relay {why}");
                     return ExitCode::from(2);
@@ -139,7 +179,15 @@ fn main() -> ExitCode {
             }
             // TODO(#64): a start failure (the node.key ACL) as a notice
             // the UI shows, not only this log line and an exit.
-            match SyncNetwork::start_with_bootstrap(relay, bootstrap, &dir.join("sync"), Arc::new(MemberGate::new())) {
+            // GAP-6r: the node starts with the stored relay-only setting.
+            let relay_only = api::stored_relay_only(&dir.join("core.db"));
+            match SyncNetwork::start_with_bootstrap(
+                relays,
+                bootstrap,
+                relay_only,
+                &dir.join("sync"),
+                Arc::new(MemberGate::new()),
+            ) {
                 Ok(net) => Some(Arc::new(net)),
                 Err(e) => {
                     eprintln!("mvs-core: sync didn't start: {e}");
@@ -233,7 +281,7 @@ mod tests {
     fn bootstrap_is_repeatable_up_to_the_cap() {
         let args = parsed(&["--data-dir", "/d", "--relay", "/r", "--bootstrap", "/a", "--bootstrap", "/b"]).unwrap();
         assert_eq!(args.bootstrap, ["/a", "/b"]);
-        assert_eq!(args.relay.as_deref(), Some("/r"));
+        assert_eq!(args.relays, ["/r"]);
         assert!(parsed(&["--data-dir", "/d"]).unwrap().bootstrap.is_empty());
         let mut many = vec!["--data-dir", "/d"];
         for _ in 0..=MAX_BOOTSTRAP {
@@ -241,5 +289,17 @@ mod tests {
         }
         assert!(parsed(&many).is_none(), "more than {MAX_BOOTSTRAP} bootstrap addresses");
         assert!(parsed(&["--data-dir", "/d", "--bootstrap"]).is_none(), "a flag without its value");
+    }
+
+    #[test]
+    fn relay_is_repeatable_up_to_the_cap_in_order() {
+        assert!(parsed(&["--data-dir", "/d"]).unwrap().relays.is_empty());
+        let two = parsed(&["--data-dir", "/d", "--relay", "/r1", "--relay", "/r2"]).unwrap();
+        assert_eq!(two.relays, ["/r1", "/r2"]);
+        let mut many = vec!["--data-dir", "/d"];
+        for _ in 0..=api::syncnet::MAX_RELAYS {
+            many.extend(["--relay", "/r"]);
+        }
+        assert!(parsed(&many).is_none(), "more than {} relays", api::syncnet::MAX_RELAYS);
     }
 }

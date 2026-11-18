@@ -1,7 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { FormattedNumber, IntlProvider } from 'react-intl';
 import type { Locale } from '../core/types';
-import { directionOf, messagesFor } from '../i18n';
+import { directionOf, LOCALES, messagesFor, pickLocale } from '../i18n';
+import { cleanOrder } from './serverOrder';
+import { cleanNotifyPrefs, type NotifyPrefs } from './notify';
+import { cleanVoicePrefs, type VoicePrefs } from './voicePrefs';
 
 export type Theme = 'system' | 'light' | 'dark';
 
@@ -12,6 +15,14 @@ export interface Settings {
   uiScale: number;
   /** Message text size in px, 12–24. */
   fontSize: number;
+  /** G-01: my order of the servers in the rail, on this computer only. */
+  serverOrder?: string[];
+  /** G-61: desktop notifications, levels and mutes, on this computer only. */
+  notify?: NotifyPrefs;
+  /** G-74: voice activity or push to talk, and the keys, on this computer only. */
+  voice?: VoicePrefs;
+  /** G-64: a short sound when someone joins or leaves my call. On unless false. */
+  callSounds?: boolean;
 }
 
 export const SCALE_MIN = 0.75;
@@ -22,8 +33,8 @@ const SCALE_STEP = 0.1;
 const STORAGE_KEY = 'mvp.settings.v1';
 
 export function defaultSettings(languages: readonly string[] = typeof navigator !== 'undefined' ? navigator.languages : []): Settings {
-  const he = languages.some((l) => l.toLowerCase().startsWith('he') || l.toLowerCase().startsWith('iw'));
-  return { locale: he || languages.length === 0 ? 'he' : 'en', theme: 'system', uiScale: 1, fontSize: 15 };
+  // The system language when we have it; otherwise English (owner, 0.4.1).
+  return { locale: pickLocale(languages), theme: 'system', uiScale: 1, fontSize: 15 };
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -43,11 +54,15 @@ function load(): Settings {
   // Stored values are checked one by one; anything odd falls back to the default.
   const num = (v: unknown, lo: number, hi: number, d: number) => (typeof v === 'number' && Number.isFinite(v) ? clamp(v, lo, hi) : d);
   return {
-    locale: stored.locale === 'he' || stored.locale === 'en' ? stored.locale : base.locale,
+    locale: LOCALES.includes(stored.locale as Locale) ? (stored.locale as Locale) : base.locale,
     theme: stored.theme === 'light' || stored.theme === 'dark' || stored.theme === 'system' ? stored.theme : base.theme,
     uiScale: num(stored.uiScale, SCALE_MIN, SCALE_MAX, base.uiScale),
     fontSize: num(stored.fontSize, FONT_MIN, FONT_MAX, base.fontSize),
-    ...(lang === 'he' || lang === 'en' ? { locale: lang } : {}),
+    serverOrder: cleanOrder(stored.serverOrder),
+    notify: cleanNotifyPrefs(stored.notify),
+    voice: cleanVoicePrefs(stored.voice),
+    ...(stored.callSounds === false ? { callSounds: false } : {}),
+    ...(LOCALES.includes(lang as Locale) ? { locale: lang as Locale } : {}),
     ...(theme === 'light' || theme === 'dark' ? { theme } : {}),
   };
 }

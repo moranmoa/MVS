@@ -17,11 +17,28 @@ pub struct Identity {
     pub avatar_color: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_data_url: Option<String>,
+    /// #354: my chosen colour (`#rrggbb`), shown to other members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bio: Option<String>,
     pub country: String,
     pub birth_date: String,
+    /// B7 §9: a correction that raises my age, waiting its 30 days
+    /// (decision 18). Until `effectiveAt` I count as under 18.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_birth_date: Option<PendingBirthDate>,
     pub recovery_checked: bool,
+}
+
+/// `Identity.pendingBirthDate`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBirthDate {
+    /// `YYYY-MM-DD`, as `Identity.birthDate`.
+    pub date: String,
+    /// Milliseconds since the epoch.
+    pub effective_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +64,13 @@ pub struct ProfileInput {
     pub bio: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_data_url: Option<String>,
+    /// #354: the small picture shown to other members (`avatar::valid_avatar`).
+    /// Absent: unchanged. `""`: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_small: Option<String>,
+    /// #354: `#rrggbb`. Absent: unchanged. `""`: none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +122,18 @@ pub struct Channel {
     pub mentions: u32,
     /// #general, the first channel (#150): it can't be deleted.
     pub is_default: bool,
+    /// G-11: the channel's order key (base-62, at most 32 characters), when
+    /// an owner or admin placed it. The order is `listChannels`' order; the
+    /// key is informational only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// G-21: the index (as in `getMessages`) of the first message after my
+    /// read marker that isn't mine; absent with nothing unread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_unread_index: Option<u64>,
+    /// G-21: how many messages after my read marker aren't mine (0 too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_count: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +164,32 @@ pub struct Message {
     /// Only on messages written on this device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_state: Option<SendState>,
+    /// On the `message.updated` that sends a message held for its key: the
+    /// provisional ID (`pending-…`) it replaces in the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<Id>,
+    /// G-24: the user IDs this message mentions (`<@userId>` tokens in the
+    /// body) who are members of the server now, in order, each once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Vec<Id>>,
+    /// G-24: the body mentions me.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions_me: Option<bool>,
+    /// G-26: up to 20 emoji, the most popular, listed in the order they
+    /// first appeared; absent when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Vec<ReactionCount>>,
+}
+
+/// G-26: one emoji under a message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionCount {
+    pub emoji: String,
+    /// How many members have it on.
+    pub count: u32,
+    /// I have it on.
+    pub mine: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +258,13 @@ pub struct Member {
     pub blocked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bio: Option<String>,
+    /// #354: their small profile picture (a checked WebP or PNG data URL,
+    /// at most 64×64), from their latest profile posts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_data_url: Option<String>,
+    /// #354: their chosen colour (`#rrggbb`); `avatarColor` is the derived one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 /// Every command rejects with this shape.
@@ -228,6 +297,12 @@ pub enum ErrorCode {
     CallFull,
     /// Voice: relay-only is on, so calls are off.
     RelayOnly,
+    /// Voice: my own identity is already in this room from another
+    /// computer (same recovery words). One computer per call until linked
+    /// devices (phase 3).
+    InCallElsewhere,
+    /// Voice rooms: the server has 10 live rooms (by this core's view).
+    RoomCap,
     /// Server lifecycle: a member still runs a version that can't read a
     /// rename, leave or delete (no `server-lifecycle-v1` cap); nothing was
     /// signed.
@@ -246,6 +321,12 @@ pub enum ErrorCode {
     CheckClock,
     NothingToDownload,
     NothingStaged,
+    /// Device link: too many attempts at this link. Reactions (G-26): 30
+    /// of mine in one channel within a minute.
+    RateLimited,
+    /// Device link: another device holds this link (someone else may be
+    /// trying).
+    LockedOut,
     DiskFull,
 }
 
@@ -327,6 +408,10 @@ pub enum UpdateChannel {
 pub struct AppInfo {
     pub version: String,
     pub update_channel: UpdateChannel,
+    /// The relay-only setting (`setRelayOnly`): peers are reached only
+    /// through the relay, and calls are off.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 /// `getRecoveryChallenge`'s result: 1-based positions.
@@ -428,11 +513,31 @@ pub enum Event {
     /// answers come only verified (see `voice`), so the flag is always true.
     #[serde(rename = "call.signal", rename_all = "camelCase")]
     CallSignal { from: Id, kind: SignalKind, payload: String, fingerprint_verified: bool },
-    /// Voice: who is in a server's room changed (join, leave, mute,
-    /// timeout, kick), mine or not. At most one per room per sync round,
-    /// only while I'm a member. A hint: `getVoiceRoom` re-reads it.
-    #[serde(rename = "voice.room")]
-    VoiceRoom(VoiceRoom),
+    /// Voice rooms: a server's live rooms changed (created, gone, join,
+    /// leave, mute, timeout, kick, rename, limit), mine or not: the whole
+    /// list, oldest first. At most one per server per sync round, only
+    /// while I'm a member. A hint: `listVoiceRooms` re-reads it.
+    #[serde(rename = "voice.rooms", rename_all = "camelCase")]
+    VoiceRooms { server_id: Id, rooms: Vec<VoiceRoom> },
+    /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
+    #[serde(rename = "memberRelay.changed")]
+    MemberRelayChanged(MemberRelay),
+    /// G-91: bringing my servers back after a restore moved on.
+    #[serde(rename = "serverRestore.changed")]
+    ServerRestoreChanged(ServerRestore),
+    /// Device link, the new device: where its link stands.
+    #[serde(rename = "deviceLink.state")]
+    DeviceLinkState(DeviceLinkState),
+    /// Device link: a new device was added to my account (shown on the
+    /// approving device at once).
+    #[serde(rename = "account.deviceAdded", rename_all = "camelCase")]
+    DeviceAdded {
+        at: u64,
+        /// A short description of the new device, plain text; left out
+        /// when unknown (today always).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// Once, after `markHealthy` commits a new version. Text only.
     #[serde(rename = "update.installed")]
     UpdateInstalled { version: String, notes: Option<String> },
@@ -500,6 +605,10 @@ pub struct CallState {
     pub participants: Vec<CallParticipant>,
     /// 5 participants: nobody else can join.
     pub full: bool,
+    /// Relay-only is on: calls are off. An ended call (no participants)
+    /// with this set ended because relay-only went on.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +617,9 @@ pub struct CallParticipant {
     /// A user ID.
     pub identity: Id,
     pub muted: bool,
+    /// G-84b: hears no one (only with `muted`; false from cores before 0.6.0).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
 }
 
 /// Why `server.removed` fired (server lifecycle).
@@ -521,23 +633,44 @@ pub enum RemovedReason {
     Closed,
 }
 
-/// Voice: a server's one voice room and who is in it, from verified hellos.
+/// Voice rooms: a live room and who is in it, from verified hellos (soft
+/// state: nothing is stored).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceRoom {
     pub server_id: Id,
     /// What `joinCall` takes; `CallState.channelId` in a call.
     pub room_id: Id,
-    /// At most 5: me first when I'm in it, then the others.
-    pub participants: Vec<VoiceParticipant>,
+    pub creator_id: Id,
+    /// ms since the epoch, by the creator's clock.
+    pub created_at: u64,
+    /// Set by the master or the server owner. Absent: the UI shows the
+    /// default name with the master's display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 2 to 5.
+    pub limit: u8,
+    /// Computed by the core: the earliest `joinedAt` (ties: the smaller ID).
+    pub master_id: Id,
+    /// At most 5, by `joinedAt` (the master first); me too when I'm in it.
+    pub members: Vec<VoiceMember>,
+    /// Relay-only is on: `createVoiceRoom` and `joinCall` answer
+    /// `relay-only`, so the UI can disable them up front.
+    #[serde(default)]
+    pub relay_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct VoiceParticipant {
+pub struct VoiceMember {
     pub user_id: Id,
     /// A display hint only.
     pub muted: bool,
+    /// G-84b: a display hint only, with `muted`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deafened: bool,
+    /// ms since the epoch: its claim, checked within 2 minutes and frozen.
+    pub joined_at: u64,
 }
 
 /// Voice: the WebRTC signalling `sendSignal` carries.
@@ -555,4 +688,125 @@ pub enum SignalKind {
 pub enum Connection {
     Direct,
     Relay,
+}
+
+/// Member relays (#368, slice 1): `setMemberRelay`'s setting. `Auto`: on
+/// while I'm owner or admin in a server I'm still a member of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRelaySetting {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Why relaying is off whatever the setting (the first that applies).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemberRelayReason {
+    /// The owner's signed global switch (`flags.json`, slice 3b).
+    GlobalOff,
+    /// No trusted adult birth date (the age claim's rule).
+    Minor,
+    /// Relay-only is on.
+    RelayOnly,
+    /// A metered network, as the desktop shell reports it (`setMetered`).
+    Metered,
+}
+
+/// Where bringing my servers back after a restore stands (G-91).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServerRestoreState {
+    /// No restore under way since this start.
+    None,
+    /// Looking for my backup on the network (none found yet).
+    Searching,
+    /// The backup is found; some servers have nobody reachable yet.
+    Waiting,
+    /// Every server from the backup is back (or isn't mine any more).
+    Done,
+}
+
+/// `getServerRestore`'s answer, and `serverRestore.changed`'s payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerRestore {
+    pub state: ServerRestoreState,
+    /// Servers the backup lists as mine (0 until it's found).
+    pub found: u32,
+    /// Of those, the ones not back yet because nobody was reachable.
+    pub waiting: u32,
+}
+
+/// `getMemberRelay`'s answer, and `memberRelay.changed`'s payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberRelay {
+    pub setting: MemberRelaySetting,
+    /// Relaying for my members now (slice 2's relay reads this). False
+    /// until the one-time disclosure was acknowledged (PO on #387).
+    pub effective: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<MemberRelayReason>,
+    /// `Auto` would turn it on: I'm owner or admin somewhere.
+    pub role: bool,
+    pub disclosure_seen: bool,
+    /// The daily byte cap, 256..=51,200 MB (default 2,048).
+    pub daily_cap_mb: u32,
+}
+
+/// Device link (`device-link-slice.md`): `startDeviceLink`'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLinkStart {
+    /// `mvs-link:1:` and base58: printable ASCII, at most 1,024 characters.
+    pub qr: String,
+    /// 10 base32 characters, `[A-Z2-7]`: a rendezvous only.
+    pub code: String,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceLinkPhase {
+    Waiting,
+    Confirm,
+    Done,
+    Expired,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceLinkReason {
+    Cancelled,
+    Timeout,
+    Refused,
+    Network,
+    /// The account arrived but this computer's keychain couldn't store it
+    /// (`keyring-unavailable` on restore).
+    Keyring,
+    /// The account arrived but couldn't be restored for another reason.
+    Restore,
+}
+
+/// `deviceLink.state`. Absent fields are left out, never null (dev-ui #391).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLinkState {
+    pub state: DeviceLinkPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sas: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<DeviceLinkReason>,
+}
+
+/// `beginDeviceApproval`'s answer: the digits to compare.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceApproval {
+    pub sas: String,
+    pub expires_at: u64,
 }

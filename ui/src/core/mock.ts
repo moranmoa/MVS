@@ -6,10 +6,16 @@
 // containing "offline" finds nobody online; one containing "adult" is 18+.
 
 import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
+import { normalizeEmoji } from './emoji';
 import type {
   CallState,
   VoiceRoom,
-  VoiceParticipant,
+  ServerRestore,
+  DeviceApproval,
+  DeviceLinkOffer,
+  MemberRelay,
+  MemberRelaySetting,
+  VoiceRoomMember,
   AgeRestriction,
   AppInfo,
   Channel,
@@ -59,9 +65,37 @@ export interface MockOptions {
   /** As the desktop shell would: report the core down, for the T8-01 screen. */
   coreDown?: 'missing' | 'start-failed' | 'crashed' | 'crash-loop' | 'keyring';
   /** joinCall rejects with this code, for the error states (screenshots). */
-  callError?: 'call-full' | 'relay-only' | 'not-implemented';
-  /** Every demo voice room starts with 5 people in it (full). */
+  callError?: 'call-full' | 'relay-only' | 'in-call-elsewhere' | 'not-implemented' | 'room-cap';
+  /**
+   * As a member who just joined, before the channel key arrives (#288): sends
+   * come back held (`pending-…`), then are sent (`arrive`), fail (`fail`), or
+   * stay held (`wait`, for screenshots).
+   */
+  keyPending?: 'arrive' | 'fail' | 'wait';
+  /** B7: the identity has a correction raising its age, waiting its 30 days (#306). */
+  pendingDob?: boolean;
+  /** signOut is refused by the OS keychain (#304: nothing changes). */
+  signOutKeyring?: boolean;
+  /** updateProfile fails (B11e: the save error state). */
+  profileError?: boolean;
+  /** The first demo voice room starts with 5 people in it (full). */
   roomFull?: boolean;
+  /** Voice rooms (0.4.3): how many live rooms each demo server starts with (default 1; 0 = none; up to 10). */
+  voiceRooms?: number;
+  /** Member relays: forced off for this reason (under 18, metered, turned off for everyone). */
+  memberRelayReason?: 'minor' | 'metered' | 'global-off';
+  /** Member relays: the one-time disclosure not seen yet (shows at start for an owner). */
+  memberRelayUnseen?: boolean;
+  /** Shortly after start: "a new device was added to your account" (label; '' = none). */
+  deviceLinked?: string;
+  /** Device link, new device: the state to reach after starting (for screenshots). */
+  deviceLink?: 'confirm' | 'expired' | 'failed';
+  /** Time between demo messages (default 47 s); hours make the last screen cross days (G-23). */
+  messageGapMs?: number;
+  /** G-91: hold the restore progress at this state (screenshots); otherwise it plays out. */
+  restore?: 'searching' | 'waiting' | 'done';
+  /** Start with relay-only on (#272): no direct connections, calls off. */
+  relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
   outdatedMembers?: boolean;
   /** The demo server "Minecraft IL" starts closed by its owner (read-only). */
@@ -153,7 +187,21 @@ function err(e: CoreError): CoreError {
   return e;
 }
 
+/** A live voice room inside the mock; the host is computed, as in the core. */
+interface MockRoom {
+  roomId: Id;
+  creatorId: Id;
+  createdAt: number;
+  name?: string;
+  limit: number;
+  members: VoiceRoomMember[];
+}
+
 export class MockCore implements CoreApi {
+  private get gapMs(): number {
+    return this.options.messageGapMs ?? MESSAGE_GAP_MS;
+  }
+
   private listeners = new Map<CoreEventName, Set<(p: unknown) => void>>();
   private servers = new Map<Id, ServerState>();
   // Invites per server, made on first use from the server's current link.
@@ -172,9 +220,17 @@ export class MockCore implements CoreApi {
   constructor(private options: MockOptions = {}) {
     this.speed = options.speed ?? 1;
     this.load();
+    if (options.pendingDob && this.identity) {
+      // A correction to an earlier date (a higher age), 9 days into its 30.
+      this.identity = { ...this.identity, pendingBirthDate: { date: '1996-04-12', effectiveAt: Date.now() + 21 * 86_400_000 } };
+    }
     if (options.simulateActivity) {
       this.timers.push(setInterval(() => this.simulateIncoming(), 4500));
       this.timers.push(setInterval(() => this.simulatePresence(), 9000));
+    }
+    if (options.deviceLinked !== undefined) {
+      const label = options.deviceLinked;
+      this.timers.push(setTimeout(() => this.simulateDeviceAdded(label, Date.now() - 2 * 60_000), 50));
     }
     if (options.updateInstalled) {
       this.timers.push(
@@ -435,17 +491,18 @@ export class MockCore implements CoreApi {
       const ch: ChannelState = {
         channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0 },
         baseCount: c.count,
-        baseStart: now - 3_600_000 - c.count * MESSAGE_GAP_MS,
+        baseStart: now - 3_600_000 - c.count * this.gapMs,
         seedOffset: hashString(c.id),
         memberIds: members.slice(1).map((m) => m.id),
         overrides: new Map(),
         appendedCount: 0,
       };
       // A little unread state so the badges show up in the demo.
-      if (ci === 1) ch.channel.unread = true;
+      // G-21: where the unread start, as the core reports it (12 here, 300 in #clips).
+      const unreadFrom = (n: number) => ({ unread: true, unreadCount: n, firstUnreadIndex: Math.max(0, c.count - n) });
+      if (ci === 1) ch.channel = { ...ch.channel, ...unreadFrom(12) };
       if (ci === 2 && seed.id === 's-gamers') {
-        ch.channel.unread = true;
-        ch.channel.mentions = 2;
+        ch.channel = { ...ch.channel, ...unreadFrom(300), mentions: 2 };
       }
       state.channels.push(ch);
       this.channelIndex.set(c.id, ch);
@@ -532,7 +589,7 @@ export class MockCore implements CoreApi {
       index,
       authorId,
       body,
-      createdAt: ch.baseStart + index * MESSAGE_GAP_MS + (h % 20_000),
+      createdAt: ch.baseStart + index * this.gapMs + (h % 20_000),
     };
     if (index > 3 && h % 11 === 0) {
       const target = index - 1 - (h % 3);
@@ -559,6 +616,41 @@ export class MockCore implements CoreApi {
 
   private someoneOnline(s: ServerState): boolean {
     return s.members.some((m) => m.id !== this.identity?.id && m.presence === 'online');
+  }
+
+  /**
+   * #288: a message held for its key. It is listed at once as `pending-…`; then
+   * the key comes (the real message replaces it) or, after the wait (2 minutes
+   * in the core, ~2 s here), it fails with a rekey-waiting notice.
+   */
+  private heldSeq = 0;
+
+  private sendHeld(ch: ChannelState, index: number, body: string): Message {
+    const held: Message = {
+      id: `pending-${(++this.heldSeq).toString(16).padStart(16, '0')}`,
+      channelId: ch.channel.id,
+      index,
+      authorId: this.identity!.id,
+      body,
+      createdAt: Date.now(),
+      sendState: 'pending',
+    };
+    this.put(ch, held, true);
+    if (this.options.keyPending === 'wait') return held;
+    if (this.options.keyPending === 'fail') {
+      this.later(2000, () => {
+        this.put(ch, { ...held, sendState: 'failed' }, false);
+        this.emit('notice', { kind: 'rekey-waiting', serverId: ch.channel.serverId });
+      });
+    } else {
+      this.later(900, () => {
+        const real: Message = { ...held, id: this.messageId(ch.channel.id, index), sendState: 'sent' };
+        ch.overrides.set(index, real);
+        this.emit('message.updated', { ...real, replaces: held.id });
+        this.later(700, () => this.put(ch, { ...real, sendState: 'received' }, false));
+      });
+    }
+    return held;
   }
 
   /** Walks a local message through pending → sent → received. */
@@ -645,30 +737,179 @@ export class MockCore implements CoreApi {
     return [...this.words];
   }
 
-  async restoreIdentity(words: string[]): Promise<Identity> {
+  async restoreIdentity(words: string[], input?: NewIdentityInput): Promise<Identity> {
     await this.wait(600);
     const clean = words.map((w) => w.trim().toLowerCase());
     const bad = clean.flatMap((w, i) => (WORDS.includes(w) ? [] : [i + 1]));
     if (clean.length !== 12 || bad.length) throw err({ code: 'invalid-words', positions: bad });
     const id = `me-${hashString(clean.join(' ')).toString(36)}`;
     this.identity = {
-      ...this.makeIdentity(id, { locale: 'he', country: 'IL', birthDate: '1995-01-01' }),
+      ...this.makeIdentity(id, input ?? { locale: 'he', country: 'IL', birthDate: '1995-01-01' }),
       displayName: '',
       recoveryChecked: true,
     };
     this.words = clean;
     this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
     this.save();
+    this.playRestore();
     return this.identity;
+  }
+
+  // ---- device link (device-link-slice.md) ---------------------------------------
+
+  private deviceLinkCode: string | null = null;
+  private approval: DeviceApproval | null = null;
+
+  async startDeviceLink(): Promise<DeviceLinkOffer> {
+    await this.wait(100);
+    const code = 'K7QX2MZRF4';
+    this.deviceLinkCode = code;
+    this.deviceLinkConfirmed = false;
+    const expiresAt = Date.now() + 5 * 60_000;
+    this.emit('deviceLink.state', { state: 'waiting' });
+    const then = this.options.deviceLink;
+    if (then) {
+      setTimeout(() => {
+        if (this.deviceLinkCode !== code) return;
+        if (then === 'confirm') this.emit('deviceLink.state', { state: 'confirm', sas: '482913' });
+        else this.emit('deviceLink.state', { state: then, ...(then === 'failed' ? { reason: 'network' as const } : {}) });
+      }, 50);
+    }
+    return { qr: `mvs-link:v1:${code.toLowerCase()}:demo`, code, expiresAt };
+  }
+
+  private deviceLinkConfirmed = false;
+
+  async confirmDeviceLink(match: boolean): Promise<null> {
+    await this.wait(100);
+    if (!this.deviceLinkCode) throw err({ code: 'not-found' });
+    this.deviceLinkConfirmed = match;
+    if (!match) {
+      this.deviceLinkCode = null;
+      this.emit('deviceLink.state', { state: 'failed', reason: 'refused' });
+    }
+    return null;
+  }
+
+  /** Mock only: a device was linked to this account elsewhere. */
+  simulateDeviceAdded(label: string, at = Date.now()): void {
+    this.emit('account.deviceAdded', { at, ...(label ? { label } : {}) });
+  }
+
+  async ackDeviceNotice(): Promise<null> {
+    return null;
+  }
+
+  async cancelDeviceLink(): Promise<null> {
+    this.deviceLinkCode = null;
+    return null;
+  }
+
+  /**
+   * Mock only, for tests and demos: the other device's side of a link. "confirm"
+   * shows the digits; "done" signs this device in as a linked account.
+   */
+  simulateDeviceLink(state: 'confirm' | 'done' | 'expired' | 'failed', reason?: 'refused' | 'network' | 'timeout' | 'keyring' | 'restore'): void {
+    if (state === 'done') {
+      // As the core: nothing is applied before this device confirmed the digits.
+      if (!this.deviceLinkConfirmed) return;
+      this.identity = { ...this.makeIdentity('me-linked', { locale: 'he', country: 'IL', birthDate: '1998-04-12' }), displayName: 'מורן', recoveryChecked: true };
+      this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
+      this.save();
+      this.emit('deviceLink.state', { state: 'done' });
+      this.emit('identity.changed', this.identity);
+      this.playRestore();
+      return;
+    }
+    this.emit('deviceLink.state', { state, ...(state === 'confirm' ? { sas: '482913' } : {}), ...(reason ? { reason } : {}) });
+  }
+
+  async beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval> {
+    await this.wait(300);
+    const code = qrOrCode.trim().toUpperCase().replace(/[\s-]/g, '');
+    // Demo: any well-formed code reaches a device, except "ZZZZZZZZZZ" (expired).
+    if (!/^[A-Z2-7]{10}$/.test(code) && !qrOrCode.startsWith('mvs-link:v1:')) throw err({ code: 'not-found' });
+    if (code === 'ZZZZZZZZZZ') throw err({ code: 'not-found' });
+    if (code === 'RRRRRRRRRR') throw err({ code: 'rate-limited' });
+    if (code === 'LLLLLLLLLL') throw err({ code: 'locked-out' });
+    this.approval = { sas: '482913', expiresAt: Date.now() + 5 * 60_000 };
+    return this.approval;
+  }
+
+  async confirmDeviceApproval(_approve: boolean): Promise<null> {
+    await this.wait(200);
+    if (!this.approval) throw err({ code: 'bad-request' });
+    this.approval = null;
+    return null;
+  }
+
+  // ---- G-91: servers coming back after a restore ---------------------------------
+
+  private serverRestore: ServerRestore = { state: 'none', found: 0, waiting: 0 };
+
+  async getServerRestore(): Promise<ServerRestore> {
+    return { ...this.serverRestore };
+  }
+
+  /** Mock only: set the restore progress (and announce it). */
+  simulateServerRestore(next: ServerRestore): void {
+    this.serverRestore = next;
+    this.emit('serverRestore.changed', { ...next });
+  }
+
+  /** After a restore or a device link: searching, then 3 found with 2 waiting, then done. */
+  private playRestore(): void {
+    const hold = this.options.restore;
+    const states: ServerRestore[] = [
+      { state: 'searching', found: 0, waiting: 0 },
+      { state: 'waiting', found: 3, waiting: 2 },
+      { state: 'done', found: 3, waiting: 0 },
+    ];
+    const last = hold ? states.findIndex((s) => s.state === hold) : states.length - 1;
+    states.slice(0, last + 1).forEach((s, i) => this.timers.push(setTimeout(() => this.simulateServerRestore(s), i === 0 ? 0 : i * 1500)));
+  }
+
+  async signOut(words?: string[], withoutWords?: boolean): Promise<null> {
+    await this.wait(300);
+    if (!this.identity) throw err({ code: 'not-found' });
+    if (words) {
+      const clean = words.map((w) => w.trim().toLowerCase());
+      const bad = clean.flatMap((w, i) => (WORDS.includes(w) ? [] : [i + 1]));
+      if (clean.length !== 12 || bad.length) throw err({ code: 'invalid-words', positions: bad });
+      if (clean.join(' ') !== this.words.join(' ')) throw err({ code: 'not-allowed' });
+    } else if (withoutWords !== true) throw err({ code: 'bad-request' });
+    if (this.options.signOutKeyring) throw err({ code: 'keyring-unavailable' }); // nothing changed
+    this.leaveCall();
+    this.identity = null;
+    this.words = [];
+    this.persisted = null;
+    this.servers.clear();
+    this.channelIndex.clear();
+    this.options.storage?.removeItem(STORAGE_KEY);
+    return null;
   }
 
   async updateProfile(input: ProfileInput): Promise<Identity> {
     if (!this.identity) throw err({ code: 'not-found' });
-    this.identity = { ...this.identity, ...input };
+    await this.wait(150);
+    if (this.options.profileError) throw err({ code: 'internal' });
+    // Like the core: every field is replaced (no avatar or bio = removed).
+    const color = input.color === undefined ? this.identity.color : input.color || undefined;
+    this.identity = { ...this.identity, displayName: input.displayName, bio: input.bio, avatarDataUrl: input.avatarDataUrl, color };
+    const small = input.avatarSmall === undefined ? undefined : input.avatarSmall || null;
     for (const s of this.servers.values()) {
-      s.members = s.members.map((m) => (m.id === this.identity!.id ? { ...m, displayName: input.displayName } : m));
+      s.members = s.members.map((m) =>
+        m.id === this.identity!.id
+          ? { ...m, displayName: input.displayName, bio: input.bio, color, ...(small === undefined ? {} : { avatarDataUrl: small ?? undefined }) }
+          : m,
+      );
+      this.emit('members.changed', { serverId: s.summary.id, members: s.members });
     }
-    this.save();
+    try {
+      this.save();
+    } catch {
+      throw err({ code: 'internal' }); // e.g. storage full (QA-03): say so, don't hang
+    }
     this.emit('identity.changed', this.identity);
     return this.identity;
   }
@@ -720,6 +961,28 @@ export class MockCore implements CoreApi {
     this.channelIndex.set(id, ch);
     this.emit('channel.added', ch.channel);
     return ch.channel;
+  }
+
+  async moveChannel(serverId: Id, channelId: Id, before?: Id, after?: Id): Promise<Channel[]> {
+    await this.wait(80);
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    const from = s.channels.findIndex((c) => c.channel.id === channelId);
+    if (from < 0) throw err({ code: 'not-found' });
+    const moving = s.channels[from];
+    const rest = s.channels.filter((c) => c !== moving);
+    const at = before ? rest.findIndex((c) => c.channel.id === before) : after ? rest.findIndex((c) => c.channel.id === after) + 1 : rest.length;
+    if ((before || after) && at < 0 + (after ? 1 : 0)) throw err({ code: 'bad-request' });
+    rest.splice(at, 0, moving);
+    s.channels = rest;
+    // Like the core's rebalance: short evenly spread keys, none ending in 0.
+    const digits = '123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    s.channels.forEach((c, i) => {
+      c.channel = { ...c.channel, position: digits[Math.min(i * 2, digits.length - 1)] + (i * 2 >= digits.length ? 'z'.repeat(1 + i) : '') };
+      this.emit('channel.updated', c.channel);
+    });
+    return s.channels.map((c) => c.channel);
   }
 
   async updateChannel(channelId: Id, input: { name?: string; adult?: boolean }): Promise<Channel> {
@@ -849,9 +1112,11 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
+    // As the core: only cap names it knows.
+    if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
   }
 
@@ -927,6 +1192,9 @@ export class MockCore implements CoreApi {
     if (this.servers.get(ch.channel.serverId)?.summary.closed) throw err({ code: 'not-allowed' });
     const index = this.count(ch);
     ch.appendedCount++;
+    if (this.options.keyPending) return this.sendHeld(ch, index, body);
+    const memberIds = new Set(this.serverOf(ch).members.map((m) => m.id));
+    const mentions = [...new Set([...body.matchAll(/<@([0-9A-Za-z_-]{1,64})>/g)].map((x) => x[1]))].filter((id) => memberIds.has(id));
     const msg: Message = {
       id: this.messageId(channelId, index),
       channelId,
@@ -935,6 +1203,7 @@ export class MockCore implements CoreApi {
       body,
       createdAt: Date.now(),
       sendState: 'pending',
+      ...(mentions.length ? { mentions } : {}),
     };
     if (replyToId) {
       const { ch: rch, index: ri } = this.parseId(replyToId);
@@ -966,6 +1235,46 @@ export class MockCore implements CoreApi {
     this.put(ch, { ...m, body: '', deleted: true, replyTo: undefined }, false);
   }
 
+  /** G-26, as the core: the same emoji check, gate and per-author cap (no fold, no rate). */
+  async react(messageId: Id, emoji: string, on: boolean): Promise<void> {
+    const e = normalizeEmoji(emoji);
+    if (e === null) throw err({ code: 'bad-request' });
+    const { ch, index } = this.parseId(messageId);
+    const m = this.messageAt(ch, index);
+    if (m.deleted) throw err({ code: 'not-found' });
+    this.lifecycleGate(this.serverOf(ch));
+    const chips = [...(m.reactions ?? [])];
+    const at = chips.findIndex((c) => c.emoji === e);
+    if ((at >= 0 && chips[at].mine) === on) return;
+    if (on) {
+      if (chips.filter((c) => c.mine).length >= 10) throw err({ code: 'bad-request' });
+      if (at >= 0) chips[at] = { ...chips[at], count: chips[at].count + 1, mine: true };
+      else chips.push({ emoji: e, count: 1, mine: true });
+    } else {
+      const count = chips[at].count - 1;
+      if (count > 0) chips[at] = { ...chips[at], count, mine: false };
+      else chips.splice(at, 1);
+    }
+    this.put(ch, { ...m, reactions: chips.length ? chips : undefined }, false);
+  }
+
+  async discardMessage(messageId: Id): Promise<null> {
+    for (const ch of this.channelIndex.values()) {
+      const at = [...ch.overrides.values()].find((m) => m.id === messageId && /^pending-/.test(m.id))?.index;
+      if (at === undefined) continue;
+      const later = [...ch.overrides.values()].filter((m) => m.index > at).sort((a, b) => a.index - b.index);
+      ch.overrides.delete(at);
+      for (const m of later) {
+        ch.overrides.delete(m.index);
+        const index = m.index - 1;
+        ch.overrides.set(index, { ...m, index, id: /^pending-/.test(m.id) ? m.id : this.messageId(ch.channel.id, index) });
+      }
+      ch.appendedCount--;
+      return null;
+    }
+    throw err({ code: 'not-found' });
+  }
+
   async retryMessage(messageId: Id): Promise<void> {
     const { ch, index } = this.parseId(messageId);
     const m = this.messageAt(ch, index);
@@ -977,7 +1286,8 @@ export class MockCore implements CoreApi {
   async markRead(channelId: Id): Promise<void> {
     const ch = this.channelIndex.get(channelId);
     if (!ch || (!ch.channel.unread && ch.channel.mentions === 0)) return;
-    ch.channel = { ...ch.channel, unread: false, mentions: 0 };
+    const { firstUnreadIndex: _first, unreadCount: _n, ...read } = ch.channel;
+    ch.channel = { ...read, unread: false, mentions: 0 };
     const s = this.serverOf(ch);
     this.refreshServerUnread(s);
     this.emit('channel.updated', ch.channel);
@@ -994,35 +1304,77 @@ export class MockCore implements CoreApi {
     }
   }
 
-  // ---- voice v1 (#223): calls only, no audio in the mock ----------------------------
+  // ---- voice rooms (0.4.3): calls only, no audio in the mock ---------------------
 
   private call: CallState | null = null;
-  /** Who is in each server's voice room, by server id. Made on first use. */
-  private rooms = new Map<Id, VoiceParticipant[]>();
+  /** Each server's live rooms, oldest first. Made on first use. */
+  private rooms = new Map<Id, MockRoom[]>();
+  private roomSeq = 0;
 
-  private roomIdOf(serverId: Id): Id {
-    return `${serverId}-voice`;
-  }
-
-  private roster(serverId: Id): VoiceParticipant[] {
-    let r = this.rooms.get(serverId);
-    if (!r) {
-      // Demo: two online people are already talking (the second one muted), or 5 with ?roomFull.
+  /** Demo rooms: the first has two online people (the second muted), or 5 with ?roomFull; the rest 1–3 each. */
+  private roomsOf(serverId: Id): MockRoom[] {
+    let list = this.rooms.get(serverId);
+    if (!list) {
+      list = [];
       const others = (this.servers.get(serverId)?.members ?? []).filter((m) => m.id !== this.identity?.id);
-      const seed = this.options.roomFull ? others.slice(0, 5) : others.filter((m) => m.presence === 'online').slice(0, 2);
-      r = seed.map((m, i) => ({ userId: m.id, muted: i === 1 }));
-      this.rooms.set(serverId, r);
+      const online = others.filter((m) => m.presence === 'online');
+      const pool = [...online, ...others.filter((m) => m.presence !== 'online')];
+      const count = Math.min(10, this.options.voiceRooms ?? 1);
+      const t0 = Date.now() - 60 * 60_000;
+      let next = 0;
+      for (let i = 0; i < count; i++) {
+        const n = i === 0 ? (this.options.roomFull ? 5 : 2) : 1 + (i % 3);
+        const people = pool.slice(next, next + n);
+        next += n;
+        if (!people.length) break;
+        const createdAt = t0 + i * 60_000;
+        list.push({
+          roomId: `${serverId}-room-${++this.roomSeq}`,
+          creatorId: people[0].id,
+          createdAt,
+          // Demo: the second room has a name of its own.
+          ...(i === 1 ? { name: 'גיימינג' } : {}),
+          limit: 5,
+          members: people.map((m, j) => ({ userId: m.id, muted: j === 1, joinedAt: createdAt + j * 1000 })),
+        });
+      }
+      this.rooms.set(serverId, list);
     }
-    return r;
+    return list;
   }
 
-  private room(serverId: Id): VoiceRoom {
-    return { serverId, roomId: this.roomIdOf(serverId), participants: this.roster(serverId).map((p) => ({ ...p })) };
+  /** The earliest joined; ties to the smaller id (design §4). */
+  private masterOf(r: MockRoom): Id {
+    return [...r.members].sort((a, b) => a.joinedAt - b.joinedAt || (a.userId < b.userId ? -1 : 1))[0].userId;
   }
 
-  private setRoster(serverId: Id, participants: VoiceParticipant[]): void {
-    this.rooms.set(serverId, participants);
-    this.emit('voice.room', this.room(serverId));
+  private view(serverId: Id, r: MockRoom): VoiceRoom {
+    return {
+      serverId,
+      roomId: r.roomId,
+      creatorId: r.creatorId,
+      createdAt: r.createdAt,
+      ...(r.name ? { name: r.name } : {}),
+      limit: r.limit,
+      masterId: this.masterOf(r),
+      members: r.members.map((p) => ({ ...p })),
+      ...(this.relayOnly ? { relayOnly: true } : {}),
+    };
+  }
+
+  private emitRooms(serverId: Id): void {
+    // An empty room is gone at once (spec §4).
+    const list = this.roomsOf(serverId).filter((r) => r.members.length > 0);
+    this.rooms.set(serverId, list);
+    this.emit('voice.rooms', { serverId, rooms: list.map((r) => this.view(serverId, r)) });
+  }
+
+  private findRoom(roomId: Id): { serverId: Id; room: MockRoom } | null {
+    for (const serverId of this.servers.keys()) {
+      const room = this.roomsOf(serverId).find((r) => r.roomId === roomId);
+      if (room) return { serverId, room };
+    }
+    return null;
   }
 
   private emitCall(): void {
@@ -1030,57 +1382,130 @@ export class MockCore implements CoreApi {
   }
 
   /** The call as seen from the room it is in. */
-  private callOf(serverId: Id): CallState {
-    const people = this.roster(serverId);
+  private callOf(room: MockRoom): CallState {
     return {
-      channelId: this.roomIdOf(serverId),
-      participants: people.map((p) => ({ identity: p.userId, muted: p.muted })),
-      full: people.length >= 5,
+      channelId: room.roomId,
+      participants: room.members.map((p) => ({ identity: p.userId, muted: p.muted, ...(p.deafened && p.muted ? { deafened: true } : {}) })),
+      full: room.members.length >= room.limit,
     };
   }
 
-  private callServer(): Id | null {
-    return [...this.servers.keys()].find((id) => this.roomIdOf(id) === this.call?.channelId) ?? null;
+  private callRoom(): { serverId: Id; room: MockRoom } | null {
+    return this.call ? this.findRoom(this.call.channelId) : null;
   }
 
-  async getVoiceRoom(serverId: Id): Promise<VoiceRoom> {
+  async listVoiceRooms(serverId: Id): Promise<VoiceRoom[]> {
     await this.wait(50);
     if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
-    return this.room(serverId);
+    return this.roomsOf(serverId).map((r) => this.view(serverId, r));
+  }
+
+  async createVoiceRoom(serverId: Id): Promise<CallState> {
+    await this.wait(200);
+    if (this.relayOnly) throw err({ code: 'relay-only' });
+    if (this.options.callError) throw err({ code: this.options.callError });
+    if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
+    if (this.roomsOf(serverId).length >= 10) throw err({ code: 'room-cap' });
+    await this.leaveCall();
+    const me = this.identity!.id;
+    const now = Date.now();
+    const room: MockRoom = {
+      roomId: `${serverId}-room-${++this.roomSeq}`,
+      creatorId: me,
+      createdAt: now,
+      limit: 5,
+      members: [{ userId: me, muted: false, joinedAt: now }],
+    };
+    this.roomsOf(serverId).push(room);
+    this.emitRooms(serverId);
+    this.call = this.callOf(room);
+    this.emitCall();
+    return this.call;
   }
 
   async joinCall(channelId: Id): Promise<CallState> {
     await this.wait(200);
+    if (this.relayOnly) throw err({ code: 'relay-only' });
     if (this.options.callError) throw err({ code: this.options.callError });
-    const serverId = [...this.servers.keys()].find((id) => this.roomIdOf(id) === channelId);
-    // Text channels don't carry calls any more (voice-room amendment).
-    if (!serverId) throw err({ code: this.channelIndex.has(channelId) ? 'not-allowed' : 'not-found' });
+    const found = this.findRoom(channelId);
+    // Text channels don't carry calls (voice-room amendment); a room that is gone is not-found.
+    if (!found) throw err({ code: this.channelIndex.has(channelId) ? 'not-allowed' : 'not-found' });
     if (this.call?.channelId === channelId) return this.call;
-    if (this.roster(serverId).length >= 5) throw err({ code: 'call-full' });
+    if (found.room.members.length >= found.room.limit) throw err({ code: 'call-full' });
     await this.leaveCall();
     const me = this.identity!.id;
-    this.setRoster(serverId, [{ userId: me, muted: false }, ...this.roster(serverId).filter((p) => p.userId !== me)]);
-    this.call = this.callOf(serverId);
+    const joinedAt = Math.max(Date.now(), ...found.room.members.map((p) => p.joinedAt + 1));
+    found.room.members.push({ userId: me, muted: false, joinedAt });
+    this.emitRooms(found.serverId);
+    this.call = this.callOf(found.room);
     this.emitCall();
     return this.call;
   }
 
   async leaveCall(): Promise<null> {
-    const serverId = this.callServer();
+    const here = this.callRoom();
     if (this.call) {
       this.call = { ...this.call, participants: [], full: false };
       this.emitCall();
       this.call = null;
     }
-    if (serverId) this.setRoster(serverId, this.roster(serverId).filter((p) => p.userId !== this.identity!.id));
+    if (here) {
+      here.room.members = here.room.members.filter((p) => p.userId !== this.identity!.id);
+      this.emitRooms(here.serverId);
+    }
     return null;
   }
 
+  async editVoiceRoom(roomId: Id, name?: string, limit?: number): Promise<null> {
+    const edit = { name, limit };
+    await this.wait(100);
+    const found = this.findRoom(roomId);
+    if (!found) throw err({ code: 'not-found' });
+    const me = this.identity!.id;
+    const owner = this.servers.get(found.serverId)?.summary.ownerId === me;
+    if (this.masterOf(found.room) !== me && !owner) throw err({ code: 'not-allowed' });
+    if (edit.limit !== undefined) {
+      const ok = Number.isInteger(edit.limit) && edit.limit >= 2 && edit.limit <= 5 && edit.limit >= found.room.members.length;
+      if (!ok) throw err({ code: 'bad-request' });
+      found.room.limit = edit.limit;
+    }
+    if (edit.name !== undefined) {
+      const name = edit.name.trim();
+      if ([...name].length > 32) throw err({ code: 'bad-request' });
+      found.room.name = name || undefined;
+    }
+    this.emitRooms(found.serverId);
+    return null;
+  }
+
+  /** Mock only, for tests and screenshots: someone else leaves a room (a host leaving hands off). */
+  simulateVoiceLeave(roomId: Id, userId: Id): void {
+    const found = this.findRoom(roomId);
+    if (!found) return;
+    found.room.members = found.room.members.filter((p) => p.userId !== userId);
+    if (this.call?.channelId === roomId) {
+      this.call = this.callOf(found.room);
+      this.emitCall();
+    }
+    this.emitRooms(found.serverId);
+  }
+
   async setMuted(muted: boolean): Promise<null> {
-    const serverId = this.callServer();
-    if (!this.call || !serverId) throw err({ code: 'not-allowed' });
-    this.setRoster(serverId, this.roster(serverId).map((p) => (p.userId === this.identity!.id ? { ...p, muted } : p)));
-    this.call = this.callOf(serverId);
+    const here = this.callRoom();
+    if (!this.call || !here) throw err({ code: 'not-allowed' });
+    here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, muted } : p));
+    this.emitRooms(here.serverId);
+    this.call = this.callOf(here.room);
+    this.emitCall();
+    return null;
+  }
+
+  async setDeafened(deafened: boolean): Promise<null> {
+    const here = this.callRoom();
+    if (!this.call || !here) throw err({ code: 'not-allowed' });
+    here.room.members = here.room.members.map((p) => (p.userId === this.identity!.id ? { ...p, deafened } : p));
+    this.emitRooms(here.serverId);
+    this.call = this.callOf(here.room);
     this.emitCall();
     return null;
   }
@@ -1134,7 +1559,80 @@ export class MockCore implements CoreApi {
   }
 
   async getAppInfo(): Promise<AppInfo> {
-    return { version: '0.1.0-alpha', updateChannel: this.releaseChannel };
+    return { version: '0.1.0-alpha', updateChannel: this.releaseChannel, relayOnly: this.relayOnly };
+  }
+
+  /** Relay-only (#272): on ends my call; every room then says so (the core: at the next sync round). */
+  private relayOnlySet: boolean | null = null;
+  private get relayOnly(): boolean {
+    return this.relayOnlySet ?? !!this.options.relayOnly;
+  }
+
+  async setRelayOnly(on: boolean): Promise<void> {
+    await this.wait(100);
+    this.relayOnlySet = on;
+    const here = this.callRoom();
+    if (on && this.call) {
+      this.emit('call.state', { ...this.call, participants: [], full: false, relayOnly: true });
+      this.call = null;
+      if (here) here.room.members = here.room.members.filter((p) => p.userId !== this.identity?.id);
+    }
+    for (const id of this.servers.keys()) this.emitRooms(id);
+    this.emitMemberRelay();
+  }
+
+  // ---- member relays, slice 1 (#368) -------------------------------------------
+
+  private memberRelaySetting: MemberRelaySetting = 'auto';
+  private memberRelaySeen: boolean | null = null;
+  private memberRelayCap = 2048;
+
+  private memberRelay(): MemberRelay {
+    const me = this.identity?.id;
+    // auto: on for an owner (the core: or an admin) of a server I'm in.
+    const role = [...this.servers.values()].some((s) => !s.summary.closed && s.summary.ownerId === me);
+    const reason = this.options.memberRelayReason ?? (this.relayOnly ? 'relay-only' : undefined);
+    const wanted = this.memberRelaySetting === 'auto' ? role : this.memberRelaySetting === 'on';
+    const seen = this.memberRelaySeen ?? !this.options.memberRelayUnseen;
+    return {
+      setting: this.memberRelaySetting,
+      // As the core: nothing relays before the disclosure was acknowledged (PO).
+      effective: !reason && wanted && seen,
+      ...(reason ? { reason } : {}),
+      role,
+      disclosureSeen: seen,
+      dailyCapMb: this.memberRelayCap,
+    };
+  }
+
+  private emitMemberRelay(): void {
+    this.emit('memberRelay.changed', this.memberRelay());
+  }
+
+  async getMemberRelay(): Promise<MemberRelay> {
+    return this.memberRelay();
+  }
+
+  async setMemberRelay(setting: MemberRelaySetting): Promise<MemberRelay> {
+    await this.wait(100);
+    if (setting !== 'auto' && setting !== 'on' && setting !== 'off') throw err({ code: 'bad-request' });
+    this.memberRelaySetting = setting;
+    this.emitMemberRelay();
+    return this.memberRelay();
+  }
+
+  async setMemberRelayCap(mb: number): Promise<MemberRelay> {
+    await this.wait(100);
+    if (!Number.isInteger(mb) || mb < 256 || mb > 51200) throw err({ code: 'bad-request' });
+    this.memberRelayCap = mb;
+    this.emitMemberRelay();
+    return this.memberRelay();
+  }
+
+  async markMemberRelayDisclosureSeen(): Promise<null> {
+    this.memberRelaySeen = true;
+    this.emitMemberRelay();
+    return null;
   }
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {

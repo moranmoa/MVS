@@ -23,15 +23,22 @@ ed25519-dalek = "2"
 blake3 = "1"
 # MIT OR Apache-2.0
 chacha20poly1305 = "0.10"
+# Device link (already in the tree: x25519 through libp2p's noise, hkdf and
+# sha2 through identity). No new crypto crate.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+hkdf = "0.12"
+sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+# MIT OR Apache-2.0, already in the tree. Profile pictures (avatar.rs).
+base64 = "0.22"
 # MIT OR Apache-2.0. Already in the tree (libp2p-identity); T8-02 invite links.
 bs58 = "0.5"
 zeroize = "1"
 # MIT. SQLite itself is public domain. Same version and features as `sync`.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 # MIT. Same versions as `sync`; RUST_LOG for the binary (stderr only).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

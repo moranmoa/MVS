@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
+import { useUnreadBadge } from '../../app/unreadBadge';
 import { phoneQuery, useMediaQuery } from '../../app/media';
+import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
 import { useCore, useCoreEvent, type Id } from '../../core';
@@ -10,6 +12,8 @@ import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
 import { SettingsScreen } from '../settings/SettingsScreen';
+import { MemberRelayFirstRun } from '../settings/MemberRelay';
+import { DeviceNotices } from './DeviceNotice';
 import { ChannelDialog, type ChannelDialogMode } from './ChannelDialog';
 import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
@@ -18,6 +22,8 @@ import { MemberList } from './MemberList';
 import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
 import { LeaveServerDialog } from './ServerLifecycle';
+import { useDesktopNotifications } from './useNotifications';
+import { useWindowTitle } from '../../app/TitleBar';
 
 const MEMBERS_KEY = 'mvp.ui.membersOpen';
 
@@ -25,16 +31,19 @@ export type ShellDialog = 'create' | 'join' | 'check' | null;
 
 export function Shell() {
   const store = useAppStore();
+  // G-62: the unread count on the app icon.
+  useUnreadBadge(store);
   const core = useCore();
   const identity = useStore(store, (s) => s.identity)!;
   const servers = useStore(store, (s) => s.servers);
   const notice = useStore(store, (s) => s.notice);
   const updateNote = useStore(store, (s) => s.updateNote);
   const flash = useStore(store, (s) => s.flash);
+  const settingsRequest = useStore(store, (s) => s.settingsRequest);
   const serverGone = useStore(store, (s) => s.serverGone);
   const uiDir = useUiDir();
   const intl = useIntl();
-  const { uiScale } = useSettings().settings;
+  const { uiScale, serverOrder = [] } = useSettings().settings;
 
   const [serverId, setServerId] = useState<Id | 'home'>(() => servers[0]?.id ?? 'home');
   const [channelByServer, setChannelByServer] = useState<Record<Id, Id>>({});
@@ -104,6 +113,8 @@ export function Shell() {
     return () => clearTimeout(t);
   }, [channelGone]);
   const server = servers.find((s) => s.id === serverId);
+  // The title bar shows the open server's name (desktop app).
+  useWindowTitle(server?.name);
 
   useEffect(() => {
     if (serverId !== 'home' && !servers.some((s) => s.id === serverId)) setServerId(servers[0]?.id ?? 'home');
@@ -114,6 +125,10 @@ export function Shell() {
     const t = setTimeout(() => store.clearServerGone(), 6000);
     return () => clearTimeout(t);
   }, [serverGone, store]);
+
+  useEffect(() => {
+    if (settingsRequest) setSettingsOpen(true);
+  }, [settingsRequest]);
 
   useEffect(() => {
     if (!flash) return;
@@ -137,11 +152,12 @@ export function Shell() {
   // Alt+Up / Alt+Down move between channels, Ctrl+Alt+Up / Down between servers.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+      // Alt+Shift+arrows move a server in the rail (G-01), handled there.
+      if (!e.altKey || e.shiftKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
       const dir = e.key === 'ArrowUp' ? -1 : 1;
       e.preventDefault();
       if (e.ctrlKey) {
-        const ids: (Id | 'home')[] = ['home', ...servers.map((s) => s.id)];
+        const ids: (Id | 'home')[] = ['home', ...sortByOrder(servers, serverOrder).map((s) => s.id)];
         const next = ids[(ids.indexOf(serverId) + dir + ids.length) % ids.length];
         setServerId(next);
       } else if (server && channels?.length && channelId) {
@@ -152,7 +168,7 @@ export function Shell() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [servers, serverId, server, channels, channelId]);
+  }, [servers, serverOrder, serverId, server, channels, channelId]);
 
   const toggleMembers = () => {
     if (phone) {
@@ -176,6 +192,13 @@ export function Shell() {
     setPhoneMembers(false);
     setPhoneView('nav');
   };
+  // G-61: a click on a desktop notification opens its channel.
+  useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
+    setSettingsOpen(false);
+    setServerId(sid);
+    setChannelByServer((m) => ({ ...m, [sid]: cid }));
+    goPhone('chat');
+  });
   const sheetOpen = phone && phoneMembers && phoneView === 'chat';
   const showMembers = !!server && (phone ? sheetOpen : membersOpen);
 
@@ -325,9 +348,17 @@ export function Shell() {
           <RecoveryCheck onChecked={closeCheck} onShowAgain={() => setShowWords(true)} />
         )}
       </Dialog>
-      <SettingsScreen open={settingsOpen} onClose={() => setSettingsOpen(false)} onCheckWords={() => setDialog('check')} />
+      {/* Member relays (#368): the one-time disclosure, the first time relaying is on. */}
+      <MemberRelayFirstRun />
+      <SettingsScreen
+        open={settingsOpen}
+        request={settingsRequest}
+        onClose={() => setSettingsOpen(false)}
+        onCheckWords={() => setDialog('check')}
+      />
 
       {/* Toasts stack in one column, so two at once never overlap. */}
+      <DeviceNotices />
       <div className="toasts">
         {serverGone && (
           <div className="toast" role="status" key={serverGone.at}>
@@ -336,7 +367,7 @@ export function Shell() {
         )}
         {flash && (
           <div className="toast" role="status" key={flash.at}>
-            <FormattedMessage id={flash.id} />
+            <FormattedMessage id={flash.id} values={flash.values} />
           </div>
         )}
         {channelGone && (

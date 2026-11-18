@@ -52,6 +52,18 @@ export const PhoneIcon = (p: IconProps) => (
     <path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a1 1 0 0 1-1 1A16 16 0 0 1 4 5a1 1 0 0 1 1-1z" />
   </Icon>
 );
+/** Voice rooms: the room's host. */
+export const CrownIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 18h16M5 15l-1-9 5 4 3-6 3 6 5-4-1 9z" />
+  </Icon>
+);
+/** G-26: add a reaction (a smiley with a plus). */
+export const SmilePlusIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M20 12a8 8 0 1 1-8-8M9 10h.01M15 10h.01M8.5 14.5a4.5 4.5 0 0 0 7 0M19 2v6M16 5h6" />
+  </Icon>
+);
 export const SpeakerIcon = (p: IconProps) => (
   <Icon {...p}>
     <path d="M4 9h4l5-4v14l-5-4H4zM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12" />
@@ -67,9 +79,27 @@ export const HangUpIcon = (p: IconProps) => (
     <path d="M3 14.5c5-4.7 13-4.7 18 0l-2.4 2.4-3.1-1.6v-2.4a11 11 0 0 0-7 0v2.4l-3.1 1.6z" />
   </Icon>
 );
+/** Muted on this device (G-03, G-17). */
+export const BellOffIcon = (p: IconProps) => (
+  <Icon className="bell-off" {...p}>
+    <path d="M6 16V11a6 6 0 0 1 9.5-4.9M18 11v5l2 2H6M10 20a2 2 0 0 0 4 0M3 3l18 18" />
+  </Icon>
+);
+
 export const MicOffIcon = (p: IconProps) => (
   <Icon {...p}>
     <path d="M9 9v2a3 3 0 0 0 5.1 2.1M15 10V5a3 3 0 0 0-5.7-1.3M19 11a7 7 0 0 1-1.2 3.9M5 11a7 7 0 0 0 11 5.7M12 18v3M3 3l18 18" />
+  </Icon>
+);
+/** G-84: deafen. */
+export const HeadphonesIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M3 18v-6a9 9 0 0 1 18 0v6M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3z" />
+  </Icon>
+);
+export const HeadphonesOffIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M3 18v-6a9 9 0 0 1 15.4-6.4M21 12v6M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3zM3 3l18 18" />
   </Icon>
 );
 export const GearIcon = (p: IconProps) => (

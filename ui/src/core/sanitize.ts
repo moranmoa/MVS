@@ -9,6 +9,7 @@
 
 import { cleanStunUrl } from '../voice/sdp';
 import type { CoreApi, CoreEventName, CoreEvents } from './api';
+import { normalizeEmoji } from './emoji';
 import type {
   AgeRestriction,
   Channel,
@@ -21,6 +22,12 @@ import type {
   ServerSummary,
   CallState,
   VoiceRoom,
+  ServerRestore,
+  DeviceApproval,
+  DeviceLinkOffer,
+  DeviceLinkState,
+  DeviceAdded,
+  MemberRelay,
   Id,
 } from './types';
 
@@ -166,9 +173,40 @@ function oneOf<T extends string>(raw: unknown, allowed: readonly T[], fallback: 
 // Unknown age limits are treated as the strictest one.
 const age = (raw: unknown): AgeRestriction => oneOf(raw, ['none', '16+', '18+'] as const, '18+');
 
+/** A real calendar date as YYYY-MM-DD, or '' when it isn't one. */
+function cleanBirthDate(raw: unknown): string {
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) return '';
+  const [y, m, d] = raw.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d ? raw : '';
+}
+
+/** B7 §9: a pending correction, or undefined when it's missing or malformed. */
+function cleanPendingBirthDate(raw: unknown): Identity['pendingBirthDate'] {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const { date, effectiveAt } = raw as Record<string, unknown>;
+  const d = cleanBirthDate(date);
+  if (!d || typeof effectiveAt !== 'number' || !Number.isFinite(effectiveAt) || effectiveAt <= 0) return undefined;
+  return { date: d, effectiveAt };
+}
+
+/** #359: a member's small picture: WebP or PNG base64 only, within the core's cap. */
+const SMALL_AVATAR = /^data:image\/(?:webp|png);base64,[A-Za-z0-9+/]+={0,2}$/;
+export function cleanSmallAvatar(raw: unknown): string | undefined {
+  return typeof raw === 'string' && raw.length <= 3500 && SMALL_AVATAR.test(raw) ? raw : undefined;
+}
+/** #359: a chosen colour, #rrggbb only. */
+export function cleanHexColor(raw: unknown): string | undefined {
+  return typeof raw === 'string' && /^#[0-9a-f]{6}$/i.test(raw) ? raw.toLowerCase() : undefined;
+}
+
 export function cleanIdentity(i: Identity): Identity {
+  const { pendingBirthDate, color: _color, ...rest } = i;
+  const pending = cleanPendingBirthDate(pendingBirthDate);
   return {
-    ...i,
+    ...(cleanHexColor(i.color) ? { color: cleanHexColor(i.color) } : {}),
+    ...rest,
+    ...(pending ? { pendingBirthDate: pending } : {}),
     shortCode: cleanCode(i.shortCode),
     displayName: cleanName(i.displayName),
     avatarColor: safeColor(i.avatarColor),
@@ -206,9 +244,22 @@ export function cleanInvite(i: Invite): Invite {
   };
 }
 
+/** G-11 (#323): an order key, base-62, 1–32 characters, never ending in 0. */
+const POSITION = /^[0-9A-Za-z]{0,31}[1-9A-Za-z]$/;
+
+/** A non-negative whole number below 2^31, or undefined. */
+const index = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 && (v as number) < 2 ** 31 ? (v as number) : undefined);
+
 export function cleanChannel(c: Channel): Channel {
+  const { position, firstUnreadIndex, unreadCount, ...rest } = c;
+  const first = index(firstUnreadIndex);
+  const n = index(unreadCount);
   return {
-    ...c,
+    ...rest,
+    // G-21: kept only as sane numbers; dropped otherwise.
+    ...(first !== undefined ? { firstUnreadIndex: first } : {}),
+    ...(n !== undefined ? { unreadCount: n } : {}),
+    ...(typeof position === 'string' && POSITION.test(position) ? { position } : {}),
     name: cleanName(c.name, CHANNEL_NAME_MAX) || '…',
     adult: c.adult === true,
     isDefault: c.isDefault === true,
@@ -218,7 +269,13 @@ export function cleanChannel(c: Channel): Channel {
 }
 
 export function cleanMember(m: Member): Member {
+  const { avatarDataUrl: rawAvatar, color: rawColor, ...m0 } = m;
+  const avatar = cleanSmallAvatar(rawAvatar);
+  const color = cleanHexColor(rawColor);
+  m = m0 as Member;
   return {
+    ...(avatar ? { avatarDataUrl: avatar } : {}),
+    ...(color ? { color } : {}),
     ...m,
     displayName: cleanName(m.displayName),
     shortCode: cleanCode(m.shortCode),
@@ -231,10 +288,55 @@ export function cleanMember(m: Member): Member {
   };
 }
 
+/** A message held for its channel key (#288): `pending-` and 16 lower-case hex. */
+export const HELD_ID = /^pending-[0-9a-f]{16}$/;
+export const isHeld = (m: Pick<Message, 'id'>): boolean => HELD_ID.test(m.id);
+
+/**
+ * G-24 (#330): the members a message mentions, as 64-hex user ids, at most 100,
+ * no repeats. Anything else in the list, or a list that isn't one, is dropped:
+ * names come from the member list, never from here.
+ */
+function cleanMentions(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const ids = [...new Set(raw.filter((x): x is string => typeof x === 'string' && /^[0-9a-f]{64}$/.test(x)))].slice(0, 100);
+  return ids.length ? ids : undefined;
+}
+
+/**
+ * G-26: at most 20 chips, each an emoji the core's check accepts in its
+ * stored form, a whole count of at least 1, and no emoji twice. Anything
+ * else is dropped.
+ */
+function cleanReactions(raw: unknown): Message['reactions'] {
+  if (!Array.isArray(raw)) return undefined;
+  const seen = new Set<string>();
+  const chips = raw
+    .filter(
+      (r): r is { emoji: string; count: number; mine: unknown } =>
+        typeof r?.emoji === 'string' &&
+        normalizeEmoji(r.emoji) === r.emoji &&
+        Number.isSafeInteger(r.count) &&
+        r.count >= 1,
+    )
+    .filter((r) => !seen.has(r.emoji) && !!seen.add(r.emoji))
+    .slice(0, 20)
+    .map((r) => ({ emoji: r.emoji, count: r.count, mine: r.mine === true }));
+  return chips.length ? chips : undefined;
+}
+
 export function cleanMessage(m: Message): Message {
   const { text, clipped } = cleanText(m.body);
+  // Only the exact held-id shape is a replacement; anything else is dropped.
+  const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
+  const mentions = cleanMentions(rawMentions);
+  const reactions = cleanReactions(rawReactions);
   return {
-    ...m,
+    ...rest,
+    ...(replaces ? { replaces } : {}),
+    ...(mentions ? { mentions } : {}),
+    ...(reactions ? { reactions } : {}),
     body: text,
     clipped: clipped || undefined,
     replyTo: m.replyTo && { ...m.replyTo, excerpt: cleanExcerpt(m.replyTo.excerpt) },
@@ -278,9 +380,15 @@ export function cleanCall(c: CallState): CallState {
     channelId: cleanHexId(c?.channelId),
     participants: participants
       .slice(0, 5)
-      .map((p) => ({ identity: cleanHexId(p?.identity), muted: p?.muted === true }))
+      .map((p) => ({
+        identity: cleanHexId(p?.identity),
+        muted: p?.muted === true,
+        // G-84b: shown only together with muted.
+        ...(p?.deafened === true && p?.muted === true ? { deafened: true } : {}),
+      }))
       .filter((p) => p.identity),
     full: c?.full === true,
+    ...(c?.relayOnly === true ? { relayOnly: true } : {}),
   };
 }
 
@@ -292,22 +400,139 @@ const ROOM_ID = /^(?:[0-9a-f]{64}|[A-Za-z0-9_-]{1,40})$/;
 const isRoomId = (v: unknown): v is Id => typeof v === 'string' && ROOM_ID.test(v);
 const onlyKeys = (o: object, keys: string[]) => Object.keys(o).every((k) => keys.includes(k));
 
+/** Voice rooms (0.4.3): what the UI accepts from the core (design §5). */
+export const VOICE_ROOMS_MAX = 10;
+export const VOICE_ROOM_LIMIT_MAX = 5;
+export const VOICE_ROOM_NAME_MAX = 32;
+const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+
 /**
- * A voice room from the core, or null to drop it: a bad id, more than 5 people,
- * a person twice, a non-boolean `muted` or any unknown field (voice-room contract).
+ * One voice room, or null to drop it: a bad id, a limit outside 2–5, more
+ * people than the limit, a person twice, a host who isn't in the room, a
+ * non-boolean `muted`, or any unknown field. A name that cleans to nothing
+ * is the default name.
  */
 export function cleanVoiceRoom(r: unknown): VoiceRoom | null {
-  if (!r || typeof r !== 'object' || !onlyKeys(r, ['serverId', 'roomId', 'participants'])) return null;
-  const { serverId, roomId, participants } = r as Record<string, unknown>;
-  if (!isRoomId(serverId) || !isRoomId(roomId) || !Array.isArray(participants) || participants.length > 5) return null;
-  const out: VoiceRoom['participants'] = [];
-  for (const p of participants as unknown[]) {
-    if (!p || typeof p !== 'object' || !onlyKeys(p, ['userId', 'muted'])) return null;
-    const { userId, muted } = p as Record<string, unknown>;
-    if (!isRoomId(userId) || typeof muted !== 'boolean' || out.some((x) => x.userId === userId)) return null;
-    out.push({ userId, muted });
+  const KEYS = ['serverId', 'roomId', 'creatorId', 'createdAt', 'name', 'limit', 'masterId', 'members', 'relayOnly'];
+  if (!r || typeof r !== 'object' || !onlyKeys(r, KEYS)) return null;
+  const { serverId, roomId, creatorId, createdAt, name, limit, masterId, members, relayOnly } = r as Record<string, unknown>;
+  if (!isRoomId(serverId) || !isRoomId(roomId) || !isRoomId(creatorId) || !isRoomId(masterId) || !isTime(createdAt)) return null;
+  if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 2 || limit > VOICE_ROOM_LIMIT_MAX) return null;
+  if (!Array.isArray(members) || members.length === 0 || members.length > limit) return null;
+  if (name !== undefined && typeof name !== 'string') return null;
+  if (relayOnly !== undefined && typeof relayOnly !== 'boolean') return null;
+  const out: VoiceRoom['members'] = [];
+  for (const p of members as unknown[]) {
+    if (!p || typeof p !== 'object' || !onlyKeys(p, ['userId', 'muted', 'deafened', 'joinedAt'])) return null;
+    const { userId, muted, deafened, joinedAt } = p as Record<string, unknown>;
+    if (!isRoomId(userId) || typeof muted !== 'boolean' || !isTime(joinedAt) || out.some((x) => x.userId === userId)) return null;
+    if (deafened !== undefined && typeof deafened !== 'boolean') return null;
+    out.push({ userId, muted, ...(deafened === true && muted ? { deafened: true } : {}), joinedAt });
   }
-  return { serverId, roomId, participants: out };
+  if (!out.some((p) => p.userId === masterId)) return null;
+  const clean = cleanName(name, VOICE_ROOM_NAME_MAX);
+  return {
+    serverId,
+    roomId,
+    creatorId,
+    createdAt,
+    ...(clean ? { name: clean } : {}),
+    limit,
+    masterId,
+    members: out,
+    ...(relayOnly === true ? { relayOnly: true } : {}),
+  };
+}
+
+/**
+ * A server's rooms, oldest first. Null (drop) for more than 10 rooms, a room
+ * twice, or one from another server; a malformed room alone is left out.
+ */
+export function cleanVoiceRooms(serverId: unknown, rooms: unknown): VoiceRoom[] | null {
+  if (!isRoomId(serverId) || !Array.isArray(rooms) || rooms.length > VOICE_ROOMS_MAX) return null;
+  const out: VoiceRoom[] = [];
+  for (const raw of rooms as unknown[]) {
+    const room = cleanVoiceRoom(raw);
+    if (!room) continue;
+    if (room.serverId !== serverId || out.some((x) => x.roomId === room.roomId)) return null;
+    out.push(room);
+  }
+  return out.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** Member relays: the daily cap range in MB (256 MB–50 GB). */
+export const MEMBER_RELAY_CAP_MIN_MB = 256;
+export const MEMBER_RELAY_CAP_MAX_MB = 51200;
+
+/** Member relays (slice 1): the whole object, or null to drop it (anything unknown or mistyped). */
+export function cleanMemberRelay(r: unknown): MemberRelay | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['setting', 'effective', 'reason', 'role', 'disclosureSeen', 'dailyCapMb'])) return null;
+  const { setting, effective, reason, role, disclosureSeen, dailyCapMb } = r as Record<string, unknown>;
+  if (typeof dailyCapMb !== 'number' || !Number.isInteger(dailyCapMb) || dailyCapMb < MEMBER_RELAY_CAP_MIN_MB || dailyCapMb > MEMBER_RELAY_CAP_MAX_MB) return null;
+  if (setting !== 'auto' && setting !== 'on' && setting !== 'off') return null;
+  if (typeof effective !== 'boolean' || typeof role !== 'boolean' || typeof disclosureSeen !== 'boolean') return null;
+  const REASONS = ['global-off', 'minor', 'relay-only', 'metered'] as const;
+  const why = REASONS.find((x) => x === reason);
+  if (reason !== undefined && reason !== null && !why) return null;
+  // A reason means off, whatever the setting.
+  if (why && effective) return null;
+  return { setting, effective, ...(why ? { reason: why } : {}), role, disclosureSeen, dailyCapMb };
+}
+
+const mustRelay = (r: unknown): MemberRelay => {
+  const clean = cleanMemberRelay(r);
+  if (!clean) throw { code: 'internal' };
+  return clean;
+};
+
+/** Device link: base32 codes (10), 6-digit digits, a printable QR payload. */
+const LINK_CODE = /^[A-Z2-7]{10}$/;
+const SAS = /^\d{6}$/;
+const QR_PAYLOAD = /^[\x21-\x7e]{1,1024}$/;
+
+export function cleanDeviceLinkOffer(r: unknown): DeviceLinkOffer | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['qr', 'code', 'expiresAt'])) return null;
+  const { qr, code, expiresAt } = r as Record<string, unknown>;
+  if (typeof qr !== 'string' || !QR_PAYLOAD.test(qr) || typeof code !== 'string' || !LINK_CODE.test(code) || !isTime(expiresAt)) return null;
+  return { qr, code, expiresAt };
+}
+
+export function cleanDeviceApproval(r: unknown): DeviceApproval | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['sas', 'expiresAt'])) return null;
+  const { sas, expiresAt } = r as Record<string, unknown>;
+  return typeof sas === 'string' && SAS.test(sas) && isTime(expiresAt) ? { sas, expiresAt } : null;
+}
+
+/** deviceLink.state, or null to drop it: an unknown state or reason, bad digits, digits outside "confirm", unknown keys. */
+export function cleanDeviceLinkState(r: unknown): DeviceLinkState | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['state', 'sas', 'reason'])) return null;
+  const { state, sas, reason } = r as Record<string, unknown>;
+  const st = (['waiting', 'confirm', 'done', 'expired', 'failed'] as const).find((x) => x === state);
+  if (!st) return null;
+  if (sas !== undefined && (typeof sas !== 'string' || !SAS.test(sas) || st !== 'confirm')) return null;
+  if (st === 'confirm' && sas === undefined) return null;
+  const why = (['cancelled', 'timeout', 'refused', 'network', 'keyring', 'restore'] as const).find((x) => x === reason);
+  if (reason !== undefined && !why) return null;
+  return { state: st, ...(sas !== undefined ? { sas: sas as string } : {}), ...(why ? { reason: why } : {}) };
+}
+
+/** account.deviceAdded: a time and an optional plain label (cleaned like a name, at most 64; empty = none); anything else drops it. */
+export function cleanDeviceAdded(r: unknown): DeviceAdded | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['at', 'label'])) return null;
+  const { at, label } = r as Record<string, unknown>;
+  if (!isTime(at) || (label !== undefined && typeof label !== 'string')) return null;
+  const clean = cleanName(label, 64);
+  return { at, ...(clean ? { label: clean } : {}) };
+}
+
+/** G-91: a known state, whole counts, and no more waiting than found; anything else is dropped. */
+export function cleanServerRestore(r: unknown): ServerRestore | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['state', 'found', 'waiting'])) return null;
+  const { state, found, waiting } = r as Record<string, unknown>;
+  const st = (['none', 'searching', 'waiting', 'done'] as const).find((x) => x === state);
+  const count = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 10_000;
+  if (!st || !count(found) || !count(waiting) || waiting > found) return null;
+  return { state: st, found, waiting };
 }
 
 /** A cleaner may return null to drop the event altogether. */
@@ -323,10 +548,25 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
   'message.added': cleanMessage,
   'message.updated': cleanMessage,
+  // Only the kinds the UI knows; anything else is dropped.
+  'notice': (n) =>
+    (n?.kind === 'encryption-renewed' || n?.kind === 'rekey-waiting') && typeof n.serverId === 'string'
+      ? { kind: n.kind, serverId: id(n.serverId) }
+      : null,
   'join.status': cleanJoin,
   'link.open': (p) => ({ link: cleanInviteLink(p?.link) }),
+  'window.state': (p) => ({ maximized: p?.maximized === true, fullScreen: p?.fullScreen === true }),
+  'window.closeRequest': () => ({}),
+  'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
   'call.state': (c) => cleanCall(c),
-  'voice.room': (r) => cleanVoiceRoom(r),
+  'memberRelay.changed': (r) => cleanMemberRelay(r),
+  'deviceLink.state': (r) => cleanDeviceLinkState(r),
+  'account.deviceAdded': (r) => cleanDeviceAdded(r),
+  'serverRestore.changed': (r) => cleanServerRestore(r),
+  'voice.rooms': (p) => {
+    const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
+    return rooms ? { serverId: p.serverId, rooms } : null;
+  },
   // For the voice engine: anything malformed is dropped, never coerced.
   'call.signal': (s) => {
     const kind = (['offer', 'answer', 'ice'] as const).find((k) => k === s?.kind);
@@ -369,6 +609,7 @@ export function guardCore(core: CoreApi): CoreApi {
     updateProfile: wrap(core.updateProfile, cleanIdentity),
     listServers: wrap(core.listServers, (l) => l.map(cleanServer)),
     listChannels: wrap(core.listChannels, (l) => l.map(cleanChannel)),
+    moveChannel: wrap(core.moveChannel, (l) => l.map(cleanChannel)),
     createChannel: wrap(core.createChannel, cleanChannel),
     updateChannel: wrap(core.updateChannel, cleanChannel),
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
@@ -379,11 +620,34 @@ export function guardCore(core: CoreApi): CoreApi {
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
     joinServer: wrap(core.joinServer, cleanJoin),
     joinCall: wrap(core.joinCall, cleanCall),
-    getVoiceRoom: wrap(core.getVoiceRoom, (r) => {
-      const room = cleanVoiceRoom(r);
-      if (!room) throw { code: 'internal' };
-      return room;
-    }),
+    listVoiceRooms: (serverId: Id) =>
+      core.listVoiceRooms(serverId).then((l) => {
+        const rooms = cleanVoiceRooms(serverId, l);
+        if (!rooms) throw { code: 'internal' };
+        return rooms;
+      }),
+    createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
+    getServerRestore: () =>
+      core.getServerRestore().then((r) => {
+        const clean = cleanServerRestore(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
+    startDeviceLink: () =>
+      core.startDeviceLink().then((r) => {
+        const clean = cleanDeviceLinkOffer(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
+    beginDeviceApproval: (qrOrCode: string) =>
+      core.beginDeviceApproval(qrOrCode).then((r) => {
+        const clean = cleanDeviceApproval(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
+    getMemberRelay: () => core.getMemberRelay().then(mustRelay),
+    setMemberRelay: (setting) => core.setMemberRelay(setting).then(mustRelay),
+    setMemberRelayCap: (mb) => core.setMemberRelayCap(mb).then(mustRelay),
     getMessages: wrap(core.getMessages, cleanRange),
     sendMessage: wrap(core.sendMessage, cleanMessage),
     on: <E extends CoreEventName>(event: E, handler: (p: CoreEvents[E]) => void) => {

@@ -15,8 +15,9 @@ const COMMANDS = Object.freeze({
   getRecoveryChallenge: [],
   checkRecoveryWords: ['answers'],
   getRecoveryWords: [],
-  restoreIdentity: ['words'],
+  restoreIdentity: ['words', 'input'],
   updateProfile: ['input'],
+  signOut: ['words', 'withoutWords'],
   // Servers and channels
   listServers: [],
   listChannels: ['serverId'],
@@ -30,7 +31,7 @@ const COMMANDS = Object.freeze({
   renameServer: ['serverId', 'name'],
   leaveServer: ['serverId'],
   closeServer: ['serverId'],
-  getUpdateNeeded: ['serverId'],
+  getUpdateNeeded: ['serverId', 'cap'],
   createInvite: ['serverId', 'input'],
   listInvites: ['serverId'],
   revokeInvite: ['serverId', 'inviteId'],
@@ -40,16 +41,31 @@ const COMMANDS = Object.freeze({
   sendMessage: ['channelId', 'body', 'replyToId'],
   editMessage: ['messageId', 'body'],
   deleteMessage: ['messageId'],
+  react: ['messageId', 'emoji', 'on'],
   retryMessage: ['messageId'],
+  moveChannel: ['serverId', 'channelId', 'before', 'after'],
+  discardMessage: ['messageId'],
   markRead: ['channelId'],
   // Safety
   blockUser: ['userId'],
   kickMember: ['serverId', 'userId'],
-  // Voice v1 (#223)
-  getVoiceRoom: ['serverId'],
+  // Device link (device-link-slice.md)
+  startDeviceLink: [],
+  cancelDeviceLink: [],
+  confirmDeviceLink: ['match'],
+  ackDeviceNotice: ['at'],
+  beginDeviceApproval: ['qrOrCode'],
+  confirmDeviceApproval: ['approve'],
+  // G-91: servers coming back after a restore
+  getServerRestore: [],
+  // Voice (#223); voice rooms (0.4.3)
+  listVoiceRooms: ['serverId'],
+  createVoiceRoom: ['serverId'],
+  editVoiceRoom: ['roomId', 'name', 'limit'],
   joinCall: ['channelId'],
   leaveCall: [],
   setMuted: ['muted'],
+  setDeafened: ['deafened'],
   sendSignal: ['to', 'kind', 'payload'],
   // App
   getStorageUsage: [],
@@ -58,6 +74,12 @@ const COMMANDS = Object.freeze({
   exportDiagnostics: [],
   getAppInfo: [],
   setUpdateChannel: ['channel'],
+  setRelayOnly: ['on'],
+  // Member relays, slice 1 (#368)
+  getMemberRelay: [],
+  setMemberRelay: ['setting'],
+  setMemberRelayCap: ['mb'],
+  markMemberRelayDisclosureSeen: [],
   restartToUpdate: [],
 });
 

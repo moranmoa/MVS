@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { FormattedMessage, FormattedNumber, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { FONT_MAX, FONT_MIN, SCALE_MAX, SCALE_MIN, useSettings, type Theme } from '../../app/settings';
@@ -6,24 +6,57 @@ import { useStore } from '../../app/store';
 import { useCore, type AppInfo, type StorageUsage } from '../../core';
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
 import { CheckIcon, ShieldIcon } from '../../components/icons';
-import { LOCALES } from '../../i18n';
+import { LanguagePicker } from '../../components/LanguagePicker';
 import { textDir, useUiDir } from '../../app/textDir';
+import { ProfileEditor, type ProfileEditorHandle } from './ProfileEditor';
+import { SignOutButton } from './SignOut';
+import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/notify';
+import { MemberRelaySetting } from './MemberRelay';
+import { DevicesSection } from './Devices';
+import { VoiceSection } from './Voice';
 
-type Section = 'account' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
-const SECTIONS: Section[] = ['account', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
+type Section = 'account' | 'privacy' | 'devices' | 'voice' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
+const SECTIONS: Section[] = ['account', 'privacy', 'devices', 'voice', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
 
 const GB = 1024 ** 3;
 const LIMIT_STEPS = [1, 2, 5, 10, 20, 50].map((g) => g * GB);
 
-export function SettingsScreen({ open, onClose, onCheckWords }: { open: boolean; onClose: () => void; onCheckWords: () => void }) {
+export function SettingsScreen({
+  open,
+  request,
+  onClose,
+  onCheckWords,
+}: {
+  open: boolean;
+  /** Open at this section, e.g. Privacy from the voice room's "Change in Settings". */
+  request?: { section: string; at: number } | null;
+  onClose: () => void;
+  onCheckWords: () => void;
+}) {
   const intl = useIntl();
   const [section, setSection] = useState<Section>(() => {
     const s = new URLSearchParams(location.search).get('settings');
     return SECTIONS.includes(s as Section) ? (s as Section) : 'appearance';
   });
+  // B11e: unsaved profile changes are asked about before leaving Account.
+  const [profileDirty, setProfileDirty] = useState(false);
+  const editor = useRef<ProfileEditorHandle>(null);
+  const [leaving, setLeaving] = useState<(() => void) | null>(null);
+  const guard = (action: () => void) => (profileDirty && section === 'account' ? setLeaving(() => action) : action());
+  const onDirtyChange = useCallback((d: boolean) => setProfileDirty(d), []);
+  useEffect(() => {
+    if (request && SECTIONS.includes(request.section as Section)) guard(() => setSection(request.section as Section));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request]);
+  const leave = () => {
+    const go = leaving;
+    setLeaving(null);
+    setProfileDirty(false);
+    go?.();
+  };
 
   return (
-    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'settings.title' })} className="settings-dialog">
+    <Dialog open={open} onClose={() => guard(onClose)} title={intl.formatMessage({ id: 'settings.title' })} className="settings-dialog">
       <div className="settings">
         <nav className="settings-nav" aria-label={intl.formatMessage({ id: 'settings.title' })}>
           <ul>
@@ -33,9 +66,12 @@ export function SettingsScreen({ open, onClose, onCheckWords }: { open: boolean;
                   type="button"
                   className={section === s ? 'active' : ''}
                   aria-current={section === s ? 'true' : undefined}
-                  onClick={() => setSection(s)}
+                  onClick={() => s !== section && guard(() => setSection(s))}
                 >
                   <FormattedMessage id={`settings.nav.${s}`} />
+                  {s === 'account' && profileDirty && (
+                    <span className="nav-dirty" role="img" aria-label={intl.formatMessage({ id: 'profile.edit.unsaved' })} />
+                  )}
                 </button>
               </li>
             ))}
@@ -45,33 +81,65 @@ export function SettingsScreen({ open, onClose, onCheckWords }: { open: boolean;
           <h3 id={`settings-h-${section}`}>
             <FormattedMessage id={`settings.nav.${section}`} />
           </h3>
-          {section === 'account' && <AccountSection onCheckWords={onCheckWords} />}
+          {section === 'account' && <AccountSection onCheckWords={onCheckWords} editor={editor} onDirtyChange={onDirtyChange} />}
           {section === 'language' && <LanguageSection />}
           {section === 'appearance' && <AppearanceSection />}
           {section === 'storage' && <StorageSection />}
           {section === 'diagnostics' && <DiagnosticsSection />}
           {section === 'about' && <AboutSection />}
+          {section === 'devices' && <DevicesSection />}
+          {section === 'voice' && <VoiceSection />}
+          {section === 'notifications' && <NotificationsSection />}
+          {section === 'privacy' && <PrivacySection focus={request?.section === 'privacy' ? request.at : undefined} />}
         </section>
       </div>
+      <Dialog open={!!leaving} onClose={() => setLeaving(null)} title={intl.formatMessage({ id: 'profile.edit.unsavedTitle' })}>
+        <div className="actions">
+          <button
+            type="button"
+            className="primary"
+            autoFocus
+            onClick={async () => {
+              if (await editor.current?.save()) leave();
+              else setLeaving(null); // the error shows in the form
+            }}
+          >
+            <FormattedMessage id="profile.edit.save" />
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => {
+              editor.current?.discard();
+              leave();
+            }}
+          >
+            <FormattedMessage id="profile.edit.unsavedDiscard" />
+          </button>
+          <button type="button" className="link" onClick={() => setLeaving(null)}>
+            <FormattedMessage id="profile.edit.unsavedBack" />
+          </button>
+        </div>
+      </Dialog>
     </Dialog>
   );
 }
 
-function AccountSection({ onCheckWords }: { onCheckWords: () => void }) {
+function AccountSection({
+  onCheckWords,
+  editor,
+  onDirtyChange,
+}: {
+  onCheckWords: () => void;
+  editor: React.Ref<ProfileEditorHandle>;
+  onDirtyChange: (dirty: boolean) => void;
+}) {
   const store = useAppStore();
   const identity = useStore(store, (s) => s.identity)!;
-  const name = identity.displayName || identity.shortCode;
   return (
-    <div className="stack">
-      <div className="account-row">
-        <Avatar name={name} color={identity.avatarColor} src={identity.avatarDataUrl} size={56} />
-        <div>
-          <Name>{name}</Name>
-          <div>
-            <Code value={identity.shortCode} />
-          </div>
-        </div>
-      </div>
+    <div className="stack account-sections">
+      <ProfileEditor ref={editor} onDirtyChange={onDirtyChange} />
+      <BirthDateSection />
       <h4>
         <FormattedMessage id="settings.account.words" />
       </h4>
@@ -92,31 +160,19 @@ function AccountSection({ onCheckWords }: { onCheckWords: () => void }) {
           </div>
         </div>
       )}
+      <h4>
+        <FormattedMessage id="signOut.heading" />
+      </h4>
+      <SignOutButton />
     </div>
   );
 }
 
 function LanguageSection() {
-  const { settings, update } = useSettings();
   const intl = useIntl();
   return (
     <div className="stack">
-      <div className="choice-list" role="radiogroup" aria-label={intl.formatMessage({ id: 'settings.language.label' })}>
-        {LOCALES.map((l) => (
-          <button
-            key={l}
-            type="button"
-            role="radio"
-            aria-checked={settings.locale === l}
-            className="choice"
-            lang={l}
-            onClick={() => update({ locale: l })}
-          >
-            <FormattedMessage id={`lang.${l}`} />
-            {settings.locale === l && <CheckIcon />}
-          </button>
-        ))}
-      </div>
+      <LanguagePicker label={intl.formatMessage({ id: 'settings.language.label' })} />
       <p className="muted small">
         <FormattedMessage id="settings.instant" />
       </p>
@@ -231,6 +287,110 @@ function Bytes({ value }: { value: number }) {
   );
 }
 
+/** G-61: the main switches; each server and channel is set from its menu. */
+function NotificationsSection() {
+  const { settings, update } = useSettings();
+  const prefs = settings.notify ?? defaultNotifyPrefs();
+  const set = (patch: Partial<NotifyPrefs>) => update({ notify: { ...prefs, ...patch } });
+  return (
+    <div className="stack">
+      {!shellNotify() && (
+        <p className="muted small" role="note">
+          <FormattedMessage id="notify.settings.desktopOnly" />
+        </p>
+      )}
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.desktop" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.desktop}
+          aria-describedby="notify-desktop-hint"
+          onChange={(e) => set({ desktop: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-desktop-hint">
+        <FormattedMessage id="notify.settings.desktopHint" />
+      </p>
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.preview" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.preview}
+          disabled={!prefs.desktop}
+          aria-describedby={prefs.desktop ? 'notify-preview-hint' : 'notify-preview-hint notify-preview-off'}
+          onChange={(e) => set({ preview: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-preview-hint">
+        <FormattedMessage id="notify.settings.previewHint" />
+      </p>
+      {prefs.desktop && prefs.preview && (
+        <p className="muted small" role="note">
+          <FormattedMessage id="notify.settings.previewPrivacy" />
+        </p>
+      )}
+      {!prefs.desktop && (
+        <p className="muted small" id="notify-preview-off">
+          <FormattedMessage id="notify.settings.previewDisabled" />
+        </p>
+      )}
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.badge" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.badge}
+          aria-describedby="notify-badge-hint"
+          onChange={(e) => set({ badge: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-badge-hint">
+        <FormattedMessage id="notify.settings.badgeHint" />
+      </p>
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.sound" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.sound}
+          aria-describedby="notify-sound-hint"
+          onChange={(e) => set({ sound: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-sound-hint">
+        <FormattedMessage id="notify.settings.soundHint" />
+      </p>
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.soundInCall" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.sound && prefs.soundInCall}
+          disabled={!prefs.sound}
+          onChange={(e) => set({ soundInCall: e.target.checked })}
+        />
+      </label>
+    </div>
+  );
+}
+
 function StorageSection() {
   const core = useCore();
   const [usage, setUsage] = useState<StorageUsage | null>(null);
@@ -341,6 +501,85 @@ function DiagnosticsSection() {
   );
 }
 
+// Relay-only (GAP-6r, #272), per device: nobody connects to me directly, so
+// members never see my IP address; calls are off while it is on.
+function PrivacySection({ focus }: { focus?: number }) {
+  const store = useAppStore();
+  const intl = useIntl();
+  const relayOnly = useStore(store, (s) => s.relayOnly);
+  const inCall = useStore(store, (s) => !!s.call);
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+  // Turning it on ends a call in progress: ask first, in the row.
+  const [confirm, setConfirm] = useState(false);
+  const switchRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!focus) return;
+    // After the dialog opens (showModal moves focus first).
+    const t = setTimeout(() => switchRef.current?.focus());
+    return () => clearTimeout(t);
+  }, [focus]);
+
+  const apply = async (on: boolean) => {
+    setConfirm(false);
+    setBusy(true);
+    setFailed(false);
+    try {
+      await store.setRelayOnly(on);
+    } catch {
+      setFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="stack">
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="privacy.relayOnly.label" />
+        </span>
+        <input
+          ref={switchRef}
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={relayOnly}
+          disabled={busy}
+          aria-describedby="relay-only-hint relay-only-calls"
+          onChange={(e) => (e.target.checked && inCall ? setConfirm(true) : void apply(e.target.checked))}
+        />
+      </label>
+      {confirm && (
+        <div className="confirm" role="alertdialog" aria-label={intl.formatMessage({ id: 'privacy.relayOnly.confirm' })}>
+          <p>
+            <FormattedMessage id="privacy.relayOnly.confirm" />
+          </p>
+          <div className="actions">
+            <button type="button" className="danger small" autoFocus onClick={() => void apply(true)}>
+              <FormattedMessage id="privacy.relayOnly.turnOn" />
+            </button>
+            <button type="button" className="secondary small" onClick={() => setConfirm(false)}>
+              <FormattedMessage id="common.cancel" />
+            </button>
+          </div>
+        </div>
+      )}
+      <p id="relay-only-hint" className="muted small">
+        <FormattedMessage id="privacy.relayOnly.hint" />
+      </p>
+      <p id="relay-only-calls" className="muted small">
+        <FormattedMessage id="privacy.relayOnly.calls" />
+      </p>
+      {failed && (
+        <p className="error small" role="alert">
+          <FormattedMessage id="invite.failed" />
+        </p>
+      )}
+      <MemberRelaySetting />
+    </div>
+  );
+}
+
 function AboutSection() {
   const core = useCore();
   const [info, setInfo] = useState<AppInfo | null>(null);
@@ -385,5 +624,45 @@ function AboutSection() {
         <FormattedMessage id="settings.about.licenses" />
       </p>
     </div>
+  );
+}
+
+/** A calendar date (YYYY-MM-DD) as the person reads it, without a time-zone shift. */
+function formatBirthDate(intl: ReturnType<typeof useIntl>, date: string): string {
+  const [y, m, d] = date.split('-').map(Number);
+  return intl.formatDate(new Date(y, m - 1, d), { dateStyle: 'long' });
+}
+
+/**
+ * B7 §2: my date of birth, and a correction that raises my age while it waits
+ * its 30 days. Correcting it ("תיקון", and cancelling a pending correction)
+ * waits for the core's correction commands.
+ */
+function BirthDateSection() {
+  const store = useAppStore();
+  const intl = useIntl();
+  const identity = useStore(store, (s) => s.identity)!;
+  const pending = identity.pendingBirthDate;
+  return (
+    <section className="dob-section" aria-labelledby="dob-heading">
+      <h4 id="dob-heading">
+        <FormattedMessage id="age.dob.section" />
+      </h4>
+      {identity.birthDate && <p className="dob-current">{formatBirthDate(intl, identity.birthDate)}</p>}
+      {pending && (
+        <p className="dob-pending" role="status">
+          <FormattedMessage
+            id="age.dob.pending"
+            values={{
+              newDate: formatBirthDate(intl, pending.date),
+              date: intl.formatDate(pending.effectiveAt, { dateStyle: 'long' }),
+            }}
+          />
+        </p>
+      )}
+      <p className="muted small">
+        <FormattedMessage id="age.dob.privacy" />
+      </p>
+    </section>
   );
 }

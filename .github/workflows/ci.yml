@@ -73,6 +73,31 @@ jobs:
         run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check licenses sources bans
       - name: relay
         run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check licenses sources bans
+      # The relay never resolves names (#443): no DNS resolver may come back
+      # in its build (Security Lead). Fails if hickory-proto is compiled in.
+      - name: relay has no DNS resolver
+        run: |
+          out=$(cargo tree --locked --manifest-path infra/relay/Cargo.toml -e normal -i hickory-proto 2>&1 || true)
+          if echo "$out" | grep -q "^hickory-proto "; then
+            echo "$out"
+            echo "::error::hickory-proto is in the relay build again"; exit 1
+          fi
+          echo "ok: no hickory-proto in the relay build"
+      # core/vendor/libp2p-dns must stay the crates.io 0.45.0 package (sha256
+      # pinned) with only the edits its README lists.
+      - name: vendored libp2p-dns matches crates.io
+        run: bash .github/scripts/check-vendored-libp2p-dns.sh
+      # core/vendor/libp2p-gossipsub: crates.io 0.49.5 plus only upstream's
+      # RUSTSEC-2026-0534 fix (the .patch beside it).
+      - name: vendored libp2p-gossipsub matches crates.io plus its fix
+        run: bash .github/scripts/check-vendored-libp2p-gossipsub.sh
+      # cargo-deny can't see path crates' advisories: check core/vendor/* in
+      # RustSec by crates.io name and upstream version. Blocking on purpose:
+      # only we can fix a vendored crate. Remove with libp2p 0.57.
+      - name: no open advisories for the vendored crates
+        run: |
+          git clone --quiet --depth 1 https://github.com/rustsec/advisory-db "$RUNNER_TEMP/advisory-db"
+          python3 .github/scripts/check-vendored-advisories.py "$RUNNER_TEMP/advisory-db"
 
   advisories:
     # Informational for now: the open advisories are all in libp2p 0.54's
@@ -86,7 +111,13 @@ jobs:
           persist-credentials: false
       - name: Install cargo-deny (checksum verified)
         run: .github/scripts/install-cargo-deny.sh
-      - run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
+      - name: core
+        run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
+      # The relay too: it has public listeners (e.g. RUSTSEC-2026-0525, a remote
+      # panic in libp2p-quic, was only caught by hand). Runs even if core fails.
+      - name: relay
+        if: always()
+        run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check advisories
 
   ui:
     name: ui build, tests and licences
@@ -196,13 +227,12 @@ jobs:
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm ci --no-audit --no-fund
-      # Skips the three tests that need a running core (names matching "the core|core events"):
-      # test/fake-core.js is spawned directly, and Windows cannot execute a .js
-      # file (EFTYPE; the shell now survives that, the core just stays down).
-      # Linux runs them. The permission (mic) tests still run here.
+      # The full suite, the fake core included: in a checkout on Windows the
+      # shell runs test/fake-core.js under Electron in Node mode (sidecar.js
+      # "script"), since Windows cannot execute a .js file.
       # DEBUG=pw:browser* puts Electron's own stdout/stderr (main's log lines,
       # the sidecar's "core:" lines) into the output, which is kept below.
-      - name: Electron e2e (without the core-spawning tests)
+      - name: Electron e2e
         working-directory: desktop
         shell: bash
         env:
@@ -210,7 +240,7 @@ jobs:
           ELECTRON_ENABLE_LOGGING: "1"
         run: |
           set -o pipefail
-          node --test --test-concurrency=1 --test-skip-pattern="the core|core events" test/e2e.test.mjs 2>&1 | tee "$RUNNER_TEMP/e2e-output.log"
+          node --test --test-concurrency=1 test/e2e.test.mjs 2>&1 | tee "$RUNNER_TEMP/e2e-output.log"
       - name: Collect e2e logs
         if: always()
         shell: bash

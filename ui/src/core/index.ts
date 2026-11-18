@@ -21,8 +21,15 @@ export * from './types';
  *   ?installed=1     a new version was just installed, with release notes
  *   ?rolledBack=1    the last update failed and the previous version is back
  *   ?coreDown=<detail> the desktop shell reports the core down (missing, start-failed, crashed, crash-loop)
- *   ?callError=<code> joinCall fails with call-full, relay-only or not-implemented
- *   ?roomFull=1      every demo voice room already has 5 people
+ *   ?callError=<code> joinCall/createVoiceRoom fail with call-full, relay-only, in-call-elsewhere, not-implemented or room-cap
+ *   ?keyPending=arrive|fail|wait  sends wait for the channel key, then go out, fail or keep waiting (#288)
+ *   ?pendingDob=1    a birth-date correction waits its 30 days (B7, #306)
+ *   ?signOutKeyring=1 signOut fails with keyring-unavailable (#304)
+ *   ?profileError=1  updateProfile fails (B11e)
+ *   ?memberRelay=minor|metered|global-off  member relaying is forced off for that reason
+ *   ?memberRelayUnseen=1  the member-relay disclosure is not seen yet (shows at start)
+ *   ?roomFull=1      the first demo voice room already has 5 people
+ *   ?voiceRooms=<n>  each demo server starts with n live voice rooms (default 1, 0–10)
  *   ?stun=<url>      the desktop shell's STUN URL for voice (stun:host:port)
  *   ?inCall=1        restartToUpdate is refused as during a call (not-allowed)
  *   ?fresh=1         forget the stored mock account
@@ -51,6 +58,18 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     coreDown: (params.get('coreDown') as MockOptions['coreDown']) ?? undefined,
     callError: (params.get('callError') as MockOptions['callError']) ?? undefined,
     roomFull: params.has('roomFull'),
+    voiceRooms: params.has('voiceRooms') ? Math.max(0, Math.min(10, Number(params.get('voiceRooms')) || 0)) : undefined,
+    profileError: params.has('profileError'),
+    signOutKeyring: params.has('signOutKeyring'),
+    pendingDob: params.has('pendingDob'),
+    keyPending: (params.get('keyPending') as MockOptions['keyPending']) ?? undefined,
+    relayOnly: params.has('relayOnly'),
+    restore: (['searching', 'waiting', 'done'] as const).find((s) => s === params.get('restore')),
+    messageGapMs: params.has('gapHours') ? Math.max(0.01, Number(params.get('gapHours')) || 1) * 3_600_000 : undefined,
+    deviceLinked: params.has('deviceLinked') ? (params.get('deviceLinked') ?? '') : undefined,
+    deviceLink: (['confirm', 'expired', 'failed'] as const).find((s) => s === params.get('deviceLink')),
+    memberRelayReason: (['minor', 'metered', 'global-off'] as const).find((r) => r === params.get('memberRelay')),
+    memberRelayUnseen: params.has('memberRelayUnseen'),
     outdatedMembers: params.has('outdated'),
     closedServer: params.has('closed'),
     stunUrl: params.get('stun') ?? undefined,

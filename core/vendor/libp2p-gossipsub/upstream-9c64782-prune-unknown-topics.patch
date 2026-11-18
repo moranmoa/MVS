@@ -1,0 +1,26 @@
+Upstream fix for RUSTSEC-2026-0534 / GHSA-vrx6-jcp8-vm7m (released in
+libp2p-gossipsub 0.50.1), backported to 0.49.5:
+https://github.com/libp2p/rust-libp2p/commit/9c647828abea0dfc0b4e827dff1e176ec8b44752
+Only the src/behaviour.rs hunk; paths shortened from protocols/gossipsub/.
+Applied with: patch -p1 < this file (offset -154 lines on 0.49.5).
+
+diff --git a/src/behaviour.rs b/src/behaviour.rs
+index 8cf5b0a3393..639f1ff376e 100644
+--- a/src/behaviour.rs
++++ b/src/behaviour.rs
+@@ -1764,6 +1764,15 @@ where
+             .peer_score
+             .below_threshold(peer_id, |ts| ts.accept_px_threshold);
+         for (topic_hash, px, backoff) in prune_data {
++            if !self.mesh.contains_key(&topic_hash) {
++                tracing::debug!(
++                    peer=%peer_id,
++                    topic=%topic_hash,
++                    "PRUNE: Received prune for unknown topic from peer"
++                );
++                continue;
++            }
++
+             if self.remove_peer_from_mesh(peer_id, &topic_hash, backoff, true) {
+                 #[cfg(feature = "metrics")]
+                 if let Some(m) = self.metrics.as_mut() {

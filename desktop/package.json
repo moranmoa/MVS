@@ -7,8 +7,8 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/security.test.js test/commands.test.js test/sidecar.test.js test/deeplink.test.js test/config.test.js test/update.test.js",
-    "e2e": "node --test --test-concurrency=1 test/e2e.test.mjs test/deeplink.e2e.test.mjs",
+    "test": "node --test test/security.test.js test/commands.test.js test/sidecar.test.js test/deeplink.test.js test/config.test.js test/update.test.js test/signout.test.js test/logfile.test.js test/notify.test.js test/metered.test.js test/ptt.test.js test/badge.test.js test/applock.test.js",
+    "e2e": "node --test --test-concurrency=1 test/e2e.test.mjs test/deeplink.e2e.test.mjs test/close.e2e.test.mjs test/applock.e2e.test.mjs",
     "dist:linux": "electron-builder --linux AppImage deb",
     "dist:win": "electron-builder --win nsis",
     "test:fuses": "node --test test/fuses.test.mjs"
@@ -24,7 +24,7 @@
     "name": "MVS",
     "email": "spike@example.invalid"
   },
-  "homepage": "https://github.com/moranmoa/MVP",
+  "homepage": "https://github.com/moranmoa/MVS",
   "build": {
     "appId": "dev.mvs.app",
     "productName": "MVS",
@@ -45,6 +45,10 @@
         "to": "mvs-config.json"
       },
       {
+        "from": "build/icons/512x512.png",
+        "to": "icon.png"
+      },
+      {
         "from": "build/THIRD-PARTY-NOTICES.txt",
         "to": "THIRD-PARTY-NOTICES.txt"
       }
@@ -59,6 +63,7 @@
         "deb"
       ],
       "category": "Network",
+      "icon": "build/icons",
       "maintainer": "MVS <spike@example.invalid>",
       "extraResources": [
         {
@@ -86,6 +91,7 @@
     },
     "win": {
       "target": "nsis",
+      "icon": "build/icon.ico",
       "extraResources": [
         {
           "from": ".core/mvs-core.exe",
@@ -104,6 +110,8 @@
       "perMachine": false,
       "allowElevation": false,
       "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
       "deleteAppDataOnUninstall": false,
       "unicode": true
     },

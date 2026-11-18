@@ -24,7 +24,7 @@
 //! rate per peer and in total, concurrent answers, gossip message size and
 //! topics, connections, and the pending-record buffer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -53,6 +53,7 @@ use zeroize::Zeroizing;
 
 use crate::access::{self, Binder, Binding, Handle, ReadGate, ServerSecret};
 use crate::limits::{Acks, DialBackoff, Pending, PerIp, RateLimiter, Refused};
+use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
@@ -95,6 +96,35 @@ const GLOBAL_PULL_BURST: u32 = 100;
 const GLOBAL_PULL_RATE: u32 = 50;
 /// Pulls being answered on blocking threads at once; more are dropped.
 const MAX_ANSWERING: usize = 8;
+/// Pulls out to one peer at once; more wait in `queued_pulls`. The answering
+/// side reserves up to a page (`PAGE_BYTES`) of its per-peer served-bytes
+/// budget (`SERVED_BYTES_BURST`) for each pull until the answer goes out, so
+/// 3 stay under it: a burst of pulls is never refused for the budget.
+const MAX_PULLS_IN_FLIGHT: usize = 3;
+/// T24: outgoing pulls per peer: a burst, then a steady rate, under the
+/// answering side's (`PULL_BURST` 30, `PULL_RATE` 10/s), so its limit never
+/// refuses ours (a refused pull fails, isn't an empty answer, and is re-asked).
+const OUT_PULL_BURST: u32 = 20;
+const OUT_PULL_RATE: u32 = 8;
+/// Most pulls `pull_all` sends one peer in one anti-entropy round: under the
+/// answering side's burst (`PULL_BURST`) and what its rate (`PULL_RATE`)
+/// refills between rounds, so a peer that holds none of our servers' logs
+/// (and answers each at once, empty) is never pushed over its limit.
+const PULLS_PER_PEER_ROUND: usize = 20;
+/// The first round to a peer that just connected: small, since the round
+/// timer, a relay reservation and the other side's own first round can all
+/// land within the same few seconds.
+const FIRST_CONTACT_PULLS: usize = 5;
+/// T23 (GAP-4b, security lead): how long an unbound peer isn't asked again
+/// for a control log it answered empty, and how often an unbound peer is
+/// probed for a server we already have a bound member of. Each such pull
+/// carries our binding to a peer that isn't known to be a member.
+const UNBOUND_REPROBE: Duration = Duration::from_secs(600);
+/// Most entries `empty_from` and `probed` each keep (security lead): peer IDs
+/// are free, so churned peers can't grow them; the oldest goes first.
+const MAX_T23_ENTRIES: usize = 10_000;
+/// How a control log's name ends (`log_name`): queued first.
+const CONTROL_SUFFIX: &str = "/control";
 /// Per-peer pull buckets remembered (also after disconnecting).
 const MAX_TRACKED_PEERS: usize = 4096;
 /// Node events waiting for the app; beyond this, events are dropped and a
@@ -123,11 +153,53 @@ const MAX_CONNECTIONS_PER_IP: usize = 8;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long [`Node::fetch_invite`] waits for answers (T8-02).
 pub const INVITE_FETCH_WAIT: Duration = Duration::from_secs(3);
+/// How long [`Node::fetch_backup`] waits for holders (a provider lookup and
+/// circuit dials included).
+pub const BACKUP_FETCH_WAIT: Duration = Duration::from_secs(3);
+/// A provider lookup for one tag at most this often: a restore retries each
+/// sync round, and the lookup is the slow part.
+const BACKUP_LOOKUP_EVERY: Duration = Duration::from_secs(60);
+/// Providers of a backup tag one fetch asks.
+const MAX_BACKUP_PROVIDERS: usize = 8;
+/// How long [`Node::fetch_notices`] waits for holders.
+pub const NOTICE_FETCH_WAIT: Duration = Duration::from_secs(3);
+/// Holders one notice fetch asks (Tech Lead: the first answer merged with
+/// at most one more, not every holder).
+const NOTICE_HOLDERS: usize = 2;
 /// Peers one envelope fetch asks.
 const MAX_FETCH_PEERS: usize = 16;
 /// Traffic on every connection at least this often, well under the 100 s a
 /// proxy like Cloudflare lets a WebSocket sit idle.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// A ping unanswered this long fails (the default is 20 s).
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Our relay's connection is closed after this many failed pings in a row.
+/// libp2p's ping no longer closes anything itself, and a connection that died
+/// silently (a NAT entry gone, a laptop lid) would otherwise sit until
+/// IDLE_TIMEOUT. Worst case [`relay_silent_for`]: within a minute, so the
+/// member relay fallback (RELAY_DOWN_AFTER) starts from a real loss.
+const RELAY_PING_MISSES: u32 = 2;
+
+/// The longest our relay can stay silent before its connection is closed.
+#[cfg(test)]
+const fn relay_silent_for() -> Duration {
+    Duration::from_secs((PING_INTERVAL.as_secs() + PING_TIMEOUT.as_secs()) * RELAY_PING_MISSES as u64)
+}
+
+/// One ping result from our relay: the misses in a row so far, and whether
+/// to close the connection now.
+fn relay_ping(misses: &mut u32, ok: bool) -> bool {
+    if ok {
+        *misses = 0;
+        return false;
+    }
+    *misses += 1;
+    if *misses >= RELAY_PING_MISSES {
+        *misses = 0;
+        return true;
+    }
+    false
+}
 /// Bytes of served pull pages: per peer, and for all peers together.
 const SERVED_BYTES_BURST: u32 = 16 * 1024 * 1024;
 const SERVED_BYTES_RATE: u32 = 2 * 1024 * 1024;
@@ -191,6 +263,11 @@ pub struct NodeConfig {
     /// bound peer reports may be dialled to turn a relayed connection into a
     /// direct one. LAN addresses never come from, or go to, the DHT.
     pub allow_lan: bool,
+    /// "Relay only" (GAP-6) from the start: no direct listener (TCP or
+    /// QUIC), no start-up dial of `bootstrap`, no hole punching. Only the
+    /// relay connection and its circuits. The same as `Node::set_relay_only(true)`
+    /// right after start, without the moment in between.
+    pub relay_only: bool,
 }
 
 /// Who may read servers opened with [`Node::open_server`] (GAP-4). Without
@@ -252,6 +329,9 @@ pub enum NodeEvent {
     /// member of `server`, `from` its identity. Opaque here: the api
     /// verifies it (C1) and calls [`Node::serve_invite`] if it holds.
     InvitePublication { server: ServerId, from: PublicKey, bytes: Vec<u8> },
+    /// Device link (new device): the signed-in device's Hello or its sealed
+    /// transfer, already answered. See `device_link`.
+    DeviceLink(crate::device_link::Inbound),
 }
 
 /// Presence on one server (M2). `online` holds bound identities (anyone
@@ -300,14 +380,37 @@ enum Command {
     RelayOnly { on: bool },
     NoDirectDials,
     NoHolePunch,
+    MemberRelay { on: bool, daily_cap_mb: u32, preferred: bool },
     #[cfg(test)]
     Served { peer: PeerId, log: String, reply: oneshot::Sender<usize> },
+    #[cfg(test)]
+    RateLimited { reply: oneshot::Sender<usize> },
+    #[cfg(test)]
+    InboundPulls { reply: oneshot::Sender<usize> },
+    #[cfg(any(test, feature = "test-util"))]
+    Dial { addr: Multiaddr },
+    #[cfg(any(test, feature = "test-util"))]
+    Listen { addr: Multiaddr },
+    #[cfg(any(test, feature = "test-util"))]
+    MemberRelayCounts { reply: oneshot::Sender<(u64, u64)> },
+    #[cfg(test)]
+    Disconnect { peer: PeerId },
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
     DropServerInvites { server: ServerId },
     FetchInvite { handle: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
+    PutBackup { blob: Vec<u8>, reply: oneshot::Sender<bool> },
+    FetchBackup { tag: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
+    PutNotice { blob: Vec<u8>, reply: oneshot::Sender<bool> },
+    FetchNotices { reply: oneshot::Sender<Vec<Vec<u8>>> },
+    NoticeSigner { signer: Option<Arc<dyn crate::notice::NoticeSigner>> },
+    LanBeacon { port: u16, reply: oneshot::Sender<bool> },
+    LinkOpen { rv: [u8; 32], e_new_pub: [u8; 32], reply: oneshot::Sender<Option<(PeerId, Multiaddr)>> },
+    LinkClose,
+    LinkFind { rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>> },
+    LinkRequest { peer: PeerId, request: crate::device_link::Request, reply: LinkReply },
     Shutdown { reply: oneshot::Sender<()> },
 }
 
@@ -364,18 +467,40 @@ struct SyncResponse {
     /// carries them.
     #[serde(default)]
     direct_addrs: Vec<ByteBuf>,
+    /// We relay for members (#368 slice 2): where to reach us, only to a
+    /// member, never on identify or the DHT (design §1 rule 2).
+    #[serde(default)]
+    relay: Option<RelayOffer>,
+}
+
+/// A member relay's offer, in pull answers to members only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RelayOffer {
+    /// Our direct listen addresses (at most `MAX_DIRECT_CANDIDATES`).
+    addrs: Vec<ByteBuf>,
+    /// An owner or admin relay: tried first.
+    preferred: bool,
 }
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    /// First: a connection it refuses (a device-link peer off the relay
+    /// circuit) must reach no other behaviour. Behaviours are asked in field
+    /// order, and one asked before a refusal keeps a connection the swarm
+    /// never reports closed (request-response then trips over it).
+    guard: DialGuard,
+    /// Second, for the same reason: a connection over a limit is refused
+    /// before any behaviour that keeps per-connection state saw it.
+    limits: connection_limits::Behaviour,
+    /// Member relays (`member_relay`): circuit relay v2 for bound current
+    /// members only, off unless the core turns it on.
+    member_relay: crate::member_relay::MemberRelay,
     relay_client: relay::client::Behaviour,
     identify: crate::announce::GlobalIdentify,
     ping: ping::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     gossipsub: gossipsub::Behaviour<gossipsub::IdentityTransform, MaxCountSubscriptionFilter<LogTopics>>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
-    limits: connection_limits::Behaviour,
-    guard: DialGuard,
     /// Hole punching (DCUtR), with verified members only (`punch`).
     punch: crate::punch::MemberPunch,
     /// Voice signalling (`/mvs/voice/1`), with verified members only (`voice`).
@@ -384,16 +509,44 @@ struct Behaviour {
     invite_pub: crate::invite::PublishBehaviour,
     /// Envelope asks, from anyone (`/mvs/invite/1`).
     invite_ask: crate::invite::AskBehaviour,
+    /// Server-list backups (`/mvs/backup/1`, G-91).
+    backup: crate::backup::BackupBehaviour,
+    /// Holder notice slot (`/mvs/notice/1`).
+    notice: crate::notice::NoticeBehaviour,
+    /// "Approve on your other device" (`/mvs/device-link/1`), relay circuit
+    /// only (`device_link`).
+    device_link: crate::device_link::LinkBehaviour,
 }
 
 type SharedBackoff = Arc<Mutex<DialBackoff<PeerId>>>;
+/// Device-link peers: reached through relay circuits only. Shared with the
+/// swarm's `DialGuard`, which refuses any other connection to them.
+type LinkPeers = Arc<Mutex<HashSet<PeerId>>>;
+type LinkReply = oneshot::Sender<Result<Vec<u8>, LinkError>>;
 
 /// Refuses every outgoing connection to a peer that is still backing off
 /// after failed dials, whoever asks: our discovery, or Kademlia's own lookups
 /// (which otherwise asked the relay for a circuit to a gone peer every
 /// round).
+/// Also refuses any connection to or from a device-link peer that is not a
+/// relay circuit (a direct dial, or a hole punch): the link stays relayed.
 struct DialGuard {
     backoff: SharedBackoff,
+    link_peers: LinkPeers,
+}
+
+impl DialGuard {
+    fn circuit_only(&self, peer: &PeerId, relayed: bool) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        if !relayed && self.link_peers.lock().unwrap().contains(peer) {
+            debug!(%peer, "device link: refusing a direct connection");
+            return Err(libp2p::swarm::ConnectionDenied::new("device link peers are reached through the relay only"));
+        }
+        Ok(())
+    }
+}
+
+fn has_circuit(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| p == Protocol::P2pCircuit)
 }
 
 impl NetworkBehaviour for DialGuard {
@@ -418,21 +571,23 @@ impl NetworkBehaviour for DialGuard {
     fn handle_established_inbound_connection(
         &mut self,
         _: ConnectionId,
-        _: PeerId,
-        _: &Multiaddr,
-        _: &Multiaddr,
+        peer: PeerId,
+        local: &Multiaddr,
+        remote: &Multiaddr,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.circuit_only(&peer, has_circuit(local) || has_circuit(remote))?;
         Ok(libp2p::swarm::dummy::ConnectionHandler)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
         _: ConnectionId,
-        _: PeerId,
-        _: &Multiaddr,
+        peer: PeerId,
+        addr: &Multiaddr,
         _: libp2p::core::Endpoint,
         _: libp2p::core::transport::PortUse,
     ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.circuit_only(&peer, has_circuit(addr))?;
         Ok(libp2p::swarm::dummy::ConnectionHandler)
     }
 
@@ -501,6 +656,8 @@ impl Node {
         let backoff: SharedBackoff =
             Arc::new(Mutex::new(DialBackoff::new(DIAL_BACKOFF_MIN, DIAL_BACKOFF_MAX, MAX_TRACKED_PEERS)));
         let mut swarm = build_swarm(key, config.relay.clone(), backoff.clone(), config.allow_lan).await?;
+        // Member relays: the daily count survives restarts (the Tech Lead, #395).
+        swarm.behaviour_mut().member_relay.keep_budget_in(config.data_dir.join("member-relay.budget"));
         // A stable port: `listen` with TCP port 0 reuses the one saved in
         // `listen.port` (written on first start); if it is taken now, a random
         // one, and the saved one is kept for next time.
@@ -510,9 +667,17 @@ impl Node {
         // hold the port for a moment: try it for about 2 s before giving up on
         // it, so the port the user allowed in the firewall is kept.
         let mut attempt = 0;
+        // Relay-only from the start: no direct listener at all (it comes up,
+        // with QUIC beside it, if relay-only is turned off later).
+        if config.relay_only {
+            swarm.behaviour_mut().punch.set_enabled(false);
+        }
         let (listener, listen) = loop {
+            if config.relay_only {
+                break (None, listen);
+            }
             match swarm.listen_on(listen.clone()) {
-                Ok(id) => break (id, listen),
+                Ok(id) => break (Some(id), listen),
                 Err(err) if listen != config.listen && attempt < SAVED_PORT_TRIES => {
                     attempt += 1;
                     debug!(%err, attempt, "the saved listen port is busy; trying again");
@@ -520,13 +685,17 @@ impl Node {
                 }
                 Err(err) if listen != config.listen => {
                     warn!(%err, "the saved listen port is taken: listening on a random one this time");
-                    break (swarm.listen_on(config.listen.clone())?, config.listen.clone());
+                    break (Some(swarm.listen_on(config.listen.clone())?), config.listen.clone());
                 }
                 Err(err) => return Err(err.into()),
             }
         };
-        for addr in &config.bootstrap {
-            let _ = swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build());
+        // Bootstrap peers are dialled directly: not while relay-only (as in
+        // `discover`), so a relay-only node's first dial is the relay's.
+        if !config.relay_only {
+            for addr in &config.bootstrap {
+                let _ = swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build());
+            }
         }
         swarm.behaviour_mut().kad.add_address(&relay_peer, config.relay.clone());
         swarm.dial(config.relay.clone())?;
@@ -536,6 +705,8 @@ impl Node {
         let (events, event_rx) = mpsc::channel(EVENT_BUFFER);
         let (answers, answer_rx) = mpsc::unbounded_channel();
         let (decoded, decoded_rx) = mpsc::unbounded_channel();
+        let (beacons, beacon_rx) = mpsc::channel(64);
+        let link_peers = swarm.behaviour().guard.link_peers.clone();
         let mut task = Task {
             swarm,
             store,
@@ -551,6 +722,7 @@ impl Node {
             pending: Pending::new(MAX_PENDING, MAX_PENDING_BYTES),
             refused: Refused::new(MAX_REFUSED),
             inbound_pulls: RateLimiter::new(PULL_BURST, PULL_RATE, MAX_TRACKED_PEERS),
+            outbound_pulls: RateLimiter::new(OUT_PULL_BURST, OUT_PULL_RATE, MAX_TRACKED_PEERS),
             all_inbound_pulls: RateLimiter::new(GLOBAL_PULL_BURST, GLOBAL_PULL_RATE, 1),
             served_bytes: RateLimiter::new(SERVED_BYTES_BURST, SERVED_BYTES_RATE, MAX_TRACKED_PEERS),
             all_served_bytes: RateLimiter::new(ALL_SERVED_BYTES_BURST, ALL_SERVED_BYTES_RATE, 1),
@@ -579,17 +751,26 @@ impl Node {
             acks: Acks::new(ACKS_PER_AUTHOR, MAX_ACK_AUTHORS, ACK_TTL),
             soon: HashSet::new(),
             direct_candidates: HashMap::new(),
-            relay_only: false,
+            relay_only: config.relay_only,
             fallback_at: HashMap::new(),
             fallback_done: HashSet::new(),
             direct_dials: true,
             listen: listen.clone(),
             port_file,
-            listener: Some(listener),
+            listener,
+            quic_listener: None,
             relayed_preferred: HashSet::new(),
             dial_backoff: backoff,
             #[cfg(test)]
             served: HashMap::new(),
+            #[cfg(test)]
+            rate_limited: 0,
+            queued_pulls: HashMap::new(),
+            empty_from: HashMap::new(),
+            probed: HashMap::new(),
+            #[cfg(test)]
+            pulls_received: 0,
+            pull_round: 0,
             presence: Presence::default(),
             last_seen: HashMap::new(),
             reached: false,
@@ -601,11 +782,49 @@ impl Node {
             fetches: HashMap::new(),
             fetch_of: HashMap::new(),
             next_fetch: 0,
+            backup_limits: crate::backup::BackupLimits::new(),
+            backup_fetch_of: HashMap::new(),
+            backup_lookups: HashMap::new(),
+            backups_expired: Instant::now(),
+            backup_looked_up: HashMap::new(),
+            notice_limits: crate::notice::NoticeLimits::new(),
+            notice_fetch_of: HashMap::new(),
+            notice_signer: None,
+            beacon: None,
+            beacon_port: crate::lan_beacon::BEACON_PORT,
+            beacons,
+            beacon_limits: crate::lan_beacon::BeaconLimits::new(),
+            beacon_next: Instant::now(),
+            beacon_round: 0,
+            tcp_port: None,
+            link_host: None,
+            link_peers,
+            link_until: HashMap::new(),
+            link_finds: HashMap::new(),
+            link_waiting: Vec::new(),
+            link_out: HashMap::new(),
+            relay_offers: HashMap::new(),
+            known_members: HashMap::new(),
+            // Down until it holds our reservation (the fallback waits
+            // RELAY_DOWN_AFTER, so a normal start never uses it).
+            relay_lost_at: Some(Instant::now()),
+            member_listeners: HashMap::new(),
+            member_reserved: HashSet::new(),
+            remembered_dialed: HashMap::new(),
+            remembered_checked: Instant::now(),
+            relay_ping_misses: HashMap::new(),
+            member_relay_rest: HashMap::new(),
+            fallback_dialed: HashMap::new(),
+            fallback_dials: HashSet::new(),
         };
+        // A relay-only start keeps no member addresses either (Security Lead).
+        if task.relay_only {
+            task.forget_remembered();
+        }
         for log in config.logs {
             task.open(log, None);
         }
-        tokio::spawn(task.run(command_rx, answer_rx, decoded_rx));
+        tokio::spawn(task.run(command_rx, answer_rx, decoded_rx, beacon_rx));
         Ok((Node { peer_id, commands }, event_rx))
     }
 
@@ -679,6 +898,54 @@ impl Node {
     /// The addresses the node listens on right now (empty until the listener
     /// is up; a relay circuit shows once reserved).
     /// Tests: how many entries our pull answers to `peer` for `log` carried.
+    /// Tests: how many pull requests this node received.
+    #[cfg(test)]
+    async fn pulls_received(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::InboundPulls { reply }).unwrap();
+        rx.await.unwrap()
+    }
+
+    /// Tests only: dial `addr` (a node met later than its bootstrap, or a
+    /// direct dial the device-link guard must refuse).
+    #[doc(hidden)]
+    /// Tests only: listen on `addr` (a reservation on a member relay, until
+    /// the client side of member relays lands).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_listen(&self, addr: Multiaddr) {
+        let _ = self.send(Command::Listen { addr });
+    }
+
+    /// Tests only: reservations and circuits this node accepted as a member
+    /// relay since it started.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn test_member_relay_counts(&self) -> Result<(u64, u64)> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::MemberRelayCounts { reply })?;
+        Ok(rx.await?)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_dial(&self, addr: Multiaddr) {
+        self.send(Command::Dial { addr }).unwrap();
+    }
+
+    /// Tests: close every connection to `peer` (as a relay circuit reset does).
+    #[cfg(test)]
+    fn test_disconnect(&self, peer: PeerId) {
+        self.send(Command::Disconnect { peer }).unwrap();
+    }
+
+    /// Tests: how many inbound pulls this node refused (any of the three limits).
+    #[cfg(test)]
+    async fn rate_limited(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::RateLimited { reply }).unwrap();
+        rx.await.unwrap()
+    }
+
     #[cfg(test)]
     async fn served(&self, peer: PeerId, log: &str) -> usize {
         let (reply, rx) = oneshot::channel();
@@ -696,6 +963,15 @@ impl Node {
     #[doc(hidden)]
     pub fn test_no_direct_dials(&self) -> Result<()> {
         self.send(Command::NoDirectDials)
+    }
+
+    /// Member relays (design #368, slice 2): relay for bound current members
+    /// of servers we share, or stop; `daily_cap_mb` is the core's
+    /// `dailyCapMb`; `preferred`: an owner or admin relay (`MemberRelay.role`),
+    /// which members try first. From `MemberRelay.effective` (#389). Never while
+    /// relay-only.
+    pub fn set_member_relay(&self, on: bool, daily_cap_mb: u32, preferred: bool) -> Result<()> {
+        self.send(Command::MemberRelay { on, daily_cap_mb, preferred })
     }
 
     /// Tests only: no hole punching (DCUtR) from or with this node, so the
@@ -777,7 +1053,120 @@ impl Node {
         Ok(rx.await?)
     }
 
+    /// G-91: keeps my backup blob here (I hold my own, announced as a DHT
+    /// provider of its tag) and hands it to the other holders: the relay
+    /// (its mailbox) and my own other devices that are connected (peers
+    /// bound to my identity). False, nothing kept or sent, if the blob
+    /// fails [`crate::backup::check`]. Best effort; the api writes again on
+    /// the next change, at login, and every 24 h.
+    pub async fn put_backup(&self, blob: Vec<u8>) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::PutBackup { blob, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// G-91: every blob held under `tag`, here and by reachable holders:
+    /// the relay, connected peers, and the DHT providers of the tag
+    /// (dialled through our relay's circuit). Within
+    /// [`crate::node::BACKUP_FETCH_WAIT`]. Untrusted: the api checks each.
+    pub async fn fetch_backup(&self, tag: [u8; 32]) -> Result<Vec<Vec<u8>>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::FetchBackup { tag, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Holder notice slot: keeps my notice here (announced under its tag)
+    /// and hands it to the holders: my own other devices that are
+    /// connected, and the relay. False, nothing kept or sent, if it fails
+    /// `notice::check` (size, tag, signature, `at` at most a day ahead).
+    /// Best effort.
+    pub async fn put_notice(&self, blob: Vec<u8>) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::PutNotice { blob, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Holder notice slot: the notices held for my tag, here and by at
+    /// most two holders, each asked with a fetch signed by the
+    /// [`crate::NoticeSigner`] (none sent without one, or while it is
+    /// locked). Within [`crate::node::NOTICE_FETCH_WAIT`]. Untrusted: the
+    /// core checks and opens each, removes duplicates by (`at`, hash) and
+    /// ignores anything older than its last acknowledgement (holders can
+    /// replay).
+    pub async fn fetch_notices(&self) -> Result<Vec<Vec<u8>>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::FetchNotices { reply })?;
+        Ok(rx.await?)
+    }
+
+    /// The core's `w_n` signer for notice fetches (None: no fetches).
+    pub fn set_notice_signer(&self, signer: Option<Arc<dyn crate::NoticeSigner>>) -> Result<()> {
+        self.send(Command::NoticeSigner { signer })
+    }
+
+    /// Starts the member-only LAN beacon (`lan_beacon`) on UDP `port`
+    /// ([`crate::LAN_BEACON_PORT`] in the app): co-members on this LAN find
+    /// us, and we them, with no relay. It sends and reads only while "LAN
+    /// allowed" is on, relay-only is off and a server is open. False if the
+    /// socket can't be had (the node works without it).
+    pub async fn start_lan_beacon(&self, port: u16) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LanBeacon { port, reply })?;
+        Ok(rx.await?)
+    }
+
     /// Closes all connections and the store.
+    /// Device link, new device: opens (or replaces) the one link. We become
+    /// a DHT provider of `rv` for [`crate::DEVICE_LINK_TTL`] and answer one
+    /// signed-in device on `/mvs/device-link/1`: its Hello with `e_new_pub`.
+    /// What arrives comes as [`NodeEvent::DeviceLink`]. While a link is open
+    /// this node dials nobody directly and is reached by its link peer
+    /// through the relay only. Our peer ID and relay circuit address (for
+    /// the QR), or None without a relay reservation (try again later).
+    pub async fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Result<Option<(PeerId, Multiaddr)>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LinkOpen { rv, e_new_pub, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Device link, new device: stops providing the rendezvous and answering.
+    pub fn device_link_close(&self) -> Result<()> {
+        self.send(Command::LinkClose)
+    }
+
+    /// Device link, signed-in device: who provides `rv` (a provider lookup,
+    /// at most [`crate::DEVICE_LINK_FIND_WAIT`]).
+    pub async fn device_link_find(&self, rv: [u8; 32]) -> Result<PeerId, LinkError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LinkFind { rv, reply }).map_err(|_| LinkError::Network)?;
+        rx.await.unwrap_or(Err(LinkError::Network))
+    }
+
+    /// Device link, signed-in device: Hello to `peer` through our relay's
+    /// circuit only; its `e_new_pub`.
+    pub async fn device_link_hello(&self, peer: PeerId, e_old_pub: [u8; 32]) -> Result<[u8; 32], LinkError> {
+        let answer = self.link_request(peer, LinkRequest::Hello(e_old_pub)).await?;
+        answer.try_into().map_err(|_| LinkError::Refused)
+    }
+
+    /// Device link, signed-in device: the sealed transfer to the peer we
+    /// said Hello to. Ok once it acknowledged receipt.
+    pub async fn device_link_send(&self, peer: PeerId, ciphertext: Vec<u8>) -> Result<(), LinkError> {
+        if ciphertext.is_empty() || ciphertext.len() >= crate::MAX_DEVICE_LINK {
+            return Err(LinkError::Refused);
+        }
+        match self.link_request(peer, LinkRequest::Sealed(ciphertext)).await?.as_slice() {
+            [1] => Ok(()),
+            _ => Err(LinkError::Refused),
+        }
+    }
+
+    async fn link_request(&self, peer: PeerId, request: LinkRequest) -> Result<Vec<u8>, LinkError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LinkRequest { peer, request, reply }).map_err(|_| LinkError::Network)?;
+        rx.await.unwrap_or(Err(LinkError::Network))
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Shutdown { reply })?;
@@ -808,6 +1197,10 @@ async fn build_swarm(
     Ok(SwarmBuilder::with_existing_identity(key)
         .with_tokio()
         .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)?
+        // QUIC beside TCP (`/udp/<port>/quic-v1`): its dials leave from the
+        // listening socket, so hole punching works where TCP simultaneous
+        // open does not (Windows).
+        .with_quic()
         .with_dns()?
         // `/dns4/<relay>/tcp/443/wss`: the relay sits behind a TLS-terminating
         // proxy (Cloudflare). Ping (every 15 s) keeps such a connection under
@@ -819,7 +1212,9 @@ async fn build_swarm(
             let peer_id = key.public().to_peer_id();
             // Our own protocol name, not the public IPFS DHT's `/ipfs/kad/1.0.0`
             // (threat model R2); the relay speaks it too.
-            let kad_config = kad::Config::new(KAD_PROTOCOL);
+            let mut kad_config = kad::Config::new(KAD_PROTOCOL);
+            // G-91: backup holders re-announce themselves this often (design §2).
+            kad_config.set_provider_publication_interval(Some(crate::backup::REANNOUNCE));
             let mut kad = kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), kad_config);
             // Server mode so peers can find each other through any peer, not
             // only through the bootstrap node. (GAP-6 moves this to client mode.)
@@ -871,7 +1266,7 @@ async fn build_swarm(
                     ),
                     relay,
                 ),
-                ping: ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL)),
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL).with_timeout(PING_TIMEOUT)),
                 kad,
                 gossipsub,
                 sync: request_response::cbor::Behaviour::new(
@@ -879,11 +1274,15 @@ async fn build_swarm(
                     request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
                 ),
                 limits: connection_limits::Behaviour::new(limits),
-                guard: DialGuard { backoff },
+                guard: DialGuard { backoff, link_peers: LinkPeers::default() },
+                member_relay: crate::member_relay::MemberRelay::new(peer_id),
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
+                backup: crate::backup::behaviour(),
+                notice: crate::notice::behaviour(),
+                device_link: crate::device_link::behaviour(),
             })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_TIMEOUT))
@@ -990,6 +1389,8 @@ struct Task {
     /// Channel records refused by the authorizer (or built only on refused ones).
     refused: Refused,
     inbound_pulls: RateLimiter<PeerId>,
+    /// T24: our pulls per peer (`OUT_PULL_BURST`, `OUT_PULL_RATE`).
+    outbound_pulls: RateLimiter<PeerId>,
     all_inbound_pulls: RateLimiter<()>,
     /// Byte budgets for served pages (tokens are bytes).
     served_bytes: RateLimiter<PeerId>,
@@ -1056,6 +1457,8 @@ struct Task {
     /// The direct listener (`NodeConfig::listen`), removed while relay-only.
     listen: Multiaddr,
     listener: Option<ListenerId>,
+    /// The QUIC listener beside it (same port when free), removed with it.
+    quic_listener: Option<ListenerId>,
     /// Where our TCP listen port is kept, so it stays the same across
     /// restarts (a firewall or router rule can then allow it once).
     port_file: PathBuf,
@@ -1068,6 +1471,23 @@ struct Task {
     /// Tests: entries served per (peer, log).
     #[cfg(test)]
     served: HashMap<(PeerId, String), usize>,
+    /// Tests: inbound pulls refused (rate limit, answering cap or byte budget).
+    #[cfg(test)]
+    rate_limited: usize,
+    /// Pulls waiting for one of the `MAX_PULLS_IN_FLIGHT` slots, per peer.
+    queued_pulls: HashMap<PeerId, BTreeSet<String>>,
+    /// T23: control logs an unbound peer answered empty, and until when it
+    /// isn't asked for them again (`UNBOUND_REPROBE`).
+    empty_from: HashMap<(PeerId, String), Instant>,
+    /// T23: when we last probed an unbound peer for a server we already have
+    /// a bound member of.
+    probed: HashMap<(PeerId, ServerId), Instant>,
+    /// Tests: pull requests this node received.
+    #[cfg(test)]
+    pulls_received: usize,
+    /// Anti-entropy rounds so far: which slice of the other control logs
+    /// `pull_shared` takes this round.
+    pull_round: usize,
     /// Who is online, per server (M2).
     presence: Presence,
     last_seen: HashMap<ServerId, SystemTime>,
@@ -1087,6 +1507,61 @@ struct Task {
     fetches: HashMap<u64, Fetch>,
     fetch_of: HashMap<request_response::OutboundRequestId, u64>,
     next_fetch: u64,
+    /// G-91: caps on backup writes and fetches; backup fetches in flight
+    /// (request, and provider lookup, to the fetch they belong to); when
+    /// held backups were last expired.
+    backup_limits: crate::backup::BackupLimits,
+    backup_fetch_of: HashMap<request_response::OutboundRequestId, u64>,
+    backup_lookups: HashMap<kad::QueryId, (u64, [u8; 32])>,
+    backups_expired: Instant,
+    /// When each tag's providers were last looked up.
+    backup_looked_up: HashMap<[u8; 32], Instant>,
+    /// Holder notice slot: caps, fetches in flight, and the core's `w_n`
+    /// signer (present while unlocked; without it no fetch is sent).
+    notice_limits: crate::notice::NoticeLimits,
+    notice_fetch_of: HashMap<request_response::OutboundRequestId, u64>,
+    notice_signer: Option<Arc<dyn crate::notice::NoticeSigner>>,
+    /// The member-only LAN beacon (`lan_beacon`): its socket once started,
+    /// the port beacons go to, where read beacons arrive, its caps, when the
+    /// next is due, which servers take the slots next, and our TCP port.
+    beacon: Option<Arc<tokio::net::UdpSocket>>,
+    beacon_port: u16,
+    beacons: mpsc::Sender<(std::net::IpAddr, Vec<u8>)>,
+    beacon_limits: crate::lan_beacon::BeaconLimits,
+    beacon_next: Instant,
+    beacon_round: usize,
+    tcp_port: Option<u16>,
+    /// Device link, new device: the one open link.
+    link_host: Option<LinkHost>,
+    /// Device-link peers (either side), reached through the relay only, and
+    /// until when; the set is shared with the `DialGuard`.
+    link_peers: LinkPeers,
+    link_until: HashMap<PeerId, Instant>,
+    /// Provider lookups for a code, and until when they may run.
+    link_finds: HashMap<kad::QueryId, (oneshot::Sender<Result<PeerId, LinkError>>, Instant)>,
+    /// Requests waiting for a relayed connection to their peer, and until when.
+    link_waiting: Vec<(PeerId, LinkRequest, LinkReply, Instant)>,
+    link_out: HashMap<request_response::OutboundRequestId, LinkReply>,
+    /// Member relays, client side (#368 slice 2, design §2): offers members
+    /// made (addresses, preferred, when), members we saw bound, since when our
+    /// relay is down, our reservations on member relays (listener → relay),
+    /// relays resting after a failure, and circuit dials through them.
+    relay_offers: HashMap<PeerId, (Vec<Multiaddr>, bool, Instant)>,
+    known_members: HashMap<PeerId, Instant>,
+    relay_lost_at: Option<Instant>,
+    member_listeners: HashMap<ListenerId, PeerId>,
+    /// Member relay listeners whose reservation was accepted.
+    member_reserved: HashSet<ListenerId>,
+    /// Remembered members dialled lately, and when the rows were last checked.
+    remembered_dialed: HashMap<PeerId, Instant>,
+    remembered_checked: Instant,
+    /// Failed pings in a row to our relay, per connection (`relay_ping`):
+    /// one dead connection among several (TCP and QUIC) is closed on its own
+    /// count (Security Lead, #400).
+    relay_ping_misses: HashMap<ConnectionId, u32>,
+    member_relay_rest: HashMap<PeerId, Instant>,
+    fallback_dialed: HashMap<(PeerId, PeerId), Instant>,
+    fallback_dials: HashSet<ConnectionId>,
 }
 
 /// One [`Node::fetch_invite`]: answers so far, until every peer answered or
@@ -1126,6 +1601,7 @@ impl Task {
         mut commands: mpsc::UnboundedReceiver<Command>,
         mut answers: mpsc::UnboundedReceiver<Answer>,
         mut decoded: mpsc::UnboundedReceiver<Decoded>,
+        mut beacon_rx: mpsc::Receiver<(std::net::IpAddr, Vec<u8>)>,
     ) {
         let mut anti_entropy = tokio::time::interval(ANTI_ENTROPY);
         // The first discovery runs as soon as the relay connection is up;
@@ -1147,19 +1623,40 @@ impl Task {
                 event = self.swarm.select_next_some() => self.on_swarm_event(event),
                 Some(answer) = answers.recv() => self.send_answer(answer),
                 Some((key, records, more, acked)) = decoded.recv() => self.on_decoded(key, records, more, acked),
+                Some((ip, packet)) = beacon_rx.recv() => self.on_beacon(ip, packet),
                 _ = soon.tick() => {
+                    // T24: send what the outgoing rate held back.
+                    let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
+                    for peer in waiting {
+                        for _ in 0..MAX_PULLS_IN_FLIGHT {
+                            self.pull_next(peer);
+                        }
+                    }
                     self.pull_soon();
                     self.direct_fallback();
                     self.recheck_punch();
+                    self.recheck_member_relay();
                     self.expire_fetches();
+                    self.link_tick();
+                    self.lan_beacon_tick();
+                    self.check_remembered();
                     let gone = self.presence.expire(Instant::now());
                     self.went_offline(gone);
                 }
                 _ = anti_entropy.tick() => {
                     self.pending.expire(Instant::now(), PENDING_TTL);
-                    self.pull_all();
+                    // T23 state outlives a disconnect (a reset relay circuit
+                    // must not make us re-probe everything), so it expires here.
+                    let now = Instant::now();
+                    self.empty_from.retain(|_, until| now < *until);
+                    self.probed.retain(|_, at| now < *at + UNBOUND_REPROBE);
+                    self.pull_all("round");
                 }
-                _ = discovery.tick() => self.discover(),
+                _ = discovery.tick() => {
+                    self.discover();
+                    self.member_relay_fallback();
+                    self.redial_remembered();
+                }
             }
         }
     }
@@ -1228,6 +1725,37 @@ impl Task {
             Command::Served { peer, log, reply } => {
                 let _ = reply.send(self.served.get(&(peer, log)).copied().unwrap_or(0));
             }
+            #[cfg(test)]
+            Command::RateLimited { reply } => {
+                let _ = reply.send(self.rate_limited);
+            }
+            #[cfg(test)]
+            Command::InboundPulls { reply } => {
+                let _ = reply.send(self.pulls_received);
+            }
+    #[cfg(any(test, feature = "test-util"))]
+            Command::Listen { addr } => {
+                let _ = self.swarm.listen_on(addr);
+            }
+    #[cfg(any(test, feature = "test-util"))]
+            Command::MemberRelayCounts { reply } => {
+                let relay = &self.swarm.behaviour().member_relay;
+                let _ = reply.send((relay.reservations, relay.circuits));
+            }
+    #[cfg(any(test, feature = "test-util"))]
+            Command::Dial { addr } => {
+                let _ = self.swarm.dial(addr);
+            }
+            Command::LinkOpen { rv, e_new_pub, reply } => {
+                let _ = reply.send(self.link_open(rv, e_new_pub));
+            }
+            Command::LinkClose => self.link_close(),
+            Command::LinkFind { rv, reply } => self.link_find(rv, reply),
+            Command::LinkRequest { peer, request, reply } => self.link_request(peer, request, reply),
+            #[cfg(test)]
+            Command::Disconnect { peer } => {
+                let _ = self.swarm.disconnect_peer_id(peer);
+            }
             Command::VoiceSend { to, bytes, reply } => {
                 let _ = reply.send(self.voice_send(to, bytes));
             }
@@ -1239,9 +1767,27 @@ impl Task {
             }
             Command::DropServerInvites { server } => self.invites.retain(|_, (s, _)| *s != server),
             Command::FetchInvite { handle, reply } => self.fetch_invite(handle, reply),
+            Command::PutBackup { blob, reply } => {
+                let _ = reply.send(self.put_backup(blob));
+            }
+            Command::FetchBackup { tag, reply } => self.fetch_backup(tag, reply),
+            Command::PutNotice { blob, reply } => {
+                let _ = reply.send(self.put_notice(blob));
+            }
+            Command::FetchNotices { reply } => self.fetch_notices(reply),
+            Command::NoticeSigner { signer } => self.notice_signer = signer,
+            Command::LanBeacon { port, reply } => {
+                let _ = reply.send(self.start_lan_beacon(port));
+            }
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
+            Command::MemberRelay { on, daily_cap_mb, preferred } => {
+                // Relay-only users never relay (design §1), whatever the core says.
+                let on = on && !self.relay_only;
+                self.swarm.behaviour_mut().member_relay.set(on, daily_cap_mb, preferred);
+                self.recheck_member_relay();
+            }
             Command::ListenAddrs { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
             }
@@ -1271,8 +1817,12 @@ impl Task {
         if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic(&self.sealing.wire(&log))) {
             warn!(%err, "subscribe failed");
         }
+        // A new log: its control log from anyone (a joiner needs it before
+        // anyone is bound), a channel only from peers that share it.
         for peer in self.connected.clone() {
-            self.pull(peer, &log);
+            if self.shares(peer, &log) {
+                self.pull(peer, &log, "open");
+            }
         }
     }
 
@@ -1568,6 +2118,378 @@ impl Task {
         }
         let live: HashSet<u64> = self.fetches.keys().copied().collect();
         self.fetch_of.retain(|_, id| live.contains(id));
+        self.backup_fetch_of.retain(|_, id| live.contains(id));
+        self.notice_fetch_of.retain(|_, id| live.contains(id));
+        self.backup_lookups.retain(|_, (id, _)| live.contains(id));
+        // Others' backups past their retention (phase B; mine stay).
+        if self.backups_expired.elapsed() >= Duration::from_secs(3600) {
+            self.backups_expired = Instant::now();
+            if let Err(err) = self.store.expire_backups(unix_now(), crate::backup::RETENTION.as_secs()) {
+                warn!(%err, "expiring held backups failed");
+            }
+            if let Err(err) = self.store.expire_notices(unix_now(), crate::notice::RETENTION.as_secs()) {
+                warn!(%err, "expiring held notices failed");
+            }
+        }
+    }
+
+    /// One answer (or failure) for fetch `id`; replies once nothing is
+    /// left to wait for.
+    fn fetch_answered(&mut self, id: u64, answer: Option<Vec<u8>>) {
+        let Some(fetch) = self.fetches.get_mut(&id) else { return };
+        fetch.waiting = fetch.waiting.saturating_sub(1);
+        if let Some(answer) = answer.filter(|a| !a.is_empty()) {
+            fetch.answers.push(answer);
+        }
+        if fetch.waiting == 0 {
+            let fetch = self.fetches.remove(&id).expect("just seen");
+            let _ = fetch.reply.send(fetch.answers);
+        }
+    }
+
+    /// The peers bound to my own identity (my other devices) that are
+    /// connected now.
+    fn my_devices(&self) -> Vec<PeerId> {
+        let Some(me) = self.access.binder.as_ref().map(|b| b.identity()) else { return Vec::new() };
+        let mut peers: Vec<PeerId> = self
+            .bound
+            .iter()
+            .filter(|((peer, _), (_, identity))| *identity == me && self.swarm.is_connected(peer))
+            .map(|((peer, _), _)| *peer)
+            .collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+
+    /// Announces us as a DHT provider of a backup tag we hold (kad then
+    /// re-announces it every 12 h on its own).
+    fn provide_backup(&mut self, tag: [u8; 32]) {
+        if let Err(err) = self.swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(&tag)) {
+            debug!(%err, "announcing a backup failed");
+        }
+    }
+
+    /// See [`Node::put_backup`].
+    fn put_backup(&mut self, blob: Vec<u8>) -> bool {
+        let Some((tag, version)) = crate::backup::check(&blob) else { return false };
+        if let Err(err) = self.store.put_backup(&tag, version, &blob, None, unix_now()) {
+            warn!(%err, "keeping my backup failed");
+            return false;
+        }
+        self.provide_backup(tag);
+        let mut holders = self.my_devices();
+        if self.swarm.is_connected(&self.relay_peer) {
+            holders.push(self.relay_peer);
+        }
+        for peer in holders {
+            self.swarm.behaviour_mut().backup.send_request(&peer, crate::backup::Request::Put(blob.clone()));
+        }
+        true
+    }
+
+    /// `/mvs/backup/1` from a peer. A fetch gets the blob held under exactly
+    /// that tag, or the same empty answer whatever the reason (R3). A write
+    /// is kept only from my own other devices (phase A: a peer bound to my
+    /// identity), within its rate caps, if it passes `check` and is newer.
+    fn on_backup_request(&mut self, peer: PeerId, request: crate::backup::Request, channel: ResponseChannel<Vec<u8>>) {
+        let now = Instant::now();
+        let answer = match request {
+            crate::backup::Request::Get(tag) => {
+                let held = if self.backup_limits.allow_fetch(peer, now) { self.store.backup(&tag) } else { Ok(None) };
+                held.ok().flatten().unwrap_or_default()
+            }
+            crate::backup::Request::Put(blob) => {
+                let me = self.access.binder.as_ref().map(|b| *b.identity().as_bytes());
+                let from = self.member_identity(peer).map(|identity| *identity.as_bytes());
+                let owner = crate::backup::write_owner(from, me);
+                let kept = crate::backup::check(&blob)
+                    .filter(|_| owner.is_some())
+                    .filter(|(tag, _)| self.backup_limits.allow_write(peer, *tag, now))
+                    .filter(|(tag, version)| {
+                        let owner = owner.flatten();
+                        self.store.put_backup(tag, *version, &blob, owner.as_ref(), unix_now()).unwrap_or(false)
+                    });
+                if let Some((tag, _)) = kept {
+                    self.provide_backup(tag);
+                }
+                vec![u8::from(kept.is_some())]
+            }
+        };
+        let _ = self.swarm.behaviour_mut().backup.send_response(channel, answer);
+    }
+
+    /// See [`Node::fetch_backup`]: mine if I hold it, one ask to the relay
+    /// and each connected peer, and a DHT lookup for the tag's providers
+    /// (each asked through our relay's circuit when found).
+    fn fetch_backup(&mut self, tag: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>>) {
+        let id = self.next_fetch;
+        self.next_fetch += 1;
+        let answers: Vec<Vec<u8>> = self.store.backup(&tag).ok().flatten().into_iter().collect();
+        let mut peers: Vec<PeerId> = self.connected.iter().copied().collect();
+        peers.truncate(MAX_FETCH_PEERS);
+        let relayed = self.swarm.is_connected(&self.relay_peer);
+        if relayed {
+            peers.push(self.relay_peer);
+        }
+        for peer in &peers {
+            let request = self.swarm.behaviour_mut().backup.send_request(peer, crate::backup::Request::Get(tag));
+            self.backup_fetch_of.insert(request, id);
+        }
+        let mut waiting = peers.len();
+        // The provider lookup only on a fresh device restoring (no server
+        // opened yet, nothing held for the tag): it can take seconds, and a
+        // writer's round runs in the api's sync loop, so it must stay quick
+        // (the relay and my connected devices answer at once).
+        let due = self.backup_looked_up.get(&tag).is_none_or(|at| at.elapsed() >= BACKUP_LOOKUP_EVERY);
+        if relayed && answers.is_empty() && self.secrets.is_empty() && due {
+            if self.backup_looked_up.len() >= MAX_FETCH_PEERS {
+                self.backup_looked_up.retain(|_, at| at.elapsed() < BACKUP_LOOKUP_EVERY);
+            }
+            self.backup_looked_up.insert(tag, Instant::now());
+            let query = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&tag));
+            self.backup_lookups.insert(query, (id, tag));
+            waiting += 1;
+        }
+        if waiting == 0 {
+            let _ = reply.send(answers);
+            return;
+        }
+        let until = Instant::now() + BACKUP_FETCH_WAIT;
+        self.fetches.insert(id, Fetch { reply, waiting, answers, until });
+    }
+
+
+    /// See [`Node::put_notice`].
+    fn put_notice(&mut self, blob: Vec<u8>) -> bool {
+        let Some((tag, at)) = crate::notice::check(&blob, unix_now()) else { return false };
+        if let Err(err) = self.store.put_notice(&tag, at, &blob, unix_now()) {
+            warn!(%err, "keeping my notice failed");
+        }
+        self.provide_backup(tag);
+        for peer in self.notice_holders(usize::MAX) {
+            self.swarm.behaviour_mut().notice.send_request(&peer, crate::notice::Request::Put(blob.clone()));
+        }
+        true
+    }
+
+    /// Holders for my notices: my own other devices that are connected,
+    /// then the relay (its mailbox, once devops adds `/mvs/notice/1`; an
+    /// older one fails at negotiation). At most `max`.
+    fn notice_holders(&self, max: usize) -> Vec<PeerId> {
+        let mut holders = self.my_devices();
+        if self.swarm.is_connected(&self.relay_peer) {
+            holders.push(self.relay_peer);
+        }
+        holders.truncate(max);
+        holders
+    }
+
+    /// `/mvs/notice/1` from a peer. A fetch, if signed for us within the
+    /// minute skew and within the caps, gets the notices held under its
+    /// tag, newest first; anything else the same empty answer (R3). A write
+    /// is kept only from my own other devices (the backup gate, phase A),
+    /// within its caps, if it passes `check`.
+    fn on_notice_request(&mut self, peer: PeerId, request: crate::notice::Request, channel: ResponseChannel<Vec<u8>>) {
+        let now = Instant::now();
+        // The cheap gates (rate caps, my own device) come before any
+        // signature check (Security Lead on #425).
+        let answer = match request {
+            crate::notice::Request::Get(fetch) => {
+                let me = *self.swarm.local_peer_id();
+                let tag = Some(())
+                    .filter(|_| self.notice_limits.allow_fetch(peer, now))
+                    .and_then(|_| fetch.verify(&me, unix_now() / 60));
+                let held = tag.and_then(|tag| self.store.notices(&tag).ok()).unwrap_or_default();
+                crate::notice::encode_answer(&held)
+            }
+            crate::notice::Request::Put(blob) => {
+                let me = self.access.binder.as_ref().map(|b| *b.identity().as_bytes());
+                let from = self.member_identity(peer).map(|identity| *identity.as_bytes());
+                // Phase A: my own devices only (no buddies for notices).
+                let mine = crate::backup::write_owner(from, me) == Some(None);
+                let kept = crate::notice::claimed_tag(&blob)
+                    .filter(|_| mine)
+                    .filter(|tag| self.notice_limits.allow_write(peer, *tag, now))
+                    .and_then(|_| crate::notice::check(&blob, unix_now()))
+                    .filter(|(tag, at)| self.store.put_notice(tag, *at, &blob, unix_now()).unwrap_or(false));
+                if let Some((tag, _)) = kept {
+                    self.provide_backup(tag);
+                }
+                vec![u8::from(kept.is_some())]
+            }
+        };
+        let _ = self.swarm.behaviour_mut().notice.send_response(channel, answer);
+    }
+
+    /// See [`Node::fetch_notices`]: what I hold for my tag, plus one signed
+    /// fetch to each of at most [`NOTICE_HOLDERS`] holders.
+    fn fetch_notices(&mut self, reply: oneshot::Sender<Vec<Vec<u8>>>) {
+        let Some(signer) = self.notice_signer.clone() else {
+            let _ = reply.send(Vec::new());
+            return;
+        };
+        let Some(key) = signer.key() else {
+            let _ = reply.send(Vec::new());
+            return;
+        };
+        let answers = self.store.notices(&crate::notice::tag_of(&key)).unwrap_or_default();
+        let id = self.next_fetch;
+        self.next_fetch += 1;
+        let minute = unix_now() / 60;
+        let mut waiting = 0;
+        for peer in self.notice_holders(NOTICE_HOLDERS) {
+            let Some(fetch) = crate::notice::Fetch::sign(&*signer, &peer, minute) else { continue };
+            let request = self.swarm.behaviour_mut().notice.send_request(&peer, crate::notice::Request::Get(fetch));
+            self.notice_fetch_of.insert(request, id);
+            waiting += 1;
+        }
+        if waiting == 0 {
+            let _ = reply.send(answers);
+            return;
+        }
+        let until = Instant::now() + NOTICE_FETCH_WAIT;
+        self.fetches.insert(id, Fetch { reply, waiting, answers, until });
+    }
+
+    /// A holder's notice answer (or failure) for fetch `id`.
+    fn on_notice_answer(&mut self, request: request_response::OutboundRequestId, answer: Option<Vec<u8>>) {
+        let Some(id) = self.notice_fetch_of.remove(&request) else { return };
+        // Only valid notices under my own tag come back (Security Lead on
+        // #425): the core checks again, but junk never reaches it.
+        let mine = self.notice_signer.as_ref().and_then(|s| s.key()).map(|key| crate::notice::tag_of(&key));
+        if let Some(fetch) = self.fetches.get_mut(&id) {
+            for notice in crate::notice::decode_answer(&answer.unwrap_or_default()) {
+                let valid = crate::notice::check(&notice, unix_now()).is_some_and(|(tag, _)| Some(tag) == mine);
+                if valid && !fetch.answers.contains(&notice) {
+                    fetch.answers.push(notice);
+                }
+            }
+        }
+        self.fetch_answered(id, None);
+    }
+
+    /// See [`Node::start_lan_beacon`].
+    fn start_lan_beacon(&mut self, port: u16) -> bool {
+        if self.beacon.is_some() {
+            return true;
+        }
+        match crate::lan_beacon::socket(port) {
+            Ok(socket) => {
+                let socket = Arc::new(socket);
+                crate::lan_beacon::spawn_reader(socket.clone(), self.beacons.clone());
+                self.beacon = Some(socket);
+                self.beacon_port = port;
+                self.beacon_next = Instant::now();
+                true
+            }
+            Err(err) => {
+                warn!(%err, "LAN beacon unavailable");
+                false
+            }
+        }
+    }
+
+    /// The beacon runs only with "LAN allowed", not relay-only, direct dials
+    /// on, and some server open (Security Lead §B.6).
+    fn beacon_on(&self) -> bool {
+        self.beacon.is_some() && self.allow_lan && !self.relay_only && self.direct_dials && !self.secrets.is_empty()
+    }
+
+    /// Our open servers' beacon keys.
+    fn beacon_keys(&self) -> Vec<(ServerId, [u8; 32])> {
+        let mut keys: Vec<(ServerId, [u8; 32])> =
+            self.secrets.iter().map(|(server, secret)| (*server, crate::lan_beacon::k_lan(secret))).collect();
+        keys.sort_by_key(|(server, _)| *server.as_bytes());
+        keys
+    }
+
+    /// Sends our beacon when due. With more open servers than slots, they
+    /// take turns.
+    fn lan_beacon_tick(&mut self) {
+        let now = Instant::now();
+        if !self.beacon_on() || now < self.beacon_next {
+            return;
+        }
+        self.beacon_next = crate::lan_beacon::next_beacon(now);
+        let (Some(socket), Some(port)) = (self.beacon.clone(), self.tcp_port) else { return };
+        let mut keys: Vec<[u8; 32]> = self.beacon_keys().into_iter().map(|(_, k)| k).collect();
+        if keys.len() > crate::lan_beacon::SLOTS {
+            let start = self.beacon_round % keys.len();
+            keys.rotate_left(start);
+            self.beacon_round = self.beacon_round.wrapping_add(crate::lan_beacon::SLOTS);
+        }
+        let epoch = crate::lan_beacon::epoch_of(unix_now());
+        // Our LAN addresses (sealed, so members dial only those): the ones
+        // we listen on, loopback last.
+        let mut ips: Vec<std::net::Ipv4Addr> = self
+            .swarm
+            .listeners()
+            .filter_map(|a| match a.iter().next() {
+                Some(Protocol::Ip4(ip)) if crate::lan_beacon::lan_scope(ip) => Some(ip),
+                _ => None,
+            })
+            .collect();
+        ips.sort_by_key(|ip| (ip.is_loopback(), *ip));
+        ips.dedup();
+        let Some(packet) = crate::lan_beacon::encode(&keys, epoch, port, self.swarm.local_peer_id(), &ips) else { return };
+        let to = std::net::SocketAddr::from((crate::lan_beacon::GROUP, self.beacon_port));
+        if let Err(err) = socket.try_send_to(&packet, to) {
+            debug!(%err, "LAN beacon send failed");
+        }
+    }
+
+    /// A beacon heard on the LAN: if it is a co-member's (a tag of one of
+    /// our servers) and its LAN-scope source is one of the addresses it
+    /// sealed, dial that address at its port, expecting its peer ID. A
+    /// replay from any other host is never dialled (#460). Never answered.
+    fn on_beacon(&mut self, ip: std::net::IpAddr, packet: Vec<u8>) {
+        let now = Instant::now();
+        let lan = matches!(ip, std::net::IpAddr::V4(v4) if crate::lan_beacon::lan_scope(v4));
+        if !lan || !self.beacon_on() || !self.beacon_limits.allow_read(now) {
+            return;
+        }
+        let epoch = crate::lan_beacon::epoch_of(unix_now());
+        let Some(beacon) = crate::lan_beacon::decode(&packet, &self.beacon_keys(), epoch) else { return };
+        let Some(source) = crate::lan_beacon::dial_target(ip, &beacon) else {
+            debug!("a LAN beacon from an address it didn't seal: not dialled");
+            return;
+        };
+        let (port, peer) = (beacon.port, beacon.peer);
+        let ip = std::net::IpAddr::V4(source);
+        if peer == *self.swarm.local_peer_id() || self.direct.contains_key(&peer) || self.link_blocks(&peer) {
+            return;
+        }
+        if !self.beacon_limits.allow_dial(std::net::SocketAddr::new(ip, port), now) {
+            return;
+        }
+        let addr = Multiaddr::from(ip).with(Protocol::Tcp(port));
+        debug!(%peer, "a co-member's LAN beacon: dialling it");
+        let opts = DialOpts::peer_id(peer).addresses(vec![addr]).condition(PeerCondition::Always).build();
+        if let Err(err) = self.swarm.dial(opts) {
+            debug!(%peer, ?err, "LAN beacon dial refused");
+        }
+    }
+
+    /// Providers found for a backup fetch's tag: each asked once, through
+    /// our relay's circuit (R3), at most [`MAX_BACKUP_PROVIDERS`]. The
+    /// lookup's own wait ends on its last step.
+    fn on_backup_providers(&mut self, query: kad::QueryId, providers: Vec<PeerId>, last: bool) {
+        let Some(&(id, tag)) = self.backup_lookups.get(&query) else { return };
+        let me = *self.swarm.local_peer_id();
+        for peer in providers.into_iter().filter(|p| *p != me).take(MAX_BACKUP_PROVIDERS) {
+            let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer));
+            self.swarm.add_peer_address(peer, circuit);
+            let request = self.swarm.behaviour_mut().backup.send_request(&peer, crate::backup::Request::Get(tag));
+            self.backup_fetch_of.insert(request, id);
+            if let Some(fetch) = self.fetches.get_mut(&id) {
+                fetch.waiting += 1;
+            }
+        }
+        if last {
+            self.backup_lookups.remove(&query);
+            self.fetch_answered(id, None);
+        }
     }
 
     /// "Relay only" on: drop the direct listener (identify then announces
@@ -1581,10 +2503,31 @@ impl Task {
         // No hole punching either way while relay-only (GAP-6).
         self.swarm.behaviour_mut().punch.set_enabled(!on);
         if on {
-            if let Some(id) = self.listener.take() {
+            // Relay-only users never relay for members (design #368 §1); the
+            // core turns it on again, if it should be, once this is off.
+            self.swarm.behaviour_mut().member_relay.stop();
+            // Nor keeps any member's address (Security Lead).
+            self.forget_remembered();
+            for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
                 self.swarm.remove_listener(id);
             }
             self.direct_candidates.clear();
+            // GAP-6r blocker 1: direct connections already open go too (the
+            // relay's own excepted). A peer with a parked relayed connection
+            // is relayed again at once (ConnectionClosed); one without meets
+            // us through a circuit at the next discovery round.
+            let direct: Vec<ConnectionId> = self
+                .direct
+                .iter()
+                .filter(|(peer, _)| **peer != self.relay_peer)
+                .flat_map(|(_, conns)| conns.iter().copied())
+                .collect();
+            if !direct.is_empty() {
+                info!(count = direct.len(), "relay only: closing direct connections");
+            }
+            for id in direct {
+                self.swarm.close_connection(id);
+            }
         } else {
             match self.swarm.listen_on(self.listen.clone()) {
                 Ok(id) => self.listener = Some(id),
@@ -1599,7 +2542,12 @@ impl Task {
     /// off; see `punch`. Each side does this once it verified the other;
     /// until then the side that would answer holds the request.
     fn try_punch(&mut self, peer: PeerId) {
-        if self.relay_only || self.direct.contains_key(&peer) || !self.relayed.contains_key(&peer) || !self.is_member(peer) {
+        if self.relay_only
+            || self.direct.contains_key(&peer)
+            || !self.relayed.contains_key(&peer)
+            || self.link_blocks(&peer)
+            || !self.is_member(peer)
+        {
             return;
         }
         if self.swarm.behaviour_mut().punch.open(peer) {
@@ -1609,6 +2557,17 @@ impl Task {
 
     /// Every second: close the punch gate of a peer that stopped being a
     /// member (kicked, or our read gate changed) since we opened it.
+    /// Every second: the member relay's gates follow who is a bound current
+    /// member now (design #368 §1 rule 1). Never while relay-only.
+    fn recheck_member_relay(&mut self) {
+        if !self.swarm.behaviour().member_relay.enabled() {
+            return;
+        }
+        let peers: Vec<PeerId> = self.swarm.behaviour().member_relay.connected().copied().collect();
+        let members = if self.relay_only { HashSet::new() } else { peers.into_iter().filter(|p| self.is_member(*p)).collect() };
+        self.swarm.behaviour_mut().member_relay.set_members(members);
+    }
+
     fn recheck_punch(&mut self) {
         for peer in self.swarm.behaviour().punch.open_peers() {
             if !self.is_member(peer) {
@@ -1654,7 +2613,9 @@ impl Task {
     }
 
     fn dial_direct(&mut self, peer: PeerId) {
-        if !self.direct_dials {
+        // Device link: no direct dial while a link is open here, nor to a
+        // link peer (`try_direct` and `direct_fallback` both end here).
+        if !self.direct_dials || self.link_blocks(&peer) {
             return;
         }
         let lan = self.allow_lan && self.is_member(peer);
@@ -1664,7 +2625,7 @@ impl Task {
             debug!(%peer, lan, candidates = listen_addrs.len(), "no direct address to try");
             return;
         }
-        debug!(%peer, lan, ?addrs, "trying a direct connection");
+        debug!(%peer, lan, addrs = addrs.len(), "trying a direct connection");
         let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::Always).build();
         if let Err(err) = self.swarm.dial(opts) {
             debug!(%peer, ?err, "direct dial refused");
@@ -1673,25 +2634,138 @@ impl Task {
 
     /// Pulls the logs we just wrote to, so receipt acks come back quickly.
     fn pull_soon(&mut self) {
+        // Receipt acks come only from members bound to the log's server, so
+        // only they are asked: a write burst while unrelated peers are
+        // connected no longer floods them with pulls.
         for log in std::mem::take(&mut self.soon) {
+            let server = self.sealing.get(&log).map(|s| s.server);
             for peer in self.connected.clone() {
-                self.pull(peer, &log);
+                if server.is_none_or(|server| self.bound.contains_key(&(peer, server))) {
+                    self.pull(peer, &log, "soon");
+                }
             }
         }
     }
 
-    fn pull_all(&mut self) {
+    fn pull_all(&mut self, cause: &'static str) {
+        self.pull_round = self.pull_round.wrapping_add(1);
         for peer in self.connected.clone() {
-            for log in self.logs.clone() {
-                self.pull(peer, &log);
+            self.pull_shared(peer, cause, PULLS_PER_PEER_ROUND);
+        }
+    }
+
+    /// Sends `peer` the next queued pull, control logs first (where joins
+    /// and bindings start), while fewer than [`MAX_PULLS_IN_FLIGHT`] are out.
+    fn pull_next(&mut self, peer: PeerId) {
+        let Some(queue) = self.queued_pulls.get_mut(&peer) else { return };
+        let next = queue.iter().find(|log| log.ends_with(CONTROL_SUFFIX)).or_else(|| queue.iter().next()).cloned();
+        let Some(log) = next else {
+            self.queued_pulls.remove(&peer);
+            return;
+        };
+        queue.remove(&log);
+        self.pull(peer, &log, "queue");
+    }
+
+    /// Whether `log` is worth pulling from `peer`. A plain-named log, and a
+    /// server's control log (where bindings and joins start), from anyone;
+    /// a channel log only from a peer bound to its server. A long-used node
+    /// with many servers so no longer pulls every channel it holds from a
+    /// peer that shares one server (it would refuse most of them).
+    fn shares(&self, peer: PeerId, log: &str) -> bool {
+        match self.sealing.get(log) {
+            None => true,
+            Some(sealed) => {
+                log == log_name(sealed.server, Scope::Control) || self.bound.contains_key(&(peer, sealed.server))
             }
         }
     }
 
-    fn pull(&mut self, peer: PeerId, log: &str) {
+    /// The channel logs of `server` we share with `peer`, pulled at once
+    /// (`peer` just bound for it).
+    fn pull_bound_channels(&mut self, peer: PeerId, server: ServerId) {
+        let logs: Vec<String> = self
+            .logs
+            .iter()
+            .filter(|log| !log.ends_with(CONTROL_SUFFIX))
+            .filter(|log| self.sealing.get(log).is_some_and(|s| s.server == server))
+            .filter(|log| self.shares(peer, log))
+            .cloned()
+            .collect();
+        for log in logs {
+            self.pull(peer, &log, "bound");
+        }
+    }
+
+    /// Pulls `peer`'s share of our logs, at most `limit` (a round:
+    /// [`PULLS_PER_PEER_ROUND`]; a first contact: [`FIRST_CONTACT_PULLS`]):
+    /// those of servers it is bound to first, then the other control
+    /// logs in turn (a different slice each round), so a node with many
+    /// servers never sends a peer more pulls than its limits take. `pull`
+    /// also keeps at most [`MAX_PULLS_IN_FLIGHT`] out at once.
+    fn pull_shared(&mut self, peer: PeerId, cause: &'static str, limit: usize) {
+        let (mut bound, mut rest): (Vec<String>, Vec<String>) = self
+            .logs
+            .iter()
+            .filter(|log| self.shares(peer, log))
+            .cloned()
+            .partition(|log| self.sealing.get(log).is_none_or(|s| self.bound.contains_key(&(peer, s.server))));
+        // T23: `rest` are control logs of servers this peer isn't bound for.
+        // Asking carries our binding, so: never one it answered empty lately,
+        // and for a server we already have a bound member of, at most one
+        // probe per UNBOUND_REPROBE (two members who meet late still bind).
+        let now = Instant::now();
+        rest.retain(|log| {
+            if self.empty_from.get(&(peer, log.clone())).is_some_and(|until| now < *until) {
+                return false;
+            }
+            let Some(server) = self.sealing.get(log).map(|s| s.server) else { return true };
+            let member_bound = self.bound.keys().any(|(_, s)| *s == server);
+            !member_bound || self.probed.get(&(peer, server)).is_none_or(|at| now >= *at + UNBOUND_REPROBE)
+        });
+        bound.sort();
+        rest.sort();
+        bound.truncate(limit);
+        let room = limit - bound.len();
+        if !rest.is_empty() && room > 0 {
+            let start = self.pull_round.wrapping_mul(room) % rest.len();
+            let probes: Vec<String> = (0..room.min(rest.len())).map(|i| rest[(start + i) % rest.len()].clone()).collect();
+            for log in &probes {
+                if let Some(server) = self.sealing.get(log).map(|s| s.server) {
+                    if self.bound.keys().any(|(_, s)| *s == server) {
+                        cap_oldest(&mut self.probed, &(peer, server), |at| *at);
+                        self.probed.insert((peer, server), now);
+                    }
+                }
+            }
+            bound.extend(probes);
+        }
+        for log in bound {
+            self.pull(peer, &log, cause);
+        }
+    }
+
+    fn pull(&mut self, peer: PeerId, log: &str, cause: &'static str) {
         let key = (peer, log.to_string());
+        // T23 on every path (round, queue, again, more…): a control log an
+        // unbound peer answered empty lately isn't asked for again.
+        if self.empty_from.get(&key).is_some_and(|until| Instant::now() < *until) {
+            self.again.remove(&key);
+            return;
+        }
         if self.decoding.contains(&key) || self.inflight.values().any(|k| *k == key) {
             self.again.insert(key);
+            return;
+        }
+        // At most MAX_PULLS_IN_FLIGHT out to one peer; the rest wait their
+        // turn (`pull_next`) instead of being refused for its byte budget.
+        // T24: and no faster than the answering side's rate, so a burst
+        // (opening many servers, quick answers freeing slots) never runs past
+        // its limit; the queue drains on the 1 s tick.
+        if self.inflight.values().filter(|(p, _)| *p == peer).count() >= MAX_PULLS_IN_FLIGHT
+            || !self.outbound_pulls.allow(peer, Instant::now())
+        {
+            self.queued_pulls.entry(peer).or_default().insert(key.1);
             return;
         }
         // Records we refused count as "have", so the peer stops sending them.
@@ -1703,6 +2777,12 @@ impl Task {
         let have = have.into_iter().map(|id| ByteBuf::from(id.as_bytes().to_vec())).collect();
         let binding = self.sealing.get(log).map(|s| s.server).and_then(|server| self.own_binding(server));
         let request = SyncRequest { log: self.sealing.wire(log), have, binding };
+        // Why this pull went out, for sync debug logs (mvs.log through
+        // MVS_DEBUG_LOG): the trigger only, never the peer or the log name.
+        // `bound`: whether the peer is bound for the log's server (a member
+        // pull) or not (a probe that carries our binding, T23).
+        let bound = self.sealing.get(log).is_none_or(|s| self.bound.contains_key(&(peer, s.server)));
+        debug!(cause, bound, in_flight = self.inflight.values().filter(|(p, _)| *p == peer).count(), "pull sent");
         let request = self.swarm.behaviour_mut().sync.send_request(&peer, request);
         self.inflight.insert(request, key);
     }
@@ -1729,6 +2809,7 @@ impl Task {
     fn bound_identity(&mut self, peer: PeerId, server: ServerId, binding: Option<Binding>) -> Option<PublicKey> {
         let identity = self.verify_binding(peer, server, binding?)?;
         self.mark_seen(server, identity, peer);
+        self.remember_member(peer);
         Some(identity)
     }
 
@@ -1748,6 +2829,24 @@ impl Task {
         if new {
             // T8-02: a member who was offline catches up on live invites.
             self.share_invites(peer, server);
+            // Bound now: its answers for this server count again (T23).
+            self.empty_from.retain(|(p, log), _| {
+                *p != peer || self.sealing.get(log).is_none_or(|s| s.server != server)
+            });
+            // Now it shares this server's channels (`shares`): pull them at
+            // once rather than at the next anti-entropy round.
+            let channels: Vec<String> = self
+                .logs
+                .iter()
+                .filter(|log| {
+                    self.sealing.get(log).is_some_and(|s| s.server == server)
+                        && **log != log_name(server, Scope::Control)
+                })
+                .cloned()
+                .collect();
+            for log in channels {
+                self.pull(peer, &log, "bound");
+            }
         }
         Some(identity)
     }
@@ -1774,6 +2873,7 @@ impl Task {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                 self.dial_backoff.lock().unwrap().connected(&peer_id);
+                self.fallback_dials.remove(&connection_id);
                 if let ConnectedPoint::Dialer { address, .. } = &endpoint {
                     if let Some((a, _)) = self.bootstrap.iter().find(|(a, _)| without_peer(a) == without_peer(address)) {
                         self.bootstrap_conns.insert(connection_id, a.clone());
@@ -1784,10 +2884,19 @@ impl Task {
                     self.swarm.close_connection(connection_id);
                     return;
                 }
+                // Relay-only: a direct connection to anyone but the relay
+                // (a dial or punch already under way when it was turned on)
+                // is closed as soon as it opens.
+                if self.relay_only && peer_id != self.relay_peer && !is_relayed(&endpoint) {
+                    debug!(%peer_id, "relay only: closing a direct connection");
+                    self.swarm.close_connection(connection_id);
+                    return;
+                }
                 if peer_id != self.relay_peer {
                     self.track_connection(peer_id, connection_id, &endpoint);
                     if is_relayed(&endpoint) {
                         self.try_punch(peer_id);
+                        self.flush_link_waiting();
                     }
                 }
                 if peer_id == self.relay_peer {
@@ -1796,19 +2905,24 @@ impl Task {
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
                 } else if self.connected.insert(peer_id) {
                     // Peer ID with its address only at debug level (PR checklist).
-                    debug!(%peer_id, address = %endpoint.get_remote_address(), "peer connected");
+                    debug!(%peer_id, relayed = is_relayed(&endpoint), "peer connected");
                     info!(%peer_id, "peer connected");
                     self.reached = true;
                     self.emit(NodeEvent::PeerConnected(peer_id));
-                    for log in self.logs.clone() {
-                        self.pull(peer_id, &log);
-                    }
+                    // A new connection is a new chance to bind: drop the
+                    // re-probe wait for this peer (a member whose link reset
+                    // would otherwise stay unbound, so offline, for up to
+                    // UNBOUND_REPROBE). Empty answers still count
+                    // (`empty_from`), so a reset doesn't re-probe what it lacks.
+                    self.probed.retain(|(p, _), _| *p != peer_id);
+                    self.pull_shared(peer_id, "connect", FIRST_CONTACT_PULLS);
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                 self.per_ip.release(connection_id);
                 self.bootstrap_conns.remove(&connection_id);
                 self.relayed_preferred.remove(&connection_id);
+                self.relay_ping_misses.remove(&connection_id);
                 let had_direct = self.direct.contains_key(&peer_id);
                 for conns in [&mut self.relayed, &mut self.direct, &mut self.parked] {
                     if let Some(set) = conns.get_mut(&peer_id) {
@@ -1823,6 +2937,7 @@ impl Task {
                         debug!(%peer_id, "direct connection gone: relayed again");
                         self.relayed.insert(peer_id, parked);
                         self.emit(NodeEvent::Link { peer: peer_id, direct: false });
+                        self.flush_link_waiting();
                     }
                 }
                 if num_established > 0 {
@@ -1832,6 +2947,7 @@ impl Task {
                     // The reservation went with the connection (e.g. the relay
                     // restarted): ask for a new one once we're back.
                     info!("relay connection lost");
+                    self.relay_lost();
                     if let Some(id) = self.circuit.take() {
                         self.swarm.remove_listener(id);
                     }
@@ -1850,6 +2966,7 @@ impl Task {
                 self.inflight.retain(|_, (p, _)| *p != peer_id);
                 self.decoding.retain(|(p, _)| *p != peer_id);
                 self.again.retain(|(p, _)| *p != peer_id);
+                self.queued_pulls.remove(&peer_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 if peer_id == self.relay_peer {
@@ -1861,7 +2978,13 @@ impl Task {
                 } else {
                     // Only addresses we would dial ourselves go into our DHT
                     // table (which, in server mode, we also serve to others).
-                    let known: Vec<Multiaddr> = info.listen_addrs.iter().filter(|a| self.reachable(a)).cloned().collect();
+                    // Never a circuit through any relay but ours (member relays).
+                    let known: Vec<Multiaddr> = info
+                        .listen_addrs
+                        .iter()
+                        .filter(|a| self.reachable(a) && (via_relay(a, &self.relay_addr) || !a.iter().any(|p| p == Protocol::P2pCircuit)))
+                        .cloned()
+                        .collect();
                     for addr in known {
                         self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                     }
@@ -1873,7 +2996,16 @@ impl Task {
                     }
                 }
             }
-            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { renewal, .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. })) => {
+                if relay_peer_id != self.relay_peer {
+                    // A member relay (slice 2): our circuit there is for members
+                    // only, never announced (identify, DHT).
+                    if !renewal {
+                        debug!("reserved on a member relay");
+                    }
+                    return;
+                }
+                self.relay_back();
                 if !renewal {
                     // Reachable through the relay now: look for peers and catch
                     // up at once rather than at the next timer tick.
@@ -1882,23 +3014,53 @@ impl Task {
                     self.emit(NodeEvent::RelayReserved);
                     let me = *self.swarm.local_peer_id();
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
-                    self.pull_all();
+                    // G-91: our provider records carry our circuit: without
+                    // an address the relay answers with its routing table's,
+                    // which may not hold us. And the backups we hold are
+                    // announced again (a restarted relay forgot them).
+                    self.swarm.add_external_address(self.relay_addr.clone().with(Protocol::P2pCircuit));
+                    for tag in self.store.notice_tags().unwrap_or_default() {
+                        self.provide_backup(tag);
+                    }
+                    for tag in self.store.backup_tags().unwrap_or_default() {
+                        self.provide_backup(tag);
+                    }
+                    self.pull_all("reservation");
                 }
             }
             SwarmEvent::NewListenAddr { listener_id, address } if Some(listener_id) == self.listener => {
                 save_port(&self.port_file, &address);
+                if let Some(Protocol::Tcp(port)) = address.iter().find(|p| matches!(p, Protocol::Tcp(_))) {
+                    self.tcp_port = Some(port);
+                }
+                // QUIC once the TCP port is known, on the same port, so one
+                // router or firewall rule (and NAT mapping) covers both.
+                // Removed with the TCP listener while relay-only.
+                if self.quic_listener.is_none() && !self.relay_only {
+                    self.quic_listener = listen_quic(&mut self.swarm, &self.listen, &address);
+                }
+            }
+            SwarmEvent::NewListenAddr { listener_id, .. } if self.member_listeners.contains_key(&listener_id) => {
+                self.member_reserved.insert(listener_id);
+            }
+            SwarmEvent::ListenerClosed { listener_id, .. } if self.member_listeners.contains_key(&listener_id) => {
+                self.member_listener_closed(listener_id);
             }
             SwarmEvent::ListenerClosed { listener_id, .. } if self.circuit == Some(listener_id) => {
                 // Reservation refused or lost: the next discovery tick asks again.
                 self.circuit = None;
+                self.swarm.remove_external_address(&self.relay_addr.clone().with(Protocol::P2pCircuit));
             }
-            SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), error, .. } if peer != self.relay_peer => {
+            SwarmEvent::OutgoingConnectionError { connection_id, peer_id: Some(peer), error, .. } if peer != self.relay_peer => {
                 // Back off this peer, and forget circuit addresses that failed
                 // (a reservation that ended): the relay denies each such dial.
                 // A dial our own guard refused isn't a new failure.
                 // Nor is an extra dial to a peer we are connected to (a
                 // direct or hole-punch attempt that failed).
-                if !matches!(error, libp2p::swarm::DialError::Denied { .. }) && !self.connected.contains(&peer) {
+                // Nor a dial through a member relay to a member who holds no
+                // reservation there (the fallback tries each known member).
+                let fallback = self.fallback_dials.remove(&connection_id);
+                if !fallback && !matches!(error, libp2p::swarm::DialError::Denied { .. }) && !self.connected.contains(&peer) {
                     let jitter = |wait| jittered(wait, OsRng.next_u32());
                     self.dial_backoff.lock().unwrap().failed(peer, Instant::now(), jitter);
                 }
@@ -1910,6 +3072,34 @@ impl Task {
                     }
                 }
                 debug!(%peer, ?error, "dial failed");
+            }
+            // Slice 2: Kademlia also files the address a connection was dialled
+            // on; a circuit through a member relay must never reach the DHT we
+            // serve (design #368 §1 rule 2), so it is taken out again at once.
+            // A silently dead connection to our relay is closed after
+            // RELAY_PING_MISSES failed pings, so the fallback clock starts.
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if peer == self.relay_peer => {
+                let misses = self.relay_ping_misses.entry(connection).or_insert(0);
+                if relay_ping(misses, result.is_ok()) {
+                    self.relay_ping_misses.remove(&connection);
+                    info!("our relay stopped answering pings: closing its connection");
+                    self.swarm.close_connection(connection);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
+                for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
+                    // P0 on #416: our configured relay's own configured address
+                    // stays, DNS name or not (configured, not peer-learned):
+                    // without it the routing table is empty and nobody is found.
+                    if peer == self.relay_peer && is_configured_relay(addr, &self.relay_addr) {
+                        continue;
+                    }
+                    // Also any DNS name a peer gave (hickory-advisories): never
+                    // stored, so never resolved or served to others.
+                    if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
+                        self.swarm.behaviour_mut().kad.remove_address(&peer, addr);
+                    }
+                }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
                 result: kad::QueryResult::GetClosestPeers(Ok(ok)),
@@ -1923,9 +3113,24 @@ impl Task {
                     {
                         continue;
                     }
-                    // Peer-supplied addresses: never let them point us into our own LAN.
-                    let addrs: Vec<Multiaddr> =
-                        peer.addrs.into_iter().filter(|a| self.reachable(a) && (!self.relay_only || via_relay(a, &self.relay_addr))).collect();
+                    // Peer-supplied addresses: never let them point us into our
+                    // own LAN, nor at a DNS name. A circuit through our own relay
+                    // (matched by its peer ID) is rebuilt from our configured
+                    // relay address instead (P0 on #416: the relay's announced
+                    // base can be a DNS name, or another port or transport).
+                    let mut addrs: Vec<Multiaddr> = Vec::new();
+                    for a in peer.addrs {
+                        let usable = if via_relay(&a, &self.relay_addr) {
+                            Some(a)
+                        } else if let Some(rebuilt) = our_relay_circuit(&a, &self.relay_addr, &peer.peer_id) {
+                            Some(rebuilt)
+                        } else {
+                            (!self.relay_only && reachable(&a, false)).then_some(a)
+                        };
+                        if let Some(a) = usable.filter(|a| !addrs.contains(a)) {
+                            addrs.push(a);
+                        }
+                    }
                     if addrs.is_empty() {
                         continue;
                     }
@@ -1955,6 +3160,7 @@ impl Task {
                     request_response::Message::Response { request_id, response } => {
                         if let Some(key) = self.inflight.remove(&request_id) {
                             self.on_response(key, response);
+                            self.pull_next(peer);
                         }
                     }
                 }
@@ -1989,6 +3195,95 @@ impl Task {
                 request_id,
                 ..
             })) => self.on_invite_answer(request_id, None),
+            SwarmEvent::Behaviour(BehaviourEvent::Notice(request_response::Event::Message { peer, message, .. })) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.on_notice_request(peer, request, channel)
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        self.on_notice_answer(request_id, Some(response))
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Notice(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            })) => {
+                debug!(%peer, %error, "notice request failed");
+                self.on_notice_answer(request_id, None);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Backup(request_response::Event::Message { peer, message, .. })) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.on_backup_request(peer, request, channel)
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        if let Some(id) = self.backup_fetch_of.remove(&request_id) {
+                            self.fetch_answered(id, Some(response));
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Backup(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            })) => {
+                debug!(%peer, %error, "backup request failed");
+                if let Some(id) = self.backup_fetch_of.remove(&request_id) {
+                    self.fetch_answered(id, None);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                id,
+                result: kad::QueryResult::GetProviders(result),
+                step,
+                ..
+            })) if self.link_finds.contains_key(&id) => {
+                let providers = match result {
+                    Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => providers.into_iter().collect(),
+                    _ => Vec::new(),
+                };
+                self.on_link_providers(id, providers, step.last);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::DeviceLink(request_response::Event::Message { peer, message, .. })) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.on_link_request(peer, request, channel)
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        if let Some(reply) = self.link_out.remove(&request_id) {
+                            let _ = reply.send(crate::device_link::outcome(response));
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::DeviceLink(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            })) => {
+                debug!(%peer, %error, "device link request failed");
+                if let Some(reply) = self.link_out.remove(&request_id) {
+                    let _ = reply.send(Err(LinkError::Network));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                id,
+                result: kad::QueryResult::GetProviders(result),
+                step,
+                ..
+            })) if self.backup_lookups.contains_key(&id) => {
+                let providers = match result {
+                    Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => providers.into_iter().collect(),
+                    _ => Vec::new(),
+                };
+                self.on_backup_providers(id, providers, step.last);
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Punch(libp2p::dcutr::Event { remote_peer_id, result })) => {
                 // A success shows up as a direct connection: `track_connection`
                 // flips the link to direct and parks the relayed one (#206).
@@ -2008,6 +3303,7 @@ impl Task {
                 // The anti-entropy timer retries.
                 if let Some(key) = self.inflight.remove(&request_id) {
                     self.again.remove(&key);
+                    self.pull_next(peer);
                 }
             }
             _ => {}
@@ -2018,9 +3314,17 @@ impl Task {
     /// read-only connection. Dropping the channel fails the request on the
     /// other side.
     fn on_request(&mut self, peer: PeerId, request: SyncRequest, channel: ResponseChannel<SyncResponse>) {
+        #[cfg(test)]
+        {
+            self.pulls_received += 1;
+        }
         let now = Instant::now();
         if !self.inbound_pulls.allow(peer, now) || !self.all_inbound_pulls.allow((), now) {
             debug!(%peer, "pull rate limit exceeded");
+            #[cfg(test)]
+            {
+                self.rate_limited += 1;
+            }
             return;
         }
         let Some(Readable { log, check: gate, reader }) = self.who_may_read(peer, request.log, request.binding) else {
@@ -2029,6 +3333,10 @@ impl Task {
         };
         if self.answering >= MAX_ANSWERING {
             debug!(%peer, "too many pulls being answered");
+            #[cfg(test)]
+            {
+                self.rate_limited += 1;
+            }
             return;
         }
         // A ~100-byte request can ask for a 4 MiB page: the page is cut to the
@@ -2036,6 +3344,10 @@ impl Task {
         let budget = self.served_bytes.available(peer, now).min(self.all_served_bytes.available((), now));
         if budget < MIN_PAGE_BUDGET {
             debug!(%peer, "served-bytes budget exhausted");
+            #[cfg(test)]
+            {
+                self.rate_limited += 1;
+            }
             return;
         }
         let max_bytes = budget.min(PAGE_BYTES);
@@ -2058,6 +3370,11 @@ impl Task {
         let allow_lan = self.allow_lan;
         let relay_only = self.relay_only;
         let mine: Vec<Multiaddr> = direct_candidates_of(self.swarm.listeners().cloned().collect());
+        // Slice 2: our member relay offer (to members only, in `member_extras`).
+        let offer = (!relay_only && self.swarm.behaviour_mut().member_relay.offering()).then(|| RelayOffer {
+            addrs: mine.iter().map(|a| ByteBuf::from(a.to_vec())).collect(),
+            preferred: self.swarm.behaviour().member_relay.preferred(),
+        });
         let store = self.reader.clone();
         let answers = self.answers.clone();
         tokio::task::spawn_blocking(move || {
@@ -2069,7 +3386,7 @@ impl Task {
                 Some(gate) if !gate.allows(&store) => (empty_response(), Vec::new()),
                 _ => answer_with_ids(&store, &log, &request.have, max_bytes),
             };
-            member_extras(&mut response, ours, &acks, &mine, allow_lan && !relay_only, &store);
+            member_extras(&mut response, ours, &acks, &mine, allow_lan && !relay_only, offer.as_ref(), &store);
             let _ = answers.send((peer, channel, response, max_bytes, ids, log));
         });
     }
@@ -2182,9 +3499,9 @@ impl Task {
                 let control = log_name(record.server(), Scope::Control);
                 let needs_control = record.auth_deps().iter().any(|d| missing.contains(d));
                 self.pending.insert(missing[0], record, Instant::now());
-                self.pull(from, &log);
+                self.pull(from, &log, "deps");
                 if needs_control && self.logs.contains(&control) {
-                    self.pull(from, &control);
+                    self.pull(from, &control, "deps");
                 }
                 Ingest::Waiting
             }
@@ -2211,15 +3528,38 @@ impl Task {
         // Presence: the answerer's binding says who it is (sent to members only).
         if let (Some(binding), Some(s)) = (response.binding.clone(), self.sealing.get(&key.1)) {
             let server = s.server;
+            let newly = !self.bound.contains_key(&(key.0, server));
             if let Some(identity) = self.verify_binding(key.0, server, binding) {
                 self.mark_seen(server, identity, key.0);
+                // Newly bound: its channels of this server are pulled now. On
+                // open they were skipped (a channel goes only to a bound peer,
+                // and the binding comes with this answer), and would otherwise
+                // wait for the next anti-entropy round: a join's first messages
+                // up to 5 s late.
+                if newly {
+                    self.pull_bound_channels(key.0, server);
+                }
+                // Slice 2: a member we know, and its member relay offer (if any).
+                self.on_member_answer(key.0, response.relay.clone());
                 // A member's direct addresses (F2): try a direct connection.
                 let addrs: Vec<Multiaddr> =
                     response.direct_addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect();
-                debug!(peer = %key.0, ?addrs, relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                debug!(peer = %key.0, addrs = addrs.len(), relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                // Relay-down resilience: remembered, to redial after a restart.
+                self.remember_addrs(key.0, server, identity, &addrs);
                 if !addrs.is_empty() && self.relayed.contains_key(&key.0) {
                     self.direct_candidates.insert(key.0, direct_candidates_of(addrs));
                     self.try_direct(key.0);
+                }
+            }
+        }
+        // T23: an unbound peer with nothing for a control log isn't asked for
+        // it again for a while (each ask carries our binding).
+        if response.records.is_empty() && !response.more {
+            if let Some(server) = self.sealing.get(&key.1).map(|s| s.server) {
+                if key.1.ends_with(CONTROL_SUFFIX) && !self.bound.contains_key(&(key.0, server)) {
+                    cap_oldest(&mut self.empty_from, &key, |until| *until);
+                    self.empty_from.insert(key.clone(), Instant::now() + UNBOUND_REPROBE);
                 }
             }
         }
@@ -2292,7 +3632,7 @@ impl Task {
             self.release_pending(id);
         }
         if follow_up(more, added_any) || self.again.remove(&key) {
-            self.pull(peer, &log);
+            self.pull(peer, &log, "more");
         }
     }
 
@@ -2495,6 +3835,458 @@ impl Task {
     }
 }
 
+/// Device link (`device_link`): rendezvous, circuit-only requests, and the
+/// one link a new device answers.
+const MAX_LINK_FINDS: usize = 4;
+const MAX_LINK_WAITING: usize = 8;
+const MAX_LINK_PEERS: usize = 64;
+const LINK_REQUEST_WAIT: Duration = Duration::from_secs(20);
+
+impl Task {
+    /// Our relay circuit address, once the relay holds a reservation for us.
+    fn our_circuit(&self) -> Option<Multiaddr> {
+        let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit);
+        let reserved = self.circuit.is_some()
+            && self.swarm.is_connected(&self.relay_peer)
+            && self.swarm.external_addresses().any(|a| *a == circuit);
+        reserved.then(|| circuit.with(Protocol::P2p(*self.swarm.local_peer_id())))
+    }
+
+    fn link_open(&mut self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<(PeerId, Multiaddr)> {
+        let circuit = self.our_circuit()?;
+        self.link_close();
+        if let Err(err) = self.swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(&rv)) {
+            debug!(%err, "device link: announcing the rendezvous failed");
+            return None;
+        }
+        self.link_host = Some(LinkHost::new(rv, e_new_pub, Instant::now()));
+        info!("device link open");
+        Some((*self.swarm.local_peer_id(), circuit))
+    }
+
+    fn link_close(&mut self) {
+        if let Some(host) = self.link_host.take() {
+            self.swarm.behaviour_mut().kad.stop_providing(&kad::RecordKey::new(&host.rv));
+            info!("device link closed");
+        }
+    }
+
+    /// Whether a direct path to `peer` is off because of a device link: any
+    /// peer while a link is open here (new device), or a link peer.
+    fn link_blocks(&self, peer: &PeerId) -> bool {
+        self.link_host.is_some() || self.link_until.contains_key(peer)
+    }
+
+    /// From now on `peer` is reached through the relay only: the guard
+    /// refuses any other connection, and direct ones already open close.
+    fn mark_link_peer(&mut self, peer: PeerId) {
+        if !self.link_until.contains_key(&peer) && self.link_until.len() >= MAX_LINK_PEERS {
+            return;
+        }
+        let until = Instant::now() + crate::DEVICE_LINK_TTL + Duration::from_secs(60);
+        self.link_until.insert(peer, until);
+        self.link_peers.lock().unwrap().insert(peer);
+        self.fallback_at.remove(&peer);
+        self.swarm.behaviour_mut().punch.close(peer);
+        for id in self.direct.get(&peer).cloned().unwrap_or_default() {
+            debug!(%peer, "device link: closing a direct connection");
+            self.swarm.close_connection(id);
+        }
+    }
+
+    fn link_find(&mut self, rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>>) {
+        if self.link_finds.len() >= MAX_LINK_FINDS {
+            let _ = reply.send(Err(LinkError::Network));
+            return;
+        }
+        let query = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&rv));
+        self.link_finds.insert(query, (reply, Instant::now() + crate::DEVICE_LINK_FIND_WAIT));
+    }
+
+    fn on_link_providers(&mut self, query: kad::QueryId, providers: Vec<PeerId>, last: bool) {
+        let me = *self.swarm.local_peer_id();
+        let found = providers.into_iter().find(|p| *p != me);
+        if found.is_none() && !last {
+            return;
+        }
+        if let Some((reply, _)) = self.link_finds.remove(&query) {
+            let _ = reply.send(found.ok_or(LinkError::NotFound));
+        }
+        if let Some(mut q) = self.swarm.behaviour_mut().kad.query_mut(&query) {
+            q.finish();
+        }
+    }
+
+    fn link_request(&mut self, peer: PeerId, request: LinkRequest, reply: LinkReply) {
+        if peer == *self.swarm.local_peer_id() || peer == self.relay_peer || self.link_waiting.len() >= MAX_LINK_WAITING {
+            let _ = reply.send(Err(LinkError::Network));
+            return;
+        }
+        self.mark_link_peer(peer);
+        if !self.link_until.contains_key(&peer) {
+            let _ = reply.send(Err(LinkError::Network));
+            return;
+        }
+        self.link_waiting.push((peer, request, reply, Instant::now() + LINK_REQUEST_WAIT));
+        if !self.relayed.contains_key(&peer) {
+            // Through our relay's circuit only, never an address from the DHT.
+            let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer));
+            let opts = DialOpts::peer_id(peer).addresses(vec![circuit]).condition(PeerCondition::Always).build();
+            if let Err(err) = self.swarm.dial(opts) {
+                debug!(%peer, ?err, "device link: dialling the circuit failed");
+            }
+        }
+        self.flush_link_waiting();
+    }
+
+    /// Sends each waiting request whose peer is now reached through a
+    /// relayed connection only; fails those past their time.
+    fn flush_link_waiting(&mut self) {
+        let now = Instant::now();
+        for (peer, request, reply, until) in std::mem::take(&mut self.link_waiting) {
+            if self.relayed.contains_key(&peer) && !self.direct.contains_key(&peer) {
+                let id = self.swarm.behaviour_mut().device_link.send_request(&peer, request);
+                self.link_out.insert(id, reply);
+            } else if now >= until {
+                let _ = reply.send(Err(LinkError::Network));
+            } else {
+                self.link_waiting.push((peer, request, reply, until));
+            }
+        }
+    }
+
+    fn on_link_request(&mut self, peer: PeerId, request: LinkRequest, channel: ResponseChannel<Vec<u8>>) {
+        let (answer, inbound) = match self.link_host.as_mut() {
+            Some(host) => host.answer(peer, request, Instant::now()),
+            None => (vec![crate::device_link::GONE], None),
+        };
+        if matches!(inbound, Some(crate::device_link::Inbound::Hello { .. })) {
+            self.mark_link_peer(peer);
+            debug!(%peer, "device link: hello");
+        }
+        let _ = self.swarm.behaviour_mut().device_link.send_response(channel, answer);
+        if let Some(inbound) = inbound {
+            self.emit(NodeEvent::DeviceLink(inbound));
+        }
+    }
+
+    /// Every second: the link's five minutes, link peers' marks, lookups and
+    /// requests past their time.
+    fn link_tick(&mut self) {
+        let now = Instant::now();
+        if self.link_host.as_ref().is_some_and(|h| h.expired(now)) {
+            self.link_close();
+        }
+        let gone: Vec<PeerId> = self.link_until.iter().filter(|(_, until)| now >= **until).map(|(p, _)| *p).collect();
+        for peer in gone {
+            self.link_until.remove(&peer);
+            self.link_peers.lock().unwrap().remove(&peer);
+        }
+        let late: Vec<kad::QueryId> =
+            self.link_finds.iter().filter(|(_, (_, until))| now >= *until).map(|(q, _)| *q).collect();
+        for query in late {
+            self.on_link_providers(query, Vec::new(), true);
+        }
+        self.flush_link_waiting();
+    }
+}
+
+/// Member relays, client side (design #368 §2).
+/// Our relay counts as down after this long without a connection to it.
+const RELAY_DOWN_AFTER: Duration = Duration::from_secs(60);
+/// Member relays we reserve on at once (design §1 rule 3).
+const MAX_MEMBER_RELAYS: usize = 2;
+/// A member relay that failed (reservation refused or lost) rests this long.
+const MEMBER_RELAY_REST: Duration = Duration::from_secs(120);
+/// A refused reservation (no reservation held yet) is tried again after this.
+const MEMBER_RELAY_RETRY: Duration = Duration::from_secs(15);
+/// Each member is dialled through each member relay at most this often, and
+/// at most this many such dials go out per round.
+const FALLBACK_DIAL_EVERY: Duration = Duration::from_secs(30);
+const MAX_FALLBACK_DIALS: usize = 16;
+/// Offers and members remembered, and for how long a member counts as known.
+const MAX_RELAY_OFFERS: usize = 64;
+const MAX_KNOWN_MEMBERS: usize = 1024;
+const KNOWN_MEMBER_TTL: Duration = Duration::from_secs(24 * 3600);
+
+impl Task {
+    /// A peer that proved a binding (in a request or an answer): one the
+    /// fallback dials through member relays when our relay is down.
+    fn remember_member(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        if self.known_members.len() >= MAX_KNOWN_MEMBERS && !self.known_members.contains_key(&peer) {
+            self.known_members.retain(|_, at| now.duration_since(*at) < KNOWN_MEMBER_TTL);
+        }
+        if self.known_members.len() < MAX_KNOWN_MEMBERS || self.known_members.contains_key(&peer) {
+            self.known_members.insert(peer, now);
+        }
+    }
+
+    /// A verified member's answer: remember it, and its relay offer (or that
+    /// it no longer makes one). Only addresses we may dial for a member.
+    fn on_member_answer(&mut self, peer: PeerId, offer: Option<RelayOffer>) {
+        let now = Instant::now();
+        self.remember_member(peer);
+        let addrs: Vec<Multiaddr> = offer
+            .as_ref()
+            .map(|o| o.addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect())
+            .unwrap_or_default();
+        let addrs: Vec<Multiaddr> =
+            direct_candidates_of(addrs).into_iter().filter(|a| dialable(a, self.allow_lan)).collect();
+        match offer {
+            Some(offer) if !addrs.is_empty() => {
+                if self.relay_offers.len() < MAX_RELAY_OFFERS || self.relay_offers.contains_key(&peer) {
+                    self.relay_offers.insert(peer, (addrs, offer.preferred, now));
+                }
+            }
+            _ => {
+                self.relay_offers.remove(&peer);
+            }
+        }
+    }
+
+    /// Our relay is gone: from now on the fallback clock runs.
+    fn relay_lost(&mut self) {
+        if self.relay_lost_at.is_none() {
+            self.relay_lost_at = Some(Instant::now());
+        }
+    }
+
+    /// Our relay holds our reservation again: back to it, member relays let go.
+    fn relay_back(&mut self) {
+        self.relay_lost_at = None;
+        self.drop_member_relays();
+    }
+
+    fn drop_member_relays(&mut self) {
+        if !self.member_listeners.is_empty() {
+            info!(count = self.member_listeners.len(), "leaving member relays");
+        }
+        self.member_reserved.clear();
+        for (id, _) in std::mem::take(&mut self.member_listeners) {
+            self.swarm.remove_listener(id);
+        }
+    }
+
+    /// The circuit address through member relay `relay`.
+    fn member_circuit(&self, relay: PeerId) -> Option<Multiaddr> {
+        let (addrs, _, _) = self.relay_offers.get(&relay)?;
+        Some(addrs.first()?.clone().with(Protocol::P2p(relay)).with(Protocol::P2pCircuit))
+    }
+
+    /// Every discovery round: once our relay has been down for
+    /// [`RELAY_DOWN_AFTER`], hold reservations on up to [`MAX_MEMBER_RELAYS`]
+    /// member relays (owner and admin relays first, then by peer ID, so the
+    /// members of a server pick the same ones and meet there), and dial the
+    /// members we know through them. Never while relay-only: relay-only
+    /// promises no member sees our IP (design §2).
+    fn member_relay_fallback(&mut self) {
+        if self.relay_only {
+            self.drop_member_relays();
+            return;
+        }
+        let Some(lost) = self.relay_lost_at else { return };
+        if lost.elapsed() < RELAY_DOWN_AFTER {
+            return;
+        }
+        let now = Instant::now();
+        let me = *self.swarm.local_peer_id();
+        self.member_relay_rest.retain(|_, until| now < *until);
+        self.relay_offers.retain(|_, (_, _, at)| now.duration_since(*at) < KNOWN_MEMBER_TTL);
+        let active: HashSet<PeerId> = self.member_listeners.values().copied().collect();
+        if active.len() < MAX_MEMBER_RELAYS {
+            let mut offers: Vec<(bool, PeerId)> = self
+                .relay_offers
+                .iter()
+                .filter(|(p, _)| **p != me && !active.contains(*p) && !self.member_relay_rest.contains_key(*p))
+                .map(|(p, (_, preferred, _))| (!*preferred, *p))
+                .collect();
+            offers.sort();
+            for (_, relay) in offers.into_iter().take(MAX_MEMBER_RELAYS - active.len()) {
+                let Some(addr) = self.member_circuit(relay) else { continue };
+                // Its gate opens only for a member it has verified on a direct
+                // connection: connect first, and reserve once the binding went
+                // both ways (we see it bound; our pull carried ours).
+                if !self.direct.contains_key(&relay) {
+                    // Chosen on purpose: a backoff left by circuit dials that
+                    // failed when our relay went down doesn't hold it back.
+                    self.dial_backoff.lock().unwrap().connected(&relay);
+                    let addrs = self.relay_offers.get(&relay).map(|(a, _, _)| a.clone()).unwrap_or_default();
+                    let opts = DialOpts::peer_id(relay).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build();
+                    if let Err(err) = self.swarm.dial(opts) {
+                        debug!(%relay, %err, "dialling a member relay failed");
+                    } else {
+                        debug!(%relay, "dialling a member relay");
+                    }
+                    continue;
+                }
+                if !self.bound.keys().any(|(p, _)| *p == relay) {
+                    debug!(%relay, "member relay not bound yet");
+                    continue;
+                }
+                match self.swarm.listen_on(addr) {
+                    Ok(id) => {
+                        info!("our relay is down: reserving on a member relay");
+                        self.member_listeners.insert(id, relay);
+                    }
+                    Err(err) => {
+                        debug!(%relay, %err, "member relay reservation failed");
+                        self.member_relay_rest.insert(relay, now + MEMBER_RELAY_REST);
+                    }
+                }
+            }
+        }
+        // Meet the members we know through the member relays we hold.
+        self.fallback_dialed.retain(|_, at| now.duration_since(*at) < FALLBACK_DIAL_EVERY);
+        let relays: Vec<PeerId> = self.member_listeners.values().copied().collect();
+        let members: Vec<PeerId> = self
+            .known_members
+            .iter()
+            .filter(|(p, at)| now.duration_since(**at) < KNOWN_MEMBER_TTL && **p != me && !self.connected.contains(*p))
+            .map(|(p, _)| *p)
+            .collect();
+        if !relays.is_empty() {
+            debug!(relays = relays.len(), members = members.len(), "meeting members through member relays");
+        }
+        let mut dials = 0;
+        for relay in relays {
+            let Some(circuit) = self.member_circuit(relay) else { continue };
+            for member in members.iter().filter(|m| **m != relay) {
+                if dials >= MAX_FALLBACK_DIALS || self.fallback_dialed.contains_key(&(relay, *member)) {
+                    continue;
+                }
+                self.fallback_dialed.insert((relay, *member), now);
+                let opts = DialOpts::peer_id(*member)
+                    .addresses(vec![circuit.clone().with(Protocol::P2p(*member))])
+                    .condition(PeerCondition::DisconnectedAndNotDialing)
+                    .build();
+                let id = opts.connection_id();
+                if self.swarm.dial(opts).is_ok() {
+                    self.fallback_dials.insert(id);
+                    dials += 1;
+                }
+            }
+        }
+    }
+
+    /// A member relay reservation ended (rest that relay) or was refused
+    /// before it began (try again shortly: its gate may not be open yet).
+    fn member_listener_closed(&mut self, id: ListenerId) {
+        if let Some(relay) = self.member_listeners.remove(&id) {
+            let held = self.member_reserved.remove(&id);
+            debug!(%relay, held, "member relay reservation ended");
+            let rest = if held { MEMBER_RELAY_REST } else { MEMBER_RELAY_RETRY };
+            self.member_relay_rest.insert(relay, Instant::now() + rest);
+        }
+    }
+}
+
+/// Relay-down resilience, remembered member addresses (design note and the
+/// leads' verdicts, 2026-11-17): direct addresses of verified members, kept
+/// in the store and redialled at start and while our relay is down. A dial
+/// hint only: Noise checks the peer ID, and the peer binds again before it
+/// counts as a member.
+/// Remembered members dialled per discovery round, and how often each one.
+const MAX_REMEMBERED_DIALS: usize = 16;
+const REMEMBERED_DIAL_EVERY: Duration = Duration::from_secs(30);
+/// How often remembered rows are checked against membership and expiry.
+const REMEMBERED_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+impl Task {
+    /// A bound member's direct addresses (from its pull answer): kept, if it
+    /// is a current member and we aren't relay-only. Only addresses we would
+    /// dial for a member; never logged.
+    fn remember_addrs(&mut self, peer: PeerId, server: ServerId, identity: PublicKey, addrs: &[Multiaddr]) {
+        if self.relay_only || !self.is_member(peer) {
+            return;
+        }
+        let keep: Vec<String> = direct_candidates_of(addrs.to_vec())
+            .into_iter()
+            .filter(|a| dialable(a, self.allow_lan))
+            .take(crate::store::MAX_REMEMBERED_ADDRS)
+            .map(|a| a.to_string())
+            .collect();
+        if keep.is_empty() {
+            return;
+        }
+        if let Err(err) = self.store.remember_peer(&server, &peer.to_bytes(), identity.as_bytes(), &keep, unix_now()) {
+            debug!(%err, "remembering a member failed");
+        }
+    }
+
+    /// Every discovery round while our relay doesn't hold our reservation
+    /// (at start too): dial the remembered members we aren't connected to,
+    /// directly. Never while relay-only.
+    fn redial_remembered(&mut self) {
+        // `direct_dials` off stands in for a firewall in tests: no redial either.
+        if self.relay_only || self.relay_lost_at.is_none() || !self.direct_dials {
+            return;
+        }
+        let now = Instant::now();
+        self.remembered_dialed.retain(|_, at| now.duration_since(*at) < REMEMBERED_DIAL_EVERY);
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let mut dials = 0;
+        for (_, peer, _, addrs) in rows {
+            if dials >= MAX_REMEMBERED_DIALS {
+                break;
+            }
+            let Ok(peer) = PeerId::from_bytes(&peer) else { continue };
+            if self.connected.contains(&peer) || self.remembered_dialed.contains_key(&peer) {
+                continue;
+            }
+            let addrs: Vec<Multiaddr> =
+                addrs.iter().filter_map(|a| a.parse().ok()).filter(|a| dialable(a, self.allow_lan)).collect();
+            if addrs.is_empty() {
+                continue;
+            }
+            self.remembered_dialed.insert(peer, now);
+            let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build();
+            if self.swarm.dial(opts).is_ok() {
+                dials += 1;
+            }
+        }
+        if dials > 0 {
+            debug!(dials, "redialling remembered members");
+        }
+    }
+
+    /// Every [`REMEMBERED_CHECK_EVERY`]: rows of peers that are no longer
+    /// members (kicked, left, removed by authority) go at once, and rows
+    /// past their 30 days.
+    fn check_remembered(&mut self) {
+        if self.remembered_checked.elapsed() < REMEMBERED_CHECK_EVERY {
+            return;
+        }
+        self.remembered_checked = Instant::now();
+        let _ = self.store.expire_peers(unix_now(), crate::store::REMEMBERED_TTL);
+        // No read gate: nobody can be shown to be a member, so nothing
+        // remembered stays (fail closed, Security Lead on #419).
+        let Some(gate) = self.access.read_gate.clone() else {
+            self.forget_remembered();
+            return;
+        };
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let gone: Vec<(ServerId, Vec<u8>)> = rows
+            .into_iter()
+            .filter(|(server, _, identity, _)| {
+                !self.secrets.contains_key(server)
+                    || !gate.may_read(&PublicKey::from_bytes(*identity), &self.store.control_log(*server))
+            })
+            .map(|(server, peer, _, _)| (server, peer))
+            .collect();
+        for (server, peer) in gone {
+            let _ = self.store.forget_peer(&server, &peer);
+        }
+    }
+
+    /// Relay-only: every remembered address goes (Security Lead).
+    fn forget_remembered(&mut self) {
+        if let Err(err) = self.store.forget_all_peers() {
+            warn!(%err, "forgetting remembered members failed");
+        }
+    }
+}
+
 /// The remote IP of a direct incoming connection; None for outgoing and
 /// relayed ones (a relayed connection's address is the relay's).
 fn incoming_ip(endpoint: &ConnectedPoint) -> Option<std::net::IpAddr> {
@@ -2551,6 +4343,32 @@ fn with_saved_port(listen: &Multiaddr, file: &std::path::Path) -> Multiaddr {
     }
 }
 
+/// `listen` (`/ip4|ip6/<ip>/tcp/<port>`) as QUIC on the same UDP port:
+/// `/ip4|ip6/<ip>/udp/<port>/quic-v1`. None for anything else.
+fn quic_of(listen: &Multiaddr) -> Option<Multiaddr> {
+    let mut parts = listen.iter();
+    let ip = parts.next().filter(|p| matches!(p, Protocol::Ip4(_) | Protocol::Ip6(_)))?;
+    let Some(Protocol::Tcp(port)) = parts.next() else { return None };
+    parts.next().is_none().then(|| Multiaddr::empty().with(ip).with(Protocol::Udp(port)).with(Protocol::QuicV1))
+}
+
+/// Listens on QUIC beside the TCP listener `listen`, on `bound`'s TCP port
+/// (the port it got, saved for next time, #200) when that is free over UDP,
+/// else any. Not fatal: without it, TCP and the relay remain.
+fn listen_quic(swarm: &mut Swarm<Behaviour>, listen: &Multiaddr, bound: &Multiaddr) -> Option<ListenerId> {
+    let port = bound.iter().find_map(|p| if let Protocol::Tcp(port) = p { Some(port) } else { None })?;
+    let on = |port: u16| listen.iter().map(|p| if let Protocol::Tcp(_) = p { Protocol::Tcp(port) } else { p }).collect();
+    let addr = quic_of(&on(port))?;
+    let any = quic_of(&on(0))?;
+    match swarm.listen_on(addr).or_else(|_| swarm.listen_on(any)) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            warn!(%err, "listening on QUIC failed; TCP and the relay only");
+            None
+        }
+    }
+}
+
 /// Saves the TCP port of our listen address the first time we get one.
 fn save_port(file: &std::path::Path, address: &Multiaddr) {
     if file.exists() {
@@ -2604,10 +4422,54 @@ pub(crate) fn via_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
     prefix == *relay
 }
 
+/// Whether `addr` is exactly our configured relay address, with or
+/// without its trailing `/p2p/<relay ID>` (Kademlia may store either).
+pub(crate) fn is_configured_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
+    if addr == relay {
+        return true;
+    }
+    let mut base = relay.clone();
+    matches!(base.pop(), Some(Protocol::P2p(_))) && *addr == base
+}
+
+/// P0 (#416 broke joins over a relay with a DNS name): a peer-learned
+/// circuit through *our configured relay*, matched by the relay's peer ID
+/// and rebuilt from our own configured `relay` address, so the
+/// peer-supplied base (a DNS name, another port, another transport) is
+/// never dialled (Security Lead's rules):
+/// - the shape is exactly `<base>/p2p/<relay ID>/p2p-circuit[/p2p/<target>]`:
+///   nothing else after `/p2p-circuit`, no nested circuits;
+/// - `<relay ID>` is our configured relay's (member relays get no
+///   exception);
+/// - `<target>`, when present, is `expected` (the peer being dialled).
+///
+/// The rebuilt `relay/p2p-circuit/p2p/<expected>`, or None.
+pub(crate) fn our_relay_circuit(addr: &Multiaddr, relay: &Multiaddr, expected: &PeerId) -> Option<Multiaddr> {
+    let relay_id = match relay.iter().last() {
+        Some(Protocol::P2p(id)) => id,
+        _ => return None,
+    };
+    let parts: Vec<Protocol<'_>> = addr.iter().collect();
+    let circuit = parts.iter().position(|p| *p == Protocol::P2pCircuit)?;
+    if circuit == 0 || parts[circuit - 1] != Protocol::P2p(relay_id) {
+        return None;
+    }
+    if parts[..circuit - 1].iter().any(|p| matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit)) {
+        return None;
+    }
+    match &parts[circuit + 1..] {
+        [] => {}
+        [Protocol::P2p(target)] if target == expected => {}
+        _ => return None,
+    }
+    Some(relay.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(*expected)))
+}
+
 /// Like [`dialable`], but a relay circuit is fine (it is how peers behind
 /// NAT are reached) as long as the relay's own address is global. Used for
-/// addresses learned from peers (Kademlia, identify) before storing or
-/// dialling them.
+/// addresses learned from peers (Kademlia, identify, member answers) before
+/// storing or
+/// dialling them. A DNS name is never reachable: see below.
 pub(crate) fn reachable(addr: &Multiaddr, allow_lan: bool) -> bool {
     let mut global = true;
     for p in addr.iter() {
@@ -2615,13 +4477,20 @@ pub(crate) fn reachable(addr: &Multiaddr, allow_lan: bool) -> bool {
             Protocol::P2pCircuit => break,
             Protocol::Ip4(ip) => global &= global_v4(ip),
             Protocol::Ip6(ip) => global &= global_v6(ip),
-            Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name) | Protocol::Dnsaddr(name) => {
-                global &= global_name(&name)
-            }
+            // Never a DNS name learned from a peer: resolving it would query a
+            // server the peer may control, and a crafted answer reaches the
+            // resolver's decoding bugs (CPU, memory, panics; hickory-advisories,
+            // Tech Lead). Only configured addresses (our relays) are names.
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => return false,
             _ => {}
         }
     }
     global || allow_lan
+}
+
+/// Whether any part of `addr` is a DNS name.
+fn has_dns(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)))
 }
 
 fn global_v4(ip: std::net::Ipv4Addr) -> bool {
@@ -2647,12 +4516,6 @@ fn global_v6(ip: std::net::Ipv6Addr) -> bool {
         || ip.is_multicast()
         || (seg & 0xfe00) == 0xfc00 // unique local
         || (seg & 0xffc0) == 0xfe80) // link local
-}
-
-/// Names that only ever mean this machine or its LAN.
-fn global_name(name: &str) -> bool {
-    let name = name.trim_end_matches('.').to_ascii_lowercase();
-    !(name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local"))
 }
 
 /// Why a pushed message isn't ingested: Ignore (not ours to judge) or Reject
@@ -2714,7 +4577,7 @@ fn decode_page(log: &str, page: &[WireEntry]) -> Vec<Incoming> {
 }
 
 fn empty_response() -> SyncResponse {
-    SyncResponse { records: Vec::new(), more: false, acks: Vec::new(), binding: None, direct_addrs: Vec::new() }
+    SyncResponse { records: Vec::new(), more: false, acks: Vec::new(), binding: None, direct_addrs: Vec::new(), relay: None }
 }
 
 /// What a pull answer carries beyond the page: our binding and the
@@ -2727,11 +4590,15 @@ fn member_extras(
     acks: &[RecordId],
     direct: &[Multiaddr],
     share_direct: bool,
+    offer: Option<&RelayOffer>,
     store: &Store,
 ) {
     for_members_only(response, ours, acks, store);
     if response.binding.is_some() && share_direct {
         response.direct_addrs = direct.iter().map(|a| ByteBuf::from(a.to_vec())).collect();
+    }
+    if response.binding.is_some() {
+        response.relay = offer.cloned();
     }
 }
 
@@ -2783,6 +4650,18 @@ fn answer_with_ids(store: &Store, log: &str, have: &[ByteBuf], max_bytes: usize)
 /// Whether to ask for the next page right away. A peer that keeps saying
 /// "more" without sending anything new is not followed; the anti-entropy
 /// timer tries again later.
+/// Before an insert into a T23 map: at [`MAX_T23_ENTRIES`], drop the entry
+/// whose time (`at`) is earliest, so the map never grows past the cap.
+fn cap_oldest<K: Clone + Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>, key: &K, at: impl Fn(&V) -> Instant) {
+    // An overwrite doesn't grow the map (tech lead): nothing to drop.
+    if map.len() < MAX_T23_ENTRIES || map.contains_key(key) {
+        return;
+    }
+    if let Some(oldest) = map.iter().min_by_key(|(_, v)| at(v)).map(|(k, _)| k.clone()) {
+        map.remove(&oldest);
+    }
+}
+
 fn follow_up(more: bool, added_any: bool) -> bool {
     more && added_any
 }
@@ -2984,6 +4863,7 @@ mod tests {
             listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
             bootstrap: Vec::new(),
             allow_lan: true,
+            relay_only: false,
         };
         let (first, _) = Node::start(config()).await.unwrap();
         let port = port_of(&first).await;
@@ -3025,6 +4905,7 @@ mod tests {
             listen: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
             bootstrap: Vec::new(),
             allow_lan: true,
+            relay_only: false,
         };
         let (node, _events) = Node::start(config).await.unwrap();
         port_of(&node).await;
@@ -3057,9 +4938,59 @@ mod tests {
     }
 
     #[test]
+    fn a_circuit_through_our_dns_relay_is_rebuilt_from_our_own_address() {
+        // P0 on #416: the relay announces itself under a DNS name (or another
+        // port or transport) than ours; matched by its peer ID, the circuit
+        // is rebuilt from our configured address (Security Lead's rules).
+        let relay_id = PeerId::random();
+        let target = PeerId::random();
+        let ours: Multiaddr = format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}").parse().unwrap();
+        let want: Multiaddr = format!("{ours}/p2p-circuit/p2p/{target}").parse().unwrap();
+        let a = |s: String| s.parse::<Multiaddr>().unwrap();
+        // Our relay's ID with the configured base passes, and so do another
+        // name, port or transport for it: all rewritten to ours.
+        for base in [
+            "/dns4/relay.example/tcp/4001",
+            "/dns4/relay.example/tcp/443/wss",
+            "/dns4/other.example/udp/4001/quic-v1",
+            "/ip4/192.168.1.5/tcp/4001",
+        ] {
+            for tail in [format!("/p2p-circuit/p2p/{target}"), "/p2p-circuit".to_owned()] {
+                let got = our_relay_circuit(&a(format!("{base}/p2p/{relay_id}{tail}")), &ours, &target);
+                assert_eq!(got.as_ref(), Some(&want), "{base}{tail}");
+            }
+        }
+        // The same host with another peer ID: refused (a member relay too).
+        let member_relay = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{member_relay}/p2p-circuit/p2p/{target}")), &ours, &target).is_none());
+        // Another target than the peer being dialled.
+        let other = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}")), &ours, &target).is_none());
+        // Extra protocols after /p2p-circuit, nested circuits, a peer ID in the base.
+        for bad in [
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}/tcp/1"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/ip4/1.2.3.4/tcp/1/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/1.2.3.4/tcp/1/p2p/{other}/p2p-circuit/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}"),
+            format!("/p2p/{relay_id}/p2p-circuit/p2p/{target}/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}"),
+        ] {
+            assert!(our_relay_circuit(&a(bad.clone()), &ours, &target).is_none(), "{bad}");
+        }
+        // A plain DNS address stays unreachable (#416 unchanged).
+        assert!(!reachable(&a("/dns4/relay.example/tcp/4001".into()), false));
+        // Kademlia keeps our configured relay's own address (with or without
+        // its /p2p), and nothing else under that name.
+        assert!(is_configured_relay(&ours, &ours));
+        assert!(is_configured_relay(&a("/dns4/relay.example/tcp/4001".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/relay.example/tcp/443/wss".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/evil.example/tcp/4001".into()), &ours));
+    }
+
+    #[test]
     fn only_global_addresses_are_dialled_unless_lan_is_allowed() {
         let a = |s: &str| s.parse::<Multiaddr>().unwrap();
-        for global in ["/ip4/8.8.8.8/tcp/4001", "/dns4/relay.example/tcp/443", "/ip6/2001:4860::1/tcp/1"] {
+        for global in ["/ip4/8.8.8.8/tcp/4001", "/ip6/2001:4860::1/tcp/1"] {
             assert!(dialable(&a(global), false), "{global}");
         }
         for local in [
@@ -3078,12 +5009,21 @@ mod tests {
             "/ip4/224.0.0.251/udp/5353",
             "/ip6/::ffff:192.168.1.5/tcp/1",
             "/ip6/ff02::1/tcp/1",
-            "/dns4/localhost/tcp/1",
-            "/dns/printer.local/tcp/1",
-            "/dns4/app.localhost./tcp/1",
         ] {
             assert!(!dialable(&a(local), false), "{local}");
             assert!(dialable(&a(local), true), "{local} with LAN allowed");
+        }
+        // A DNS name learned from a peer is never dialled or stored, LAN or
+        // not (hickory-advisories): only configured addresses are names.
+        for name in [
+            "/dns4/relay.example/tcp/443",
+            "/dns/peer.example.org/tcp/4001",
+            "/dns6/x.example/udp/1/quic-v1",
+            "/dnsaddr/bootstrap.example",
+            "/dns4/localhost/tcp/1",
+            "/dns4/evil.example/tcp/1/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc/p2p-circuit",
+        ] {
+            assert!(!dialable(&a(name), true) && !reachable(&a(name), true), "{name}");
         }
         // Every component counts, not only the last.
         assert!(!dialable(&a("/ip4/10.0.0.1/tcp/1/ip4/8.8.8.8/tcp/2"), false));
@@ -3098,11 +5038,26 @@ mod tests {
     }
 
     #[test]
+    fn quic_listens_beside_tcp_on_the_same_port() {
+        let a = |s: &str| s.parse::<Multiaddr>().unwrap();
+        assert_eq!(quic_of(&a("/ip4/0.0.0.0/tcp/4001")), Some(a("/ip4/0.0.0.0/udp/4001/quic-v1")));
+        assert_eq!(quic_of(&a("/ip6/::/tcp/0")), Some(a("/ip6/::/udp/0/quic-v1")));
+        assert_eq!(quic_of(&a("/dns4/example.com/tcp/4001")), None);
+        assert_eq!(quic_of(&a("/ip4/0.0.0.0/tcp/443/wss")), None);
+        assert_eq!(quic_of(&a("/ip4/0.0.0.0/udp/4001/quic-v1")), None);
+    }
+
+    #[test]
     fn only_direct_incoming_connections_count_per_ip() {
         let a = |s: &str| s.parse::<Multiaddr>().unwrap();
         let incoming = |local: &str, remote: &str| ConnectedPoint::Listener { local_addr: a(local), send_back_addr: a(remote) };
         let direct = incoming("/ip4/0.0.0.0/tcp/4001", "/ip4/203.0.113.7/tcp/51000");
         assert_eq!(incoming_ip(&direct), Some("203.0.113.7".parse().unwrap()));
+        // QUIC counts against the same per-IP budget as TCP.
+        let quic = incoming("/ip4/0.0.0.0/udp/4001/quic-v1", "/ip4/203.0.113.7/udp/51000/quic-v1");
+        assert_eq!(incoming_ip(&quic), Some("203.0.113.7".parse().unwrap()));
+        let quic6 = incoming("/ip6/::/udp/4001/quic-v1", "/ip6/2001:db8::7/udp/51000/quic-v1");
+        assert_eq!(incoming_ip(&quic6), Some("2001:db8::7".parse().unwrap()));
         let relayed = incoming(
             "/ip4/198.51.100.1/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc/p2p-circuit",
             "/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc",
@@ -3237,7 +5192,11 @@ mod tests {
         bootstrap: Option<u16>,
         access: Access,
     ) -> (Node, mpsc::Receiver<NodeEvent>) {
-        let dir = std::env::temp_dir().join(format!("sync-gap4-{}-{name}", std::process::id()));
+        // One folder per test node: parallel tests reuse names ("member",
+        // "stranger"), and a shared folder would share its key and store.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sync-gap4-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let config = NodeConfig {
             // Nothing listens there: no relay in this test.
@@ -3248,6 +5207,7 @@ mod tests {
             listen: format!("/ip4/127.0.0.1/tcp/{}", listen.unwrap_or(0)).parse().unwrap(),
             bootstrap: bootstrap.map(|p| format!("/ip4/127.0.0.1/tcp/{p}").parse().unwrap()).into_iter().collect(),
             allow_lan: true,
+            relay_only: false,
         };
         Node::start_with(config, access).await.unwrap()
     }
@@ -3308,6 +5268,280 @@ mod tests {
         assert_eq!(tick(&mut events, second.id(), 1).await, Some("sent"));
         assert_eq!(tick(&mut events, second.id(), 10).await, Some("delivered"));
         for node in [author, stranger, member] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// P0 (0.3.1 joins): a long-used node with many servers no longer floods
+    /// a peer that shares one of them with pulls for every log it holds. A
+    /// fresh peer opening that one server gets its records in normal time,
+    /// and neither side ever has to refuse the other's pulls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_with_many_servers_pulls_only_what_a_peer_shares() {
+        use crate::testutil::{message, test_key};
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let secret = ServerSecret::from_bytes([10; 32]);
+        let (many, _events) = test_node_events("many", None, None, access(1)).await;
+        let port = port_of(&many).await;
+        for i in 0..40u8 {
+            let other = ServerId::from_bytes([100 + i; 32]);
+            many.open_server(other, ServerSecret::from_bytes([200 - i; 32])).unwrap();
+            many.open_channel(other, ChannelId::from_bytes([150 + i; 32])).await.unwrap();
+        }
+        many.open_server(server(), secret.clone()).unwrap();
+        many.open_channel(server(), channel()).await.unwrap();
+        many.append(message(0, &[], 0)).await.unwrap();
+
+        let fresh = test_node("fresh", None, Some(port), access(0)).await;
+        fresh.open_server(server(), secret).unwrap();
+        fresh.open_channel(server(), channel()).await.unwrap();
+        // Timed from here: what's measured is the sync, not how long a new
+        // node takes to create its key and store (seconds on a busy disk,
+        // the flake that put this test on the board).
+        let start = Instant::now();
+        eventually(&fresh, (0, 1), 15).await;
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(10), "the shared server's records took {took:?}");
+        // Two more anti-entropy rounds with 82 logs on one side: nobody had to
+        // refuse a pull (before, the first round alone was 82 pulls at once).
+        tokio::time::sleep(ANTI_ENTROPY * 2 + Duration::from_secs(1)).await;
+        assert_eq!((many.rate_limited().await, fresh.rate_limited().await), (0, 0), "pulls refused (many, fresh)");
+        for node in [many, fresh] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// A burst of local writes while a peer that shares none of our servers
+    /// is connected (QA's owner posting with a second device online): the
+    /// receipt pulls after each write go only to members, so that peer never
+    /// has to refuse a pull.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_burst_pulls_only_from_members() {
+        use crate::testutil::{message_in, test_key};
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let (writer, _events) = test_node_events("writer", None, None, access(1)).await;
+        let port = port_of(&writer).await;
+        writer.open_server(server(), ServerSecret::from_bytes([11; 32])).unwrap();
+        // 60 channels: each write lands in a log of its own, as QA's owner
+        // writing across many servers did (one log's writes coalesce).
+        let channels: Vec<ChannelId> = (0..60u8).map(|i| ChannelId::from_bytes([100 + i; 32])).collect();
+        for c in &channels {
+            writer.open_channel(server(), *c).await.unwrap();
+        }
+        let other = test_node("other", None, Some(port), access(0)).await;
+        other.open_server(ServerId::from_bytes([77; 32]), ServerSecret::from_bytes([78; 32])).unwrap();
+        let start = Instant::now();
+        while writer.peers().await.unwrap().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never connected");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for c in &channels {
+            writer.append(message_in(*c)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(other.rate_limited().await, 0, "the non-member refused pulls after a write burst");
+        for node in [writer, other] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// T23: once an unbound peer answered our servers' control logs empty, it
+    /// isn't asked for them again (each ask carries our binding): after the
+    /// first rounds, a fresh peer gets only the pulls for the server it shares.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbound_peer_is_not_asked_again_for_what_it_answered_empty() {
+        use crate::testutil::test_key;
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let secret = ServerSecret::from_bytes([12; 32]);
+        let (many, _events) = test_node_events("t23-many", None, None, access(1)).await;
+        let port = port_of(&many).await;
+        for i in 0..40u8 {
+            let other = ServerId::from_bytes([60 + i; 32]);
+            many.open_server(other, ServerSecret::from_bytes([150 - i; 32])).unwrap();
+        }
+        many.open_server(server(), secret.clone()).unwrap();
+        let fresh = test_node("t23-fresh", None, Some(port), access(0)).await;
+        fresh.open_server(server(), secret).unwrap();
+        // Connect, then three rounds: every control log probed once.
+        tokio::time::sleep(ANTI_ENTROPY * 3 + Duration::from_secs(2)).await;
+        let before = fresh.pulls_received().await;
+        tokio::time::sleep(ANTI_ENTROPY * 2 + Duration::from_secs(1)).await;
+        let later = fresh.pulls_received().await - before;
+        // Two more rounds: only the shared server's control log (and
+        // follow-ups), not the 40 it has nothing of.
+        assert!(later <= 6, "{later} pulls in two rounds after the probes");
+        assert!(before >= 40, "only {before} pulls before: the probes never ran");
+        for node in [many, fresh] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// T23: two members who each already have a bound peer for the server
+    /// still bind when they meet later (the first probe is allowed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn members_who_meet_late_still_bind() {
+        use crate::testutil::test_key;
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let secret = ServerSecret::from_bytes([13; 32]);
+        let identity = |n: u8| test_key(n).identity();
+        let start_pair = |a: &'static str, b: &'static str, ka: u8, kb: u8| {
+            let secret = secret.clone();
+            async move {
+                let (first, _) = test_node_events(a, None, None, access(ka)).await;
+                first.open_server(server(), secret.clone()).unwrap();
+                let second = test_node(b, None, Some(port_of(&first).await), access(kb)).await;
+                second.open_server(server(), secret).unwrap();
+                (first, second)
+            }
+        };
+        async fn online(node: &Node, want: PublicKey) -> bool {
+            node.presence(server()).await.unwrap().online.contains(&want)
+        }
+        let seen = |node, n: u8| online(node, identity(n));
+        let (a, b) = start_pair("late-a", "late-b", 1, 0).await;
+        let (c, d) = start_pair("late-c", "late-d", 2, 3).await;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(seen(&a, 0).await && seen(&c, 3).await) {
+            assert!(Instant::now() < deadline, "the first pairs never bound");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Now A and C meet: each already has a bound member.
+        c.test_dial(format!("/ip4/127.0.0.1/tcp/{}", port_of(&a).await).parse().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(seen(&a, 2).await && seen(&c, 1).await) {
+            assert!(Instant::now() < deadline, "members who met late never bound");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for node in [a, b, c, d] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// The Tech Lead on #399: a silently dead connection to our relay is
+    /// closed within about a minute (two failed pings in a row), so the
+    /// member relay fallback starts; one lost ping alone closes nothing.
+    #[test]
+    fn a_silent_relay_is_closed_within_a_minute() {
+        assert!(relay_silent_for() <= Duration::from_secs(60), "{:?}", relay_silent_for());
+        let mut misses = 0;
+        assert!(!relay_ping(&mut misses, false), "one miss");
+        assert!(!relay_ping(&mut misses, true), "an answer resets");
+        assert!(!relay_ping(&mut misses, false));
+        assert!(relay_ping(&mut misses, false), "two in a row close it");
+        assert_eq!(misses, 0);
+    }
+
+    #[test]
+    fn t23_maps_stay_under_the_cap_dropping_the_oldest() {
+        let mut map: HashMap<u32, Instant> = HashMap::new();
+        let start = Instant::now();
+        for i in 0..(MAX_T23_ENTRIES as u32 + 50) {
+            cap_oldest(&mut map, &i, |at| *at);
+            map.insert(i, start + Duration::from_millis(u64::from(i)));
+        }
+        assert_eq!(map.len(), MAX_T23_ENTRIES);
+        assert!(!map.contains_key(&0) && !map.contains_key(&49), "the oldest stayed");
+        assert!(map.contains_key(&(MAX_T23_ENTRIES as u32 + 49)), "the newest went");
+        // At the cap, overwriting a key drops nothing.
+        let key = MAX_T23_ENTRIES as u32 + 49;
+        cap_oldest(&mut map, &key, |at| *at);
+        map.insert(key, start);
+        assert_eq!(map.len(), MAX_T23_ENTRIES);
+        assert!(map.contains_key(&50), "an overwrite evicted the oldest");
+    }
+
+    /// 0.4.1 presence bug: three members in a triangle (each has another bound
+    /// member). One link resets and comes back: both ends must see each other
+    /// online again soon, not after T23's 10-minute re-probe wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn members_see_each_other_online_again_after_a_link_reset() {
+        use crate::testutil::test_key;
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let secret = ServerSecret::from_bytes([14; 32]);
+        async fn online(node: &Node, want: PublicKey) -> bool {
+            node.presence(server()).await.unwrap().online.contains(&want)
+        }
+        let id = |n: u8| test_key(n).identity();
+        let addr = |port: u16| -> Multiaddr { format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap() };
+        // C first; B meets C, then A meets C: A and B each already have a
+        // bound member when they meet, so their first probes are recorded.
+        let (c, _) = test_node_events("tri-c", None, None, access(2)).await;
+        c.open_server(server(), secret.clone()).unwrap();
+        let b = test_node("tri-b", None, Some(port_of(&c).await), access(1)).await;
+        b.open_server(server(), secret.clone()).unwrap();
+        let a = test_node("tri-a", None, Some(port_of(&c).await), access(0)).await;
+        a.open_server(server(), secret).unwrap();
+        // Generous: the Windows runner is slow to set up connections.
+        let wait = |what: &'static str| (what, Instant::now() + Duration::from_secs(60));
+        let (what, until) = wait("B and A bound to C");
+        while !(online(&b, id(2)).await && online(&a, id(2)).await) {
+            assert!(Instant::now() < until, "{what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        a.test_dial(addr(port_of(&b).await));
+        let (what, until) = wait("A and B bound");
+        while !(online(&a, id(1)).await && online(&b, id(0)).await) {
+            assert!(Instant::now() < until, "{what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The A–B link resets (a relay circuit reset), then A dials B again.
+        a.test_disconnect(b.peer_id());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Redial until linked again, over TCP and QUIC: on Windows a TCP
+        // redial from the reused listen port to the same peer can sit in
+        // TIME_WAIT for minutes (a real device would come back through the
+        // relay). Only the link is retried; the claim stays the same.
+        let port_b = port_of(&b).await;
+        let quic_b: Multiaddr = format!("/ip4/127.0.0.1/udp/{port_b}/quic-v1").parse().unwrap();
+        let (what, until) = wait("A and B online again after the reset");
+        let mut redial = Instant::now() - Duration::from_secs(10);
+        while !(online(&a, id(1)).await && online(&b, id(0)).await) {
+            assert!(Instant::now() < until, "{what}");
+            if redial.elapsed() >= Duration::from_secs(3) && !a.peers().await.unwrap().contains(&b.peer_id()) {
+                a.test_dial(addr(port_b));
+                a.test_dial(quic_b.clone());
+                redial = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for node in [a, b, c] {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// T24: T23 under `open` plus
+    /// the queue. Opening 40 servers back to back while an unbound peer is
+    /// connected sends ~40 control pulls within a second, past the peer's
+    /// burst (30); refused pulls aren't recorded as empty and are re-asked
+    /// (51 pulls for 40 logs). Fix: pace outgoing pulls per peer (e.g. burst
+    /// 20, 8/s) and drain the queue on a 1 s tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_opened_while_a_peer_is_connected_are_probed_once_each() {
+        use crate::testutil::test_key;
+        let key = |n: u8| -> Option<Arc<dyn Binder>> { Some(Arc::new(test_key(n))) };
+        let access = |n: u8| Access { binder: key(n), read_gate: Some(Arc::new(AcceptAll)), stub_gate: None };
+        let (opener, _events) = test_node_events("t23-opener", None, None, access(1)).await;
+        let peer = test_node("t23-peer", None, Some(port_of(&opener).await), access(0)).await;
+        peer.open_server(ServerId::from_bytes([99; 32]), ServerSecret::from_bytes([98; 32])).unwrap();
+        let start = Instant::now();
+        while opener.peers().await.unwrap().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never connected");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let before = peer.pulls_received().await;
+        for i in 0..40u8 {
+            opener.open_server(ServerId::from_bytes([20 + i; 32]), ServerSecret::from_bytes([120 + i; 32])).unwrap();
+        }
+        tokio::time::sleep(ANTI_ENTROPY * 3 + Duration::from_secs(1)).await;
+        let asked = peer.pulls_received().await - before;
+        assert!(asked <= 44, "{asked} pulls for 40 control logs (at most one each, plus a few)");
+        assert!(asked >= 40, "only {asked}: the opened servers weren't probed");
+        for node in [opener, peer] {
             node.shutdown().await.unwrap();
         }
     }
@@ -3441,6 +5675,7 @@ mod tests {
                 listen: listen.parse().unwrap(),
                 bootstrap,
                 allow_lan: true,
+                relay_only: false,
             }
         };
         let (a, _a_events) = Node::start(node("a", "/ip4/127.0.0.1/tcp/0/ws".into(), vec![])).await.unwrap();
@@ -3526,12 +5761,22 @@ mod tests {
         let answer = |n: u8, share_direct: bool| {
             let mut response = empty_response();
             let check = ReadCheck { gate: gate.clone(), identity: test_key(n).identity(), server: server() };
-            member_extras(&mut response, Some((check, binding.clone())), &[], &direct, share_direct, &store);
+            member_extras(&mut response, Some((check, binding.clone())), &[], &direct, share_direct, None, &store);
             response.direct_addrs
         };
         assert_eq!(answer(1, true).len(), 1, "a member gets our direct addresses");
         assert!(answer(1, false).is_empty(), "relay-only (or LAN off): none, even to a member");
         assert!(answer(2, true).is_empty(), "a non-member: none");
+        // Slice 2: our member relay offer, to a member only.
+        let offer = RelayOffer { addrs: vec![ByteBuf::from(direct[0].to_vec())], preferred: true };
+        let offered = |n: u8| {
+            let mut response = empty_response();
+            let check = ReadCheck { gate: gate.clone(), identity: test_key(n).identity(), server: server() };
+            member_extras(&mut response, Some((check, binding.clone())), &[], &direct, false, Some(&offer), &store);
+            response.relay
+        };
+        assert_eq!(offered(1), Some(offer.clone()), "a member learns we relay");
+        assert_eq!(offered(2), None, "a non-member never does");
     }
 
     /// The answer side of presence: our binding and acks go only to a

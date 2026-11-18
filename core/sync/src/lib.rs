@@ -31,6 +31,11 @@ mod keyfile;
 mod limits;
 mod presence;
 mod punch;
+mod backup;
+mod notice;
+mod lan_beacon;
+mod device_link;
+mod member_relay;
 mod invite;
 mod voice;
 #[cfg(test)]
@@ -39,6 +44,23 @@ pub(crate) mod testutil;
 pub use access::{binding_message, Binder, Handle, ReadGate, ServerSecret};
 pub use node::{Access, Node, NodeConfig, NodeEvent, PresenceState, Reachability, Via};
 pub use records::{ChannelId, Record, RecordId, Scope, ServerId, Stub};
+pub use backup::MAX_BACKUP;
+pub use lan_beacon::BEACON_PORT as LAN_BEACON_PORT;
+pub use notice::{
+    fetch_message as notice_fetch_message, tag_of as notice_tag, NoticeSigner, FETCH_CONTEXT as NOTICE_FETCH_CONTEXT,
+    NOTICE_BODY, NOTICE_LEN, NOTICE_TAG_CONTEXT,
+};
+pub use device_link::{
+    Inbound as DeviceLinkInbound, LinkError as DeviceLinkError, DEVICE_LINK_FIND_WAIT,
+    DEVICE_LINK_TTL, MAX_DEVICE_LINK,
+};
+#[cfg(feature = "test-util")]
+pub use device_link::rendezvous as device_link_rendezvous;
+pub use member_relay::{
+    CIRCUIT_DURATION as MEMBER_RELAY_CIRCUIT_DURATION, DEFAULT_DAILY_CAP_MB as MEMBER_RELAY_DEFAULT_CAP_MB,
+    MAX_CIRCUITS as MEMBER_RELAY_MAX_CIRCUITS, MAX_CIRCUIT_BYTES as MEMBER_RELAY_MAX_CIRCUIT_BYTES,
+    MAX_RESERVATIONS as MEMBER_RELAY_MAX_RESERVATIONS,
+};
 pub use invite::{MAX_PER_SERVER as MAX_INVITES_PER_SERVER, MAX_PUBLICATION as MAX_INVITE_PUBLICATION};
 pub use voice::{VoiceError, MAX_VOICE_BLOB};
 pub use store::{Append, ChannelLog, ControlLog, Held, IngestError, Store};

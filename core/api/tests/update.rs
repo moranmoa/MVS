@@ -72,6 +72,8 @@ fn release(channel: &str, version: &str, signer: &SigningKey) -> Release {
 struct Host {
     releases: Arc<Mutex<BTreeMap<String, Release>>>,
     built_for: Arc<Mutex<Vec<String>>>,
+    /// `flags.json` (slice 3b), the same for every channel here.
+    flags: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Host {
@@ -87,6 +89,9 @@ struct Fake {
 }
 
 impl UpdateSource for Fake {
+    fn flags(&self) -> Result<Vec<u8>, SourceError> {
+        self.host.flags.lock().unwrap().clone().ok_or(SourceError::NotFound)
+    }
     fn manifest(&self, channel: &str) -> Result<Vec<u8>, SourceError> {
         assert_eq!(channel, self.channel, "a source only serves its own channel");
         let releases = self.host.releases.lock().unwrap();
@@ -208,6 +213,36 @@ fn the_background_loop_downloads_once_the_ui_is_up() {
         core.stop_updates();
         looping.join().unwrap();
     });
+}
+
+/// Slice 3b: the owner's signed `flags.json` turns member relays off for
+/// everyone, with reason `global-off`, through the update loop only.
+#[test]
+fn the_signed_global_switch_turns_member_relays_off() {
+    let i = install("global-off", "1.0.0");
+    let mut flags = updater::flags::SignedFlags::new(&updater::flags::FlagsBody {
+        v: 1,
+        issued_at: NOW_MS / 1000,
+        member_relay_off: true,
+    })
+    .unwrap();
+    flags.sign(&key(1));
+    *i.host.flags.lock().unwrap() = Some(flags.to_json().into_bytes());
+    let reason = || call(&i.peer, "getMemberRelay").unwrap()["reason"].clone();
+    assert_ne!(reason(), json!("global-off"));
+    let core = &i.peer.core;
+    std::thread::scope(|s| {
+        let looping = s.spawn(|| core.run_update_loop());
+        assert!(call(&i.peer, "markHealthy").is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while reason() != json!("global-off") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        core.stop_updates();
+        looping.join().unwrap();
+    });
+    let now = call(&i.peer, "getMemberRelay").unwrap();
+    assert_eq!((now["reason"].clone(), now["effective"].clone()), (json!("global-off"), json!(false)));
 }
 
 #[test]
@@ -341,7 +376,9 @@ fn the_loop_stops_when_asked() {
 }
 
 #[test]
-fn checks_are_six_hours_apart_with_half_an_hour_of_jitter() {
+fn checks_are_an_hour_apart_with_five_minutes_of_jitter() {
+    // Owner, 2026-11-11: a published update should show within about an hour.
+    assert_eq!((CHECK_EVERY.as_secs(), CHECK_JITTER.as_secs()), (3600, 300));
     let lo = CHECK_EVERY - CHECK_JITTER;
     let hi = CHECK_EVERY + CHECK_JITTER;
     let spread: std::collections::BTreeSet<_> = (0..50).map(|_| next_interval()).collect();

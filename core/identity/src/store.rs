@@ -106,14 +106,100 @@ impl OsKeychain {
     }
 
     fn entry(&self, name: &str) -> Result<keyring_core::Entry, StoreError> {
-        // Sets up the platform's default store on first use.
-        if let Err(e) = keyring::Entry::store_status() {
-            return Err(StoreError(e.to_string()));
-        }
+        default_store()?;
         let owned = modifiers(name);
         let mods: HashMap<&str, &str> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         keyring_core::Entry::new_with_modifiers(KEYCHAIN_SERVICE, name, &mods).map_err(platform)
     }
+}
+
+/// Sets up the platform's default store once it works.
+///
+/// On Linux we set up the Secret Service store ourselves. keyring's own
+/// setup (`Entry::store_status`) runs once per process and keeps its first
+/// result, so a Secret Service that wasn't up yet when the core first asked
+/// (a D-Bus session or gnome-keyring started alongside the core) left that
+/// core with `keyring-unavailable` forever (QA, 0.4.5 features run). Here a
+/// failure is not kept: the next call tries again, and a success is kept.
+#[cfg(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn default_store() -> Result<(), StoreError> {
+    static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    static SETUP: Mutex<()> = Mutex::new(());
+    if READY.get().is_some() {
+        return Ok(());
+    }
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    if READY.get().is_none() {
+        let store = zbus_secret_service_keyring_store::Store::new().map_err(platform)?;
+        keyring_core::set_default_store(store);
+        let _ = READY.set(());
+    }
+    Ok(())
+}
+
+/// Windows and macOS: their stores don't depend on a service that may start
+/// later, so keyring's once-per-process setup is enough.
+#[cfg(all(feature = "os-keychain", not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))))]
+fn default_store() -> Result<(), StoreError> {
+    keyring::Entry::store_status().as_ref().map(|_| ()).map_err(|e| StoreError(e.to_string()))
+}
+
+/// No entry under this name. On Linux that is only "none" when the keychain
+/// can see everything (Security Lead on #388). A locked collection hides
+/// its items from the search; reporting "none" then would make the app
+/// offer sign-up over an identity it can't see, so it's an error
+/// (`keyring-unavailable`) instead. See [`missing_is_none`] for the rule.
+#[cfg(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn no_entry() -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+    use secret_service::{blocking::SecretService, EncryptionType};
+    let fail = |e: secret_service::Error| StoreError(e.to_string());
+    let ss = SecretService::connect(EncryptionType::Plain).map_err(fail)?;
+    let default = match ss.get_default_collection() {
+        Ok(collection) => Some(collection.is_locked().map_err(fail)?),
+        Err(_) => None,
+    };
+    let all = || -> Result<Vec<bool>, StoreError> {
+        let mut locked = Vec::new();
+        for collection in ss.get_all_collections().map_err(fail)? {
+            locked.push(collection.is_locked().map_err(fail)?);
+        }
+        Ok(locked)
+    };
+    missing_is_none(default, all)?;
+    Ok(None)
+}
+
+/// Whether a missing entry may be reported as none. `default`: whether the
+/// `default` alias's collection is locked, `None` without that alias;
+/// `all`: whether each collection is locked, asked only without the alias.
+/// - With the alias: an error if that collection is locked.
+/// - Without it (KeePassXC, some KWallet bridges; Tech Lead on #392): an
+///   error if any collection is locked, or if there are none at all.
+#[cfg_attr(not(all(feature = "os-keychain", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))), allow(dead_code))]
+fn missing_is_none(
+    default: Option<bool>,
+    all: impl FnOnce() -> Result<Vec<bool>, StoreError>,
+) -> Result<(), StoreError> {
+    let locked = match default {
+        Some(locked) => locked,
+        None => {
+            let all = all()?;
+            if all.is_empty() {
+                return Err(StoreError("the keychain has no collection".into()));
+            }
+            all.contains(&true)
+        }
+    };
+    if locked {
+        return Err(StoreError("a keychain collection is locked".into()));
+    }
+    Ok(())
+}
+
+/// Windows and macOS: a missing entry is just missing.
+#[cfg(all(feature = "os-keychain", not(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))))]
+fn no_entry() -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+    Ok(None)
 }
 
 #[cfg(all(feature = "os-keychain", target_os = "windows"))]
@@ -137,7 +223,7 @@ impl SecretStore for OsKeychain {
     fn load(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         match self.entry(name)?.get_secret() {
             Ok(secret) => Ok(Some(Zeroizing::new(secret))),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => no_entry(),
             Err(e) => Err(platform(e)),
         }
     }
@@ -175,5 +261,73 @@ mod tests {
             windows_target("identity-secret-v1"),
             "io.github.moranmoa.mvs.identity.v1/identity-secret-v1"
         );
+    }
+}
+
+/// QA on 0.4.5: a Secret Service that comes up after the first call is
+/// still found (keyring's own setup kept the first failure for the whole
+/// process). Needs `dbus-daemon` and `gnome-keyring-daemon`; run with
+/// `--ignored` and `MVS_LATE_KEYRING_START`, a shell command that starts a
+/// session bus at `DBUS_SESSION_BUS_ADDRESS` and an unlocked keyring on it.
+#[cfg(all(test, feature = "os-keychain", target_os = "linux"))]
+mod late_secret_service {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs dbus-daemon and gnome-keyring (MVS_LATE_KEYRING_START)"]
+    fn a_secret_service_started_after_the_first_call_is_used() {
+        let start = std::env::var("MVS_LATE_KEYRING_START").expect("MVS_LATE_KEYRING_START");
+        let keychain = OsKeychain::new();
+        assert!(keychain.save("late-test", b"one").is_err(), "no bus yet");
+        let status = std::process::Command::new("sh").arg("-c").arg(&start).status().unwrap();
+        assert!(status.success(), "the keyring didn't start");
+        keychain.save("late-test", b"one").expect("found once it is up");
+        assert_eq!(keychain.load("late-test").unwrap().as_deref().map(|s| s.as_slice()), Some(&b"one"[..]));
+        keychain.delete("late-test").unwrap();
+    }
+}
+
+/// Security Lead on #388, Tech Lead on #392: a missing entry is "none"
+/// while every collection it could be in is unlocked; once one is locked,
+/// the same lookup is an error, so the app never offers sign-up over an
+/// identity it can't see. Needs a running, unlocked gnome-keyring on the
+/// session bus, with or without a `default` alias; run with `--ignored` and
+/// `MVS_LOCK_KEYRING`, a shell command that locks the collection in use.
+#[cfg(all(test, feature = "os-keychain", target_os = "linux"))]
+mod locked_collection {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs an unlocked gnome-keyring (MVS_LOCK_KEYRING)"]
+    fn a_missing_entry_in_a_locked_collection_is_an_error() {
+        let lock = std::env::var("MVS_LOCK_KEYRING").expect("MVS_LOCK_KEYRING");
+        let keychain = OsKeychain::new();
+        assert_eq!(keychain.load("never-saved").unwrap(), None, "unlocked: just missing");
+        let status = std::process::Command::new("sh").arg("-c").arg(&lock).status().unwrap();
+        assert!(status.success(), "the collection didn't lock");
+        assert!(keychain.load("never-saved").is_err(), "locked: an error, not None");
+    }
+}
+
+/// Tech Lead on #392: when a missing entry counts as none, with and without
+/// a `default` alias (the real Secret Service is in `locked_collection`).
+#[cfg(test)]
+mod missing_entry_rule {
+    use super::*;
+
+    fn never() -> Result<Vec<bool>, StoreError> {
+        panic!("the alias answers; the collections aren't asked")
+    }
+
+    #[test]
+    fn a_locked_or_absent_collection_is_an_error() {
+        // With a default alias: its lock decides.
+        assert!(missing_is_none(Some(false), never).is_ok());
+        assert!(missing_is_none(Some(true), never).is_err());
+        // Without one (KeePassXC, KWallet bridges): every collection counts.
+        assert!(missing_is_none(None, || Ok(vec![false, false])).is_ok());
+        assert!(missing_is_none(None, || Ok(vec![false, true])).is_err());
+        assert!(missing_is_none(None, || Ok(Vec::new())).is_err(), "no collection at all");
+        assert!(missing_is_none(None, || Err(StoreError("bus".into()))).is_err());
     }
 }

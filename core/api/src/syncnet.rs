@@ -26,9 +26,9 @@ use records::{ChannelId, PublicKey, Record, RecordId, Scope, ServerId};
 use sync::{log_name, log_of, Access, Node, NodeConfig, NodeEvent, ServerSecret, Store};
 use tokio::runtime::Runtime;
 
-use crate::access::{KeyBinder, MemberReadGate, MemberStubGate};
+use crate::access::{KeyBinder, MemberReadGate, MemberStubGate, NoticeKey};
 use crate::gate::MemberGate;
-use crate::ports::{Network, Reach};
+use crate::ports::{DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, Network, Reach};
 use crate::types::SendState;
 use crate::voice::VoiceNet;
 use crate::Core;
@@ -54,6 +54,34 @@ pub fn relay_addr(text: &str) -> Result<Multiaddr, String> {
         Some(libp2p::multiaddr::Protocol::P2p(_)) => Ok(addr),
         _ => Err("must end in /p2p/<relay peer id>".to_owned()),
     }
+}
+
+/// Most relays a node is given (`--relay`, repeatable; multi-relay part A).
+pub const MAX_RELAYS: usize = 4;
+
+/// The relay list: 1 to [`MAX_RELAYS`] entries, each checked by
+/// [`relay_addr`], no two for the same relay (peer ID), in the given order.
+/// Errors never quote an address (they reach the log).
+pub fn relay_addrs<S: AsRef<str>>(texts: &[S]) -> Result<Vec<Multiaddr>, String> {
+    if texts.is_empty() {
+        return Err("no relay".to_owned());
+    }
+    if texts.len() > MAX_RELAYS {
+        return Err(format!("more than {MAX_RELAYS} relays"));
+    }
+    let mut out: Vec<Multiaddr> = Vec::with_capacity(texts.len());
+    let mut ids = std::collections::HashSet::new();
+    for (i, text) in texts.iter().enumerate() {
+        let addr = relay_addr(text.as_ref()).map_err(|why| format!("relay {}: {why}", i + 1))?;
+        let Some(libp2p::multiaddr::Protocol::P2p(id)) = addr.iter().last() else {
+            unreachable!("relay_addr checked the /p2p suffix")
+        };
+        if !ids.insert(id) {
+            return Err(format!("relay {}: the same relay twice", i + 1));
+        }
+        out.push(addr);
+    }
+    Ok(out)
 }
 type SendStates = Arc<Mutex<HashMap<RecordId, SendState>>>;
 
@@ -86,6 +114,8 @@ pub struct SyncNetwork {
     /// Servers fetched at least once (the first fetch waits for the pull).
     fetched: Mutex<HashSet<ServerId>>,
     binder: Arc<KeyBinder>,
+    /// Signs notice fetches with `w_n`, from unlock to lock.
+    notice_key: Arc<NoticeKey>,
     /// B6: where each record written here stands.
     send_states: SendStates,
     hints: Mutex<Option<Receiver<()>>>,
@@ -93,33 +123,73 @@ pub struct SyncNetwork {
     voice: Mutex<Option<Receiver<VoiceSignal>>>,
     /// T8-02: invite publications members pushed, until the core takes them.
     invite_pushes: InvitePushes,
+    /// Device link (new device): what arrived on the link.
+    link_inbox: LinkInbox,
+    relay: Multiaddr,
 }
 
 type InvitePushes = Arc<Mutex<Vec<(ServerId, Vec<u8>)>>>;
+/// Device link (new device): what arrived on the link, until the core takes it.
+type LinkInbox = Arc<Mutex<Vec<DeviceLinkInbound>>>;
+/// Inbound link messages kept (sync answers at most a few per link).
+const LINK_INBOX: usize = 16;
+
+fn link_error(err: sync::DeviceLinkError) -> DeviceLinkError {
+    match err {
+        sync::DeviceLinkError::NotFound => DeviceLinkError::NotFound,
+        sync::DeviceLinkError::Network => DeviceLinkError::Network,
+        sync::DeviceLinkError::Refused => DeviceLinkError::Refused,
+    }
+}
+
+/// The peer of a device-link address (only the peer ID is used: sync dials
+/// it through our own relay's circuit, whatever the address says).
+fn link_peer(to: &DeviceLinkAddr) -> Result<PeerId, DeviceLinkError> {
+    to.peer.parse().map_err(|_| DeviceLinkError::NotFound)
+}
 /// Pushed publications kept between two sync rounds; more are dropped (a
 /// member re-announces when it binds again).
 const INVITE_PUSH_QUEUE: usize = 1024;
 
 impl SyncNetwork {
     /// Starts a node in `data_dir` (its `store.db` and `node.key`) that
-    /// reaches peers through `relay`.
-    pub fn start(relay: Multiaddr, data_dir: &Path, gate: Arc<MemberGate>) -> anyhow::Result<Self> {
-        Self::start_with_bootstrap(relay, Vec::new(), data_dir, gate)
+    /// reaches peers through `relays` (see [`relay_addrs`]).
+    pub fn start(
+        relays: Vec<Multiaddr>,
+        data_dir: &Path,
+        gate: Arc<MemberGate>,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_bootstrap(relays, Vec::new(), false, data_dir, gate)
     }
 
     /// Like [`SyncNetwork::start`], also dialling `bootstrap` directly (each
     /// checked by [`relay_addr`]): the relay's plain TCP address, so that
     /// identify observes our public address for hole punching (#219).
+    /// `relay_only`: the stored setting ([`crate::stored_relay_only`]); the
+    /// node starts with it, so a relay-only start never listens or dials
+    /// directly.
     pub fn start_with_bootstrap(
-        relay: Multiaddr,
+        relays: Vec<Multiaddr>,
         bootstrap: Vec<Multiaddr>,
+        relay_only: bool,
         data_dir: &Path,
         gate: Arc<MemberGate>,
     ) -> anyhow::Result<Self> {
+        // Multi-relay part A: the list reaches here, but until sync takes
+        // several (part B, dev-sync) only the first is used, so behaviour
+        // doesn't change. Counts only in the log, never addresses.
+        let Some(relay) = relays.first().cloned() else { anyhow::bail!("no relay") };
+        if relays.len() > 1 {
+            tracing::debug!(
+                relays = relays.len(),
+                "multi-relay: using the first relay until sync takes several"
+            );
+        }
         let runtime =
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+        let relay_copy = relay.clone();
         let config = NodeConfig {
-            relay,
+            relay: relay.clone(),
             data_dir: data_dir.to_owned(),
             logs: Vec::new(),
             authorizer: gate,
@@ -128,6 +198,10 @@ impl SyncNetwork {
             // F2: a direct LAN connection to a peer that proved it shares a
             // server with us (sync never takes LAN addresses from the DHT).
             allow_lan: true,
+            // GAP-6r: relay-only from the first moment (no direct listener,
+            // no bootstrap dial, no punching); `set_relay_only` toggles it
+            // later.
+            relay_only,
         };
         // GAP-4: our pulls carry bindings signed with the identity key (once
         // unlocked), and channel logs are served to members only.
@@ -140,6 +214,14 @@ impl SyncNetwork {
             stub_gate: Some(Arc::new(MemberStubGate)),
         };
         let (node, mut events) = runtime.block_on(Node::start_with(config, access))?;
+        let notice_key = Arc::new(NoticeKey::default());
+        node.set_notice_signer(Some(notice_key.clone()))?;
+        // Relay-down resilience: co-members on this LAN find us by the
+        // member-only beacon (it stays quiet while relay-only or "LAN
+        // allowed" is off). The node works without it.
+        if !runtime.block_on(node.start_lan_beacon(sync::LAN_BEACON_PORT)).unwrap_or(false) {
+            eprintln!("mvs-core: no LAN beacon");
+        }
         // Events are only hints: a stored record wakes the core's sync loop
         // (`Core::run_sync_loop`), which re-reads the store. Coalesced (one
         // pending hint is enough) and drained, so the node never blocks.
@@ -150,6 +232,8 @@ impl SyncNetwork {
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
         let invite_pushes: InvitePushes = Arc::default();
         let pushes = invite_pushes.clone();
+        let link_inbox: LinkInbox = Arc::default();
+        let inbox = link_inbox.clone();
         runtime.spawn(async move {
             while let Some(event) = events.recv().await {
                 let wake = match event {
@@ -175,6 +259,20 @@ impl SyncNetwork {
                     // M2: someone came online or left: a hint only; the core asks
                     // the node (`online`), so a dropped event loses nothing.
                     NodeEvent::Presence { .. } => true,
+                    // Device link (new device): the core takes it at its next
+                    // round (`device_link_take`).
+                    NodeEvent::DeviceLink(inbound) => {
+                        let mut queue = inbox.lock().expect("not poisoned");
+                        if queue.len() < LINK_INBOX {
+                            queue.push(match inbound {
+                                sync::DeviceLinkInbound::Hello { e_old_pub } => DeviceLinkInbound::Hello { e_old_pub },
+                                sync::DeviceLinkInbound::Sealed { ciphertext } => {
+                                    DeviceLinkInbound::Sealed { ciphertext }
+                                }
+                            });
+                        }
+                        true
+                    }
                     _ => false,
                 };
                 if wake {
@@ -189,11 +287,14 @@ impl SyncNetwork {
             opened: Mutex::new(HashMap::new()),
             fetched: Mutex::new(HashSet::new()),
             binder,
+            notice_key,
             send_states,
             hints: Mutex::new(Some(hints)),
             waker,
             voice: Mutex::new(Some(voice)),
             invite_pushes,
+            link_inbox,
+            relay: relay_copy,
         })
     }
 
@@ -226,6 +327,12 @@ impl SyncNetwork {
     /// Wakes the sync loop now, e.g. so it sees its stop flag.
     pub fn wake(&self) {
         let _ = self.waker.try_send(());
+    }
+
+    /// `peer`'s circuit through our relay (what sync dials for a device link).
+    fn circuit_to(&self, peer: PeerId) -> String {
+        use libp2p::multiaddr::Protocol;
+        self.relay.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer)).to_string()
     }
 
     /// Every record of `log` in sync's store, decoded again.
@@ -261,6 +368,23 @@ impl VoiceNet for SyncNetwork {
 }
 
 impl Network for SyncNetwork {
+    fn link_counts(&self) -> Option<(usize, usize)> {
+        let peers = self.runtime.block_on(self.node.peers()).ok()?.len();
+        Some((peers, self.direct_peers().len()))
+    }
+
+    fn set_relay_only(&self, on: bool) {
+        if let Err(e) = self.node.set_relay_only(on) {
+            tracing::warn!(%e, "relay-only not applied");
+        }
+    }
+
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        if let Err(e) = self.node.set_member_relay(on, daily_cap_mb, role) {
+            tracing::warn!(%e, "member relay setting not applied");
+        }
+    }
+
     /// The server must have been opened (`open_server`): logs are never
     /// opened by their plain names, which anyone could ask for (GAP-4).
     fn publish(&self, record: &Record) {
@@ -299,6 +423,7 @@ impl Network for SyncNetwork {
 
     fn lock(&self) {
         self.binder.lock();
+        self.notice_key.lock();
     }
 
     /// Asked of the node each time (never mirrored from events, which can be
@@ -321,6 +446,10 @@ impl Network for SyncNetwork {
 
     fn send_state(&self, id: RecordId) -> Option<SendState> {
         self.send_states.lock().expect("not poisoned").get(&id).copied()
+    }
+
+    fn wake(&self) {
+        SyncNetwork::wake(self);
     }
 
     fn prune(&self, id: records::RecordId) {
@@ -347,6 +476,69 @@ impl Network for SyncNetwork {
         self.runtime.block_on(self.node.fetch_invite(handle)).unwrap_or_default()
     }
 
+    /// G-91: kept by this node (its own, announced as a DHT provider) and
+    /// handed to the relay mailbox and my other connected devices. `tag` is
+    /// the blob's own (sync checks it again).
+    fn put_backup(&self, tag: [u8; 32], blob: &[u8]) {
+        let _ = tag;
+        if !self.runtime.block_on(self.node.put_backup(blob.to_vec())).unwrap_or(false) {
+            eprintln!("mvs-core: sync refused the server backup");
+        }
+    }
+
+    fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
+        self.runtime.block_on(self.node.fetch_backup(tag)).unwrap_or_default()
+    }
+
+    fn put_notice(&self, blob: &[u8]) {
+        if !self.runtime.block_on(self.node.put_notice(blob.to_vec())).unwrap_or(false) {
+            eprintln!("mvs-core: sync refused the notice");
+        }
+    }
+
+    /// Sync fetches under the unlocked `w_n`'s own tag: another `tag_n`
+    /// gets nothing.
+    fn fetch_notices(&self, tag_n: [u8; 32]) -> Vec<Vec<u8>> {
+        use sync::NoticeSigner;
+        if self.notice_key.key().map(|key| sync::notice_tag(&key)) != Some(tag_n) {
+            return Vec::new();
+        }
+        self.runtime.block_on(self.node.fetch_notices()).unwrap_or_default()
+    }
+
+    fn notice_unlock(&self, w_n: &records::SigningKey) {
+        self.notice_key.unlock(w_n);
+    }
+
+    fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<DeviceLinkAddr> {
+        self.link_inbox.lock().expect("not poisoned").clear();
+        let (peer, circuit) = self.runtime.block_on(self.node.device_link_open(rv, e_new_pub)).ok().flatten()?;
+        Some(DeviceLinkAddr { peer: peer.to_base58(), circuit: circuit.to_string() })
+    }
+
+    fn device_link_close(&self) {
+        let _ = self.node.device_link_close();
+        self.link_inbox.lock().expect("not poisoned").clear();
+    }
+
+    fn device_link_take(&self) -> Vec<DeviceLinkInbound> {
+        std::mem::take(&mut *self.link_inbox.lock().expect("not poisoned"))
+    }
+
+    fn device_link_find(&self, rv: [u8; 32]) -> Result<DeviceLinkAddr, DeviceLinkError> {
+        let peer = self.runtime.block_on(self.node.device_link_find(rv)).map_err(link_error)?;
+        Ok(DeviceLinkAddr { peer: peer.to_base58(), circuit: self.circuit_to(peer) })
+    }
+
+    fn device_link_hello(&self, to: &DeviceLinkAddr, e_old_pub: [u8; 32]) -> Result<[u8; 32], DeviceLinkError> {
+        let peer = link_peer(to)?;
+        self.runtime.block_on(self.node.device_link_hello(peer, e_old_pub)).map_err(link_error)
+    }
+
+    fn device_link_send(&self, to: &DeviceLinkAddr, ciphertext: &[u8]) -> Result<(), DeviceLinkError> {
+        let peer = link_peer(to)?;
+        self.runtime.block_on(self.node.device_link_send(peer, ciphertext.to_vec())).map_err(link_error)
+    }
     fn take_invite_publications(&self) -> Vec<(ServerId, Vec<u8>)> {
         std::mem::take(&mut *self.invite_pushes.lock().expect("not poisoned"))
     }
@@ -403,7 +595,7 @@ mod tests {
             "/ip4/127.0.0.1/tcp/9/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc"
                 .parse()
                 .unwrap();
-        let net = SyncNetwork::start(relay, &dir, Arc::new(MemberGate::new())).unwrap();
+        let net = SyncNetwork::start(vec![relay], &dir, Arc::new(MemberGate::new())).unwrap();
         let owner = SigningKey::from_bytes(&[4; 32]);
         let genesis = authority::sign_genesis(&owner, [1; 16], 1, b"{}").unwrap();
         // GAP-4: nothing is synced, or published, for a server not opened.
@@ -416,11 +608,104 @@ mod tests {
         drop(net);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// GAP-6r blocker 0 (#272): started with the stored relay-only setting,
+    /// the node never listens directly and never dials its bootstrap
+    /// address; started without it, it does listen (so the check means
+    /// something).
+    #[test]
+    fn a_relay_only_start_makes_no_direct_listen_or_dial() {
+        use libp2p::multiaddr::Protocol;
+        use std::time::{Duration, Instant};
+
+        let relay: Multiaddr =
+            "/ip4/127.0.0.1/tcp/9/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc"
+                .parse()
+                .unwrap();
+        let direct = |net: &SyncNetwork| -> Vec<Multiaddr> {
+            let addrs = net.runtime.block_on(net.node.listen_addrs()).unwrap();
+            addrs.into_iter().filter(|a| !a.iter().any(|p| p == Protocol::P2pCircuit)).collect()
+        };
+        let start = |name: &str, relay_only: bool, bootstrap: Vec<Multiaddr>| {
+            let dir = std::env::temp_dir()
+                .join(format!("mvs-syncnet-relayonly-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let net = SyncNetwork::start_with_bootstrap(
+                vec![relay.clone()],
+                bootstrap,
+                relay_only,
+                &dir,
+                Arc::new(MemberGate::new()),
+            )
+            .unwrap();
+            (net, dir)
+        };
+
+        // Without relay-only: a direct listener shows up.
+        let (net, dir) = start("off", false, Vec::new());
+        let since = Instant::now();
+        while direct(&net).is_empty() {
+            assert!(since.elapsed() < Duration::from_secs(10), "never listened directly");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(net);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Relay-only from the start: a bootstrap address that counts every
+        // connection to it, and no direct listener at any point.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.set_nonblocking(true).unwrap();
+        let bootstrap: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc",
+            probe.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let (net, dir) = start("on", true, vec![bootstrap]);
+        let since = Instant::now();
+        while since.elapsed() < Duration::from_secs(3) {
+            assert_eq!(direct(&net), Vec::<Multiaddr>::new(), "relay-only, yet listening directly");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut dialled = 0;
+        while probe.accept().is_ok() {
+            dialled += 1;
+        }
+        assert_eq!(dialled, 0, "a relay-only start dialled its bootstrap address");
+        drop(net);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
 mod relay_tests {
-    use super::relay_addr;
+    use super::{relay_addr, relay_addrs, MAX_RELAYS};
+
+    const ID_A: &str = "12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc";
+    const ID_B: &str = "12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt";
+
+    #[test]
+    fn a_relay_list_has_one_to_four_distinct_checked_entries() {
+        let a = format!("/dns4/relay.example.org/tcp/443/wss/p2p/{ID_A}");
+        let b = format!("/dns4/relay2.example.org/tcp/443/wss/p2p/{ID_B}");
+        // In order, as given.
+        let got = relay_addrs(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(got.iter().map(|m| m.to_string()).collect::<Vec<_>>(), [a.clone(), b.clone()]);
+        assert_eq!(relay_addrs(&[a.as_str()]).unwrap().len(), 1);
+        // Empty, a bad entry, too many.
+        assert_eq!(relay_addrs::<&str>(&[]).unwrap_err(), "no relay");
+        let err = relay_addrs(&[a.as_str(), "/dns4/relay3.example.org/tcp/443"]).unwrap_err();
+        assert!(err.starts_with("relay 2:"), "{err}");
+        let five: Vec<String> = (0..=MAX_RELAYS)
+            .map(|i| format!("/ip4/127.0.0.1/tcp/{}/p2p/{ID_A}", 4000 + i))
+            .collect();
+        assert_eq!(relay_addrs(&five).unwrap_err(), format!("more than {MAX_RELAYS} relays"));
+        // The same relay (peer ID) twice, even at another address.
+        let a_tcp = format!("/dns4/relay.example.org/tcp/4001/p2p/{ID_A}");
+        assert_eq!(relay_addrs(&[a.clone(), a_tcp]).unwrap_err(), "relay 2: the same relay twice");
+        // Errors never quote the address.
+        assert!(!err.contains("example.org"));
+    }
 
     #[test]
     fn a_relay_must_name_its_peer_id() {

@@ -37,7 +37,7 @@ fn peer(name: &str, words: &str, relay: &str) -> Peer {
     let dir = std::env::temp_dir().join(format!("mvs-two-peers-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let net = Arc::new(
-        SyncNetwork::start(relay.parse().unwrap(), &dir, Arc::new(MemberGate::new())).unwrap(),
+        SyncNetwork::start(vec![relay.parse().unwrap()], &dir, Arc::new(MemberGate::new())).unwrap(),
     );
     let events = Arc::new(CollectingSink::new());
     // Locked: the core unlocks it when the identity is restored.
@@ -54,7 +54,7 @@ fn peer(name: &str, words: &str, relay: &str) -> Peer {
     )
     .unwrap();
     core.restore_identity(words.split(' ').map(String::from).collect()).unwrap();
-    let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None };
+    let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
     core.update_profile(profile).unwrap();
     Peer { core, events, net, _cipher: cipher, _dir: dir }
 }
@@ -70,6 +70,29 @@ fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
 /// T8-02: a short link joins over real sync: the guest, a stranger with no
 /// secret, asks for the envelope (`/mvs/invite/1`), gets the owner's
 /// publication, opens and checks it, and joins.
+#[test]
+#[ignore = "needs a relay: set RELAY and run with --ignored"]
+fn a_restore_on_a_fresh_device_brings_the_servers_back() {
+    let Ok(relay) = std::env::var("RELAY") else {
+        eprintln!("RELAY not set; skipped");
+        return;
+    };
+    // My first device: a server, and its backup (the login round writes it).
+    let first = peer("BackupFirst", OWNER, &relay);
+    let server = first.core.create_server("Backed up", AgeRestriction::None).unwrap();
+    first.core.sync_now().unwrap();
+    // A clean machine, the same words: the server comes back from the
+    // network (G-91: `/mvs/backup/1`, my first device as the holder).
+    let fresh = peer("BackupFresh", OWNER, &relay);
+    eventually("the fresh device to get my server back", || {
+        let _ = first.core.sync_now();
+        let _ = fresh.core.sync_now();
+        fresh.core.list_servers().unwrap().iter().any(|s| s.id == server.id)
+    });
+    eprintln!("restore from the network: done");
+}
+
+/// T8-02 (continued): see above.
 #[test]
 #[ignore = "needs a relay: set RELAY and run with --ignored"]
 fn a_short_link_joins_through_a_relay() {
@@ -473,8 +496,7 @@ fn two_members_join_a_call_and_signal_over_sync() {
         owner.core.sync_now().unwrap();
         owner.core.list_members(&server.id).unwrap().len() == 2
     });
-    // Calls happen only in the server's voice room.
-    let room = owner.core.get_voice_room(&server.id).unwrap().room_id;
+    // Calls happen in voice rooms.
 
     for p in [&owner, &guest] {
         p.core.set_voice(p.net.clone());
@@ -497,7 +519,12 @@ fn two_members_join_a_call_and_signal_over_sync() {
         !o.is_empty() && !g.is_empty()
     });
 
-    owner.core.join_call(&room).unwrap();
+    let room = owner.core.create_voice_room(&server.id).unwrap().channel_id;
+    eventually("the guest to see the room", || {
+        deliver();
+        owner.core.voice_tick();
+        guest.core.list_voice_rooms(&server.id).unwrap().iter().any(|r| r.room_id == room)
+    });
     guest.core.join_call(&room).unwrap();
     let mut seen = Vec::new();
     eventually("the owner to see the guest in the call", || {
@@ -528,4 +555,74 @@ fn two_members_join_a_call_and_signal_over_sync() {
     );
     owner.core.leave_call().unwrap();
     guest.core.leave_call().unwrap();
+}
+
+/// A device with no identity yet (a fresh install), on `SyncNetwork`.
+fn fresh_device(name: &str, relay: &str) -> Peer {
+    let dir = std::env::temp_dir().join(format!("mvs-two-peers-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let net = Arc::new(
+        SyncNetwork::start(vec![relay.parse().unwrap()], &dir, Arc::new(MemberGate::new())).unwrap(),
+    );
+    let events = Arc::new(CollectingSink::new());
+    let cipher = Arc::new(GroupKeysCipher::locked());
+    let core = Core::open(
+        Config { db_path: Some(dir.join("core.db")), app_version: "test".into() },
+        Ports {
+            secrets: Arc::new(MemoryStore::new()),
+            network: net.clone(),
+            events: events.clone(),
+            clock: Arc::new(SystemClock),
+            cipher: cipher.clone(),
+        },
+    )
+    .unwrap();
+    Peer { core, events, net, _cipher: cipher, _dir: dir }
+}
+
+/// Device link end to end over the real node (`/mvs/device-link/1`, the DHT
+/// rendezvous, a relay between them): the signed-in device finds the new
+/// one by its typed code, both see the same digits, the account comes over,
+/// and the two devices never connect directly.
+#[test]
+fn a_device_link_brings_the_account_over_sync() {
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let relay = start_relay(&runtime);
+    let old = peer("LinkOld", OWNER, &relay);
+    let me = old.core.get_identity().unwrap().unwrap().id;
+    let new = fresh_device("LinkNew", &relay);
+
+    // The new device needs its relay reservation first.
+    let mut link = None;
+    eventually("the new device to start a link", || {
+        link = new.core.start_device_link().ok();
+        link.is_some()
+    });
+    let link = link.unwrap();
+    // The rendezvous record takes a moment to reach the relay's DHT.
+    let mut approval = None;
+    eventually("the signed-in device to find the code", || {
+        approval = old.core.begin_device_approval(&link.code).ok();
+        approval.is_some()
+    });
+    let approval = approval.unwrap();
+    let mut sas = None;
+    eventually("the new device to show the digits", || {
+        new.core.sync_now().unwrap();
+        sas = new.events.take().into_iter().find_map(|e| match e {
+            Event::DeviceLinkState(s) if s.state == DeviceLinkPhase::Confirm => s.sas,
+            _ => None,
+        });
+        sas.is_some()
+    });
+    assert_eq!(sas.as_deref(), Some(approval.sas.as_str()), "both devices show the same digits");
+
+    new.core.confirm_device_link(true).unwrap();
+    old.core.confirm_device_approval(true).unwrap();
+    eventually("the account to arrive on the new device", || {
+        new.core.sync_now().unwrap();
+        new.core.get_identity().unwrap().is_some_and(|i| i.id == me)
+    });
+    assert!(!old.net.direct_peers().contains(&new.net.peer_id()), "the link went direct (old side)");
+    assert!(!new.net.direct_peers().contains(&old.net.peer_id()), "the link went direct (new side)");
 }

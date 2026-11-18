@@ -18,9 +18,17 @@ export interface Identity {
   /** CSS colour for the generated avatar; real avatars come later. */
   avatarColor: string;
   avatarDataUrl?: string;
+  /** #359: my chosen colour (#rrggbb), shown to others; falls back to avatarColor. */
+  color?: string;
   bio?: string;
   country: string;
   birthDate: BirthDate;
+  /**
+   * B7 §9 (#306): a correction that raises my age, waiting its 30 days. Until
+   * `effectiveAt` my current age stays. Absent otherwise; identity.changed
+   * fires when it takes effect.
+   */
+  pendingBirthDate?: { date: BirthDate; effectiveAt: Timestamp };
   /** False until the person proved they wrote the 12 words down. */
   recoveryChecked: boolean;
 }
@@ -35,6 +43,10 @@ export interface ProfileInput {
   displayName: string;
   bio?: string;
   avatarDataUrl?: string;
+  /** #359: a 48×48 WebP/PNG (≤ 2,560 bytes) that others see. Absent = unchanged, '' = removed. */
+  avatarSmall?: string;
+  /** #359: #rrggbb. Absent = unchanged, '' = cleared. */
+  color?: string;
 }
 
 export type AgeRestriction = 'none' | '16+' | '18+';
@@ -64,6 +76,18 @@ export interface Channel {
   isDefault: boolean;
   unread: boolean;
   mentions: number;
+  /**
+   * G-11 (#323): the shared order key (base-62, compared as a string). Only
+   * informative: the order is the core's list order, never a re-sort by this.
+   */
+  position?: string;
+  /**
+   * G-21: the index of the first message I haven't read, from the core's read
+   * marker (my own messages don't count). Absent when everything is read.
+   */
+  firstUnreadIndex?: number;
+  /** G-21: how many messages from others I haven't read. */
+  unreadCount?: number;
 }
 
 export type Presence = 'online' | 'offline';
@@ -84,6 +108,10 @@ export interface Member {
   /** Blocked by me: their messages are collapsed on this device only. */
   blocked?: boolean;
   bio?: string;
+  /** #359: the member's small picture (data:image/webp|png), from their profile post. */
+  avatarDataUrl?: string;
+  /** #359: the member's chosen colour (#rrggbb). */
+  color?: string;
 }
 
 /** `keyring`: the OS keychain is missing or unusable (QA-20; core code `keyring-unavailable`). */
@@ -114,11 +142,21 @@ export interface CoreError {
     | 'timeout'
     | 'core-unavailable'
     | 'core-restarted'
+    /** #304, desktop: the native "sign out without the words" dialog was declined. */
+    | 'cancelled'
     | 'too-large'
     | 'keyring-unavailable'
     // Voice v1 (#223)
     | 'call-full'
     | 'relay-only'
+    /** #294: my own identity is already in this room from another computer (clears ~30 s after it stops). */
+    | 'in-call-elsewhere'
+    /** Device link: too many approval attempts. */
+    | 'rate-limited'
+    /** Device link: the link is locked (too many tries, or another session holds it): someone else may be trying. */
+    | 'locked-out'
+    /** Voice rooms (0.4.3): this server already has 10 live rooms. */
+    | 'room-cap'
     // In-app update (core/api CONFORMANCE "Updates")
     | 'offline'
     | 'invalid-update'
@@ -163,8 +201,24 @@ export interface Message {
   /** Only set on messages written on this device. */
   sendState?: SendState;
   mentionsMe?: boolean;
+  /**
+   * G-24 (#330): the users this message mentions who are members now, as
+   * 64-hex ids. The body holds them as <@id> tokens; the UI shows names from the
+   * member list, and a token whose id isn't here as a former member.
+   */
+  mentions?: string[];
+  /**
+   * G-26: at most 20 emoji (the most popular), listed in the order they first
+   * appeared; absent when there are none. `mine`: I have it on.
+   */
+  reactions?: { emoji: string; count: number; mine: boolean }[];
   /** Set by the UI when the text was too long or had too many lines to show in full. */
   clipped?: boolean;
+  /**
+   * Only on the one message.updated that sends a message held for its channel
+   * key (#288): the `pending-…` id of the held entry this message replaces.
+   */
+  replaces?: Id;
 }
 
 export interface MessageRange {
@@ -198,6 +252,8 @@ export type UpdateChannel = 'stable' | 'beta';
 export interface AppInfo {
   version: string;
   updateChannel: UpdateChannel;
+  /** Relay-only (GAP-6r, #272): this device is reached only through the relay; calls are off. */
+  relayOnly?: boolean;
 }
 
 /** An invite to a server (#214). `maxUses` 0 is unlimited; no `expiresAt` is never. */
@@ -221,6 +277,8 @@ export interface CreatedInvite {
 export interface CallParticipant {
   identity: Id;
   muted: boolean;
+  /** G-84b: hears no one (only with muted; never from cores before 0.6.0). */
+  deafened?: boolean;
 }
 
 /** My current call. After leaveCall, `participants` is empty. `full` = 5 in. */
@@ -228,22 +286,92 @@ export interface CallState {
   channelId: Id;
   participants: CallParticipant[];
   full: boolean;
+  /** Relay-only is on (#272): with no participants, my call was ended for it. */
+  relayOnly?: boolean;
 }
 
-/** Someone in a server's voice room. `userId` is a member id. */
-export interface VoiceParticipant {
+/** Someone in a voice room. `userId` is a member id; `joinedAt` (ms) orders the hand-off. */
+export interface VoiceRoomMember {
   userId: Id;
   muted: boolean;
+  /** G-84b: a display hint, only with muted. */
+  deafened?: boolean;
+  joinedAt: number;
 }
 
 /**
- * The voice room of a server (voice v1 amendment): one per server, open to every
- * member. `roomId` is what joinCall takes. At most 5 people, me included when in.
+ * A live voice room (voice rooms, 0.4.3: "Join to create"). Soft state: it lives
+ * while someone is in it. `roomId` is what joinCall takes. The core computes
+ * `masterId` (the room's host); the UI never derives it. No `name` = the
+ * default "{master}'s room".
  */
 export interface VoiceRoom {
   serverId: Id;
   roomId: Id;
-  participants: VoiceParticipant[];
+  creatorId: Id;
+  createdAt: number;
+  name?: string;
+  /** 2–5 (the mesh maximum). */
+  limit: number;
+  masterId: Id;
+  members: VoiceRoomMember[];
+  /** Relay-only is on here (#272): joining and creating are off before trying. */
+  relayOnly?: boolean;
+}
+
+/** Member relays, slice 1 (design #368): relaying for my servers' members. */
+export type MemberRelaySetting = 'auto' | 'on' | 'off';
+/** Why it is off whatever the setting (first match). */
+export type MemberRelayReason = 'global-off' | 'minor' | 'relay-only' | 'metered';
+export interface MemberRelay {
+  setting: MemberRelaySetting;
+  /** Relaying now. */
+  effective: boolean;
+  reason?: MemberRelayReason;
+  /** `auto` would turn it on: I'm an owner or admin in a server I'm in. */
+  role: boolean;
+  /** The one-time disclosure was acknowledged. */
+  disclosureSeen: boolean;
+  /** The daily byte cap in MB: 256–51200, default 2048. */
+  dailyCapMb: number;
+}
+
+/** Device link (device-link-slice.md), new device: what to show to the signed-in device. */
+export interface DeviceLinkOffer {
+  /** The QR payload (no secret). */
+  qr: string;
+  /** 10 base32 characters, for typing. */
+  code: string;
+  expiresAt: number;
+}
+
+export type DeviceLinkState = {
+  state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed';
+  /** 6 digits, from "confirm" on. */
+  sas?: string;
+  reason?: 'cancelled' | 'timeout' | 'refused' | 'network' | 'keyring' | 'restore';
+};
+
+/** account.deviceAdded: a device was added to my account (dev-identity's #393 name). No `label` = unknown (always, for now). */
+export interface DeviceAdded {
+  at: number;
+  label?: string;
+}
+
+/** Device link, signed-in device: the digits to compare. */
+export interface DeviceApproval {
+  sas: string;
+  expiresAt: number;
+}
+
+/**
+ * G-91: my servers coming back after a restore or a device link (#457).
+ * `found`: live servers the backup lists (0 until found); `waiting`: of those, not back yet.
+ */
+export interface ServerRestore {
+  state: 'none' | 'searching' | 'waiting' | 'done';
+  found: number;
+  waiting: number;
 }
 
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */

@@ -81,26 +81,184 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
 | The mock's `getRecoveryWords` answers at any time | The Rust core answers only until the check passes, then `not-allowed` (until the app lock, #31); the mock should too |
 | The mock accepts any `updateProfile` input | The Rust core refuses oversize fields and any avatar other than a base64 PNG, JPEG, WebP or GIF `data:` URL (`bad-request`) |
 | The mock has no `grantRole` / `revokeRole` | Add them to `CoreCommands` (proposed below) |
+| The mock never holds a message for its key | The Rust core (see "Messages held for their key" below): a plain member without the channel key yet gets the message back at once as `pending`, with a provisional ID, instead of `not-allowed`. The mock should do the same when it simulates a fresh join |
 
 ## Proposed contract additions (Rust has them; `api.ts` doesn't yet)
+
+- Profile picture and colour for other members (#354, `src/avatar.rs`):
+  - `updateProfile` input gains `avatarSmall?` and `color?`: absent means unchanged, `""` clears.
+    - `avatarSmall` is a `data:image/(webp|png);base64,` URL of at most 2,560 bytes and 64×64 declared, and still (no APNG `acTL`, no animated WebP). `color` is `#rrggbb`. Anything else, or a profile post over 4 KiB, is `bad-request`.
+    - The large `avatarDataUrl` and the bio stay on this device.
+  - **Publishing:** they go in my profile post (`avatar`, `color`), at most one per server per 10 minutes. Changes are coalesced, and the pending one survives a restart. Nothing is posted without a change.
+  - **Receivers** check each post the same way, without decoding pixels. A valid value sets it, `""` clears it, an absent field leaves it, and an invalid value is ignored.
+  - **Exposed:** `Member.avatarDataUrl?` and `Member.color?` (`avatarColor` stays the derived one), plus `Identity.color?`. A profile post that arrives brings `members.changed`.
+  - **UI (Security Lead):** the picture is rendered only via `<img src>`, with CSP `img-src 'self' data:`.
+
+- Mentions (G-24, GAPS §2.5):
+  - A mention is the token `<@userId>` (64 lower-case hex) in the body, never a name. The UI shows the current name, or `mention.unknown` for someone no longer in the server. Older clients show the token as text. It counts toward the 4,000 code points.
+  - `Message.mentions?: userId[]` (additive) lists the mentioned users who are members now, in order, each once.
+  - `Message.mentionsMe?: true` when the body mentions me.
+  - `Channel.mentions` and `ServerSummary.mentions` count unread messages that mention me (after the read marker, not mine). `markRead` resets them. `ServerSummary.unread` is set when any channel has unread messages; both come from `listServers`.
+  - No authority or sync change: mentions are read from the message body.
+
+- Emoji reactions (G-26; design `g26-reactions-design.md` with Amendment 1):
+  - `react(messageId, emoji, on: boolean)` returns `null` and fires `message.updated` for the message. Nothing is signed when it's already so (an add of an emoji I have on, or a removal of one I don't).
+  - `Message.reactions?: { emoji, count, mine }[]` (additive) lists at most 20 emoji: the 20 with the most members, ties going to the one that appeared first. They're listed in the order they first appeared, and the field is absent when there are none. A deleted message has none.
+  - A change from anyone brings one `message.updated` for the message in that sync round. Reactions are never unread, never a mention, and never notify.
+  - **The emoji check** (core on write and on fold; the UI's sanitizer must match it):
+    - One trailing U+FE0F is dropped first, so 👍 and 👍+FE0F are the same chip. The stored form never ends in FE0F.
+    - 1–32 bytes and at most 10 scalars, made of elements joined by single ZWJs (U+200D: never first, never last, never doubled).
+    - An element is one of:
+      - an emoji base (the pictographic blocks U+1F000–1FAFF, plus the older emoji symbols listed in `src/reaction.rs`), with at most one VS16 or skin tone (U+1F3FB–1F3FF) straight after it;
+      - a pair of regional indicators;
+      - a keycap `[0-9#*] FE0F? 20E3`.
+    - Never a control, bidi, whitespace or tag character (U+E0020–E007F, so no subdivision flags in v1), and no custom emoji.
+  - Errors, with nothing signed:
+    - `bad-request`: the emoji fails the check, or it would be my 11th emoji on this message.
+    - `not-found`: no such message I can see, or it is deleted.
+    - `not-allowed`: I can't write in that channel now (the same rule as a message).
+    - `update-needed`: a current member's latest profile post lacks `reactions-v1`. `getUpdateNeeded(serverId, "reactions-v1")` says who.
+    - `rate-limited`: 30 reaction records of mine in this channel within a minute.
+  - **Record:** `Kind::Reaction = 21`, channel scope, at most 256 bytes. Authority judges it like a `Message` (any member; a kick's cut voids it the same way). The body is sealed with the channel key over a fixed 66-byte plaintext, so its length doesn't give the emoji away. The plaintext is `target (32) ‖ op (1 = add, 0 = remove) ‖ len u8 ‖ emoji ‖ zero padding`. On open, it's refused when:
+    - `len` is over 32;
+    - the emoji isn't valid UTF-8, or fails the check, or ends in FE0F;
+    - the op isn't 0 or 1;
+    - the padding isn't all zero.
+
+    The design said 64 bytes, but 32 + 1 + 1 + 32 needs 66, so 66 keeps the 32-byte emoji limit.
+  - **The fold** (deterministic in every core):
+    - The channel's records go in causal order: deps first, and (claimed time, ID) only between records that are concurrent.
+    - **Time bounds** (the security lead's fix: claimed times are the author's own):
+      - A record's effective time is the later of its claimed time and its deps' effective times.
+      - A reaction claiming a time more than 10 minutes before its deps' effective time is ignored.
+      - A record claiming a time more than 10 minutes past the folding core's clock waits: it isn't counted, and its time doesn't count for the records built on it, until then.
+    - **Rate:** an author's accepted reaction is ignored when 30 of theirs are already counted within a minute of its effective time, either way. The count uses the effective time capped at now, so the 10 minutes of lead add no room.
+    - A new reaction is signed at its effective time (my clock, or its deps' time if later), so a clock up to 10 minutes slow isn't ignored as backdated.
+    - **Accepted residual (dev-sync follow-up, GAP-25):** a hostile client whose reactions have stale deps, or no channel deps at all (only `auth_deps` is required), can still spread its claimed times freely. Only the receive-time check at sync ingest bounds that.
+    - Then a reaction counts only if it opens to a valid plaintext whose target is a shown `Message` of that channel that isn't deleted.
+    - Per (message, emoji, author), the last op wins.
+    - An add is ignored while the author already has 10 emoji on that message; a removal frees a place.
+    - There's no per-message cap in the state, so one member can't lock a message.
+  - **Known residual:** with more than 20 distinct emoji on a message, the rarest drop out of view (not out of state). One member can add at most 10.
+  - **Rollout:** a `reactions-v1` cap in profile posts (above). An older core refuses kind 21 and would stall on every channel record after one, so nobody reacts until every current member posts the cap. The release that reads kind 21 also posts it.
+  - **Known residual: late joiners on an old version.** Someone who joins later with a pre-reactions build meets the kind-21 records already there and stalls on that channel's log, as with lifecycle records (#229). The gate can't see them before they join, since their caps arrive only with their first profile post. A join can't be refused on version either: the core has no version field to check. So:
+    - the release notes say reactions need everyone on that version;
+    - the in-app updater (hourly check) narrows the window;
+    - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
+
+- New-messages divider (G-21, option A):
+  - `Channel.unreadCount?: number` and `Channel.firstUnreadIndex?: number` (additive) count the messages after my read marker that aren't mine, in `getMessages` order. `firstUnreadIndex` is the `getMessages` index of the first of them, and is absent when there are none. `Channel.unread` is `unreadCount > 0`. They appear in `listChannels` and `channel.updated`.
+  - `markRead(channelId)` returns `null` and moves the marker to the channel's last message. It emits `channel.updated` with `unreadCount: 0` and no `firstUnreadIndex`.
+  - Events keep the UI in step with the marker (v0.4.1 fix):
+    - A new message from someone else brings `channel.updated` for its channel, with `unread`, `unreadCount`, `firstUnreadIndex` and `mentions`.
+    - Then a `server.updated` with the server's recounted `unread` and `mentions`.
+    - `markRead` brings `channel.updated` and then that same `server.updated`.
+    - Every `server.updated` carries the counted `unread` and `mentions`.
+    - While a channel is open and its bottom is seen, the UI calls `markRead` on such a `channel.updated`.
+  - A channel never read counts from when this device joined the server, so history from before isn't unread.
+  - The marker is local only (kv `read/<channel>`), and phase 3 syncs it. The count comes from the stored records, with no network or paging.
+  - **v1 limit:** the marker is a point in `(time, ID)` order, and a message counts as unread only if it comes after it. A message that arrives late, with a time older than the marker (an offline peer catching up, say), is shown in its place but isn't counted as unread.
+  - Counts are recomputed on each `listChannels`. A per-channel cached count is a follow-up (board P3), if lists get slow.
+
+- Channel order (G-11, Tech Lead's design):
+  - `moveChannel(serverId, channelId, before?, after?)` returns `Channel[]` in the new order. It puts the channel right before `before`, or right after `after`, or last with neither; both given must be one gap.
+    - Errors: `not-allowed` below admin, `not-found` for an unknown channel, `bad-request` for a neighbour that isn't a live channel of the server, or two that aren't one gap.
+  - It signs one control-log `Post` tagged `mvs/channel-order/v1`, `{"mvs":"mvs/channel-order/v1","v":1,"pos":{channelHex: key}}`, with no new record kind or channel field, so 0.3.x peers ignore it.
+    - Keys are base-62 (`0-9A-Za-z`), compared as strings, 1–32 characters, never ending in `0`.
+    - A move normally sends one key between its neighbours'. When a neighbour has no key yet, or the key would pass 32 characters, it sends keys for every channel (a rebalance).
+  - **Who counts:** a post counts only if its author was owner or admin at that record, in the state of the post's causal past. Per channel, the last counting post in authority's order wins. Bad keys, deleted channels and unknown channels are ignored.
+  - **Order:** `listChannels` returns channels in order. Placed ones come first by key (then by ID); the rest keep today's order.
+  - `Channel.position` (additive, the key) appears on placed channels, in `listChannels` and in `channel.updated`. The core emits `channel.updated` for each channel a local move repositioned. The UI uses the list order and never re-sorts by the key.
+
+- Restore servers, phase A (#291, `src/backup.rs`), and its progress (G-91).
+  - **When the backup is written:** only when my server set changed since the last write, on the first sync round after start (login), or every 24 h (`BACKUP_REPUBLISH_MS`). Then my server list (server IDs and sync secrets) is merged into the newest backup the holders keep (`Network::fetch_backup`), sealed as the next version and handed to them (`Network::put_backup`). Rounds with nothing due fetch and put nothing. The fetch and the put run outside the core lock.
+    - Servers this device listed and no longer has get a tombstone.
+    - Merging keeps what my other devices wrote.
+  - **The blob:** `mvsb1 ‖ tag ‖ w_pub ‖ version ‖ nonce ‖ XChaCha20-Poly1305(padded JSON) ‖ Ed25519 sig by w`.
+    - The keys come from the words (#292). There's no identity key in it.
+    - It's padded to 4 KiB steps, at most 64 KiB.
+  - **On `restoreIdentity`:** the core fetches the backup (`Network::fetch_backup`), keeps the newest valid one, and rejoins each live server as the same member (#290). It posts no new join, profile or age claim.
+    - A server whose log no longer lists me isn't entered.
+    - A restore still waiting is tried again. While no backup is found: backoff, after 1 min, doubling (2, 4, 8, 16, 32) up to once an hour. Once it is found: only the servers still waiting, every 30 s (`REJOIN_EVERY_MS`), with no new backup fetch, so each comes back within 2 minutes of a member of it being reachable. Nothing more once it is done. After a restart mid-restore the backup is searched for again.
+    - A server leaves the restore only on a definite answer: back (`Joined`), closed, or refused as no longer mine (`Invalid` with evidence: the log shows an accepted kick or leave of me). Anything else (nobody reachable, a partial answer, age-blocked, any error) waits for the next try, so one bad round never loses a server (Security Lead on #457).
+    - Accepted residual (Security Lead on #472): a partial log that has an old leave of mine but not my later rejoin still drops the server. That errs on the safe side, and an invite link brings it back.
+    - The app lock (`Core::lock_keys`) drops the server secrets a waiting restore holds and pauses it; after `unlock_keys` the backup is fetched again. Otherwise, once found, a newer backup isn't fetched again until the next start or unlock.
+  - **Progress (G-91):** `getServerRestore()` returns `ServerRestore { state, found, waiting }`. The event `serverRestore.changed` carries the same, sent only when something in it changed.
+    - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).
+    - `found`: the live servers the backup lists (0 until found). `waiting`: of those, the ones not back yet.
+    - The UI shows "searching" and "waiting" honestly on the restore screen, with the invite-link hint (PO G-91 criterion 2). A server I left, was removed from, or that closed never comes back and isn't counted as waiting.
+  - **Holders:** the ports are no-ops until dev-sync's `/mvs/backup/1` and devops' mailbox exist. `LoopbackNetwork` holds them for tests.
+
+- `signOut({ words: string[] } | { withoutWords: true })` returns `null` (both read at the top level of `args`). It removes this identity from this computer.
+  - `words` must be this identity's 12 words: `invalid-words` (with `positions`) for unknown words, `not-allowed` for another identity's. `withoutWords: true` is the explicit "I accept losing this account" path. Neither: `bad-request`. No identity: `not-found`.
+  - In order, fail safe:
+    1. A wipe marker (the intent) is written beside `core.db`. If it can't be written: `internal`, and nothing changed.
+    2. The keychain secret is deleted. If that fails: `keyring-unavailable`, the marker is removed, and nothing changed. Once the secret is gone, a failure to delete the recovery-check entry doesn't stop the sign-out.
+    3. The local database is emptied and servers are closed. The core answers and exits, and the shell restarts it.
+  - At the next start, before anything opens, with the marker present:
+    - **The keychain says the secret is gone:** `core.db` and the sync folder are deleted, then the marker. That includes its `node.key`, so a new identity here gets a new peer ID. On failure the core exits and retries at the next start.
+    - **The secret is still there:** only the marker is cleared.
+    - **The keychain can't be read:** nothing is deleted, the marker stays, and the core starts offline, never with the old node key.
+  - The app then starts at "create or restore". No new event: the UI goes back to onboarding on `ok` (pending requests fail with `core-restarted`).
+
+- `updateProfile` with a new display name (trimmed) posts a new profile post to every server I'm still a member of (not kicked, not left, not closed); the latest one wins for everyone. The same name, or a new bio or avatar only, posts nothing: bio and avatar stay on this device, since the profile post carries the name (and caps) only. A server that refuses the post is skipped; the call still succeeds. Errors as before: `bad-request` for a bad name, bio or avatar, `not-found` with no identity.
+
+- Age claims and the 30-day rule (decision 18, B13 §3, B7 §9). Each claim is decided from my latest accepted claim in that server:
+  - A birth date that raises me from "not adult" to adult posts nothing. It sets `Identity.pendingBirthDate: { date, effectiveAt }` (`effectiveAt` = when found + 30 days). Until then I count as under 18: the core refuses 18+ joins (`age-blocked`), and servers keep my earlier claim.
+  - When `effectiveAt` passes, the next sync round posts "adult" to every server I'm still in, clears `pendingBirthDate`, and emits `identity.changed`.
+  - A lowering is posted at once. A claim equal to the one the server holds isn't posted again.
+  - So a restore (`restoreIdentity(words, input)`) can't skip the 30 days: the rejoin compares against the claim the server already holds.
+  - A raise means a *changed* date. A date entered at sign-up on this computer, or one a server's **"adult"** claim already agrees with, is the one my claims come from. A "not adult" agreement proves nothing: a restored date a day short of 18 still waits. Turning 18 with it is a birthday, with no wait.
+  - **Known limit,** until the encrypted backup (#291) brings the old birth date back: after a restore with a new adult date, a server I join for the first time has no earlier claim to compare, so it gets "adult" at once. Joining a fresh server first doesn't lift the wait on the old ones: only an agreeing claim or the 30 days do. The client clock, or a modified client, can also skip the wait (Security Lead, GAP-22).
+
+- Restore on a new computer:
+  - `restoreIdentity(words, input?: { locale, country, birthDate })`. The words don't carry the country or birth date, so the UI asks them again (with the agreement) before the words and passes them here, as `createIdentity` takes them. The name follows with `updateProfile`.
+  - Rejoining a server I'm still a member of (its invite link, after a restore) signs no new join. It never posts an empty display name or an age claim without a birth date: the server keeps the profile and claim it holds. With no birth date it isn't age-blocked either: my earlier claim stands. A known age below the server's minimum still blocks.
 
 - `grantRole(serverId, userId, role: 'admin' | 'moderator' | 'member')` and
   `revokeRole(serverId, userId)`.
 - `Member.role: 'owner' | 'admin' | 'moderator' | 'member'`.
-- Voice calls (voice v1, piece B; `src/voice.rs`). IDs are 64 lower-case hex, and `identity` is a user ID.
-  - Calls happen only in each server's one voice room, whose ID is derived: `blake3::derive_key("mvs/voice-room/v1", serverId)`. There is no channel record for it, no 18+ gate, and text channels carry no calls.
-  - `getVoiceRoom(serverId)` returns `VoiceRoom { serverId, roomId, participants: { userId, muted }[] }`.
-    - Participants: me first when I'm in it, at most 5 (the first to arrive), built from verified hellos only, each dropped 30 s after we last received one.
+- Voice calls (voice v1, piece B; voice rooms v2, 0.4.3; `src/voice.rs`). IDs are 64 lower-case hex, and `identity` is a user ID.
+  - Calls happen only in voice rooms ("join to create"). Rooms are soft state carried in voice hellos: no records, nothing stored or synced. A room lives while a verified participant's hellos keep arriving, and is gone with its last one. Text channels carry no calls, and there is no 18+ gate.
+    - A room's ID is derived and checked by every receiver: `blake3::derive_key("mvs/voice-room/v2", serverId ‖ creatorKey ‖ createdAt_ms_le)`. It can't be claimed for another creator or time, and it can't be a channel's or a v1 room's.
+    - Caps: 10 live rooms per server (the first to arrive), each room's `limit` (2 to 5) of members, and one room per identity (a hello for another room ends the earlier stay).
+  - `VoiceRoom { serverId, roomId, creatorId, createdAt, name?, limit, masterId, members: { userId, muted, joinedAt }[], relayOnly }`.
+    - `members` are ordered by `joinedAt`, at most 5. They're built from verified hellos only, each dropped 30 s after we last received one, and include me when I'm in the room.
+    - `masterId` is computed by the core: the earliest `joinedAt`, with ties going to the smaller ID.
+      - `joinedAt` is frozen for a stay. While a core is learning a room (within 30 s of first hearing of it: it just started, or the core just came online), a claim must be no earlier than `createdAt` and no later than the hello's time plus 120 s, or the hello is dropped. Every member already in the room says hello within that time, so cores agree whatever order the hellos arrive in. A newcomer to a room known for longer has its claim clamped to at least now minus 120 s, never dropped.
+      - Accepted residual: someone joining within 2 minutes of another member can claim to be earlier.
+      - So the master is advisory: it can only rename and set the limit, and grants no other right. The server owner's edit always wins: the master applies it whatever the master set before.
+    - `name` and `limit` come only from the master's hellos. With `name` absent, the UI shows the default name with the master's display name.
+  - `createVoiceRoom(serverId)` returns a `CallState` for the new room (its `channelId` is the room ID), with me as its creator and master. It leaves any other call first.
+    - Errors: `not-found` (a server I don't have), `not-allowed` (not a member, or kicked), `room-cap` (10 live rooms, by this core's view), `relay-only`, `in-call-elsewhere`, `not-implemented`.
+  - `listVoiceRooms(serverId)` returns the server's live rooms, `VoiceRoom[]`, oldest first.
     - Errors: `not-found` for a server I don't have (a kicked member's core removes it), `not-allowed` if I'm not a member or I'm kicked.
-  - `joinCall(channelId)` takes the room ID and returns `CallState { channelId, participants: { identity, muted }[], full }`, me first; `channelId` is the room ID. It leaves any other call first.
+  - `editVoiceRoom(roomId, name?, limit?)` returns `null`. `name: ""` restores the default.
+    - The master's edit is applied at once, and its next hello, sent at once, carries it.
+    - The server owner's edit is sent to the master as an `edit`, and the master applies it only if the signer owns the server.
     - Errors:
-      - `not-found`: an unknown ID.
+      - `not-allowed`: neither the master nor the owner;
+      - `bad-request`: a name over 32 characters, or with bidi, control or zero-width characters; a limit outside 2 to 5, or below who is in the room;
+      - `not-found`: no such live room, or the master is unreachable for the owner's edit.
+  - `joinCall(channelId)` takes a live room's ID and returns `CallState { channelId, participants: { identity, muted }[], full, relayOnly }`, me first; `channelId` is the room ID. It leaves any other call first.
+    - Errors:
+      - `not-found`: an unknown ID, or a room that's gone.
       - `not-allowed`: a text channel's ID, not a member, or kicked.
-      - `call-full`: 5 are already in.
+      - `call-full`: the room is at its limit.
       - `relay-only`: relay-only is on, so calls are off.
+      - `in-call-elsewhere`: my own identity is already in a room from another computer. One computer per call, one room per identity.
       - `not-implemented`: no voice transport (sync's piece A).
   - `leaveCall()` returns `null` and is idempotent. The app lock and quitting leave too.
   - `setMuted(muted: boolean)` returns `null`. `not-allowed` outside a call.
+  - `setDeafened(deafened: boolean)` returns `null` (G-84b). `not-allowed` outside a call. The others see it only together with mute, and only from cores that understand it:
+    - `CallParticipant` and the voice room members gain `deafened`. It's present only when true, and only together with `muted`.
+    - On the wire, every hello's `payload` advertises caps: `{"caps":["deafen"]}`, as JSON with no other keys.
+      - At most 128 bytes and 8 caps, each 1–16 characters of `[a-z0-9-]`. Unknown caps are ignored, and anything malformed means no caps.
+      - Cores before 0.6.0 never read a hello's payload.
+    - Caps are remembered per signer, up to 1024; when full, the stalest goes. They expire with the roster's hello timeout.
+    - A hello carries `deafened: true` only to signers that advertised `deafen`, because older cores refuse unknown fields.
+      - A broadcast hello is sealed twice, with a fresh nonce each time. Everyone else, my own other computers included, gets the plain one.
+    - A received `deafened` counts only with `muted`.
   - `sendSignal(to, kind: 'offer' | 'answer' | 'ice', payload: string)` returns `null`.
     - Errors:
       - `not-allowed`: not in a call, or `to` isn't in it.
@@ -109,18 +267,98 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - Events:
     - `call.state` (a `CallState`) on every change to my call: join, leave, mute or timeout. After a leave, or a refusal by a full call, its `participants` is `[]`.
     - `call.signal { from, kind, payload, fingerprintVerified: true }`.
-    - `voice.room` (a `VoiceRoom`) when a room's roster changes (join, leave, mute, timeout, kick), whether or not I'm in it. At most one per room per sync round, and only while I'm a member. It's a hint: re-read with `getVoiceRoom`. `muted` is a display hint.
+    - `voice.rooms { serverId, rooms: VoiceRoom[] }`: the whole list, sent when a server's rooms change (created, gone, join, leave, mute, timeout, kick, rename, limit), whether or not I'm in one.
+      - At most one per server per sync round, and only while I'm a member.
+      - It's a hint: re-read with `listVoiceRooms`. `muted` is a display hint.
   - It fails closed. A core-to-core envelope is signed by the sender's identity key under `mvs/voice-signal/v1`, and the signature covers the SDP and its fingerprint. The core drops, without an event:
-    - an envelope that doesn't verify or isn't `v: 1`;
+    - an envelope that doesn't verify, or isn't `v: 2` (0.4.x's v1 is dropped, so rooms need everyone on 0.4.3 or later);
+    - one without a `room { creator, createdAt }`, or whose room ID doesn't derive from it;
+    - a hello for a room new to us whose `createdAt` is more than 120 s ahead of our clock (an older room is fine: we may have come online late), or whose creator may not call;
+    - an 11th room's hellos;
+    - a `joinedAt` outside the window above while learning a room;
+    - an `edit` from anyone but the server owner, or one not sent to the master;
     - one outside ±120 s of our clock;
     - a replayed nonce (up to 4096 remembered; when the cache is full, new envelopes are dropped);
-    - one from someone who couldn't join that call themselves;
+    - one from someone who couldn't call in that server;
     - an offer or answer without a fingerprint.
-  - Presence: a hello every 10 s, a bye on leaving, and a participant dropped after 30 s of silence.
-    - Hellos and byes go only to members who could join that call themselves, so a call in an 18+ channel isn't shown to anyone else.
+  - Presence: a hello every 10 s, a bye on leaving, and a participant dropped after 30 s of silence. A master that goes quiet is dropped the same way, and the hand-off follows.
+    - Hellos and byes go only to members who may call.
+    - They also go to my own identity, which reaches only my other computers (same recovery words). A hello or bye signed by me counts only when sync bound its sender to me and it has no `to`. It marks me "in a call elsewhere" until its bye or 30 s without a hello, and never appears in a roster. My own envelopes echoed back are replays.
     - A full call's refusal counts only if it comes from someone already in that call, within 10 s of joining.
   - `applyUpdate` answers `not-allowed` during a call.
-- `CoreError.code`, voice: `'call-full' | 'relay-only'`.
+- Relay-only (GAP-6r), per device:
+  - `setRelayOnly(on: boolean)` returns `null`. It's stored in the core database and needs no identity. On:
+    - the network keeps no direct listener, makes no direct dials, and reaches peers only through relay circuits, and direct connections already open are closed (#274);
+    - my call ends at once (a bye to the others, then a `call.state` with `participants: []` and `relayOnly: true`);
+    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off.
+  - At start, `mvs-core` reads the stored value before the network starts, and the node starts relay-only from the first moment (`NodeConfig.relay_only`: no direct listener, no bootstrap dial, no punching). It fails closed: a database that can't be opened or read, or a value other than off, means on.
+  - Shown up front:
+    - `AppInfo.relayOnly` from `getAppInfo`;
+    - `VoiceRoom.relayOnly`, so the UI can disable "Join" before trying;
+    - `CallState.relayOnly`.
+  - After a change, one `voice.rooms` per server at the next sync round carries the new value.
+- `CoreError.code`, voice: `'call-full' | 'relay-only' | 'in-call-elsewhere' | 'room-cap'`.
+- Member relays (#368, slice 1). The setting only: the relay itself is slice 2.
+  - `MemberRelay { setting: 'auto' | 'on' | 'off', effective: boolean, reason?: 'global-off' | 'minor' | 'relay-only' | 'metered', role: boolean, disclosureSeen: boolean, dailyCapMb: number }`.
+    - `setting` is stored in the core database, per device, and defaults to `'auto'`.
+    - `role` is true when I'm owner or admin in at least one server where I'm still a member (not closed, kicked or left), by the log as read so far.
+    - `'auto'` means `role`.
+    - `effective` is false until the one-time disclosure is acknowledged with `markMemberRelayDisclosureSeen` (PO on #387), whatever the setting. It's the one value slice 2's relay reads, so it fails closed. The UI shows the disclosure when relaying would be on but `disclosureSeen` is false: no `reason`, and the setting is `'on'`, or `'auto'` with `role`.
+    - `reason` forces `effective` off, whatever the setting. The first that applies wins:
+      1. `global-off`: the signed manifest's flag. Reserved; slice 3, never set yet.
+      2. `minor`: no trusted adult birth date (the age claim's rule: a restored date counts only once it agrees or its 30 days are up).
+      3. `relay-only`: relay-only is on.
+      4. `metered`: the desktop shell reports a metered connection (`setMetered`, below).
+    - Without an identity, `effective` is false.
+    - `dailyCapMb` defaults to 2048.
+  - `getMemberRelay()` returns `MemberRelay`.
+  - `setMemberRelay(setting)` returns `MemberRelay`. A setting other than those three is `bad-request`.
+  - `setMemberRelayCap(mb: number)` returns `MemberRelay`. Values from 256 to 51200 are accepted; anything else is `bad-request`.
+  - `markMemberRelayDisclosureSeen()` returns `null`.
+  - `setMetered(metered: boolean)` returns `null` (slice 3a). The desktop shell sends it, never the page: it is not in the renderer's allow-list or `CoreCommands`. Kept in memory only; the shell sets it whenever a core comes up, then on every change (it checks at start, every 60 s and when the network changes, and any error counts as not metered). A non-boolean or an extra field is `bad-request`.
+  - Event `memberRelay.changed`, with a `MemberRelay` payload. It fires once whenever any field differs from the last value announced, and never otherwise. That covers:
+    - a role read from the log (promote, demote, ownership);
+    - a join or leave;
+    - relay-only toggled;
+    - the birth date changing, or its 30 days ending;
+    - the setting, the cap or the disclosure changing.
+    The core checks after every command and every sync round.
+  - `core.status.memberRelay.effective` is the desktop shell's to add (it builds `core.status`). It can follow `memberRelay.changed`.
+- Device link, "approve on your other device" (`device-link-slice.md`). The network is dev-sync's `/mvs/device-link/1`, behind the port in `device-link-port-api.md`.
+  - **New device** (signed out):
+    - `startDeviceLink()` returns `{ qr, code, expiresAt }`. It's `not-allowed` once signed in, and `offline` without a relay reservation.
+      - `qr` is `mvs-link:1:` and base58 of `e_new_pub ‖ peer ID ‖ "\n" ‖ circuit address`. It's printable ASCII, at most 1024 characters.
+      - `code` is 10 characters of base32 (`[A-Z2-7]`), a rendezvous only: `derive_key("mvs/device-link-rv/v1", code)`.
+      - The link lasts 5 minutes. A new `startDeviceLink` replaces it.
+    - `cancelDeviceLink()` returns `null`.
+    - `confirmDeviceLink(match: boolean)` returns `null`, dispatched as `{ match }`. This is the new device's own check of the digits (Security Lead on #394): a DHT server that saw the rendezvous could race the first Hello with its own account.
+      - Nothing (seed, profile, birth date) is applied before `match=true`. A box that arrives earlier is held until then.
+      - `match=false` ends the link (`failed`, `refused`) and wipes anything held.
+      - Errors: `not-found` with no link; `bad-request` before `confirm`, when no digits are shown yet.
+    - Event `deviceLink.state`: `{ state: 'waiting' | 'confirm' | 'done' | 'expired' | 'failed', sas?, reason?: 'cancelled' | 'timeout' | 'refused' | 'network' | 'keyring' | 'restore' }`. Absent fields are left out, never `null`.
+      - `waiting` comes on start.
+      - `confirm`, with `sas`, comes on the approving device's first hello.
+      - `done` comes once the account has arrived and my user has confirmed the digits, followed by `identity.changed`.
+      - `expired` (`timeout`) comes after 5 minutes.
+      - `failed` comes with `cancelled`, or with `refused` (`confirmDeviceLink(false)`, or a box that doesn't open), or, when the account arrived but couldn't be restored, with `keyring` (this computer's keychain couldn't store it) or `restore` (anything else).
+  - **Approving device** (signed in):
+    - `beginDeviceApproval(qrOrCode)` returns `{ sas, expiresAt }`. A code may be lowercase, with spaces or dashes. Errors:
+      - `bad-request`: neither a QR nor a code;
+      - `not-allowed`: signed out;
+      - `not-found`: no such link, expired, or a QR whose key isn't the one answering;
+      - `locked-out`: another device's Hello holds the link, so someone else may be trying, and the user should start again (Security Lead on #394);
+      - `rate-limited`: after 3 attempts at one link;
+      - `offline`.
+      A retry from the same device reuses its one-time key, so it's the same session with the same digits.
+    - `confirmDeviceApproval(approve: boolean)` returns `null`. `true` sends the account and emits `account.deviceAdded { at, label? }`. `false` ends this attempt, and nothing is sent. Errors: `bad-request` with no approval in progress, `not-found` once expired.
+    - `account.deviceAdded { at, label? }`: `label` is plain text, at most 64 characters, with no control characters and no invisible format or direction marks (zero-width, bidi embeddings, overrides and isolates, word joiner, line and paragraph separators, BOM), and left out when unknown (today always). The notice is kept in the core database until `ackDeviceNotice(at)` (which returns `null`; an unknown `at` is fine). It's announced again at the first sync round after each start until acknowledged, so a client may see the same `at` twice and should key notices by it. The cross-device notice will feed the same store.
+  - **Crypto:**
+    - one-time X25519 keys;
+    - the SAS is `derive_key("mvs/device-link-sas/v1", e_new_pub ‖ e_old_pub)`, its first 4 bytes little-endian, mod 10^6, as 6 digits;
+    - the transfer key is `HKDF-SHA256(X25519, info "mvs/device-link/v1" ‖ e_new_pub ‖ e_old_pub)`. A low-order point gives no key;
+    - the account goes as one XChaCha20-Poly1305 box, a 24-byte nonce first: `{ seed, profile: { displayName, avatarSmall?, color? }, birthDate, birthDateTrusted, country }`.
+  - **Restore:** the new device follows `restoreIdentity`'s path: the keychain, then the backup's servers (#291). The birth date stays trusted if it was (#306), and the picture and colour are checked as for a profile post.
+  - **Not yet:** the notice on my other devices needs a notice slot at the backup holders (dev-sync). For now only the approving device shows `account.deviceAdded`.
 - Invites (#208), all moderator and up (`not-allowed` below that):
   - `createInvite(serverId, input?: { expiresMs?: number, maxUses?: number })`
     returns `{ id, link, expiresAt?, maxUses? }`. `expiresMs` is the last time a
@@ -149,6 +387,20 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - A short link stops working when its invite is revoked, expires or is
       used up, and when the server is closed, left or purged.
 - `Member.connection: 'direct' | 'relay' | null` (#187): how we reach an online member, a direct connection (LAN) or through the relay; `null` for us and for members who are offline. A change fires `members.changed`.
+- Messages held for their key (#285 follow-up). A plain member who just joined has no channel key until a moderator's re-key reaches them (usually well under a second).
+  - `sendMessage` then resolves at once with `{ ..., id: 'pending-<16 hex>', sendState: 'pending' }`, and fires `message.added` with it. Nothing is sealed or sent yet.
+    - The message is listed after the channel's stored messages (`getMessages`, `getMessageCount`).
+    - It lives in memory only: a restart drops it.
+    - At most 50 are held per channel at once; past that, `not-allowed`. Failed ones are bounded too: beyond 50 failed in a channel the oldest are dropped (the UI may still show them until it re-reads the channel).
+  - When the key comes, the core's background sync seals and sends it, and fires `message.updated` with the real message: its record `id`, `sendState: 'sent'`, and **`replaces: 'pending-…'`**. From then on it is an ordinary message (`sent`, then `received`).
+    - **Its `index` may differ from the pending entry's.** The same round can bring in other messages first: the key can make earlier messages readable, and others may have written meanwhile. These come as their own `message.added` events, before the replacement. The real message is placed after them, and any other held messages after it.
+    - So on `replaces`, the UI drops the entry with that `pending-…` ID (wherever it sits) before applying the message at its `index`. It should also re-read `getMessageCount` (or the visible window) rather than keep its own count.
+  - With no key after **2 minutes**, or if I can no longer send there (kicked, left, closed), it turns failed:
+    - `message.updated` with the same `pending-…` ID and `sendState: 'failed'`;
+    - and `notice: rekey-waiting` for the server.
+    - It stays listed, failed, until a restart or `discardMessage(messageId)`, which drops a held or failed `pending-…` message and wipes its text (`not-found` for any other ID). "Send again" is `discardMessage` plus a new `sendMessage`.
+  - `Message.replaces?: string` is new, and appears only on that one `message.updated`.
+  - A moderator or above never gets a pending message: they make the key on the way. A non-member, or someone kicked, still gets `not-allowed` at once.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):
@@ -158,7 +410,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - Each sync round it goes out once the rollout gate is open, and is retried until a member has it (B6 `sent`). Then the secret and subscription go too, and the others re-key.
     - If I'm kicked first, the `Leave` is dropped.
     - The leaver isn't banned, and comes back through a new invite as a plain member.
-  - `getUpdateNeeded(serverId)` returns the user IDs of members whose latest profile post lacks `server-lifecycle-v1`, or who have none: who blocks a rename or a delete. An empty list means the gate is open.
+  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). Any other cap name is `bad-request`. An empty list means the gate is open.
   - `closeServer(serverId)` returns `null`. The owner deletes the server for good: the core syncs first, then sends the close.
     - On the owner's core, and on every member's when it reads the close, the server is closed, not purged at once. `server.closed { serverId }` fires; any call there ends; its keys and sync subscription go, and it's no longer synced. It stays in `listServers`, read-only, with `ServerSummary.closed: true` (additive).
     - 30 days (`CLOSED_RETENTION_MS`) after the close was received, the rest is purged and `server.removed { serverId, reason: 'closed' }` fires. Its genesis and close record are kept forever, so the server reads as closed, never unknown.
@@ -170,7 +422,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks the cap.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 
@@ -213,7 +465,7 @@ plus a relaunch through the launcher.
 **Rules the core keeps:**
 - The first check runs once the UI is up (the first `markHealthy`, so the
   UI hears `update.ready`), or 2 minutes after start if that never comes.
-  Then every 6 h ± 30 min (jitter), and at once after `setUpdateChannel`.
+  Then every hour ± 5 min (jitter), and at once after `setUpdateChannel`.
   Each check downloads whatever is available. Downloads are never paused
   for a call: only the apply step waits. Check and download errors go to
   the log (`RUST_LOG`), never to the UI. An already staged version is

@@ -18,12 +18,18 @@ anyhow = "1"
 async-trait = "0.1"
 blake3 = "1"
 chacha20poly1305 = "0.10"
+# The LAN beacon socket (`lan_beacon`): shared port, multicast. Already in
+# the tree through tokio.
+socket2 = { version = "0.6", features = ["all"] }
 # Test and harness keys only (the app gets keys from core/identity).
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures = "0.3"
 libp2p = { version = "0.56", features = [
     "tokio",
     "tcp",
+    # QUIC (`/udp/<port>/quic-v1`) beside TCP: the direct path hole punching
+    # can open on Windows too (TCP simultaneous open never completes there).
+    "quic",
     # /wss to the relay behind Cloudflare: TLS by rustls with webpki roots
     # (libp2p-websocket's client config), no native-tls.
     "websocket",
@@ -43,7 +49,7 @@ libp2p = { version = "0.56", features = [
 ] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 records = { path = "../records" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
@@ -60,3 +66,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
 ] }
+
+[features]
+# Test hooks (`Node::test_dial`, `test_listen`, the member relay counts, the
+# device-link rendezvous helper) for this crate's integration tests only;
+# never in a build the app ships.
+test-util = []
+
+[dev-dependencies]
+# Turns `test-util` on for `tests/` (the crate's own integration tests).
+sync = { path = ".", features = ["test-util"] }

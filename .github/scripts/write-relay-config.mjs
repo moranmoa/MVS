@@ -5,9 +5,24 @@
 //   RELAY_TCP=/dns4/<tcp host>/tcp/4001/p2p/<peer id> \
 //   node write-relay-config.mjs <out.json>
 //
-// Output: {"relay": ..., "bootstrap": [...], "stun": ...}; each key only when its variable
-// is set ({} for neither). bootstrap is a plain-TCP route to the relay, so the
-// relay can observe clients' public addresses (DCUtR, #219).
+// Multi-relay: RELAYS and RELAYS_TCP are lists, one multiaddr per line or
+// comma-separated (or both). RELAYS wins over RELAY, and RELAYS_TCP over
+// RELAY_TCP; the singles stay as the fallback.
+// - relays (part A): 1-4, no relay (peer ID) twice, each
+//   /<host>/tcp/<port>[/ws|/wss]/p2p/<id> or /<host>/udp/<port>/quic-v1/p2p/<id>;
+// - bootstrap (part C): 1-4 (the clients' MAX_BOOTSTRAP), each plain TCP
+//   /<host>/tcp/<port>/p2p/<id> or QUIC /<host>/udp/<port>/quic-v1/p2p/<id>,
+//   at most one per relay and transport, so a relay can have TCP and QUIC;
+// - the two must agree: every bootstrap entry belongs to a configured relay,
+//   and every configured relay has at least one bootstrap entry (when a
+//   bootstrap is set at all).
+// Any mismatch fails the build. Errors name an entry's position, never the
+// address. <host> is /dns4|/dns6|/dns|/ip4|/ip6 followed by the name or IP.
+//
+// Output: {"relay": ..., "relays": [...], "bootstrap": [...], "stun": ...}; each key
+// only when its variable is set ({} for none). With RELAYS, "relay" is its
+// first entry. bootstrap is a direct (non-wss) route to the relays, so they
+// can observe clients' public addresses (DCUtR, #219).
 //
 // On Windows runners, run it with MSYS2_ENV_CONV_EXCL=RELAY (a prefix, so it
 // covers RELAY_TCP too): Git Bash otherwise rewrites "/dns4/..." into
@@ -20,16 +35,19 @@ if (!out) {
   process.exit(2);
 }
 
+function fail(message) {
+  console.error(`::error::${message}`);
+  process.exit(1);
+}
+
 function checked(name, value) {
   if (!value.startsWith("/") || /\s/.test(value) || value.length > 512) {
-    console.error(`::error::${name} is not a multiaddr (starts with /, no spaces, at most 512 chars)`);
-    process.exit(1);
+    fail(`${name} is not a multiaddr (starts with /, no spaces, at most 512 chars)`);
   }
   // Pinned by peer ID: without /p2p/<id>, Noise would accept whoever answers
   // at that address.
   if (!/\/p2p\/[1-9A-HJ-NP-Za-km-z]{46,60}$/.test(value)) {
-    console.error(`::error::${name} must end in /p2p/<relay peer id>`);
-    process.exit(1);
+    fail(`${name} must end in /p2p/<relay peer id>`);
   }
   return value;
 }
@@ -39,18 +57,68 @@ function checked(name, value) {
 // credentials: STUN-only needs none).
 function stunUrl(value) {
   const m = /^stun:([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:]{2,39}\]):(\d{1,5})$/.exec(value);
-  if (!m || Number(m[2]) < 1 || Number(m[2]) > 65535) {
-    console.error("::error::the STUN URL must be stun:<host>:<port>");
-    process.exit(1);
-  }
+  if (!m || Number(m[2]) < 1 || Number(m[2]) > 65535) fail("the STUN URL must be stun:<host>:<port>");
   return value;
 }
 
+const MAX_RELAYS = 4;
+const MAX_BOOTSTRAP = 4;
+const HOST = "/(?:dns4|dns6|dns|ip4|ip6)/[^/\\s]+";
+const PORT = "(?:[1-9][0-9]{0,4})";
+const ID = "/p2p/[1-9A-HJ-NP-Za-km-z]{46,60}";
+const RELAY_FORM = new RegExp(`^${HOST}(?:/tcp/${PORT}(?:/wss?)?|/udp/${PORT}/quic-v1)${ID}$`);
+const BOOTSTRAP_FORM = new RegExp(`^${HOST}(?:/tcp/${PORT}|/udp/${PORT}/quic-v1)${ID}$`);
+const peerId = (addr) => addr.slice(addr.lastIndexOf("/p2p/") + 5);
+const transport = (addr) => (addr.includes("/quic-v1/") ? "quic" : "tcp");
+const relayRule = { max: MAX_RELAYS, form: RELAY_FORM, key: peerId };
+const bootstrapRule = { max: MAX_BOOTSTRAP, form: BOOTSTRAP_FORM, key: (a) => `${peerId(a)} ${transport(a)}` };
+
+// A list variable: multiaddrs separated by newlines and/or commas (a
+// multiaddr never contains either); each entry trimmed, empty ones dropped,
+// each checked against the form, at most `max`, no `key` twice.
+function checkedList(name, text, { max, form, key }) {
+  const entries = text.split(/[\r\n,]/).map((e) => e.trim()).filter(Boolean);
+  if (entries.length > max) fail(`${name}: at most ${max} entries`);
+  const seen = new Set();
+  return entries.map((entry, i) => {
+    const addr = checked(`${name}, entry ${i + 1},`, entry);
+    if (!form.test(addr)) fail(`${name}, entry ${i + 1}: wrong form (see write-relay-config.mjs)`);
+    if (seen.has(key(addr))) fail(`${name}, entry ${i + 1}: listed twice`);
+    seen.add(key(addr));
+    return addr;
+  });
+}
+
+// The relay list and the bootstrap list must describe the same relays.
+function agree(relays, bootstrap) {
+  if (!relays.length || !bootstrap.length) return;
+  const relayIds = new Set(relays.map(peerId));
+  bootstrap.forEach((addr, i) => {
+    if (!relayIds.has(peerId(addr))) fail(`bootstrap entry ${i + 1} belongs to no configured relay`);
+  });
+  const covered = new Set(bootstrap.map(peerId));
+  relays.forEach((addr, i) => {
+    if (!covered.has(peerId(addr))) fail(`relay ${i + 1} has no bootstrap entry`);
+  });
+}
+
 const config = {};
-if (process.env.RELAY) config.relay = checked("the relay address", process.env.RELAY);
-if (process.env.RELAY_TCP) config.bootstrap = [checked("the TCP bootstrap address", process.env.RELAY_TCP)];
+const relays = process.env.RELAYS ? checkedList("the relay list", process.env.RELAYS, relayRule) : [];
+if (relays.length) {
+  config.relay = relays[0];
+  config.relays = relays;
+} else if (process.env.RELAY) {
+  config.relay = checkedList("the relay address", process.env.RELAY, { ...relayRule, max: 1 })[0];
+}
+const boot = process.env.RELAYS_TCP ? checkedList("the bootstrap list", process.env.RELAYS_TCP, bootstrapRule) : [];
+if (boot.length) {
+  config.bootstrap = boot;
+} else if (process.env.RELAY_TCP) {
+  config.bootstrap = checkedList("the TCP bootstrap address", process.env.RELAY_TCP, { ...bootstrapRule, max: 1 });
+}
+agree(config.relays || (config.relay ? [config.relay] : []), config.bootstrap || []);
 if (process.env.STUN) config.stun = stunUrl(process.env.STUN);
 writeFileSync(out, JSON.stringify(config));
-console.log(config.relay ? "relay configured" : "::warning::no relay address in this build: the app will run offline");
-console.log(config.bootstrap ? "TCP bootstrap configured" : "no TCP bootstrap address in this build");
+console.log(config.relays ? `${config.relays.length} relays configured` : config.relay ? "relay configured" : "::warning::no relay address in this build: the app will run offline");
+console.log(config.bootstrap ? `${config.bootstrap.length} bootstrap address(es) configured` : "no bootstrap address in this build");
 console.log(config.stun ? "STUN configured" : "no STUN server in this build");

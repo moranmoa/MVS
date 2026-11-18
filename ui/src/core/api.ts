@@ -29,6 +29,13 @@ import type {
   CallState,
   CallSignal,
   VoiceRoom,
+  ServerRestore,
+  DeviceApproval,
+  DeviceLinkOffer,
+  DeviceLinkState,
+  DeviceAdded,
+  MemberRelay,
+  MemberRelaySetting,
 } from './types';
 
 export interface CoreCommands {
@@ -56,8 +63,23 @@ export interface CoreCommands {
    * Success also lifts a burned challenge.
    */
   getRecoveryWords(): Promise<string[]>;
-  restoreIdentity(words: string[]): Promise<Identity>;
+  /**
+   * The account from its 12 words. `input` (#290) carries what the restore asks
+   * again, as for a new account (spec: age, restore asks again): language, country,
+   * birth date. The words alone still work.
+   */
+  restoreIdentity(words: string[], input?: NewIdentityInput): Promise<Identity>;
   updateProfile(input: ProfileInput): Promise<Identity>;
+  /**
+   * #304: removes this identity from this computer (the account stays on the
+   * network). Proof: this identity's 12 words, or `withoutWords` to accept
+   * losing it. Rejects invalid-words (with positions), not-allowed (another
+   * account's words), keyring-unavailable (nothing changed), bad-request,
+   * not-found. On desktop, withoutWords first asks in a native dialog; declining
+   * gives cancelled. On ok the core exits and the shell restarts it, and the
+   * shell clears the page's storage and its log.
+   */
+  signOut(words?: string[], withoutWords?: boolean): Promise<null>;
 
   // Servers and channels
   listServers(): Promise<ServerSummary[]>;
@@ -66,6 +88,12 @@ export interface CoreCommands {
   createChannel(serverId: Id, input: { name: string; adult: boolean }): Promise<Channel>;
   /** Owner only. Same name rules as createChannel. */
   updateChannel(channelId: Id, input: { name?: string; adult?: boolean }): Promise<Channel>;
+  /**
+   * G-11 (#323), owner or admin: puts the channel right before `before`, right
+   * after `after`, or last. Returns the server's channels in the new order.
+   * Rejects not-allowed, not-found, bad-request.
+   */
+  moveChannel(serverId: Id, channelId: Id, before?: Id, after?: Id): Promise<Channel[]>;
   /** Owner only; `not-allowed` for the default channel. */
   deleteChannel(channelId: Id): Promise<void>;
   listMembers(serverId: Id): Promise<Member[]>;
@@ -83,8 +111,12 @@ export interface CoreCommands {
   leaveServer(serverId: Id): Promise<void>;
   /** Owner only, for good. Then `server.closed`; 30 days later `server.removed { reason: 'closed' }`. */
   closeServer(serverId: Id): Promise<void>;
-  /** Who blocks rename and close: members whose MVS is too old. Empty when the gate is open. */
-  getUpdateNeeded(serverId: Id): Promise<Id[]>;
+  /**
+   * Who blocks a gate: members whose MVS is too old. No cap: rename and close;
+   * `'reactions-v1'`: reactions (G-26). Any other cap is `bad-request`. Empty
+   * when the gate is open.
+   */
+  getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]>;
   /**
    * Invites (#214), moderator and up (`not-allowed` below). `expiresMs` is the last
    * moment a join is accepted (ms since epoch; absent = never, `bad-request` if
@@ -102,24 +134,61 @@ export interface CoreCommands {
   sendMessage(channelId: Id, body: string, replyToId?: Id): Promise<Message>;
   editMessage(messageId: Id, body: string): Promise<void>;
   deleteMessage(messageId: Id): Promise<void>;
+  /**
+   * G-26: turns my `emoji` on or off under a message; then `message.updated`.
+   * Nothing changes when it's already so. Errors: `bad-request` (not an emoji
+   * `normalizeEmoji` accepts, or my 11th on this message), `not-found` (or
+   * deleted), `not-allowed`, `update-needed` (`getUpdateNeeded(serverId,
+   * 'reactions-v1')` says who), `rate-limited` (30 a minute per channel).
+   */
+  react(messageId: Id, emoji: string, on: boolean): Promise<void>;
   retryMessage(messageId: Id): Promise<void>;
+  /**
+   * #288: drops a held or failed `pending-…` message and wipes its text. No
+   * event: the caller removes it. `not-found` for any other id. "Send again" is
+   * this plus a new sendMessage.
+   */
+  discardMessage(messageId: Id): Promise<null>;
   markRead(channelId: Id): Promise<void>;
 
   // Safety
   blockUser(userId: Id): Promise<void>;
   kickMember(serverId: Id, userId: Id): Promise<void>;
+  // Device link (device-link-slice.md)
+  /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
+  startDeviceLink(): Promise<DeviceLinkOffer>;
+  cancelDeviceLink(): Promise<null>;
+  /** New device, on "confirm": the digits match the other device (Security Lead: nothing is applied before true). false fails the link. */
+  confirmDeviceLink(match: boolean): Promise<null>;
+  /** The "new device added" notice was seen ("It was me"); the core stops showing it. */
+  ackDeviceNotice(at: number): Promise<null>;
+  /** Signed-in device: reach the new device by its QR payload or code. Rejects not-found (no such link, or expired), rate-limited. */
+  beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
+  /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */
+  confirmDeviceApproval(approve: boolean): Promise<null>;
+  /** G-91: how far my servers are from coming back after a restore. */
+  getServerRestore(): Promise<ServerRestore>;
   // Voice v1 (#223)
-  /** A server's voice room and who is in it. Rejects not-found, not-allowed (not a member, kicked). */
-  getVoiceRoom(serverId: Id): Promise<VoiceRoom>;
+  /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
+  listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
   /**
-   * Joins a voice room (leaving any other call first); `channelId` is the room's
-   * id. Rejects not-found, not-allowed (a text channel), call-full, relay-only, not-implemented.
+   * Opens a new room in a server with me as its host, leaving any call first.
+   * Rejects room-cap (10 live rooms), relay-only, in-call-elsewhere, not-allowed.
+   */
+  createVoiceRoom(serverId: Id): Promise<CallState>;
+  /** The room's host or the server owner: rename (`''` = default) or set the limit (2–5, not below the count); a left-out field stays. The change arrives in the next voice.rooms. Rejects not-allowed, not-found (gone, or the host unreachable for an owner), bad-request. */
+  editVoiceRoom(roomId: Id, name?: string, limit?: number): Promise<null>;
+  /**
+   * Joins a live voice room (leaving any other call first); `channelId` is the room's
+   * id. Rejects not-found (not live), not-allowed (a text channel), call-full (at its limit), relay-only, in-call-elsewhere (#294: I'm already in it from another computer), not-implemented.
    */
   joinCall(channelId: Id): Promise<CallState>;
   /** Idempotent. */
   leaveCall(): Promise<null>;
   /** `not-allowed` when not in a call. */
   setMuted(muted: boolean): Promise<null>;
+  /** G-84b: tells the others in my call I hear no one (shown with mute). `not-allowed` outside a call. */
+  setDeafened(deafened: boolean): Promise<null>;
   /** For the voice engine only (ui/src/voice). Payload at most 12 KiB. */
   sendSignal(to: Id, kind: CallSignal['kind'], payload: string): Promise<null>;
 
@@ -131,6 +200,20 @@ export interface CoreCommands {
   exportDiagnostics(): Promise<string>;
   getAppInfo(): Promise<AppInfo>;
   setUpdateChannel(channel: UpdateChannel): Promise<void>;
+  /**
+   * Relay-only (GAP-6r, #272), per device: no direct connections, so members
+   * never see my IP; calls are off. On ends my call (a `call.state` with no
+   * participants and `relayOnly`), and `joinCall` answers `relay-only` until off.
+   * Shown up front as `AppInfo.relayOnly` and `VoiceRoom.relayOnly`.
+   */
+  setRelayOnly(on: boolean): Promise<void>;
+  /** Member relays (slice 1, #368): the setting, what it is now, and why it's off. */
+  getMemberRelay(): Promise<MemberRelay>;
+  setMemberRelay(setting: MemberRelaySetting): Promise<MemberRelay>;
+  /** The daily cap in MB (256–51200); bad-request outside it. */
+  setMemberRelayCap(mb: number): Promise<MemberRelay>;
+  /** The one-time disclosure was acknowledged ("OK"). */
+  markMemberRelayDisclosureSeen(): Promise<null>;
   restartToUpdate(): Promise<void>;
 }
 
@@ -156,7 +239,8 @@ export interface CoreEvents {
   /** Once, after the launcher went back to the previous version. */
   'update.rolledBack': { failed: string; running: string };
   /** e.g. after a kick: the server's encryption was renewed. */
-  'notice': { kind: 'encryption-renewed'; serverId: Id };
+  /** rekey-waiting: a message held for its key failed; sending there waits for a moderator's re-key. */
+  'notice': { kind: 'encryption-renewed' | 'rekey-waiting'; serverId: Id };
   /**
    * Desktop app only: an mvs:// invite link the OS handed to the app (a click
    * in a browser or chat). The UI opens the join dialog with it and joins only
@@ -165,11 +249,25 @@ export interface CoreEvents {
   'link.open': { link: string };
   /** Desktop shell (T8-01): sent on every change and on every page load. */
   'core.status': CoreStatus;
+  /** Desktop shell (G-61): a desktop notification was clicked; open its channel. */
+  'notify.click': { channelId: Id; messageId: Id | null };
+  /** Desktop shell, own title bar: maximized or restored, fullscreen or not. */
+  'window.state': { maximized: boolean; fullScreen: boolean };
+  /** Desktop shell: a close during a call; the UI asks, then closes with windowControl('close'). */
+  'window.closeRequest': Record<string, never>;
   /** Every change to my call; participants [] after leaving. */
   'call.state': CallState;
   'call.signal': CallSignal;
-  /** A voice room's roster changed (join, leave, mute, timeout), mine or not. A hint: re-read with getVoiceRoom. */
-  'voice.room': VoiceRoom;
+  /** A server's rooms changed (create, join, leave, mute, edit, timeout), mine or not. Coalesced; a hint: re-read with listVoiceRooms. */
+  'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
+  /** G-91: sent when anything in the restore progress changes. */
+  'serverRestore.changed': ServerRestore;
+  /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
+  'deviceLink.state': DeviceLinkState;
+  /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */
+  'account.deviceAdded': DeviceAdded;
+  /** Member relays: anything in it changed (role, servers, relay-only, birth date, setting). */
+  'memberRelay.changed': MemberRelay;
 }
 
 export type CoreEventName = keyof CoreEvents;

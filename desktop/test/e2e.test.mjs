@@ -107,6 +107,9 @@ const until = async (cond, ms = 5_000) => {
   }
   return true;
 };
+/** A real key event through Electron's input pipeline (Playwright's skip before-input-event). */
+const key = (type, keyCode) =>
+  app.evaluate(({ BrowserWindow }, [t, k]) => BrowserWindow.getAllWindows()[0].webContents.sendInputEvent({ type: t, keyCode: k }), [type, keyCode]);
 
 test('permissions are refused, except the microphone during a call', async () => {
   // V-C2: no call, no microphone.
@@ -186,10 +189,65 @@ test('legacy desktop capture never gives a stream', async () => {
   assert.equal(await page.evaluate(() => location.origin), 'app://mvs');
 });
 
-test('the page sees only copyText, invoke and onEvent', async () => {
+test('the page sees only copyText, invoke, notify, onEvent, the core-down actions and the title bar', async () => {
   const keys = await page.evaluate(() => Object.keys(window.mvs).sort());
-  assert.deepEqual(keys, ['copyText', 'invoke', 'onEvent', 'openLogsFolder', 'retryCore']);
+  const frame = process.platform === 'darwin' ? [] : ['windowControl', 'windowFrame'];
+  assert.deepEqual(keys, ['copyText', 'invoke', 'lock', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setPushToTalk', 'setUnreadCount', ...frame].sort());
   assert.equal(await page.evaluate(() => typeof window.ipcRenderer), 'undefined');
+});
+
+test('push-to-talk: only the chosen key, only in a call, released after 200 ms (G-74)', async () => {
+  for (const bad of [null, 'KeyV', [], { key: 'MetaLeft' }, { key: 'v' }, { globalMute: 'M' }, { globalMute: 'Super+M' }, { globalMute: 'CommandOrControl+C' }, { globalMute: 'Alt+F4' }, { globalMute: 'Shift+F10' }]) {
+    assert.equal(await page.evaluate((s) => window.mvs.setPushToTalk(s), bad), 'invalid', JSON.stringify(bad));
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setPushToTalk({ key: 'KeyV', globalMute: null })), 'ok');
+  await page.evaluate(() => {
+    window.__ptt = [];
+    window.__pttOff = window.mvs.onEvent((name) => name.startsWith('ptt.') && window.__ptt.push(name));
+  });
+  // Not in a call: nothing.
+  await key('keyDown', 'V');
+  await key('keyUp', 'V');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), []);
+  // In a call: down, then up after the release delay; other keys say nothing.
+  assert.ok((await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]))).ok);
+  await key('keyDown', 'B');
+  await key('keyUp', 'B');
+  await key('keyDown', 'V');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), ['ptt.down']);
+  await key('keyUp', 'V');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), ['ptt.down'], 'held for the release delay');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), ['ptt.down', 'ptt.up']);
+  // A global toggle-mute shortcut: registered with the OS only during a call.
+  const registered = () => app.evaluate(({ globalShortcut }) => globalShortcut.isRegistered('Alt+Shift+F13'));
+  const set = await page.evaluate(() => window.mvs.setPushToTalk({ key: 'KeyV', globalMute: 'Alt+Shift+F13' }));
+  assert.ok(set === 'ok' || set === 'shortcut-taken', set);
+  if (set === 'ok') {
+    assert.equal(await registered(), true);
+    // The same settings again change nothing.
+    assert.equal(await page.evaluate(() => window.mvs.setPushToTalk({ key: 'KeyV', globalMute: 'Alt+Shift+F13' })), 'ok');
+    assert.equal(await registered(), true);
+    await page.evaluate(() => window.mvs.invoke('leaveCall', []));
+    assert.ok(await until(async () => !(await registered())), 'released when the call ends');
+    assert.ok((await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]))).ok);
+    assert.equal(await registered(), true, 'back for the next call');
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setPushToTalk({ key: null, globalMute: null })), 'ok');
+  assert.equal(await registered(), false);
+  await page.evaluate(() => window.__pttOff());
+  await page.evaluate(() => window.mvs.invoke('leaveCall', []));
+});
+
+test('setUnreadCount takes whole numbers 0..9999 only (G-62)', async () => {
+  for (const bad of [-1, 1.5, 10000, '3', null, NaN, Infinity, { n: 1 }]) {
+    assert.equal(await page.evaluate((v) => window.mvs.setUnreadCount(v), bad), false);
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(12)), true);
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(0)), true);
 });
 
 test('copyText writes plain text only, through main', async () => {
@@ -203,6 +261,25 @@ test('copyText writes plain text only, through main', async () => {
   // The page itself still has no clipboard permission.
   const web = await page.evaluate(() => navigator.clipboard.writeText('web').then(() => 'ok', () => 'denied'));
   assert.equal(web, 'denied');
+});
+
+test('the title bar command does only its actions', { skip: process.platform === 'darwin' }, async () => {
+  assert.equal(await page.evaluate(() => window.mvs.windowFrame), process.platform === 'win32' ? 'overlay' : 'custom');
+  for (const bad of ['setBounds', 'devtools', '', 'constructor', 'theme:#ff0000', 'maximize', 'state']) {
+    assert.equal(await page.evaluate((a) => window.mvs.windowControl(a), bad), false);
+  }
+  assert.equal(await page.evaluate(() => window.mvs.windowControl('toggle-maximize')), true);
+  assert.equal(await page.evaluate(() => window.mvs.windowControl('toggle-maximize')), true);
+});
+
+test('notify goes through main; the page itself still cannot notify (G-61)', async () => {
+  // Malformed notices are refused before anything reaches the OS.
+  assert.equal(await page.evaluate(() => window.mvs.notify({ title: 'x' })), false);
+  assert.equal(await page.evaluate(() => window.mvs.notify('x')), false);
+  assert.equal(await page.evaluate(() => window.mvs.notify({ title: 'a', body: 'b', channelId: 'bad id!' })), false);
+  // The web Notification permission stays denied.
+  const perm = await page.evaluate(() => Notification.requestPermission());
+  assert.equal(perm, 'denied');
 });
 
 test('allowed commands reach the core with named args and the data dir', async () => {
@@ -244,4 +321,18 @@ test('retryCore restarts the core, at most once in 5 s; the log file exists (T8-
   const dir = await app.evaluate(({ app: a }) => a.getPath('logs'));
   const { readdirSync } = await import('node:fs');
   assert.ok(readdirSync(dir).includes('mvs.log'), 'mvs.log in the logs folder');
+});
+
+// Last: it closes the app. During a call a close is held for the page to ask
+// first; this demo page never answers, and a second close still closes.
+test('during a call, a second close always closes (the page cannot keep the app open)', { skip: process.platform === 'darwin' }, async () => {
+  const joined = await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]));
+  assert.ok(joined.ok, JSON.stringify(joined));
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close());
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1, 'the first close is held');
+  const closed = new Promise((resolve) => app.once('close', resolve));
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close()).catch(() => {});
+  await closed;
+  app = null;
 });

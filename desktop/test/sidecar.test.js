@@ -57,11 +57,53 @@ test('spawned by absolute path, no shell, minimal env, data dir argument', async
 test('relative paths are refused', () => {
   assert.throws(() => new Sidecar({ exe: 'mvs-core', dataDir: DATA, onEvent() {} }), /absolute/);
   assert.throws(() => new Sidecar({ exe: FAKE, dataDir: 'data', onEvent() {} }), /absolute/);
+  assert.throws(() => new Sidecar({ exe: process.execPath, script: 'fake-core.js', dataDir: DATA, onEvent() {} }), /absolute/);
+});
+
+test('a .js stand-in runs as exe <script> with ELECTRON_RUN_AS_NODE (checkouts on Windows)', async () => {
+  let seen;
+  const spawnImpl = (exe, args, opts) => {
+    seen = { exe, args, opts };
+    return require('node:child_process').spawn(exe, args, opts);
+  };
+  const core = new Sidecar({ exe: process.execPath, script: FAKE, dataDir: DATA, onEvent() {}, spawnImpl }).start();
+  const res = await core.request('getAppInfo', {});
+  core.stop();
+  assert.equal(seen.exe, process.execPath);
+  assert.deepEqual(seen.args, [FAKE, '--data-dir', DATA]);
+  assert.equal(seen.opts.env.ELECTRON_RUN_AS_NODE, '1');
+  assert.deepEqual(res.ok.argv, ['--data-dir', DATA]);
 });
 
 test('minimalEnv keeps only the listed variables', () => {
   const env = minimalEnv({ HOME: '/h', NODE_OPTIONS: '--inspect', ELECTRON_RUN_AS_NODE: '1', LD_PRELOAD: 'x.so', DBUS_SESSION_BUS_ADDRESS: 'unix:x' });
   assert.deepEqual(env, { HOME: '/h', DBUS_SESSION_BUS_ADDRESS: 'unix:x' });
+});
+
+test('MVS_DEBUG_LOG=1 gives the core a fixed sync/join filter, and nothing else does', () => {
+  const filter = 'off,mvs::join=info,sync=debug';
+  assert.equal(minimalEnv({ HOME: '/h', MVS_DEBUG_LOG: '1' }).RUST_LOG, filter);
+  // The user's own RUST_LOG never reaches the core, with or without it.
+  assert.equal(minimalEnv({ HOME: '/h', RUST_LOG: 'api=trace' }).RUST_LOG, undefined);
+  assert.equal(minimalEnv({ HOME: '/h', RUST_LOG: 'api=trace', MVS_DEBUG_LOG: '1' }).RUST_LOG, filter);
+  for (const v of ['0', 'true', 'yes', '', ' 1']) assert.equal(minimalEnv({ MVS_DEBUG_LOG: v }).RUST_LOG, undefined, v);
+  assert.equal('MVS_DEBUG_LOG' in minimalEnv({ MVS_DEBUG_LOG: '1' }), false);
+});
+
+test('a sync debug line from the core reaches mvs.log with peer IDs and addresses redacted', () => {
+  const { createLog } = require('../src/logfile');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mvs-debuglog-'));
+  try {
+    const log = createLog(dir);
+    const peer = '12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc';
+    const server = 'ab'.repeat(32);
+    log(`core: 2026-11-10T14:00:00Z DEBUG sync::node: dialling peer=${peer} address=/ip4/203.0.113.7/tcp/4001/p2p/${peer} server=${server}`);
+    const text = fs.readFileSync(path.join(dir, 'mvs.log'), 'utf8');
+    for (const secret of [peer, '203.0.113.7', server]) assert.ok(!text.includes(secret), text);
+    assert.ok(text.includes('dialling'), text);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a request\'s events arrive before its response', async () => {

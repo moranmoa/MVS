@@ -4,6 +4,8 @@
 // MVS_RELAY (and MVS_BOOTSTRAP) environment variables instead.
 //
 //   { "relay": "/dns4/<host>/tcp/443/wss/p2p/<peer id>",
+//     "relays": ["/dns4/<host>/…/p2p/<id>", …],                  (optional, 1-4;
+//                                     multi-relay: preferred over "relay")
 //     "bootstrap": ["/dns4/<host>/tcp/4001/p2p/<peer id>",        (optional)
 //                   "/dns4/<host>/udp/4001/quic-v1/p2p/<peer id>"],
 //     "stun": "stun:<host>:3478" }                            (optional, voice)
@@ -58,6 +60,56 @@ function relayFor({ packaged, resourcesPath, env = process.env, warn = (m) => co
   return value;
 }
 
+/** Most relays passed on (mvs-core takes at most 4; multi-relay part A). */
+const MAX_RELAYS = 4;
+
+/** The pinned peer ID at the end of a checked relay address. */
+function peerIdOf(addr) {
+  return addr.slice(addr.lastIndexOf('/p2p/') + 5);
+}
+
+/**
+ * The relays to give the core, in order of preference (multi-relay part A):
+ * the `relays` list of mvs-config.json, or MVS_RELAYS (one per line, or
+ * comma-separated) in a checkout. Each must pass validRelay; bad entries and
+ * a second entry for the same relay (peer ID) are dropped with a warning that
+ * never names them, and at most MAX_RELAYS are kept. Without a usable list,
+ * the single `relay` / MVS_RELAY (relayFor) is the fallback. [] = offline.
+ * @param {{ packaged: boolean, resourcesPath?: string, env?: object, warn?: (m: string) => void }} o
+ * @returns {string[]}
+ */
+function relaysFor(o) {
+  const { packaged, resourcesPath, env = process.env, warn = (m) => console.warn(m) } = o;
+  let list;
+  if (packaged) {
+    const file = path.join(resourcesPath, 'mvs-config.json');
+    if (fs.existsSync(file)) {
+      try {
+        list = JSON.parse(fs.readFileSync(file, 'utf8')).relays;
+      } catch {
+        list = undefined; // relayFor warns below
+      }
+    }
+  } else if (typeof env.MVS_RELAYS === 'string' && env.MVS_RELAYS.trim()) {
+    list = env.MVS_RELAYS.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+  }
+  if (list !== undefined && list !== null && !Array.isArray(list)) {
+    warn('ignoring a malformed relay list');
+    list = undefined;
+  }
+  if (Array.isArray(list) && list.length) {
+    const ok = list.filter(validRelay);
+    if (ok.length < list.length) warn('ignoring malformed relay addresses');
+    const seen = new Set();
+    const distinct = ok.filter((a) => !seen.has(peerIdOf(a)) && seen.add(peerIdOf(a)));
+    if (distinct.length < ok.length) warn('ignoring a relay listed twice');
+    if (distinct.length > MAX_RELAYS) warn(`using the first ${MAX_RELAYS} relays`);
+    if (distinct.length) return distinct.slice(0, MAX_RELAYS);
+    warn('no usable relay in the list; trying the single relay');
+  }
+  const single = relayFor(o);
+  return single ? [single] : [];
+}
 
 /** Most `bootstrap` entries passed on (mvs-core takes at most 4). */
 const MAX_BOOTSTRAP = 4;
@@ -83,7 +135,8 @@ function bootstrapFor({ packaged, resourcesPath, env = process.env, warn = (m) =
       return []; // relayFor already warned
     }
   } else {
-    list = env.MVS_BOOTSTRAP ? env.MVS_BOOTSTRAP.split(',') : undefined;
+    // Commas and/or newlines, like MVS_RELAYS; entries trimmed, empty ones dropped.
+    list = env.MVS_BOOTSTRAP ? env.MVS_BOOTSTRAP.split(/[\r\n,]/).map((s) => s.trim()).filter(Boolean) : undefined;
   }
   if (list === undefined || list === null) return [];
   if (!Array.isArray(list)) {
@@ -153,4 +206,4 @@ function logHost(addr) {
   return m ? m[1] : null;
 }
 
-module.exports = { MAX_RELAY, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, bootstrapFor, logHost, validStun, stunFor, stunHost };
+module.exports = { MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, relaysFor, bootstrapFor, logHost, validStun, stunFor, stunHost };

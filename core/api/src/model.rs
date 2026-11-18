@@ -149,7 +149,7 @@ pub(crate) struct GenesisBody {
 // right after the join (posts need a member).
 // TODO(groupkeys): the display name is readable by anyone holding the
 // records (relays too) until control-log content is encrypted.
-// TODO(profiles): updateProfile re-posts it to every server.
+// `updateProfile` with a new name re-posts it to every server I'm in.
 
 /// A v0 link, `mvs://join/<server>/<invite>/<secret>`, all 64 hex
 /// (`crate::invite_link`, the one parser). The secret (GAP-4) is a bearer
@@ -165,7 +165,13 @@ pub(crate) const FIRST_INVITE: Action = Action::Invite { expires_ms: 0, max_uses
 /// Server lifecycle (#229): what a profile post says this version can read.
 /// Old versions ignore the field (`ProfileBody` takes unknown fields).
 pub(crate) const SERVER_LIFECYCLE_CAP: &str = "server-lifecycle-v1";
-
+/// G-26: this version reads `Reaction` records (kind 21). Older cores
+/// refuse an unknown kind and stall the channel behind it, so nobody
+/// reacts until every member posts this.
+pub(crate) const REACTIONS_CAP: &str = "reactions-v1";
+/// Every cap this version posts, and the only names `getUpdateNeeded`
+/// takes.
+pub(crate) const CAPS: [&str; 2] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {
@@ -174,15 +180,26 @@ struct ProfileBody {
     /// Absent before server lifecycle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     caps: Vec<String>,
+    /// #354: a small picture (`avatar::valid_avatar`); absent leaves the
+    /// earlier one, `""` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    avatar: Option<String>,
+    /// #354: `#rrggbb`; absent leaves the earlier one, `""` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
 }
 
-/// The post a member signs to tell the server their display name, and
-/// what this version can read.
-pub(crate) fn profile_action(display_name: &str) -> Action {
+/// The post a member signs to tell the server their display name, picture
+/// and colour, and what this version can read. `None` leaves a field out, so
+/// receivers keep the earlier value (a restore never wipes it); `Some("")`
+/// clears it (#354).
+pub(crate) fn profile_action_with(display_name: &str, avatar: Option<&str>, color: Option<&str>) -> Action {
     let body = ProfileBody {
         mvs: PROFILE_TAG.to_owned(),
         display_name: display_name.to_owned(),
-        caps: vec![SERVER_LIFECYCLE_CAP.to_owned()],
+        caps: CAPS.iter().map(|c| (*c).to_owned()).collect(),
+        avatar: avatar.map(str::to_owned),
+        color: color.map(str::to_owned),
     };
     Action::Post { text: serde_json::to_string(&body).expect("plain struct") }
 }
@@ -381,6 +398,30 @@ impl<'a> ServerView<'a> {
     /// role, then key.
     /// Each author's latest display name from their profile posts. A name
     /// with bidi, control or zero-width characters (B23) isn't shown.
+    /// #354: each member's picture and colour from their profile posts, in
+    /// order: a valid value sets it, `""` clears it, an absent field leaves
+    /// it, and an invalid one is ignored (untrusted posts).
+    pub fn looks(&self) -> BTreeMap<PublicKey, (Option<String>, Option<String>)> {
+        let by_id: HashMap<RecordId, &Record> = self.records.iter().map(|r| (r.id(), r)).collect();
+        let mut out: BTreeMap<PublicKey, (Option<String>, Option<String>)> = BTreeMap::new();
+        for id in &self.state.posts {
+            let Some(record) = by_id.get(id) else { continue };
+            let Some(body) = parse_profile(record) else { continue };
+            let entry = out.entry(record.author()).or_default();
+            match body.avatar.as_deref() {
+                Some("") => entry.0 = None,
+                Some(url) if crate::avatar::valid_avatar(url) => entry.0 = Some(url.to_owned()),
+                _ => {}
+            }
+            match body.color.as_deref() {
+                Some("") => entry.1 = None,
+                Some(color) if crate::avatar::valid_color(color) => entry.1 = Some(color.to_owned()),
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn display_names(&self) -> BTreeMap<PublicKey, String> {
         let by_id: HashMap<RecordId, &Record> = self.records.iter().map(|r| (r.id(), r)).collect();
         let mut names: BTreeMap<PublicKey, String> = BTreeMap::new();
@@ -395,20 +436,33 @@ impl<'a> ServerView<'a> {
         names
     }
 
-    /// Server lifecycle's rollout gate (#229): whether each author's latest
-    /// profile post carries [`SERVER_LIFECYCLE_CAP`]. Members with no
-    /// profile post are absent (they count as needing an update).
-    pub fn lifecycle_caps(&self) -> BTreeMap<PublicKey, bool> {
+    /// A rollout gate (#229, G-26): whether each author's latest profile
+    /// post carries `cap` (one of [`CAPS`]). Members with no profile post
+    /// are absent (they count as needing an update).
+    pub fn caps(&self, cap: &str) -> BTreeMap<PublicKey, bool> {
         let by_id: HashMap<RecordId, &Record> = self.records.iter().map(|r| (r.id(), r)).collect();
         let mut caps = BTreeMap::new();
         for id in &self.state.posts {
             let Some(record) = by_id.get(id) else { continue };
             if let Some(profile) = parse_profile(record) {
-                let ready = profile.caps.iter().any(|c| c == SERVER_LIFECYCLE_CAP);
+                let ready = profile.caps.iter().any(|c| c == cap);
                 caps.insert(record.author(), ready);
             }
         }
         caps
+    }
+
+    /// The other current, non-kicked members whose latest profile post
+    /// lacks `cap` (or who have none): who keeps that gate shut.
+    pub fn lacking(&self, cap: &str, me: PublicKey) -> Vec<PublicKey> {
+        let caps = self.caps(cap);
+        self.state
+            .members
+            .iter()
+            .filter(|m| **m != me && !self.state.kicked.contains(m))
+            .filter(|m| caps.get(m) != Some(&true))
+            .copied()
+            .collect()
     }
 
     pub fn members(&self) -> Vec<MemberInfo> {
@@ -516,9 +570,304 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
+// ---- G-24: mentions -----------------------------------------------------
+//
+// A mention is the stable token `<@userId>` in a message body (GAPS §2.5):
+// the user ID as 64 lower-case hex, never a name, so a rename or two people
+// with one name don't break it. Older clients show the token as text.
+
+/// The users a body mentions, in order of first mention, each once.
+pub(crate) fn mention_tokens(text: &str) -> Vec<PublicKey> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("<@") {
+        let after = &rest[at + 2..];
+        let hex = after.get(..64);
+        let closed = after.as_bytes().get(64) == Some(&b'>');
+        let key = hex
+            .filter(|h| closed && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            .and_then(parse_hex32)
+            .map(PublicKey::from_bytes);
+        match key {
+            Some(key) => {
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+                rest = &after[65..];
+            }
+            None => rest = after,
+        }
+    }
+    out
+}
+
+// ---- G-11: channel order ---------------------------------------------------
+//
+// Tech Lead's design (side notes, g11-channel-order-design.md): a control-log
+// `Post` tagged `mvs/channel-order/v1`, like profile posts, so every version
+// accepts it and older ones ignore it. Body:
+// `{"mvs":"mvs/channel-order/v1","v":1,"pos":{"<channel hex>":"<key>"}}`.
+// Keys are fractional indexes: base-62 digits (`0-9A-Za-z`, ASCII order),
+// compared as strings, 1..=32 long, never ending in `0`.
+
+const CHANNEL_ORDER_TAG: &str = "mvs/channel-order/v1";
+/// The longest position key; a longer one means a rebalance.
+pub(crate) const POSITION_MAX: usize = 32;
+const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+#[derive(Serialize, Deserialize)]
+struct ChannelOrderBody {
+    mvs: String,
+    v: u32,
+    pos: BTreeMap<String, String>,
+}
+
+pub(crate) fn channel_order_action(pos: &BTreeMap<ChannelId, String>) -> Action {
+    let body = ChannelOrderBody {
+        mvs: CHANNEL_ORDER_TAG.to_owned(),
+        v: 1,
+        pos: pos.iter().map(|(id, key)| (hex_id(id.as_bytes()), key.clone())).collect(),
+    };
+    Action::Post { text: serde_json::to_string(&body).expect("plain struct") }
+}
+
+/// A well-formed position key.
+pub(crate) fn valid_position(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= POSITION_MAX
+        && key.bytes().all(|b| DIGITS.contains(&b))
+        && !key.ends_with('0')
+}
+
+fn digit(b: u8) -> u32 {
+    DIGITS.iter().position(|d| *d == b).expect("checked digit") as u32
+}
+
+/// A key strictly between `lo` and `hi` (`None`: no bound), both valid and
+/// `lo < hi`. Never ends in `0`, so there's always room before it.
+pub(crate) fn key_between(lo: Option<&str>, hi: Option<&str>) -> String {
+    let lo = lo.unwrap_or("").as_bytes();
+    let mut hi = hi.map(str::as_bytes);
+    let mut out = Vec::new();
+    for i in 0.. {
+        let l = lo.get(i).map_or(0, |b| digit(*b));
+        let h = hi.map_or(62, |hi| hi.get(i).map_or(0, |b| digit(*b)));
+        if h > l + 1 {
+            out.push(DIGITS[((l + h) / 2) as usize]);
+            break;
+        }
+        out.push(DIGITS[l as usize]);
+        if h > l {
+            // Below `hi` from here on: any larger tail fits.
+            hi = None;
+        }
+    }
+    String::from_utf8(out).expect("ascii")
+}
+
+/// `n` evenly spread keys, short (a rebalance).
+pub(crate) fn spread_keys(n: usize) -> Vec<String> {
+    let mut width = 1u32;
+    while 62u128.pow(width) <= (n as u128 + 1) * 4 {
+        width += 1;
+    }
+    let span = 62u128.pow(width);
+    (1..=n as u128)
+        .map(|i| {
+            let mut value = span * i / (n as u128 + 1);
+            let mut digits = vec![b'0'; width as usize];
+            for slot in digits.iter_mut().rev() {
+                *slot = DIGITS[(value % 62) as usize];
+                value /= 62;
+            }
+            let key = String::from_utf8(digits).expect("ascii");
+            key.trim_end_matches('0').to_owned()
+        })
+        .collect()
+}
+
+impl ServerView<'_> {
+    /// G-11: each live channel's position key. Channel-order posts count in
+    /// authority's linear order, each only if its author was owner or admin
+    /// at that record: in the state of the post's causal past (its deps and
+    /// theirs). Per channel, the last counting post wins. Deleted and
+    /// unknown channels, and bad keys, are ignored.
+    ///
+    /// Cheap against spam (Security Lead on #323): a post whose author was
+    /// never owner or admin in this server is skipped before anything is
+    /// parsed or resolved, and each resolved post's answer is remembered.
+    pub fn channel_positions(&self) -> BTreeMap<ChannelId, String> {
+        let ever_admin = self.ever_admin();
+        let by_id: HashMap<RecordId, &Record> = self.records.iter().map(|r| (r.id(), r)).collect();
+        let mut out = BTreeMap::new();
+        for id in &self.state.posts {
+            let Some(record) = by_id.get(id) else { continue };
+            if !ever_admin.contains(&record.author()) {
+                continue;
+            }
+            let Some(Action::Post { text }) = Action::from_record(record) else { continue };
+            let Ok(body) = serde_json::from_str::<ChannelOrderBody>(&text) else { continue };
+            if body.mvs != CHANNEL_ORDER_TAG || body.v != 1 {
+                continue;
+            }
+            if !self.admin_at(record, &by_id) {
+                continue;
+            }
+            for (channel, key) in body.pos {
+                let Some(channel) = parse_hex32(&channel).map(ChannelId::from_bytes) else { continue };
+                if valid_position(&key) && self.state.channels.contains_key(&channel) {
+                    out.insert(channel, key);
+                }
+            }
+        }
+        out
+    }
+
+    /// G-11 (#323, QA on 0.4.2): what unplaced channels sort by, so they keep
+    /// the order they were made in on every device. #general first; then the
+    /// causal depth of the `ChannelCreate` (a channel made after another
+    /// builds on it); then its time; then its record ID. Not the channel ID:
+    /// that is random, and `moveChannel` built its new order on it.
+    pub fn creation_order(&self) -> HashMap<ChannelId, (bool, usize, u64, RecordId)> {
+        let by_id: HashMap<RecordId, &Record> = self.records.iter().map(|r| (r.id(), r)).collect();
+        let mut depths = HashMap::new();
+        self.state
+            .channels
+            .iter()
+            .map(|(id, c)| {
+                let depth = record_depth(c.created, &by_id, &mut depths);
+                let ts = by_id.get(&c.created).map_or(0, |r| r.ts());
+                (*id, (!c.general, depth, ts, c.created))
+            })
+            .collect()
+    }
+
+    /// Everyone who was ever owner or admin here: the owner, and the target
+    /// of any accepted grant of admin or owner. One pass, no resolving.
+    fn ever_admin(&self) -> HashSet<PublicKey> {
+        let mut out = HashSet::from([self.owner]);
+        for record in self.records.iter().filter(|r| r.kind() == Kind::Grant) {
+            if let Some(Action::Grant { target, role }) = Action::from_record(record) {
+                if role >= authority::Role::Admin {
+                    out.insert(target);
+                }
+            }
+        }
+        out
+    }
+
+    /// `record`'s author is owner or admin in the state of its causal past.
+    /// The answer depends only on the record (its ID fixes its deps, and so
+    /// its past), so it's remembered by ID.
+    fn admin_at(&self, record: &Record, by_id: &HashMap<RecordId, &Record>) -> bool {
+        if let Some(known) = admin_cache().lock().expect("not poisoned").get(&record.id()) {
+            return *known;
+        }
+        let mut past: Vec<Record> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack: Vec<RecordId> = record.deps().to_vec();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(r) = by_id.get(&id) {
+                stack.extend(r.deps().iter().copied());
+                past.push((*r).clone());
+            }
+        }
+        let state = authority::resolve(self.id, &past);
+        let admin = state.role(record.author()) >= authority::Role::Admin;
+        let mut cache = admin_cache().lock().expect("not poisoned");
+        if cache.len() >= ADMIN_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(record.id(), admin);
+        admin
+    }
+}
+
+/// The longest dep path from `start` down to a record with no known deps
+/// (iterative, so a long log can't overflow the stack). Remembered in `memo`.
+fn record_depth(
+    start: RecordId,
+    by_id: &HashMap<RecordId, &Record>,
+    memo: &mut HashMap<RecordId, usize>,
+) -> usize {
+    let mut stack = vec![start];
+    while let Some(&id) = stack.last() {
+        if memo.contains_key(&id) {
+            stack.pop();
+            continue;
+        }
+        let deps = by_id.get(&id).map_or(&[][..], |r| r.deps());
+        let pending: Vec<RecordId> = deps.iter().copied().filter(|d| !memo.contains_key(d)).collect();
+        if pending.is_empty() {
+            let depth = deps.iter().map(|d| memo[d] + 1).max().unwrap_or(0);
+            memo.insert(id, depth);
+            stack.pop();
+        } else {
+            stack.extend(pending);
+        }
+    }
+    memo[&start]
+}
+
+/// `admin_at` answers by record ID, at most this many (then it starts over).
+const ADMIN_CACHE_MAX: usize = 4096;
+
+fn admin_cache() -> &'static std::sync::Mutex<HashMap<RecordId, bool>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<RecordId, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G-24: `<@64 lower-case hex>` tokens, in order, each once; anything
+    /// else (short, upper-case, unclosed, a name) isn't a mention.
+    #[test]
+    fn mention_tokens_are_strict() {
+        let a = "a".repeat(64);
+        let b = format!("{}1", "b".repeat(63));
+        let text = format!("hi <@{a}> and <@{b}>, again <@{a}>! <@{}> <@{}> <@{a} <@נועה>", "A".repeat(64), "c".repeat(63));
+        let keys: Vec<String> = mention_tokens(&text).iter().map(|k| hex_id(k.as_bytes())).collect();
+        assert_eq!(keys, [a.clone(), b]);
+        assert!(mention_tokens("").is_empty());
+        assert!(mention_tokens("<@").is_empty());
+        assert_eq!(mention_tokens(&format!("<@<@{a}>")).len(), 1);
+    }
+
+    /// G-11: 1,000 moves into the same gap keep every key valid and at most
+    /// 32 characters (a rebalance when the next one would pass it), and the
+    /// order always holds.
+    #[test]
+    fn position_keys_stay_short_and_ordered() {
+        let mut keys = spread_keys(4);
+        assert!(keys.windows(2).all(|w| w[0] < w[1]) && keys.iter().all(|k| valid_position(k)));
+        let mut rebalances = 0;
+        for _ in 0..1_000 {
+            // Right after the first key, before the second, again and again.
+            let key = key_between(Some(&keys[0]), Some(&keys[1]));
+            if key.len() > POSITION_MAX {
+                keys = spread_keys(keys.len());
+                rebalances += 1;
+            } else {
+                assert!(keys[0] < key && key < keys[1], "{} < {key} < {}", keys[0], keys[1]);
+                keys.insert(1, key);
+                keys.truncate(4);
+            }
+            assert!(keys.iter().all(|k| valid_position(k)), "{keys:?}");
+            assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        }
+        assert!(rebalances > 0, "never needed a rebalance");
+        // Before the first and after the last, too.
+        assert!(key_between(None, Some("1")).as_str() < "1");
+        assert!("z" < key_between(Some("z"), None).as_str());
+        assert!(!valid_position("") && !valid_position("a0") && !valid_position("a-b"));
+        assert!(!valid_position(&"a".repeat(33)));
+    }
 
     #[test]
     fn civil_dates() {

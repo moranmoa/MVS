@@ -97,6 +97,11 @@ pub trait Network: Send + Sync {
     /// Every record of `server` that reachable peers hold. Empty when nobody
     /// is online.
     fn fetch(&self, server: ServerId) -> Vec<Record>;
+    /// Diagnostics (the join log): peers connected now, and how many of them
+    /// directly. None for a network that doesn't know.
+    fn link_counts(&self) -> Option<(usize, usize)> {
+        None
+    }
 
     /// GAP-4: the identity key for peer bindings, from unlock to lock.
     fn unlock(&self, key: &records::SigningKey) {
@@ -124,6 +129,10 @@ pub trait Network: Send + Sync {
         let _ = id;
         None
     }
+
+    /// Asks the background sync loop (`Core::run_sync_loop`) for a round
+    /// now rather than at its next tick. Nothing to do without one.
+    fn wake(&self) {}
 
     /// B6-p: replace a held record by its stub, if the stub gate agrees.
     fn prune(&self, id: records::RecordId) {
@@ -181,6 +190,131 @@ pub trait Network: Send + Sync {
     fn close_server(&self, server: ServerId) {
         let _ = server;
     }
+
+    /// GAP-6r: the user's relay-only setting, at start and on each change.
+    /// On: no direct listener, no direct dials, peers through relay circuits
+    /// only.
+    fn set_relay_only(&self, on: bool) {
+        let _ = on;
+    }
+
+    /// Member relays (#368, slice 2): relay for bound current members of
+    /// servers we share (`MemberRelay.effective`), up to `daily_cap_mb` a
+    /// day; `role`: an owner or admin relay (members try those first). At
+    /// start and on each change.
+    fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
+        let _ = (on, daily_cap_mb, role);
+    }
+
+    /// Restore servers, phase A (#291): hands my sealed backup to the
+    /// holders (dev-sync's `/mvs/backup/1` stores and the relay mailbox, when
+    /// they exist). Best effort; the next sync round writes again.
+    fn put_backup(&self, tag: [u8; 32], blob: &[u8]) {
+        let _ = (tag, blob);
+    }
+
+    /// Every blob reachable holders keep under `tag`: untrusted answers,
+    /// which the core checks (`backup::open`).
+    fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
+        let _ = tag;
+        Vec::new()
+    }
+
+    // ---- holder notice slot (`notice-slot-spec.md`, dev-sync's network) ----
+
+    /// Hands my notice (`"mvsn1" ‖ …`, exactly `sync::NOTICE_LEN` bytes) to
+    /// the holders. Best effort.
+    fn put_notice(&self, blob: &[u8]) {
+        let _ = blob;
+    }
+
+    /// The notices holders keep under `tag_n` (the unlocked `w_n`'s tag;
+    /// nothing while [`Network::notice_unlock`] hasn't been called).
+    /// Untrusted answers: the core checks and opens each, removes
+    /// duplicates by (`at`, hash), and ignores anything older than its last
+    /// acknowledgement for that kind, since holders can replay.
+    fn fetch_notices(&self, tag_n: [u8; 32]) -> Vec<Vec<u8>> {
+        let _ = tag_n;
+        Vec::new()
+    }
+
+    /// The notice write key `w_n`, which signs notice fetches, from unlock
+    /// to [`Network::lock`].
+    fn notice_unlock(&self, w_n: &records::SigningKey) {
+        let _ = w_n;
+    }
+
+    // ---- device link (`device-link-port-api.md`, dev-sync's network) ----
+
+    /// New device: starts (or replaces) the one link, provider of `rv` for
+    /// 5 minutes, accepting one session on `/mvs/device-link/1`. `None`:
+    /// no relay reservation yet.
+    fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<DeviceLinkAddr> {
+        let _ = (rv, e_new_pub);
+        None
+    }
+
+    /// Stops providing and refuses further requests. Idempotent.
+    fn device_link_close(&self) {}
+
+    /// What arrived since the last call.
+    fn device_link_take(&self) -> Vec<DeviceLinkInbound> {
+        Vec::new()
+    }
+
+    /// Approving device, short-code path: who provides `rv`.
+    fn device_link_find(&self, rv: [u8; 32]) -> Result<DeviceLinkAddr, DeviceLinkError> {
+        let _ = rv;
+        Err(DeviceLinkError::NotFound)
+    }
+
+    /// Sends Hello over the relay circuit only; the new device's key back.
+    fn device_link_hello(&self, to: &DeviceLinkAddr, e_old_pub: [u8; 32]) -> Result<[u8; 32], DeviceLinkError> {
+        let _ = (to, e_old_pub);
+        Err(DeviceLinkError::Network)
+    }
+
+    /// Sends the sealed transfer to the same peer; Ok once it was received.
+    fn device_link_send(&self, to: &DeviceLinkAddr, ciphertext: &[u8]) -> Result<(), DeviceLinkError> {
+        let _ = (to, ciphertext);
+        Err(DeviceLinkError::Network)
+    }
+}
+
+/// Device link: where the new device can be reached (its peer ID, base58,
+/// and its relay circuit address).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLinkAddr {
+    pub peer: String,
+    pub circuit: String,
+}
+
+/// Device link: what reached the new device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceLinkInbound {
+    /// The signed-in device's one-time key (the network already answered
+    /// with ours).
+    Hello { e_old_pub: [u8; 32] },
+    /// The sealed transfer from that same peer.
+    Sealed { ciphertext: Vec<u8> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLinkError {
+    NotFound,
+    Network,
+    Refused,
+}
+
+/// The fake's one link: its rendezvous, address, key, inbox, and the key of
+/// the first Hello (one session).
+struct FakeLink {
+    rv: [u8; 32],
+    addr: DeviceLinkAddr,
+    e_new_pub: [u8; 32],
+    inbox: Vec<DeviceLinkInbound>,
+    locked: Option<[u8; 32]>,
+    sealed: bool,
 }
 
 /// An envelope handle, its server and the publication served under it.
@@ -192,6 +326,10 @@ type ServedInvite = ([u8; 32], ServerId, Vec<u8>);
 pub struct LoopbackNetwork {
     records: Mutex<HashMap<ServerId, Vec<Record>>>,
     invites: Mutex<Vec<ServedInvite>>,
+    /// A holder of backups: the highest valid version per tag.
+    backups: Mutex<HashMap<[u8; 32], Vec<u8>>>,
+    /// Device link: the one open link (the frozen port's fake guidance).
+    link: Mutex<Option<FakeLink>>,
 }
 
 impl LoopbackNetwork {
@@ -211,6 +349,75 @@ impl Network for LoopbackNetwork {
 
     fn fetch(&self, server: ServerId) -> Vec<Record> {
         self.records.lock().expect("not poisoned").get(&server).cloned().unwrap_or_default()
+    }
+
+    /// As a holder would (design §2): checked before it's kept, and only a
+    /// higher version replaces what's there.
+    fn put_backup(&self, tag: [u8; 32], blob: &[u8]) {
+        let Ok((blob_tag, version)) = crate::backup::check(blob) else { return };
+        if blob_tag != tag {
+            return;
+        }
+        let mut backups = self.backups.lock().expect("not poisoned");
+        let newer = backups
+            .get(&tag)
+            .and_then(|held| crate::backup::check(held).ok())
+            .is_none_or(|(_, held)| version > held);
+        if newer {
+            backups.insert(tag, blob.to_vec());
+        }
+    }
+
+    fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
+        self.backups.lock().expect("not poisoned").get(&tag).cloned().into_iter().collect()
+    }
+
+    fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<DeviceLinkAddr> {
+        let peer = format!("fake-{}", hex::encode(&e_new_pub[..4]));
+        let addr = DeviceLinkAddr { circuit: format!("/fake-relay/p2p-circuit/p2p/{peer}"), peer };
+        let link = FakeLink { rv, addr: addr.clone(), e_new_pub, inbox: Vec::new(), locked: None, sealed: false };
+        *self.link.lock().expect("not poisoned") = Some(link);
+        Some(addr)
+    }
+
+    fn device_link_close(&self) {
+        *self.link.lock().expect("not poisoned") = None;
+    }
+
+    fn device_link_take(&self) -> Vec<DeviceLinkInbound> {
+        let mut link = self.link.lock().expect("not poisoned");
+        link.as_mut().map(|l| std::mem::take(&mut l.inbox)).unwrap_or_default()
+    }
+
+    fn device_link_find(&self, rv: [u8; 32]) -> Result<DeviceLinkAddr, DeviceLinkError> {
+        let link = self.link.lock().expect("not poisoned");
+        link.as_ref().filter(|l| l.rv == rv).map(|l| l.addr.clone()).ok_or(DeviceLinkError::NotFound)
+    }
+
+    fn device_link_hello(&self, to: &DeviceLinkAddr, e_old_pub: [u8; 32]) -> Result<[u8; 32], DeviceLinkError> {
+        let mut link = self.link.lock().expect("not poisoned");
+        let l = link.as_mut().filter(|l| l.addr == *to && !l.sealed).ok_or(DeviceLinkError::NotFound)?;
+        // One session: the first Hello's key; a repeat gets the same answer.
+        match l.locked {
+            Some(first) if first != e_old_pub => return Err(DeviceLinkError::Refused),
+            Some(_) => {}
+            None => {
+                l.locked = Some(e_old_pub);
+                l.inbox.push(DeviceLinkInbound::Hello { e_old_pub });
+            }
+        }
+        Ok(l.e_new_pub)
+    }
+
+    fn device_link_send(&self, to: &DeviceLinkAddr, ciphertext: &[u8]) -> Result<(), DeviceLinkError> {
+        let mut link = self.link.lock().expect("not poisoned");
+        let l = link.as_mut().filter(|l| l.addr == *to).ok_or(DeviceLinkError::NotFound)?;
+        if l.locked.is_none() || l.sealed {
+            return Err(DeviceLinkError::Refused);
+        }
+        l.sealed = true;
+        l.inbox.push(DeviceLinkInbound::Sealed { ciphertext: ciphertext.to_vec() });
+        Ok(())
     }
 
     fn serve_invite(&self, server: ServerId, handle: [u8; 32], publication: &[u8], _: bool) -> bool {

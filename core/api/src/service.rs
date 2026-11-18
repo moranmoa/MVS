@@ -1,7 +1,7 @@
 //! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,10 +15,14 @@ use records::{ChannelId, Draft, Kind, PublicKey, Record, RecordId, Scope, Server
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::avatar;
+use crate::backup;
+use crate::devicelink::{self, OneTimeKey, Target};
 use crate::chat;
+use crate::reaction;
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
-use crate::ports::{CipherError, GroupCipher, Network, Ports, Reach, SharedSecrets};
+use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
 use crate::rekey::JoinBucket;
 use crate::types::*;
 use crate::update::Updates;
@@ -28,7 +32,85 @@ use updater::client::UpdateEvent;
 const DEFAULT_STORAGE_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 const KV_STORAGE_LIMIT: &str = "storage-limit";
 const KV_UPDATE_CHANNEL: &str = "update-channel";
+/// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
+/// about this computer's network.
+const KV_RELAY_ONLY: &str = "relay-only";
+/// Device link: "a new device was added" notices not yet acknowledged
+/// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
+/// start until acknowledged; the cross-device notice will feed it too.
+const KV_DEVICE_NOTICES: &str = "device-notices";
+/// At most this many notices are kept, the newest.
+const MAX_DEVICE_NOTICES: usize = 32;
+/// Member relays (#368, slice 1): `auto`, `on` or `off` (default `auto`);
+/// the one-time disclosure seen (`[1]`); the daily cap in MB (u32le).
+const KV_MEMBER_RELAY: &str = "member-relay";
+const KV_MEMBER_RELAY_SEEN: &str = "member-relay-disclosure-seen";
+const KV_MEMBER_RELAY_CAP: &str = "member-relay-cap-mb";
+/// Slice 3b: the last verified `memberRelayOff` from the signed `flags.json`.
+/// Written only by the update loop; there is no command for it.
+const KV_MEMBER_RELAY_GLOBAL_OFF: &str = "member-relay-global-off";
+/// The member relay's daily cap: default and accepted range, in MB.
+pub const MEMBER_RELAY_CAP_DEFAULT_MB: u32 = 2_048;
+pub const MEMBER_RELAY_CAP_MB: std::ops::RangeInclusive<u32> = 256..=51_200;
+
+/// Fails closed: off only when never set or set to off (`[0]`); any other
+/// value is on.
+fn relay_only_in(db: &Db) -> CoreResult<bool> {
+    Ok(!matches!(db.get(KV_RELAY_ONLY)?.as_deref(), None | Some([0])))
+}
+
+/// GAP-6r: the stored relay-only setting in the core database at
+/// `db_path`, read before the network starts so the node starts with it.
+/// Fails closed: a database that can't be opened or read means on, so an
+/// error never starts a relay-only user with direct connections. A fresh
+/// data dir (no `core.db` yet) is off: the database is created empty.
+pub fn stored_relay_only(db_path: &Path) -> bool {
+    match Db::open(Some(db_path)).and_then(|db| relay_only_in(&db)) {
+        Ok(on) => on,
+        Err(e) => {
+            // No path: it names the user's profile folder.
+            eprintln!("mvs-core: can't read the relay-only setting ({:?}); starting relay-only", e.code);
+            true
+        }
+    }
+}
 const KV_RECOVERY_CHALLENGE: &str = "recovery-challenge";
+/// Restore servers (#291): my servers as the backup last saw them, server
+/// ID (hex) to when this device first listed it. Not secret.
+const KV_BACKUP_KNOWN: &str = "backup-known";
+/// G-21: per channel, `read/<channel hex>` = the last message read, as
+/// JSON `[ts, "<record id hex>"]`. Local only (phase 3 syncs it).
+const KV_READ_PREFIX: &str = "read/";
+/// #354: a profile change waits to be published (coalesced).
+const KV_PROFILE_PENDING: &str = "profile-pending";
+/// Profile save (#378): the post limit's next-allowed time (GCRA's
+/// theoretical arrival time, u64le ms). Replaces `profile-posted-at`.
+const KV_PROFILE_POST_TAT: &str = "profile-post-tat";
+/// #359 follow-up: servers whose profile post was refused (JSON hex list).
+const KV_PROFILE_RETRY: &str = "profile-retry";
+/// Profile posts (Tech Lead, #378): a burst of [`PROFILE_POST_BURST`] at
+/// once, so an explicit save goes out right away, then one per this long
+/// (later changes coalesce: the latest values go).
+pub const PROFILE_POST_EVERY_MS: u64 = 10 * 60_000;
+pub const PROFILE_POST_BURST: u64 = 3;
+/// Restore servers: a restore still has servers to rejoin from the backup.
+const KV_BACKUP_PENDING: &str = "backup-pending";
+/// Restore servers: a fingerprint of the server set last backed up, and
+/// when it was last put (u64le ms).
+const KV_BACKUP_WRITTEN: &str = "backup-written";
+const KV_BACKUP_PUT_AT: &str = "backup-put-at";
+/// Restore servers: an unchanged backup is put again this often (design
+/// §4), so holders keep it and copies heal.
+pub const BACKUP_REPUBLISH_MS: u64 = 24 * 3_600_000;
+/// Restore servers: a restore still waiting (no backup found yet, or
+/// servers nobody could be reached for) is retried after 1 min, doubling
+/// to at most 1 h (Tech Lead); back to 1 min once it's done.
+pub const BACKUP_RETRY_FIRST_MS: u64 = 60_000;
+pub const BACKUP_RETRY_MAX_MS: u64 = 60 * 60_000;
+/// G-91: once the backup is found, the servers still waiting are tried
+/// this often (no backup fetch), so each is back within 2 minutes of a
+/// member of it being reachable (PO acceptance).
+pub const REJOIN_EVERY_MS: u64 = 30_000;
 
 pub struct Config {
     /// `None` keeps everything in memory (tests).
@@ -49,6 +131,63 @@ struct Profile {
     /// (#general). Older profiles and restored identities have none: English.
     #[serde(default)]
     locale: Option<Locale>,
+    /// B7 §9 / B13 §3 (decision 18): a birth date that raises my age over an
+    /// earlier "not adult" claim counts only from `effective_at`; until
+    /// then I count as under 18. `None`: nothing pending.
+    #[serde(default)]
+    pending_birth_date: Option<PendingBirth>,
+    /// #354: the small picture and colour other members see.
+    #[serde(default)]
+    avatar_small: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+    /// The birth date is the one my claims were made from: set at sign-up
+    /// here, agreeing with a claim a server already holds, or past its 30
+    /// days. Turning 18 with a trusted date is just a birthday: no wait.
+    /// False after a restore (the date was entered again) until one of
+    /// those happens. Profiles saved before this field: trusted.
+    #[serde(default = "trusted")]
+    birth_date_trusted: bool,
+}
+
+fn trusted() -> bool {
+    true
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingBirth {
+    date: String,
+    effective_at: u64,
+}
+
+/// Decision 18: a raise of the age takes effect this long after it was found.
+pub const AGE_RAISE_DELAY_MS: u64 = 30 * 86_400_000;
+
+impl Profile {
+    /// A raise is waiting at `now`.
+    fn raise_pending(&self, now: u64) -> bool {
+        self.pending_birth_date.as_ref().is_some_and(|p| now < p.effective_at)
+    }
+
+    /// My age as it counts at `now`: from the birth date, but at most 17
+    /// while a raise is pending (the earlier "not adult" claim stands).
+    fn effective_age(&self, now: u64) -> Option<u32> {
+        let age = model::age_on(&self.birth_date, now)?;
+        Some(if self.raise_pending(now) { age.min(17) } else { age })
+    }
+
+    /// A pending raise whose 30 days are up takes effect. True if it did.
+    fn settle(&mut self, now: u64) -> bool {
+        match &self.pending_birth_date {
+            Some(p) if now >= p.effective_at => {
+                self.birth_date_trusted = true;
+                self.pending_birth_date = None;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Kept in the store so a restart neither resets the count nor offers new
@@ -65,6 +204,13 @@ pub const CHALLENGE_POSITIONS: usize = 3;
 pub const MAX_CHECK_FAILURES: u8 = 5;
 /// How often the background sync runs without a hint.
 pub const SYNC_EVERY: Duration = Duration::from_secs(2);
+/// How long a message held for its channel key (the re-key a moderator
+/// makes when they read the join) waits before it is marked `failed`.
+pub const KEY_PENDING_FOR: Duration = Duration::from_secs(120);
+/// Provisional IDs of messages held for their key.
+pub const KEY_PENDING_PREFIX: &str = "pending-";
+/// Messages held for their key per channel at once; more get `not-allowed`.
+pub const MAX_KEY_PENDING: usize = 50;
 /// A join that found nobody online is retried in the background: first
 /// after `JOIN_RETRY_FIRST`, doubling up to `JOIN_RETRY_MAX`, for at most
 /// `JOIN_RETRY_FOR` (until then the inviter may still come online).
@@ -92,12 +238,51 @@ impl Me {
     }
 }
 
+/// Device link, the new device's side: the one-time key, until when, and
+/// the approving device's key once its Hello came (one session).
+struct NewLink {
+    key: OneTimeKey,
+    expires_at: u64,
+    old_pub: Option<[u8; 32]>,
+    /// My user said the digits match (`confirmDeviceLink(true)`). Nothing
+    /// is applied before: a DHT server that saw the rendezvous could race
+    /// the first Hello and send its own seed (Security Lead on #394).
+    confirmed: bool,
+    /// The opened account, held until `confirmed`.
+    held: Option<devicelink::Payload>,
+}
+
+/// Device link, the approving device's side, per link: the one-time key
+/// (the same for a retry, so the one session stays ours), the attempts, and
+/// once a Hello was answered, the address, the new device's key and when
+/// it ends.
+struct Approval {
+    key: OneTimeKey,
+    attempts: u32,
+    link: Option<(DeviceLinkAddr, [u8; 32])>,
+    expires_at: u64,
+}
+
 struct Inner {
     db: Db,
+    /// The core clock (G-26: the reaction fold skips records from the future).
+    clock: Arc<dyn crate::ports::Clock>,
     vault: Vault<SharedSecrets>,
     me: Option<Me>,
     /// The OS keychain failed at startup (QA-20).
     keyring_unavailable: bool,
+    /// Member relays: the value last announced (`memberRelay.changed` fires
+    /// when it differs). `None` until first worked out.
+    member_relay: Option<MemberRelay>,
+    /// Slice 3a: the shell says the network is metered (`setMetered`). In
+    /// memory only: the shell sets it at every start.
+    metered: bool,
+    /// Device link, the new device: my one link.
+    device_link: Option<NewLink>,
+    /// Device link, the approving device: by link (the QR's key or the
+    /// code's rendezvous), with the one in progress.
+    approvals: HashMap<[u8; 32], Approval>,
+    approving: Option<[u8; 32]>,
     /// Loaded on first use per server, then kept current record by record.
     logs: HashMap<ServerId, Log>,
     /// Messages already announced to the UI, per server, with what was
@@ -116,6 +301,42 @@ struct Inner {
     join_waiting: BTreeSet<ServerId>,
     /// Voice calls: mine, and who is in which call.
     calls: voice::Calls,
+    /// Messages written before their channel key reached me (a member who
+    /// just joined), oldest first: sent by the sync loop when it comes.
+    /// In memory only (never the plain text on disk): lost on restart.
+    key_pending: Vec<KeyPending>,
+}
+
+/// A message held for its channel key (`Core::send_message`).
+struct KeyPending {
+    /// Provisional, `pending-` + 16 random hex: never a record ID.
+    id: String,
+    server: ServerId,
+    channel: ChannelId,
+    author: PublicKey,
+    body: Zeroizing<String>,
+    created_at: u64,
+    failed: bool,
+}
+
+impl KeyPending {
+    fn message(&self, index: usize) -> Message {
+        Message {
+            id: self.id.clone(),
+            channel_id: model::hex_id(self.channel.as_bytes()),
+            index,
+            author_id: model::hex_id(self.author.as_bytes()),
+            body: self.body.as_str().to_owned(),
+            created_at: self.created_at,
+            edited_at: None,
+            deleted: None,
+            send_state: Some(if self.failed { SendState::Failed } else { SendState::Pending }),
+            replaces: None,
+            mentions: None,
+            mentions_me: None,
+            reactions: None,
+        }
+    }
 }
 
 pub struct Core {
@@ -126,6 +347,43 @@ pub struct Core {
     updates: Option<Arc<Updates>>,
     /// Joins that found nobody online yet, by link: retried by `sync_now`.
     pending_joins: Mutex<HashMap<String, PendingJoin>>,
+    /// Where `core.db` lives (`None` in memory): sign-out leaves its wipe
+    /// marker beside it.
+    db_path: Option<PathBuf>,
+    /// Signed out: the shell restarts the core, which finishes the wipe.
+    signed_out: AtomicBool,
+    /// Restore servers: the first sync round after start backs up (login).
+    backup_started: AtomicBool,
+    /// Device link: the stored notices were announced since this start.
+    notices_announced: AtomicBool,
+    /// Restore servers: when the next retry of a pending restore is due and
+    /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
+    /// once the restore is done.
+    backup_retry: Mutex<(u64, u64)>,
+    /// G-91: the restore under way, once its backup is found.
+    restore: Mutex<RestoreProgress>,
+    /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
+    /// waits, holding no server secrets.
+    keys_locked: AtomicBool,
+}
+
+/// G-91: a restore's progress. The backup is fetched until found (with
+/// backoff: a holder lookup is slow); after that only the servers still
+/// waiting are tried, every [`REJOIN_EVERY_MS`], so each comes back soon
+/// after a member of it is reachable (PO: within 2 minutes).
+struct RestoreProgress {
+    /// Live servers the backup lists (`None` until it's found).
+    found: Option<u32>,
+    /// Those not back yet: server → its sync secret.
+    waiting: BTreeMap<ServerId, Zeroizing<[u8; 32]>>,
+    /// What `getServerRestore` answers; announced when it changes.
+    status: ServerRestore,
+}
+
+impl RestoreProgress {
+    fn new(state: ServerRestoreState) -> RestoreProgress {
+        RestoreProgress { found: None, waiting: BTreeMap::new(), status: ServerRestore { state, found: 0, waiting: 0 } }
+    }
 }
 
 struct PendingJoin {
@@ -150,6 +408,63 @@ fn vault_error(e: VaultError) -> CoreError {
     }
 }
 
+/// Beside `core.db`: present from a sign-out until its files are gone.
+fn sign_out_marker(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("signed-out")
+}
+
+/// A sign-out's marker is still there after [`finish_sign_out`]: the
+/// keychain couldn't be read, so its files weren't deleted. The network
+/// must stay off (the old `node.key`).
+pub fn sign_out_pending(db_path: &Path) -> bool {
+    sign_out_marker(db_path).exists()
+}
+
+/// Sign-out, at the next start, before the database or the network opens.
+/// The marker beside `db_path` is an intent; `secret_present` is what the
+/// keychain says now (`None`: it can't be read).
+/// - No marker: nothing to do.
+/// - Marker, secret gone: the sign-out happened. Deletes `core.db` (and its
+///   `-wal`/`-shm`) and `sync_dir`, then the marker, and returns true.
+/// - Marker, secret still there: the sign-out never deleted it. The intent
+///   is cleared and nothing else is touched.
+/// - Marker, keychain unreadable: nothing is touched and the marker stays
+///   for the next start.
+///
+/// An error leaves the marker, so the next start tries again; the caller
+/// must not start the network on an error (the old `node.key` would link
+/// the next identity here to the last one).
+pub fn finish_sign_out(
+    db_path: &Path,
+    sync_dir: &Path,
+    secret_present: Option<bool>,
+) -> std::io::Result<bool> {
+    let marker = sign_out_marker(db_path);
+    if !marker.exists() {
+        return Ok(false);
+    }
+    match secret_present {
+        None => return Ok(false),
+        Some(true) => {
+            std::fs::remove_file(marker)?;
+            return Ok(false);
+        }
+        Some(false) => {}
+    }
+    let gone = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    gone(std::fs::remove_dir_all(sync_dir))?;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(suffix);
+        gone(std::fs::remove_file(PathBuf::from(name)))?;
+    }
+    std::fs::remove_file(marker)?;
+    Ok(true)
+}
+
 fn phrase_error(e: PhraseError) -> CoreError {
     let positions = e.positions().into_iter().map(|p| p + 1).collect();
     CoreError { code: ErrorCode::InvalidWords, positions: Some(positions) }
@@ -163,16 +478,11 @@ fn parse_server(id: &str) -> CoreResult<ServerId> {
     model::parse_hex32(id).map(ServerId::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
 
-/// Server lifecycle's rollout gate (#229): every current, non-kicked member
-/// but `me` has `server-lifecycle-v1` in their latest profile post (none
-/// counts as needing an update).
-fn gate_open(view: &ServerView, me: PublicKey) -> bool {
-    let caps = view.lifecycle_caps();
-    view.state
-        .members
-        .iter()
-        .filter(|m| **m != me && !view.state.kicked.contains(m))
-        .all(|m| caps.get(m) == Some(&true))
+/// A rollout gate (#229, G-26): every current, non-kicked member but `me`
+/// has `cap` in their latest profile post (none counts as needing an
+/// update).
+fn gate_open(view: &ServerView, me: PublicKey, cap: &str) -> bool {
+    view.lacking(cap, me).is_empty()
 }
 
 impl Core {
@@ -181,9 +491,15 @@ impl Core {
         let vault = Vault::new(SharedSecrets(ports.secrets.clone()));
         let mut inner = Inner {
             db,
+            clock: ports.clock.clone(),
             vault,
             me: None,
             keyring_unavailable: false,
+            member_relay: None,
+            metered: false,
+            device_link: None,
+            approvals: HashMap::new(),
+            approving: None,
             logs: HashMap::new(),
             announced: HashMap::new(),
             net: ports.network.clone(),
@@ -192,7 +508,13 @@ impl Core {
             join_buckets: HashMap::new(),
             join_waiting: BTreeSet::new(),
             calls: voice::Calls::default(),
+            key_pending: Vec::new(),
         };
+        // GAP-6r: the stored relay-only setting, applied before anything
+        // else reaches the network.
+        let relay_only = relay_only_in(&inner.db)?;
+        inner.calls.set_relay_only(relay_only);
+        ports.network.set_relay_only(relay_only);
         // QA-20: without a usable keychain the core still starts, and says so
         // (`keyring-unavailable`) instead of crashing or looking empty.
         let state = match inner.vault.state() {
@@ -205,22 +527,30 @@ impl Core {
             Err(e) => return Err(vault_error(e)),
         };
         if state == Some(VaultState::Ready) {
-            let phrase = inner.vault.open().map_err(vault_error)?;
-            inner.me = Some(inner.load_me(phrase)?);
-            unlock_cipher(&ports, inner.me.as_ref());
-            // GAP-4: every server opened for sync before any command can
-            // publish to it (the sync loop also reopens them each round).
-            for server in inner.db.servers()? {
-                inner.load(server)?;
-                inner.open_sync(&ports, server)?;
-            }
+            inner.open_stored(&ports)?;
         }
+        // The first member relay value: later changes are announced.
+        inner.check_member_relay(&ports, &mut Vec::new());
+        // G-91: a restore that was still bringing servers back before a
+        // restart searches again.
+        let restore_state = if inner.db.get(KV_BACKUP_PENDING)?.is_some() {
+            ServerRestoreState::Searching
+        } else {
+            ServerRestoreState::None
+        };
         Ok(Core {
             inner: Mutex::new(inner),
             ports,
             app_version: config.app_version,
             updates: None,
             pending_joins: Mutex::default(),
+            db_path: config.db_path,
+            signed_out: AtomicBool::new(false),
+            backup_started: AtomicBool::new(false),
+            notices_announced: AtomicBool::new(false),
+            backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
+            restore: Mutex::new(RestoreProgress::new(restore_state)),
+            keys_locked: AtomicBool::new(false),
         })
     }
 
@@ -231,11 +561,106 @@ impl Core {
         let _ = self.leave_call();
         self.ports.cipher.lock();
         self.ports.network.lock();
+        self.keys_locked.store(true, Ordering::SeqCst);
+        // G-91 (Security Lead on #457): the server secrets a restore took
+        // from the backup go too; the backup is fetched again after unlock.
+        let mut restore = self.restore.lock().expect("not poisoned");
+        restore.found = None;
+        restore.waiting.clear();
+        drop(restore);
+        *self.backup_retry.lock().expect("not poisoned") = (0, BACKUP_RETRY_FIRST_MS);
+    }
+
+    /// `signOut({ words } | { withoutWords: true })`: removes this identity
+    /// from this computer. The UI first makes sure the user has their
+    /// words: `words` must be this identity's 12 words (`invalid-words` for
+    /// unknown words, `not-allowed` for another identity's); `withoutWords`
+    /// is the explicit "I accept losing this account" path.
+    ///
+    /// Fail safe, in this order:
+    /// 1. the keychain secret is deleted; if that fails nothing changed
+    ///    (`keyring-unavailable`) and the identity still opens;
+    /// 2. once it's gone, the local database is emptied and a wipe marker
+    ///    is written beside it; the next start deletes `core.db` and the
+    ///    sync folder (its `node.key` too, so a new identity here gets a
+    ///    new peer ID) before opening anything ([`finish_sign_out`]);
+    /// 3. the core then exits, and the shell restarts it at "create or
+    ///    restore".
+    ///
+    /// With the secret gone the identity can't come back on its own; a
+    /// later failure only leaves data nobody can open, and the marker
+    /// retries its deletion at every start.
+    pub fn sign_out(&self, words: Option<Vec<String>>, without_words: bool) -> CoreResult<()> {
+        {
+            let inner = self.lock();
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            match words {
+                Some(words) => {
+                    let phrase =
+                        RecoveryPhrase::parse(&words.join(" ")).map_err(phrase_error)?;
+                    if phrase.identity().public_key() != me.key() {
+                        return Err(ErrorCode::NotAllowed.into());
+                    }
+                }
+                None if without_words => {}
+                None => return Err(ErrorCode::BadRequest.into()),
+            }
+        }
+        let _ = self.leave_call();
+        self.pending_joins.lock().expect("not poisoned").clear();
+        let mut inner = self.lock();
+        // 1. The intent: the marker, before anything is deleted. Without it
+        //    a crash could leave the files of a gone identity. It can't be
+        //    written: nothing changed.
+        let marker = self.db_path.as_deref().map(sign_out_marker);
+        if let Some(marker) = &marker {
+            if let Err(e) = std::fs::write(marker, b"") {
+                eprintln!("mvs-core: the sign-out marker wasn't written: {}", e.kind());
+                return Err(ErrorCode::Internal.into());
+            }
+        }
+        // 2. The keychain: the identity is gone once its secret is. If that
+        //    fails, the intent is withdrawn and nothing changed. (A marker
+        //    that can't be removed is cleared at the next start, since the
+        //    secret is still there: `finish_sign_out`.)
+        match inner.vault.forget() {
+            Ok(true) => {}
+            Ok(false) => eprintln!("mvs-core: signed out; the recovery-check marker stays"),
+            Err(e) => {
+                if let Some(marker) = &marker {
+                    let _ = std::fs::remove_file(marker);
+                }
+                return Err(vault_error(e));
+            }
+        }
+        // 3. Nothing below may stop the sign-out: the identity is gone.
+        self.ports.cipher.lock();
+        self.ports.network.lock();
+        if let Ok(servers) = inner.db.servers() {
+            for server in servers {
+                self.ports.network.close_server(server);
+            }
+        }
+        if let Err(e) = inner.db.wipe() {
+            eprintln!("mvs-core: the database wasn't emptied: {:?}", e.code);
+        }
+        inner.me = None;
+        inner.logs.clear();
+        inner.calls = voice::Calls::default();
+        self.signed_out.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Signed out: the request loop answers this request, then stops, and
+    /// the shell restarts the core.
+    pub fn signed_out(&self) -> bool {
+        self.signed_out.load(Ordering::SeqCst)
     }
 
     /// After the app lock: the cipher gets our secret back. The next read or
     /// send replays what it lost (see `unlock_cipher`).
     pub fn unlock_keys(&self) {
+        self.keys_locked.store(false, Ordering::SeqCst);
         unlock_cipher(&self.ports, self.lock().me.as_ref());
     }
 
@@ -255,7 +680,13 @@ impl Core {
         f: impl FnOnce(&mut Inner, &Ports, &mut Events) -> CoreResult<T>,
     ) -> CoreResult<T> {
         let mut events = Vec::new();
-        let result = f(&mut self.lock(), &self.ports, &mut events);
+        let result = {
+            let mut inner = self.lock();
+            let result = f(&mut inner, &self.ports, &mut events);
+            // Member relays: anything the command changed is announced.
+            inner.check_member_relay(&self.ports, &mut events);
+            result
+        };
         self.emit(events);
         result
     }
@@ -263,15 +694,14 @@ impl Core {
     // ---- identity -------------------------------------------------------
 
     pub fn get_identity(&self) -> CoreResult<Option<Identity>> {
-        let inner = self.lock();
-        if inner.keyring_unavailable {
-            return Err(ErrorCode::KeyringUnavailable.into());
-        }
+        let mut inner = self.lock();
+        inner.recheck_keyring(&self.ports)?;
         inner.me.as_ref().map(|me| inner.identity_json(me)).transpose()
     }
 
     pub fn create_identity(&self, input: NewIdentityInput) -> CoreResult<CreatedIdentity> {
         self.run(|inner, ports, events| {
+            inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());
             }
@@ -283,6 +713,8 @@ impl Core {
                 country: input.country,
                 birth_date: input.birth_date,
                 locale: Some(input.locale),
+                // Entered at sign-up here: my claims come from it.
+                birth_date_trusted: true,
                 ..Profile::default()
             };
             let me = inner.new_me(phrase, profile)?;
@@ -381,35 +813,291 @@ impl Core {
     }
 
     pub fn restore_identity(&self, words: Vec<String>) -> CoreResult<Identity> {
-        self.run(|inner, ports, _| {
+        self.restore_identity_with(words, None)
+    }
+
+    /// `restoreIdentity(words, input?)`: the words don't carry the country
+    /// or birth date (spec, age §), so the UI asks them again before the
+    /// words and passes them here, as `createIdentity` takes them. Without
+    /// `input` this device has neither, and a rejoin keeps what my servers
+    /// already hold (no age claim from no date).
+    pub fn restore_identity_with(
+        &self,
+        words: Vec<String>,
+        input: Option<NewIdentityInput>,
+    ) -> CoreResult<Identity> {
+        // TODO(backup): the spec restores these from the encrypted identity
+        // backup (docs/design, restore servers); until then the UI asks
+        // again. The name comes after, from `updateProfile`.
+        let profile = match input {
+            Some(input) => Profile {
+                country: input.country,
+                birth_date: input.birth_date,
+                locale: Some(input.locale),
+                ..Profile::default()
+            },
+            None => Profile::default(),
+        };
+        self.restore_with_profile(&words.join(" "), profile)
+    }
+
+    /// The restore path: the words into the keychain, `profile` sealed, then
+    /// my servers back from my backup (#291). Device link comes here too,
+    /// with the profile the approving device sent.
+    fn restore_with_profile(&self, words: &str, profile: Profile) -> CoreResult<Identity> {
+        let identity = self.run(|inner, ports, _| {
+            inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());
             }
-            let phrase = RecoveryPhrase::parse(&words.join(" ")).map_err(phrase_error)?;
+            let phrase = RecoveryPhrase::parse(words).map_err(phrase_error)?;
             inner.vault.restore(&phrase).map_err(vault_error)?;
             inner.db.delete(KV_RECOVERY_CHALLENGE)?;
-            // TODO(backup): the spec restores the birth date from the
-            // encrypted identity backup; until then the UI asks again.
-            let me = inner.new_me(phrase, Profile::default())?;
+            let me = inner.new_me(phrase, profile)?;
             let identity = inner.identity_json(&me)?;
             inner.me = Some(me);
             unlock_cipher(ports, inner.me.as_ref());
             Ok(identity)
-        })
+        })?;
+        // Restore servers (#291 phase A): my backup on the network brings
+        // my servers back, rejoined as the same member (the #290 path).
+        self.lock().db.set(KV_BACKUP_PENDING, b"1")?;
+        *self.restore.lock().expect("not poisoned") = RestoreProgress::new(ServerRestoreState::None);
+        self.set_restore_status(ServerRestoreState::Searching);
+        let done = self.restore_from_backup();
+        self.schedule_backup_retry(done);
+        Ok(identity)
+    }
+
+    /// G-91: `getServerRestore`.
+    pub fn get_server_restore(&self) -> ServerRestore {
+        self.restore.lock().expect("not poisoned").status
+    }
+
+    /// Sets the restore's state (counts from the progress) and announces
+    /// `serverRestore.changed` if anything changed.
+    fn set_restore_status(&self, state: ServerRestoreState) {
+        let changed = {
+            let mut progress = self.restore.lock().expect("not poisoned");
+            let status = ServerRestore {
+                state,
+                found: progress.found.unwrap_or(0),
+                waiting: progress.waiting.len() as u32,
+            };
+            let changed = progress.status != status;
+            progress.status = status;
+            changed.then_some(status)
+        };
+        if let Some(status) = changed {
+            self.emit(vec![Event::ServerRestoreChanged(status)]);
+        }
+    }
+
+    /// Restore servers (#291 phase A): fetches my backup from the holders,
+    /// keeps the newest valid one, and rejoins each live server I don't have
+    /// yet as the same member (`Inner::join`: no new join, nothing posted
+    /// over what the server holds). A server it lists that no longer has
+    /// me as a member isn't entered (a stale backup can't undo a leave or a
+    /// kick). Servers nobody can be reached for are tried again (G-91: every
+    /// [`REJOIN_EVERY_MS`], without fetching the backup again) until all
+    /// are in. Returns whether the restore is done.
+    fn restore_from_backup(&self) -> bool {
+        let Some(keys) = self.lock().me.as_ref().map(|me| me.identity.backup_keys()) else {
+            return true;
+        };
+        if self.restore.lock().expect("not poisoned").found.is_none() {
+            let answers = self.ports.network.fetch_backup(keys.tag());
+            // No backup found (yet): try again later.
+            let Some(plain) = backup::newest(&keys, &answers) else {
+                self.set_restore_status(ServerRestoreState::Searching);
+                return false;
+            };
+            let live: Vec<(ServerId, Zeroizing<[u8; 32]>)> = plain
+                .servers
+                .iter()
+                .filter(|(_, e)| e.live())
+                .filter_map(|(id, entry)| {
+                    Some((
+                        model::parse_hex32(id).map(ServerId::from_bytes)?,
+                        model::parse_hex32(&entry.secret).map(Zeroizing::new)?,
+                    ))
+                })
+                .collect();
+            let mut progress = self.restore.lock().expect("not poisoned");
+            progress.found = Some(live.len() as u32);
+            progress.waiting = live.into_iter().collect();
+        }
+        let tries: Vec<(ServerId, Zeroizing<[u8; 32]>)> = {
+            let progress = self.restore.lock().expect("not poisoned");
+            progress.waiting.iter().map(|(server, secret)| (*server, secret.clone())).collect()
+        };
+        for (server, secret) in tries {
+            if self.lock().db.has_server(server).unwrap_or(true) {
+                self.restore.lock().expect("not poisoned").waiting.remove(&server);
+                continue;
+            }
+            let fetched = self.open_and_fetch(server, &secret);
+            // "Invalid" is final only with evidence in the log (Security Lead
+            // on #457): a partial log could otherwise drop a server I'm in.
+            let me = self.lock().me.as_ref().map(Me::key);
+            let judged = me.is_some_and(|me| removal_shown(server, me, &fetched));
+            let status = self.run(|inner, ports, events| {
+                // No invite: a member I still am needs none; anyone else is
+                // refused by authority and nothing is stored or sent.
+                let none = RecordId::from_bytes([0; 32]);
+                inner.join(ports, server, none, &secret, "", fetched, events)
+            });
+            if restore_settles(&status, judged) {
+                self.restore.lock().expect("not poisoned").waiting.remove(&server);
+                if !matches!(status, Ok(JoinStatus::Joined { .. })) {
+                    let _ = self.close_candidate(server);
+                }
+            }
+        }
+        let done = self.restore.lock().expect("not poisoned").waiting.is_empty();
+        if done {
+            let _ = self.lock().db.delete(KV_BACKUP_PENDING);
+        }
+        self.set_restore_status(if done { ServerRestoreState::Done } else { ServerRestoreState::Waiting });
+        done
+    }
+
+    /// After a restore attempt that isn't done: while the backup isn't
+    /// found, the next fetch after the current wait, and the wait after
+    /// that doubled, at most [`BACKUP_RETRY_MAX_MS`]; once it's found, the
+    /// waiting servers again after [`REJOIN_EVERY_MS`]. `done`: back to
+    /// [`BACKUP_RETRY_FIRST_MS`].
+    fn schedule_backup_retry(&self, done: bool) {
+        let now = self.ports.clock.now_ms();
+        let found = self.restore.lock().expect("not poisoned").found.is_some();
+        let mut retry = self.backup_retry.lock().expect("not poisoned");
+        *retry = if done {
+            (0, BACKUP_RETRY_FIRST_MS)
+        } else if found {
+            (now + REJOIN_EVERY_MS, retry.1)
+        } else {
+            (now + retry.1, (retry.1 * 2).min(BACKUP_RETRY_MAX_MS))
+        };
+    }
+
+    /// Each sync round: a pending restore is tried again only when its
+    /// wait is up (dev-sync on #339: a real holder lookup is slow; G-91:
+    /// found servers every [`REJOIN_EVERY_MS`]).
+    fn retry_backup_restore(&self) {
+        if self.keys_locked.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.lock().db.get(KV_BACKUP_PENDING).ok().flatten().is_none() {
+            return;
+        }
+        let due = self.backup_retry.lock().expect("not poisoned").0 <= self.ports.clock.now_ms();
+        if due {
+            let done = self.restore_from_backup();
+            self.schedule_backup_retry(done);
+        }
+    }
+
+    /// One backup round (Tech Lead on #317): decide under the lock, fetch
+    /// outside it, merge and seal under it, put outside it. Nothing at all
+    /// happens on a round with nothing due (`Inner::backup_due`).
+    fn backup_round(&self) {
+        let now = self.ports.clock.now_ms();
+        let login = !self.backup_started.load(Ordering::SeqCst);
+        let tag = {
+            let inner = self.lock();
+            match inner.backup_due(now, login) {
+                Ok(true) => inner.me.as_ref().map(|me| me.identity.backup_keys().tag()),
+                Ok(false) => None,
+                Err(e) => {
+                    eprintln!("mvs-core: the server backup wasn't checked: {:?}", e.code);
+                    None
+                }
+            }
+        };
+        let Some(tag) = tag else {
+            if login && self.lock().me.is_some() {
+                self.backup_started.store(true, Ordering::SeqCst);
+            }
+            return;
+        };
+        let answers = self.ports.network.fetch_backup(tag);
+        let blob = self.lock().backup_merge(now, &answers);
+        match blob {
+            Ok(Some(blob)) => self.ports.network.put_backup(tag, &blob),
+            Ok(None) => {}
+            Err(e) => eprintln!("mvs-core: the server backup wasn't written: {:?}", e.code),
+        }
+        self.backup_started.store(true, Ordering::SeqCst);
     }
 
     pub fn update_profile(&self, input: ProfileInput) -> CoreResult<Identity> {
-        self.run(|inner, _, events| {
+        self.run(|inner, ports, events| {
             model::check_profile(&input)?;
+            // #354: the picture and colour other members see. Absent:
+            // unchanged; "": cleared (published as "", so it clears for
+            // everyone); otherwise checked strictly.
+            let ok = |v: &Option<String>, valid: fn(&str) -> bool| {
+                v.as_deref().is_none_or(|s| s.is_empty() || valid(s))
+            };
+            if !ok(&input.avatar_small, avatar::valid_avatar) || !ok(&input.color, avatar::valid_color) {
+                return Err(ErrorCode::BadRequest.into());
+            }
             let me = inner.me.as_mut().ok_or(ErrorCode::NotFound)?;
-            me.profile.display_name = input.display_name.trim().to_owned();
+            let name = input.display_name.trim().to_owned();
+            let small = input.avatar_small.or_else(|| me.profile.avatar_small.clone());
+            let color = input.color.or_else(|| me.profile.color.clone());
+            // The whole post must fit a control Post (Tech Lead).
+            let authority::Action::Post { text } =
+                model::profile_action_with(&name, small.as_deref(), color.as_deref())
+            else {
+                unreachable!("a profile is a post")
+            };
+            if text.len() > records::Kind::Post.max_body() {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            let changed =
+                me.profile.display_name != name || me.profile.avatar_small != small || me.profile.color != color;
+            me.profile.display_name = name;
             me.profile.bio = input.bio;
             me.profile.avatar_data_url = input.avatar_data_url;
-            // TODO(profiles): publish the new name to my servers; members
-            // see the name from my profile post until then.
+            me.profile.avatar_small = small;
+            me.profile.color = color;
             let profile = me.profile.clone();
             let key = *me.identity.storage_key().expose_secret();
             inner.db.save_profile(&key, &serde_json::to_vec(&profile).expect("plain struct"))?;
+            // A change goes to every server I'm still in, as a new profile
+            // post (the latest wins): at once while the burst lasts, then once
+            // per PROFILE_POST_EVERY_MS (coalesced; the pending one survives a
+            // restart). The bio and the large picture stay on this device.
+            if changed {
+                inner.db.set(KV_PROFILE_PENDING, b"1")?;
+                inner.flush_profile(ports)?;
+                // Profile save (#378, acceptance 7): my row in every server
+                // I'm a member of, so each place that shows me updates now.
+                // The profile is saved already: a server that fails here is
+                // logged, not an error.
+                let key = inner.me.as_ref().expect("checked above").key();
+                for server in inner.db.servers()? {
+                    let row = (|| -> CoreResult<Option<Event>> {
+                        if inner.db.closed_at(server)?.is_some() {
+                            return Ok(None);
+                        }
+                        inner.load(server)?;
+                        let view = inner.view(server)?;
+                        if view.state.closed.is_some() || !view.state.is_member(key) {
+                            return Ok(None);
+                        }
+                        Ok(Some(Event::MembersChanged {
+                            server_id: model::hex_id(server.as_bytes()),
+                            members: inner.members_json(&view)?,
+                        }))
+                    })();
+                    match row {
+                        Ok(event) => events.extend(event),
+                        Err(e) => eprintln!("mvs-core: members.changed after a profile save: {:?}", e.code),
+                    }
+                }
+            }
             let identity = inner.identity_json(inner.me.as_ref().expect("checked above"))?;
             events.push(Event::IdentityChanged(identity.clone()));
             Ok(identity)
@@ -423,7 +1111,9 @@ impl Core {
         let mut out = Vec::new();
         for id in inner.db.servers()? {
             inner.load(id)?;
-            out.push(inner.summary(id)?);
+            // G-21 and G-24: the server rail's unread dot and mention badge.
+            let summary = inner.counted_summary(&*self.ports.cipher, id)?;
+            out.push(summary);
         }
         Ok(out)
     }
@@ -432,7 +1122,9 @@ impl Core {
         let mut inner = self.lock();
         let server = inner.load_mine(parse_server(server_id)?)?;
         let me = inner.me.as_ref().map(Me::key);
-        inner.view(server).map(|view| view.channels(me))
+        let mut list = inner.view(server)?.channels(me);
+        inner.fill_unread(&*self.ports.cipher, server, &mut list)?;
+        Ok(list)
     }
 
     pub fn list_members(&self, server_id: &str) -> CoreResult<Vec<Member>> {
@@ -488,7 +1180,7 @@ impl Core {
             };
             let invite = sign(2, vec![general.id()], &model::FIRST_INVITE)?;
             let profile =
-                sign(3, vec![invite.id()], &model::profile_action(&me.profile.display_name))?;
+                sign(3, vec![invite.id()], &model::profile_action_with(&me.profile.display_name, me.profile.avatar_small.as_deref(), me.profile.color.as_deref()))?;
             inner.logs.insert(server, Log::new(server, []));
             // GAP-4: a fresh sync secret, sealed, and sync opened with it
             // before anything is published.
@@ -500,9 +1192,10 @@ impl Core {
                 ports.network.publish(&record);
                 inner.store(server, record)?;
             }
-            let claim = inner.sign_age_claim(ports, server)?;
-            ports.network.publish(&claim);
-            inner.store(server, claim)?;
+            if let Some(claim) = inner.age_claim(ports, server)? {
+                ports.network.publish(&claim);
+                inner.store(server, claim)?;
+            }
             inner.db.add_server(server, ports.clock.now_ms())?;
             let summary = inner.summary(server)?;
             events.push(Event::ServerAdded(summary.clone()));
@@ -518,7 +1211,11 @@ impl Core {
         }
         let searching = JoinStatus::Searching { link: link.clone() };
         self.ports.events.emit(&Event::JoinStatus(searching.clone()));
+        let short = matches!(crate::invite_link::parse(&link), Ok(crate::invite_link::InviteLink::V1 { .. }));
+        tracing::info!(target: "mvs::join", short_link = short, "join: started");
+        self.log_links("join: links at start");
         let status = self.try_join(&link)?;
+        tracing::info!(target: "mvs::join", outcome = join_status_name(&status), "join: first attempt done");
         if matches!(status, JoinStatus::NobodyOnline { .. }) {
             // The inviter may not be reachable yet: keep trying (`retry_joins`).
             let now = Instant::now();
@@ -543,6 +1240,7 @@ impl Core {
                     return Ok(JoinStatus::Closed { link: link.to_owned() });
                 }
                 let fetched = self.open_and_fetch(server, &secret);
+                tracing::info!(target: "mvs::join", records = fetched.len(), "join: fetched the server's control log");
                 self.run(|inner, ports, events| {
                     inner.join(ports, server, invite, &secret, link, fetched, events)
                 })
@@ -572,13 +1270,23 @@ impl Core {
         use crate::crypto::invite::{handle, open, InvitePublication};
         let h = handle(key);
         let mut status = JoinStatus::NobodyOnline { link: link.to_owned() };
-        for answer in self.ports.network.fetch_invite(h) {
-            let Some(publication) = InvitePublication::decode(&answer) else { continue };
+        let answers = self.ports.network.fetch_invite(h);
+        tracing::info!(target: "mvs::join", answers = answers.len(), "join: asked peers for the invite");
+        for answer in answers {
+            let Some(publication) = InvitePublication::decode(&answer) else {
+                tracing::info!(target: "mvs::join", "join: an answer didn't decode");
+                continue;
+            };
             if *publication.handle() != h {
+                tracing::info!(target: "mvs::join", "join: an answer named another invite");
                 continue;
             }
-            let Some(opened) = open(key, prefix, publication.envelope()) else { continue };
+            let Some(opened) = open(key, prefix, publication.envelope()) else {
+                tracing::info!(target: "mvs::join", "join: an answer didn't open with this link");
+                continue;
+            };
             if !publication.names(key, &opened) {
+                tracing::info!(target: "mvs::join", "join: an answer didn't name its invite");
                 continue;
             }
             let server = opened.server;
@@ -587,8 +1295,12 @@ impl Core {
                 return Ok(JoinStatus::Closed { link: link.to_owned() });
             }
             let fetched = self.open_and_fetch(server, &opened.secret);
+            tracing::info!(target: "mvs::join", records = fetched.len(), "join: fetched the server's control log");
             let author = ServerView::build(server, &Log::new(server, fetched.clone()))
                 .and_then(|view| view.state.invites.get(&opened.invite).map(|invite| invite.author));
+            if !fetched.is_empty() && !author.is_some_and(|author| publication.verify(&author)) {
+                tracing::info!(target: "mvs::join", invite_known = author.is_some(), "join: the answer's signature didn't check");
+            }
             let joined = if fetched.is_empty() {
                 JoinStatus::NobodyOnline { link: link.to_owned() }
             } else if !author.is_some_and(|author| publication.verify(&author)) {
@@ -633,6 +1345,7 @@ impl Core {
             pending.iter().filter(|(_, p)| now >= p.next).map(|(link, _)| link.clone()).collect()
         };
         for link in due {
+            self.log_links("join: retrying");
             let status = match self.try_join(&link) {
                 Ok(status) => status,
                 Err(e) => {
@@ -640,6 +1353,7 @@ impl Core {
                     continue;
                 }
             };
+            tracing::info!(target: "mvs::join", outcome = join_status_name(&status), "join: retry done");
             let mut pending = self.pending_joins.lock().expect("not poisoned");
             if matches!(status, JoinStatus::NobodyOnline { .. }) {
                 if let Some(p) = pending.get_mut(&link) {
@@ -653,6 +1367,15 @@ impl Core {
                 drop(pending);
                 self.ports.events.emit(&Event::JoinStatus(status));
             }
+        }
+    }
+
+    /// The join log's view of the network: how many peers we're connected to
+    /// (through the relay or directly). Counts only, never who.
+    fn log_links(&self, step: &str) {
+        match self.ports.network.link_counts() {
+            Some((peers, direct)) => tracing::info!(target: "mvs::join", peers, direct, "{step}"),
+            None => tracing::info!(target: "mvs::join", "{step}"),
         }
     }
 
@@ -699,9 +1422,9 @@ impl Core {
         self.run(|inner, ports, events| {
             inner.load_mine(server)?;
             inner.lifecycle_role(server, authority::Role::Admin)?;
-            inner.lifecycle_gate(server)?;
+            inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP)?;
             inner.publish_control(ports, server, &Action::ServerEdit { name: name.to_owned() })?;
-            let summary = inner.summary(server)?;
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
             events.push(Event::ServerUpdated(summary.clone()));
             Ok(summary)
         })
@@ -726,7 +1449,7 @@ impl Core {
             let leave =
                 inner.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
             inner.db.set_leave(server, &leave)?;
-            if inner.lifecycle_gate(server).is_ok() {
+            if inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
                 ports.network.publish(&leave);
             }
             // Gone from the UI at once; only the sync secret and the control
@@ -765,25 +1488,22 @@ impl Core {
         }
     }
 
-    /// `getUpdateNeeded`: the members whose latest profile post lacks
-    /// `server-lifecycle-v1` (or who have none), so the UI can say who
-    /// blocks a rename or a delete (`update-needed`). Empty: the gate is
-    /// open.
-    pub fn get_update_needed(&self, server_id: &str) -> CoreResult<Vec<Id>> {
+    /// `getUpdateNeeded`: the members whose latest profile post lacks `cap`
+    /// (or who have none), so the UI can say who blocks it
+    /// (`update-needed`). No cap: `server-lifecycle-v1` (a rename or a
+    /// delete); `"reactions-v1"`: reactions (G-26). Any other name is
+    /// `bad-request`. Empty: the gate is open.
+    pub fn get_update_needed(&self, server_id: &str, cap: Option<&str>) -> CoreResult<Vec<Id>> {
+        let cap = match cap {
+            None => model::SERVER_LIFECYCLE_CAP,
+            Some(cap) => *model::CAPS.iter().find(|c| **c == cap).ok_or(ErrorCode::BadRequest)?,
+        };
         let server = parse_server(server_id)?;
         self.run(|inner, _, _| {
             inner.load_mine(server)?;
             let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
             let view = inner.view(server)?;
-            let caps = view.lifecycle_caps();
-            Ok(view
-                .state
-                .members
-                .iter()
-                .filter(|m| **m != me && !view.state.kicked.contains(m))
-                .filter(|m| caps.get(m) != Some(&true))
-                .map(|m| model::hex_id(m.as_bytes()))
-                .collect())
+            Ok(view.lacking(cap, me).iter().map(|m| model::hex_id(m.as_bytes())).collect())
         })
     }
 
@@ -797,7 +1517,7 @@ impl Core {
         self.run(|inner, ports, events| {
             inner.load_mine(server)?;
             inner.lifecycle_role(server, authority::Role::Owner)?;
-            inner.lifecycle_gate(server)?;
+            inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP)?;
             inner.publish_control(ports, server, &Action::ServerClose)?;
             inner.close_locally(ports, server, events)
         })
@@ -839,6 +1559,93 @@ impl Core {
         let json = self.channel_json(server, channel)?;
         self.ports.events.emit(&Event::ChannelUpdated(json.clone()));
         Ok(json)
+    }
+
+    /// G-11 `moveChannel(serverId, channelId, before?, after?)`: owner and
+    /// admin only (`not-allowed`). Puts the channel right before `before`,
+    /// or right after `after`, or last with neither; both must agree (the
+    /// two neighbours of one gap), else `bad-request`, as for a neighbour
+    /// that isn't a live channel of the server. One signed channel-order
+    /// post: a key between the new neighbours', or, when a neighbour has no
+    /// key yet or the key would pass 32 characters, keys for every channel
+    /// in the new order (a rebalance). Returns the channels in order, and
+    /// emits `channel.updated` for each one whose position changed.
+    pub fn move_channel(
+        &self,
+        server_id: &str,
+        channel_id: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> CoreResult<Vec<Channel>> {
+        let server = parse_server(server_id)?;
+        let parse = |id: &str| model::parse_hex32(id).map(ChannelId::from_bytes);
+        let channel = parse(channel_id).ok_or(ErrorCode::NotFound)?;
+        let (moved, positions) = {
+            let mut inner = self.lock();
+            inner.load_mine(server)?;
+            let me = inner.me.as_ref().map(Me::key).ok_or(ErrorCode::NotFound)?;
+            let view = inner.view(server)?;
+            if view.state.role(me) < authority::Role::Admin {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            if !view.state.channels.contains_key(&channel) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let positions = view.channel_positions();
+            let mut order: Vec<ChannelId> = view.ordered_channels();
+            order.retain(|c| *c != channel);
+            let neighbour = |id: Option<&str>| -> CoreResult<Option<ChannelId>> {
+                id.map(|id| {
+                    parse(id)
+                        .filter(|c| order.contains(c))
+                        .ok_or_else(|| CoreError::from(ErrorCode::BadRequest))
+                })
+                .transpose()
+            };
+            let (before, after) = (neighbour(before)?, neighbour(after)?);
+            let at = match (before, after) {
+                (Some(b), Some(a)) => {
+                    let b_at = order.iter().position(|c| *c == b).expect("checked");
+                    if b_at == 0 || order[b_at - 1] != a {
+                        return Err(ErrorCode::BadRequest.into());
+                    }
+                    b_at
+                }
+                (Some(b), None) => order.iter().position(|c| *c == b).expect("checked"),
+                (None, Some(a)) => order.iter().position(|c| *c == a).expect("checked") + 1,
+                (None, None) => order.len(),
+            };
+            order.insert(at, channel);
+            let prev = at.checked_sub(1).map(|i| order[i]);
+            let next = order.get(at + 1).copied();
+            let key_of = |c: Option<ChannelId>| -> Option<Option<&String>> {
+                match c {
+                    None => Some(None),
+                    Some(c) => positions.get(&c).map(Some),
+                }
+            };
+            let single = match (key_of(prev), key_of(next)) {
+                (Some(lo), Some(hi)) if lo.is_none_or(|lo| hi.is_none_or(|hi| lo < hi)) => {
+                    let key = model::key_between(lo.map(String::as_str), hi.map(String::as_str));
+                    (key.len() <= model::POSITION_MAX).then_some(key)
+                }
+                _ => None,
+            };
+            let moved: BTreeMap<ChannelId, String> = match single {
+                Some(key) => BTreeMap::from([(channel, key)]),
+                None => order.iter().copied().zip(model::spread_keys(order.len())).collect(),
+            };
+            (moved, positions)
+        };
+        self.control_action(server_id, model::channel_order_action(&moved))?;
+        let list = self.list_channels(server_id)?;
+        for json in &list {
+            let id = parse(&json.id).expect("own hex");
+            if moved.get(&id).is_some_and(|key| positions.get(&id) != Some(key)) {
+                self.ports.events.emit(&Event::ChannelUpdated(json.clone()));
+            }
+        }
+        Ok(list)
     }
 
     /// B11: the owner deletes a channel; never #general (`not-allowed`).
@@ -903,12 +1710,39 @@ impl Core {
     }
 
     fn channel_json(&self, server: ServerId, channel: ChannelId) -> CoreResult<Channel> {
-        let inner = self.lock();
+        let mut inner = self.lock();
         inner.open_sync(&self.ports, server)?;
         let me = inner.me.as_ref().map(Me::key);
         let id = model::hex_id(channel.as_bytes());
-        let view = inner.view(server)?;
-        view.channels(me).into_iter().find(|c| c.id == id).ok_or_else(|| ErrorCode::Internal.into())
+        let found = inner.view(server)?.channels(me).into_iter().find(|c| c.id == id);
+        let mut json = [found.ok_or(ErrorCode::Internal)?];
+        inner.fill_unread(&*self.ports.cipher, server, &mut json)?;
+        let [json] = json;
+        Ok(json)
+    }
+
+    /// G-21 `markRead(channelId)`: everything in the channel now counts as
+    /// read (the marker moves to its last message), and `channel.updated`
+    /// carries the reset `unreadCount` and no `firstUnreadIndex`, then
+    /// `server.updated` with the server's recounted dot and badge. Local only.
+    pub fn mark_read(&self, channel_id: &str) -> CoreResult<()> {
+        let (server, channel) = {
+            let mut inner = self.lock();
+            let (server, channel) = inner.find_channel(channel_id)?;
+            let shown = inner.shown(&*self.ports.cipher, server, channel)?;
+            let last = shown.iter().map(|s| (s.record.ts(), *s.record.id().as_bytes())).max();
+            let marker = last.unwrap_or((self.ports.clock.now_ms(), [0; 32]));
+            let key = format!("{KV_READ_PREFIX}{}", model::hex_id(channel.as_bytes()));
+            let value = serde_json::to_vec(&(marker.0, hex::encode(marker.1))).expect("plain tuple");
+            inner.db.set(&key, &value)?;
+            (server, channel)
+        };
+        let json = self.channel_json(server, channel)?;
+        self.ports.events.emit(&Event::ChannelUpdated(json));
+        // The server rail too: its dot and badge come from all its channels.
+        let summary = self.lock().counted_summary(&*self.ports.cipher, server)?;
+        self.ports.events.emit(&Event::ServerUpdated(summary));
+        Ok(())
     }
 
     /// Rust addition (`undoKick`, B4 kick-undo): the owner lets a kicked
@@ -967,7 +1801,7 @@ impl Core {
             let record = inner.publish_control(ports, server, &action)?;
             if matches!(action, Action::Invite { .. } | Action::RevokeInvite { .. }) {
                 // The server's link may name another invite now.
-                events.push(Event::ServerUpdated(inner.summary(server)?));
+                events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 return Ok(record.id());
             }
             let after = inner.view(server)?;
@@ -1002,15 +1836,16 @@ impl Core {
         self.lock().calls.in_call()
     }
 
-    /// `joinCall(roomId)`: leaves any other call first. Calls happen only in
-    /// a server's voice room: a text channel answers `not-allowed`.
+    /// `joinCall(roomId)`: a live voice room of one of my servers; leaves
+    /// any other call first. A text channel answers `not-allowed`, an
+    /// unknown or gone room `not-found`.
     pub fn join_call(&self, room_id: &str) -> CoreResult<CallState> {
         let room =
             model::parse_hex32(room_id).map(ChannelId::from_bytes).ok_or(ErrorCode::NotFound)?;
         self.voice(|calls, ctx, inner| {
-            let server = match inner.room_server(room)? {
-                Some(server) => server,
-                None => {
+            let server = match calls.room_server(room) {
+                Some(server) if inner.db.has_server(server)? => server,
+                _ => {
                     inner.channel_server(room)?;
                     return Err(ErrorCode::NotAllowed.into());
                 }
@@ -1019,21 +1854,42 @@ impl Core {
         })
     }
 
-    /// `getVoiceRoom`: who is in the server's voice room. `not-found` for a
-    /// server I don't have, `not-allowed` if I'm not a member (or kicked).
-    pub fn get_voice_room(&self, server_id: &str) -> CoreResult<VoiceRoom> {
+    /// `createVoiceRoom(serverId)`: a new room with me as its master, and
+    /// me in it (leaving any other call first). `room-cap` at 10 live rooms.
+    pub fn create_voice_room(&self, server_id: &str) -> CoreResult<CallState> {
         let server = parse_server(server_id)?;
         self.voice(|calls, ctx, inner| {
             if !inner.db.has_server(server)? {
                 return Err(ErrorCode::NotFound.into());
             }
-            let me = ctx.key.verifying_key().to_bytes();
-            let room = voice::room_id(server);
-            if !voice::Members::may_call(inner, PublicKey::from_bytes(me), server, room) {
+            calls.create(ctx, inner, server)
+        })
+    }
+
+    /// `listVoiceRooms(serverId)`: the server's live rooms, oldest first.
+    /// `not-found` for a server I don't have, `not-allowed` if I'm not a
+    /// member (or kicked).
+    pub fn list_voice_rooms(&self, server_id: &str) -> CoreResult<Vec<VoiceRoom>> {
+        let server = parse_server(server_id)?;
+        self.voice(|calls, ctx, inner| {
+            if !inner.db.has_server(server)? {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let me = PublicKey::from_bytes(ctx.key.verifying_key().to_bytes());
+            if !voice::Members::may_call(inner, me, server) {
                 return Err(ErrorCode::NotAllowed.into());
             }
-            Ok(calls.voice_room(ctx, inner, server))
+            Ok(calls.list(ctx, inner, server))
         })
+    }
+
+    /// `editVoiceRoom(roomId, name?, limit?)`: by the room's master (applied
+    /// now) or the server owner (sent to the master). `name: ""` restores
+    /// the default.
+    pub fn edit_voice_room(&self, room_id: &str, name: Option<String>, limit: Option<u8>) -> CoreResult<()> {
+        let room =
+            model::parse_hex32(room_id).map(ChannelId::from_bytes).ok_or(ErrorCode::NotFound)?;
+        self.voice(|calls, ctx, inner| calls.edit(ctx, inner, room, name, limit))
     }
 
     /// `leaveCall`: idempotent.
@@ -1050,6 +1906,11 @@ impl Core {
     /// `setMuted`: `not-allowed` outside a call.
     pub fn set_muted(&self, muted: bool) -> CoreResult<()> {
         self.voice(|calls, ctx, inner| calls.set_muted(ctx, inner, muted))
+    }
+
+    /// G-84b `setDeafened`: shown to the others in my call (with mute).
+    pub fn set_deafened(&self, deafened: bool) -> CoreResult<()> {
+        self.voice(|calls, ctx, inner| calls.set_deafened(ctx, inner, deafened))
     }
 
     /// `sendSignal`: to a participant of my call.
@@ -1186,8 +2047,13 @@ impl Core {
 
     /// Seals `body` for the channel's members and sends it. The first
     /// message of a channel, or the first after a removal, needs a key
-    /// rotation: a moderator or above makes one on the way; anyone else
-    /// gets `not-allowed` until one arrives.
+    /// rotation: a moderator or above makes one on the way. A plain member
+    /// without the key yet (just joined: the moderator's re-key is on its
+    /// way) gets the message back at once as `sendState: pending`, with a
+    /// provisional `pending-…` ID. The sync loop sends it when the key comes
+    /// (`message.updated` carrying `replaces`), or after
+    /// [`KEY_PENDING_FOR`] marks it `failed` (`message.updated`, and
+    /// `notice: rekey-waiting`). Never a wait on the request thread.
     pub fn send_message(
         &self,
         channel_id: &str,
@@ -1200,9 +2066,17 @@ impl Core {
         if body.trim().is_empty() || !authority::message_text_ok(body) {
             return Err(ErrorCode::BadRequest.into());
         }
-        self.run(|inner, ports, events| {
+        let message = self.run(|inner, ports, events| {
             let (server, channel) = inner.find_channel(channel_id)?;
-            let sealed = inner.seal(ports, server, channel, body)?;
+            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
+                Ok(sealed) => sealed,
+                Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
+                    let message = inner.hold_for_key(ports, server, channel, body)?;
+                    events.push(Event::MessageAdded(message.clone()));
+                    return Ok(message);
+                }
+                Err(e) => return Err(e),
+            };
             let record =
                 inner.sign_in_channel(ports, server, channel, None, Kind::Message, sealed)?;
             inner.store(server, record.clone())?;
@@ -1210,7 +2084,12 @@ impl Core {
             let message = inner.message(&*ports.cipher, server, channel, record.id())?;
             events.push(Event::MessageAdded(message.clone()));
             Ok(message)
-        })
+        })?;
+        if message.send_state == Some(SendState::Pending) && message.id.starts_with(KEY_PENDING_PREFIX) {
+            // A round of the background sync now: it brings the re-key in.
+            self.ports.network.wake();
+        }
+        Ok(message)
     }
 
     /// The author only (authority's rule). The new text is sealed like a
@@ -1221,10 +2100,22 @@ impl Core {
         }
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
-            let sealed = inner.seal(ports, server, channel, body)?;
+            let sealed = inner.seal(ports, server, channel, body.as_bytes())?;
             let body = [target.as_bytes().as_slice(), &sealed].concat();
             inner.tombstone_or_edit(ports, events, server, channel, target, Kind::MessageEdit, body)
         })
+    }
+
+    /// Drops a message held for its key (`pending-…`, pending or failed)
+    /// before it was sent: its text is wiped from memory now, and nothing
+    /// was ever sent. For "send again" (discard, then a new `sendMessage`)
+    /// or dismissing a failed one. `not-found` for any other ID, or one
+    /// already sent or discarded.
+    pub fn discard_message(&self, message_id: &str) -> CoreResult<()> {
+        let mut inner = self.lock();
+        let at = inner.key_pending.iter().position(|p| p.id == message_id).ok_or(ErrorCode::NotFound)?;
+        inner.key_pending.remove(at);
+        Ok(())
     }
 
     /// The author, or a moderator or above who outranks them. The message
@@ -1242,6 +2133,77 @@ impl Core {
                 Kind::MessageDelete,
                 body,
             )
+        })
+    }
+
+    /// G-26: turns my `emoji` on or off under a message, as a sealed
+    /// `Reaction` record (`crate::reaction` has the rules every core folds
+    /// by). Nothing is signed when it is already so.
+    /// - `bad-request`: not an emoji `reaction::normalize` accepts, or an
+    ///   11th emoji of mine on this message;
+    /// - `not-found`: no such message I can see, or it is deleted;
+    /// - `not-allowed`: I may not write in that channel now;
+    /// - `update-needed`: another member's version can't read reactions
+    ///   (`getUpdateNeeded(serverId, "reactions-v1")` says who);
+    /// - `rate-limited`: 30 reactions of mine in this channel within a
+    ///   minute.
+    pub fn react(&self, message_id: &str, emoji: &str, on: bool) -> CoreResult<()> {
+        let emoji = reaction::normalize(emoji).ok_or(ErrorCode::BadRequest)?;
+        self.run(|inner, ports, events| {
+            let (server, channel, target, _) = inner.find_message(message_id)?;
+            // 18+ channels only with an accepted 18+ claim (B7).
+            if !inner.visible(server)?.contains(&channel) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+            let view = inner.view(server)?;
+            if !view.state.is_member(me) || view.is_kicked(&me) || view.state.closed.is_some() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.cap_gate(server, model::REACTIONS_CAP)?;
+            let cipher = &*ports.cipher;
+            let shown = inner.shown(cipher, server, channel)?;
+            let live: HashSet<RecordId> =
+                shown.iter().filter(|s| !s.deleted).map(|s| s.record.id()).collect();
+            if !live.contains(&target) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let now = ports.clock.now_ms();
+            let folded = chat::reactions(cipher, server, channel, log, &live, now);
+            let mine = folded.on.get(&target);
+            if mine.is_some_and(|m| m.is_on(&emoji, me)) == on {
+                return Ok(());
+            }
+            if on && mine.is_some_and(|m| m.count_of(me) >= reaction::PER_AUTHOR) {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            // Counted the way every core will count the record I'd sign.
+            if folded.gate.near(me) >= reaction::RATE_LIMIT {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            let plaintext =
+                reaction::Reaction::encode(target, &emoji, on).ok_or(ErrorCode::BadRequest)?;
+            let sealed = inner.seal(ports, server, channel, &plaintext)?;
+            // Signed at its effective time, never before its deps: a clock
+            // that runs behind the others' must not make every core ignore
+            // it as backdated. (Sealing may have added a key rotation.)
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let deps = chat::channel_deps(log, channel);
+            let ts = folded.gate.sign_at(&deps);
+            let seq = chat::channel_seq(log, channel, &me);
+            let auth = auth_deps(&inner.view(server)?);
+            let record =
+                inner.sign_channel(server, channel, seq, deps, auth, ts, Kind::Reaction, sealed)?;
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            if !chat::would_accept(log, &record) {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.store(server, record.clone())?;
+            ports.network.publish(&record);
+            let message = inner.message(cipher, server, channel, target)?;
+            events.push(Event::MessageUpdated(message));
+            Ok(())
         })
     }
 
@@ -1263,7 +2225,9 @@ impl Core {
     pub fn get_message_count(&self, channel_id: &str) -> CoreResult<usize> {
         let mut inner = self.lock();
         let (server, channel) = inner.find_channel(channel_id)?;
-        inner.message_count(&*self.ports.cipher, server, channel)
+        // Messages held for their key are listed after the stored ones.
+        let held = inner.key_pending.iter().filter(|p| p.channel == channel).count();
+        Ok(inner.message_count(&*self.ports.cipher, server, channel)? + held)
     }
 
     /// Messages `start..end` (0-based, end exclusive) of the channel.
@@ -1277,13 +2241,15 @@ impl Core {
         let (server, channel) = inner.find_channel(channel_id)?;
         let me = inner.me.as_ref().map(Me::key);
         let shown = inner.shown(&*self.ports.cipher, server, channel)?;
-        let end = end.min(shown.len());
+        let members = inner.view(server)?.state.members.clone();
+        // Messages held for their key come after the stored ones.
+        let held: Vec<&KeyPending> = inner.key_pending.iter().filter(|p| p.channel == channel).collect();
+        let end = end.min(shown.len() + held.len());
         let start = start.min(end);
-        let messages = shown[start..end]
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                message_json(s, start + i, channel, me, &Status { net: &*inner.net, db: &inner.db })
+        let messages = (start..end)
+            .map(|index| match shown.get(index) {
+                Some(s) => message_json(s, index, channel, me, &Status { net: &*inner.net, db: &inner.db }, &members),
+                None => held[index - shown.len()].message(index),
             })
             .collect();
         Ok(MessageRange { channel_id: channel_id.to_owned(), start, messages })
@@ -1332,8 +2298,28 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        self.announce_device_notices();
+        // Device link, the new device: its link moves on even before sign-in.
+        self.poll_device_link();
+        let result = self.sync_round();
+        // Member relays: a role read from the log, a leave, a birth date
+        // whose 30 days ended.
+        let mut events = Vec::new();
+        self.lock().check_member_relay(&self.ports, &mut events);
+        self.emit(events);
+        result
+    }
+
+    fn sync_round(&self) -> CoreResult<()> {
         self.retry_joins();
         self.flush_leaves();
+        // A restore still waiting on its backup or on servers nobody could
+        // be reached for: retried with backoff.
+        self.retry_backup_restore();
+        // Restore servers (#291 phase A): my server list, backed up when it
+        // changed, at login, or every 24 h; the network calls run outside
+        // the core lock.
+        self.backup_round();
         let servers = {
             let mut inner = self.lock();
             if inner.me.is_none() {
@@ -1366,6 +2352,10 @@ impl Core {
             // Closed servers past their 30 days: purged but for their
             // genesis and close.
             inner.expire_closed(ports, events)?;
+            // Decision 18: a raise whose 30 days are up takes effect.
+            inner.apply_due_birth_date(ports, events)?;
+            // #354: a coalesced profile change, once its 10 minutes are up.
+            inner.flush_profile(ports)?;
             for (server, records) in fetched {
                 if !inner.db.has_server(server)? {
                     continue;
@@ -1385,7 +2375,7 @@ impl Core {
                     continue;
                 }
                 if inner.view(server)?.state.server_name != name_before {
-                    events.push(Event::ServerUpdated(inner.summary(server)?));
+                    events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
@@ -1431,7 +2421,8 @@ impl Core {
                     });
                 }
             }
-            Ok(())
+            // Messages held for their key: sent now if it came.
+            inner.send_key_pending(ports, events)
         })
     }
 
@@ -1500,7 +2491,340 @@ impl Core {
             Some(b"beta") => UpdateChannel::Beta,
             _ => UpdateChannel::Stable,
         };
-        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel })
+        let relay_only = relay_only_in(&self.lock().db)?;
+        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only })
+    }
+
+    /// `setRelayOnly(on)` (GAP-6r): stored, then applied to the network. On
+    /// ends my call first (its media would go direct) and refuses calls
+    /// until it's off. Each of my servers gets a `voice.rooms` with the new
+    /// `relayOnly` at the next tick. Needs no identity.
+    pub fn set_relay_only(&self, on: bool) -> CoreResult<()> {
+        if on {
+            self.lock().calls.set_relay_only(true);
+            self.leave_call()?;
+        }
+        self.run(|inner, ports, _| {
+            inner.db.set(KV_RELAY_ONLY, &[u8::from(on)])?;
+            inner.calls.set_relay_only(on);
+            for server in inner.db.servers()? {
+                inner.calls.mark_dirty(server);
+            }
+            ports.network.set_relay_only(on);
+            Ok(())
+        })
+    }
+
+    /// Member relays (#368, slice 1): the setting and what it comes to now.
+    pub fn get_member_relay(&self) -> CoreResult<MemberRelay> {
+        let now = self.ports.clock.now_ms();
+        self.lock().member_relay_now(now)
+    }
+
+    /// `auto`, `on` or `off`; a forced-off reason still wins.
+    pub fn set_member_relay(&self, setting: MemberRelaySetting) -> CoreResult<MemberRelay> {
+        self.run(|inner, ports, _| {
+            let value: &[u8] = match setting {
+                MemberRelaySetting::Auto => b"auto",
+                MemberRelaySetting::On => b"on",
+                MemberRelaySetting::Off => b"off",
+            };
+            inner.db.set(KV_MEMBER_RELAY, value)?;
+            inner.member_relay_now(ports.clock.now_ms())
+        })
+    }
+
+    /// The daily cap in MB, [`MEMBER_RELAY_CAP_MB`], else `bad-request`.
+    pub fn set_member_relay_cap(&self, mb: u32) -> CoreResult<MemberRelay> {
+        if !MEMBER_RELAY_CAP_MB.contains(&mb) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        self.run(|inner, ports, _| {
+            inner.db.set(KV_MEMBER_RELAY_CAP, &mb.to_le_bytes())?;
+            inner.member_relay_now(ports.clock.now_ms())
+        })
+    }
+
+    /// Slice 3a: the desktop shell's metered-connection flag (shell only,
+    /// never the page). Kept in memory; forces member relaying off with
+    /// reason `metered` while set.
+    pub fn set_metered(&self, metered: bool) -> CoreResult<()> {
+        self.run(|inner, _, _| {
+            inner.metered = metered;
+            Ok(())
+        })
+    }
+
+    /// The one-time disclosure was shown and acknowledged.
+    pub fn mark_member_relay_disclosure_seen(&self) -> CoreResult<()> {
+        self.run(|inner, _, _| inner.db.set(KV_MEMBER_RELAY_SEEN, &[1]))
+    }
+
+    // ---- device link (`device-link-slice.md`) ----------------------------
+
+    /// New device: a one-time key, a code and a QR, served for 5 minutes.
+    /// Replaces any earlier link. `not-allowed` once signed in; `offline`
+    /// without a relay reservation yet.
+    pub fn start_device_link(&self) -> CoreResult<DeviceLinkStart> {
+        self.run(|inner, ports, events| {
+            if inner.me.is_some() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            ports.network.device_link_close();
+            inner.device_link = None;
+            let key = OneTimeKey::generate();
+            let code = devicelink::new_code();
+            let rv = devicelink::rendezvous(&code).expect("a fresh code is valid");
+            let addr = ports.network.device_link_open(rv, key.public).ok_or(ErrorCode::Offline)?;
+            let qr = devicelink::qr(&key.public, &addr);
+            if qr.len() > devicelink::MAX_QR {
+                ports.network.device_link_close();
+                return Err(ErrorCode::Internal.into());
+            }
+            let expires_at = ports.clock.now_ms() + devicelink::LINK_TTL_MS;
+            inner.device_link = Some(NewLink { key, expires_at, old_pub: None, confirmed: false, held: None });
+            events.push(link_state(DeviceLinkPhase::Waiting, None, None));
+            Ok(DeviceLinkStart { qr, code, expires_at })
+        })
+    }
+
+    /// New device: ends the link (`failed`, `cancelled`). Nothing to cancel
+    /// is fine.
+    pub fn cancel_device_link(&self) -> CoreResult<()> {
+        self.run(|inner, ports, events| {
+            if inner.device_link.take().is_some() {
+                ports.network.device_link_close();
+                events.push(link_state(DeviceLinkPhase::Failed, None, Some(DeviceLinkReason::Cancelled)));
+            }
+            Ok(())
+        })
+    }
+
+    /// New device, each sync round (and on the network's wake-up): the
+    /// approving device's Hello shows the digits (`confirm`); its sealed
+    /// account is opened and held until my user confirms the digits
+    /// (`confirmDeviceLink`), then restored (`done`, then
+    /// `identity.changed`); a link past its 5 minutes ends (`expired`).
+    pub fn poll_device_link(&self) {
+        let mut events = Vec::new();
+        let payload = {
+            let mut inner = self.lock();
+            let Some(link) = inner.device_link.as_mut() else { return };
+            let mut end = None;
+            for inbound in self.ports.network.device_link_take() {
+                match inbound {
+                    DeviceLinkInbound::Hello { e_old_pub } if link.old_pub.is_none() => {
+                        link.old_pub = Some(e_old_pub);
+                        let sas = devicelink::sas(&link.key.public, &e_old_pub);
+                        events.push(link_state(DeviceLinkPhase::Confirm, Some(sas), None));
+                    }
+                    DeviceLinkInbound::Sealed { ciphertext } => {
+                        let opened = link.old_pub.and_then(|old| {
+                            let key = link.key.transfer_key(&old, &link.key.public, &old)?;
+                            devicelink::open(&key, &ciphertext)
+                        });
+                        match opened {
+                            Some(p) => link.held = Some(p),
+                            None => end = Some((DeviceLinkPhase::Failed, DeviceLinkReason::Refused)),
+                        }
+                        // The network takes one transfer per link.
+                        self.ports.network.device_link_close();
+                        break;
+                    }
+                    DeviceLinkInbound::Hello { .. } => {}
+                }
+            }
+            let ready = link.confirmed && link.held.is_some();
+            if !ready && end.is_none() && self.ports.clock.now_ms() >= link.expires_at {
+                end = Some((DeviceLinkPhase::Expired, DeviceLinkReason::Timeout));
+            }
+            if let Some((phase, reason)) = end {
+                // One use: the keys and anything held are wiped.
+                inner.device_link = None;
+                self.ports.network.device_link_close();
+                events.push(link_state(phase, None, Some(reason)));
+                None
+            } else if ready {
+                inner.device_link.take().and_then(|mut link| link.held.take())
+            } else {
+                None
+            }
+        };
+        self.emit(events);
+        if let Some(payload) = payload {
+            self.apply_link(payload);
+        }
+    }
+
+    /// New device: my user compared the digits with the approving device's.
+    /// `true` lets the account be applied (now, if it has arrived, else when
+    /// it does); `false` ends the link (`failed`, `refused`) and wipes
+    /// anything held. Nothing is applied before `true`: whoever got to the
+    /// link first may not be my device (Security Lead on #394).
+    /// `not-found` with no link; `bad-request` before the digits are shown.
+    pub fn confirm_device_link(&self, matches: bool) -> CoreResult<()> {
+        let payload = {
+            let mut inner = self.lock();
+            let link = inner.device_link.as_mut().ok_or(ErrorCode::NotFound)?;
+            if link.old_pub.is_none() {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            if !matches {
+                inner.device_link = None;
+                self.ports.network.device_link_close();
+                drop(inner);
+                self.emit(vec![link_state(DeviceLinkPhase::Failed, None, Some(DeviceLinkReason::Refused))]);
+                return Ok(());
+            }
+            link.confirmed = true;
+            match link.held.is_some() {
+                true => inner.device_link.take().and_then(|mut link| link.held.take()),
+                false => None,
+            }
+        };
+        if let Some(payload) = payload {
+            self.apply_link(payload);
+        }
+        Ok(())
+    }
+
+    /// New device: the account, through `restoreIdentity`'s path. The same
+    /// identity and person: the age isn't asked again, and the birth date
+    /// stays as trusted as it was (#306).
+    fn apply_link(&self, payload: devicelink::Payload) {
+        let profile = Profile {
+            display_name: payload.profile.display_name.clone(),
+            avatar_small: payload.profile.avatar_small.clone().filter(|a| avatar::valid_avatar(a)),
+            color: payload.profile.color.clone().filter(|c| avatar::valid_color(c)),
+            birth_date: payload.birth_date.clone(),
+            birth_date_trusted: payload.birth_date_trusted,
+            country: payload.country.clone(),
+            ..Profile::default()
+        };
+        let done = match self.restore_with_profile(&payload.seed, profile) {
+            Ok(identity) => vec![link_state(DeviceLinkPhase::Done, None, None), Event::IdentityChanged(identity)],
+            Err(e) => {
+                eprintln!("mvs-core: a device link's account wasn't restored: {:?}", e.code);
+                let reason = match e.code {
+                    ErrorCode::KeyringUnavailable => DeviceLinkReason::Keyring,
+                    _ => DeviceLinkReason::Restore,
+                };
+                vec![link_state(DeviceLinkPhase::Failed, None, Some(reason))]
+            }
+        };
+        self.emit(done);
+    }
+
+    /// Signed-in device: reaches the link in `qr_or_code` and returns the
+    /// digits to compare. `bad-request` for neither a QR nor a code;
+    /// `not-found` for no such link (or expired, or another device's
+    /// session); `locked-out` when another device's Hello holds the link;
+    /// `rate-limited` after 3 attempts at one link; `offline`.
+    pub fn begin_device_approval(&self, qr_or_code: &str) -> CoreResult<DeviceApproval> {
+        let target = Target::parse(qr_or_code).ok_or(ErrorCode::BadRequest)?;
+        let id = target.link_id();
+        let now = self.ports.clock.now_ms();
+        let old_pub = {
+            let mut inner = self.lock();
+            if inner.me.is_none() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.approving = None;
+            // Expired approvals go (Tech Lead on #393).
+            inner.approvals.retain(|_, a| now < a.expires_at);
+            let approval = inner.approvals.entry(id).or_insert_with(|| Approval {
+                key: OneTimeKey::generate(),
+                attempts: 0,
+                link: None,
+                expires_at: now + devicelink::LINK_TTL_MS,
+            });
+            if approval.attempts >= devicelink::MAX_ATTEMPTS {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            approval.attempts += 1;
+            approval.key.public
+        };
+        // The network, outside the lock (a lookup can take seconds).
+        let net = &self.ports.network;
+        let addr = match &target {
+            Target::Qr { addr, .. } => addr.clone(),
+            Target::Code { rendezvous } => net.device_link_find(*rendezvous).map_err(link_error)?,
+        };
+        let new_pub = net.device_link_hello(&addr, old_pub).map_err(link_error)?;
+        if matches!(&target, Target::Qr { new_pub: qr_pub, .. } if *qr_pub != new_pub) {
+            return Err(ErrorCode::NotFound.into());
+        }
+        let mut inner = self.lock();
+        let approval = inner.approvals.get_mut(&id).ok_or(ErrorCode::NotFound)?;
+        approval.link = Some((addr, new_pub));
+        approval.expires_at = now + devicelink::LINK_TTL_MS;
+        let expires_at = approval.expires_at;
+        inner.approving = Some(id);
+        Ok(DeviceApproval { sas: devicelink::sas(&new_pub, &old_pub), expires_at })
+    }
+
+    /// Signed-in device: the user compared the digits. `true` sends my
+    /// account, sealed, and shows "a new device was added"; `false` ends
+    /// this attempt. `bad-request` with no approval in progress; `not-found`
+    /// once it expired.
+    pub fn confirm_device_approval(&self, approve: bool) -> CoreResult<()> {
+        let now = self.ports.clock.now_ms();
+        let (addr, sealed) = {
+            let mut inner = self.lock();
+            let id = inner.approving.take().ok_or(ErrorCode::BadRequest)?;
+            let approval = inner.approvals.get(&id).ok_or(ErrorCode::BadRequest)?;
+            let Some((addr, new_pub)) = approval.link.clone() else {
+                return Err(ErrorCode::BadRequest.into());
+            };
+            if now >= approval.expires_at {
+                inner.approvals.remove(&id);
+                return Err(ErrorCode::NotFound.into());
+            }
+            if !approve {
+                return Ok(());
+            }
+            let old_pub = approval.key.public;
+            let key = approval.key.transfer_key(&new_pub, &new_pub, &old_pub).ok_or(ErrorCode::NotFound)?;
+            let payload = inner.link_payload()?;
+            let sealed = devicelink::seal(&key, &payload);
+            // One use: this link's key is wiped.
+            inner.approvals.remove(&id);
+            (addr, sealed)
+        };
+        self.ports.network.device_link_send(&addr, &sealed).map_err(link_error)?;
+        // TODO(device link): the notice to my other devices goes on the
+        // backup-store notice path once holders keep one (dev-sync).
+        // Kept until acknowledged, and announced now.
+        {
+            let inner = self.lock();
+            let mut notices = device_notices(&inner.db)?;
+            notices.push(now);
+            // The newest MAX_DEVICE_NOTICES only (Tech Lead on #415).
+            let extra = notices.len().saturating_sub(MAX_DEVICE_NOTICES);
+            notices.drain(..extra);
+            inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))?;
+        }
+        self.emit(vec![Event::DeviceAdded { at: now, label: notice_label(None) }]);
+        Ok(())
+    }
+
+    /// Device link: the user saw the "a new device was added" notice with
+    /// this `at`; it isn't announced again. An unknown `at` is fine.
+    pub fn ack_device_notice(&self, at: u64) -> CoreResult<()> {
+        let inner = self.lock();
+        let mut notices = device_notices(&inner.db)?;
+        notices.retain(|n| *n != at);
+        inner.db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&notices).expect("plain list"))
+    }
+
+    /// Device link: once per start (the first sync round, when the UI is
+    /// up), every notice not yet acknowledged.
+    fn announce_device_notices(&self) {
+        if self.notices_announced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let notices = device_notices(&self.lock().db).unwrap_or_default();
+        self.emit(notices.into_iter().map(|at| Event::DeviceAdded { at, label: notice_label(None) }).collect());
     }
 
     pub fn set_update_channel(&self, channel: UpdateChannel) -> CoreResult<()> {
@@ -1570,7 +2894,7 @@ impl Core {
     }
 
     /// The background check: once the UI is up (or after a fallback wait),
-    /// then every 6 h ± 30 min, and at once after a channel switch. Downloads
+    /// then every hour ± 5 min, and at once after a channel switch. Downloads
     /// whatever is available; the apply waits for the user (or next start).
     /// Returns when `Updates::stop` is called; without updates, at once.
     pub fn run_update_loop(&self) {
@@ -1581,6 +2905,21 @@ impl Core {
         loop {
             if let Ok(channel) = self.ui_channel() {
                 self.emit_update(updates.background_round(channel, self.now_secs()));
+                // Slice 3b: the owner's signed global switch, fetched with the
+                // check. Kept in kv; only this path writes it.
+                let off = updates.member_relay_off(channel);
+                let mut events = Vec::new();
+                {
+                    let mut inner = self.lock();
+                    let value: &[u8] = if off { b"1" } else { b"0" };
+                    if inner.db.get(KV_MEMBER_RELAY_GLOBAL_OFF).ok().flatten().as_deref() != Some(value) {
+                        if let Err(e) = inner.db.set(KV_MEMBER_RELAY_GLOBAL_OFF, value) {
+                            eprintln!("mvs-core: the global member relay flag wasn't stored: {:?}", e.code);
+                        }
+                    }
+                    inner.check_member_relay(&self.ports, &mut events);
+                }
+                self.emit(events);
             }
             if !updates.wait(crate::update::next_interval()) {
                 return;
@@ -1611,19 +2950,20 @@ fn update_event(e: UpdateEvent) -> Event {
 }
 
 impl voice::Members for Inner {
-    /// Room-only: the server's voice room, a server of mine whose genesis
-    /// is accepted (its ID checked against it), a member, not kicked. No
-    /// 18+ gate: the room isn't a channel record.
-    fn may_call(&mut self, who: PublicKey, server: ServerId, channel: ChannelId) -> bool {
-        if channel != voice::room_id(server) {
-            return false;
-        }
+    /// A server of mine whose genesis is accepted (its ID checked against
+    /// it), a member, not kicked. No 18+ gate: rooms aren't channel records.
+    /// (The room's ID derives from the server: `voice` checks that.)
+    fn may_call(&mut self, who: PublicKey, server: ServerId) -> bool {
         let mine = self.db.servers().is_ok_and(|servers| servers.contains(&server));
         if !mine || self.load(server).is_err() || self.view(server).is_err() {
             return false;
         }
         let state = self.logs[&server].resolver.state();
         state.members.contains(&who) && !state.kicked.contains(&who)
+    }
+
+    fn is_owner(&mut self, who: PublicKey, server: ServerId) -> bool {
+        self.load(server).is_ok() && self.view(server).is_ok_and(|view| view.owner == who)
     }
 
     fn audience(&mut self, server: ServerId) -> Vec<PublicKey> {
@@ -1675,20 +3015,211 @@ impl Inner {
     /// Our age claim for `server` (B7): 18+ or not, from the sealed birth
     /// date, which never leaves this device. A restored identity has no
     /// birth date yet and claims "not 18+".
-    fn sign_age_claim(&self, ports: &Ports, server: ServerId) -> CoreResult<Record> {
-        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+    /// The age claim to post in `server` now, if any (decision 18, B13 §3,
+    /// B7 §9), from my latest accepted claim there:
+    /// - a raise ("not adult" there, adult by my birth date) that hasn't
+    ///   taken effect yet posts nothing and starts its 30 days
+    ///   (`pendingBirthDate`); until then I count as under 18;
+    /// - a lowering, or a first claim, is posted at once;
+    /// - the same as my current claim: nothing.
+    ///
+    /// So a restore (a birth date entered again) can't skip the 30 days, while
+    /// turning 18 with the date my claims came from (`birth_date_trusted`:
+    /// set at sign-up here) is just a birthday, with no wait.
+    fn age_claim(&mut self, ports: &Ports, server: ServerId) -> CoreResult<Option<Record>> {
         let now = ports.clock.now_ms();
-        let adult = model::age_on(&me.profile.birth_date, now).is_some_and(|age| age >= 18);
+        self.settle_birth_date(now)?;
+        let mut trust = false;
+        let (prior, adult, raise, pending) = {
+            let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            let key = me.key();
+            let view = self.view(server)?;
+            let claimed =
+                view.records.iter().any(|r| r.kind() == Kind::AgeClaim && r.author() == key);
+            let prior = claimed.then(|| view.state.adults.contains(&key));
+            let profile = &me.profile;
+            let by_date = model::age_on(&profile.birth_date, now).is_some_and(|age| age >= 18);
+            let pending = profile.raise_pending(now);
+            // A raise is a *changed* date (a restore entered it again): with
+            // the date my claims came from, turning 18 is just a birthday.
+            let raise = prior == Some(false) && by_date && !pending && !profile.birth_date_trusted;
+            // Only an *adult* agreement (a server already holds "adult" and
+            // the date says adult) makes a restored date the one my claims
+            // come from. A "not adult" agreement proves nothing: a date a day
+            // short of 18 would agree, then skip the wait the next day
+            // (Security Lead). Nor does a server with no claim.
+            let agrees =
+                !profile.birth_date_trusted && !pending && prior == Some(true) && by_date;
+            if agrees {
+                trust = true;
+            }
+            (prior, profile.effective_age(now).is_some_and(|age| age >= 18), raise, pending)
+        };
+        if trust {
+            self.update_profile_with(|p| p.birth_date_trusted = true)?;
+        }
+        if raise {
+            let date = self.me.as_ref().expect("checked above").profile.birth_date.clone();
+            self.update_profile_with(|p| {
+                p.pending_birth_date =
+                    Some(PendingBirth { date, effective_at: now + AGE_RAISE_DELAY_MS });
+            })?;
+            return Ok(None);
+        }
+        // Nothing new to say; and while a raise waits, a server that already
+        // holds "adult" keeps it (no lowering from the wait itself).
+        if prior == Some(adult) || (prior == Some(true) && pending) {
+            return Ok(None);
+        }
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let key = me.key();
         let view = self.view(server)?;
-        authority::sign_control(
+        let record = authority::sign_control(
             me.identity.signing_key(),
             server,
-            view.next_seq(&me.key()),
+            view.next_seq(&key),
             view.deps(None),
             now,
             &Action::AgeClaim { adult },
         )
-        .map_err(|_| ErrorCode::BadRequest.into())
+        .map_err(|_| CoreError::from(ErrorCode::BadRequest))?;
+        Ok(Some(record))
+    }
+
+    /// Changes my stored profile and saves it (sealed).
+    fn update_profile_with(&mut self, change: impl FnOnce(&mut Profile)) -> CoreResult<()> {
+        let me = self.me.as_mut().ok_or(ErrorCode::NotFound)?;
+        change(&mut me.profile);
+        let key = *me.identity.storage_key().expose_secret();
+        let json = serde_json::to_vec(&me.profile).expect("plain struct");
+        self.db.save_profile(&key, &json)
+    }
+
+    /// A pending raise whose 30 days are up takes effect (and is saved).
+    /// True if it did.
+    fn settle_birth_date(&mut self, now: u64) -> CoreResult<bool> {
+        let due = self.me.as_ref().is_some_and(|me| {
+            me.profile.pending_birth_date.as_ref().is_some_and(|p| now >= p.effective_at)
+        });
+        if due {
+            self.update_profile_with(|p| {
+                p.settle(now);
+            })?;
+        }
+        Ok(due)
+    }
+
+    /// My servers for the backup: server ID (hex) to sync secret (hex), not
+    /// closed.
+    fn backup_set(&self) -> CoreResult<BTreeMap<String, String>> {
+        let mut current = BTreeMap::new();
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            if let Some(secret) = self.secret(server)? {
+                current.insert(model::hex_id(server.as_bytes()), hex::encode(*secret));
+            }
+        }
+        Ok(current)
+    }
+
+    fn backup_fingerprint(current: &BTreeMap<String, String>) -> Vec<u8> {
+        let json = serde_json::to_vec(current).expect("plain map");
+        blake3::derive_key("mvs/backup-written/v1", &json).to_vec()
+    }
+
+    /// Restore servers (#291 phase A, Tech Lead on #317): a write is due
+    /// only when my server set changed since the last one, on the first
+    /// round after start (`login`), or [`BACKUP_REPUBLISH_MS`] after the
+    /// last. Otherwise a round fetches and puts nothing.
+    fn backup_due(&self, now: u64, login: bool) -> CoreResult<bool> {
+        if self.me.is_none() {
+            return Ok(false);
+        }
+        let changed = self.db.get(KV_BACKUP_WRITTEN)?.as_deref()
+            != Some(Self::backup_fingerprint(&self.backup_set()?).as_slice());
+        let last = self
+            .db
+            .get(KV_BACKUP_PUT_AT)?
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        Ok(login || changed || now.saturating_sub(last) >= BACKUP_REPUBLISH_MS)
+    }
+
+    /// My server list merged into the newest of `answers` (fetched outside
+    /// the lock): servers I'm in are live; servers this device listed
+    /// before and no longer has (left, kicked, closed, purged) get a
+    /// tombstone; what my other devices wrote is kept. Sealed as the next
+    /// version, to be put outside the lock. `None`: nothing to back up.
+    fn backup_merge(&mut self, now: u64, answers: &[Vec<u8>]) -> CoreResult<Option<Vec<u8>>> {
+        let Some(keys) = self.me.as_ref().map(|me| me.identity.backup_keys()) else {
+            return Ok(None);
+        };
+        let mut known: BTreeMap<String, u64> = self
+            .db
+            .get(KV_BACKUP_KNOWN)?
+            .and_then(|json| serde_json::from_slice(&json).ok())
+            .unwrap_or_default();
+        let current = self.backup_set()?;
+        let remote = backup::newest(&keys, answers);
+        if remote.is_none() && current.is_empty() && known.is_empty() {
+            // Nothing to back up, and that's settled until my server set
+            // changes or the republish is due. Without this, a new account
+            // (or a restore whose backup isn't found yet) fetched on every
+            // round: a real mailbox allows 60 fetches an hour (G-91).
+            self.db.set(KV_BACKUP_WRITTEN, &Self::backup_fingerprint(&current))?;
+            self.db.set(KV_BACKUP_PUT_AT, &now.to_le_bytes())?;
+            return Ok(None);
+        }
+        let remote = remote.unwrap_or_default();
+        let mut plain = remote.clone();
+        for (id, secret) in &current {
+            let joined_at = *known.entry(id.clone()).or_insert(now);
+            let mut ours = backup::Plain::default();
+            ours.servers.insert(id.clone(), backup::Entry { secret: secret.clone(), joined_at, gone_at: None });
+            plain.merge(&ours);
+        }
+        for id in known.keys().filter(|id| !current.contains_key(*id)) {
+            if let Some(entry) = plain.servers.get_mut(id) {
+                if entry.live() {
+                    entry.gone_at = Some(now.max(entry.joined_at + 1));
+                }
+            }
+        }
+        known.retain(|id, _| current.contains_key(id));
+        plain.version = remote.version + 1;
+        let blob = backup::seal(&keys, &plain).map_err(|_| ErrorCode::Internal)?;
+        self.db.set(KV_BACKUP_KNOWN, &serde_json::to_vec(&known).expect("plain map"))?;
+        self.db.set(KV_BACKUP_WRITTEN, &Self::backup_fingerprint(&current))?;
+        self.db.set(KV_BACKUP_PUT_AT, &now.to_le_bytes())?;
+        Ok(Some(blob))
+    }
+
+    /// Each sync round: a raise whose 30 days are up takes effect, and its
+    /// "adult" claim goes to every server I'm still in.
+    fn apply_due_birth_date(&mut self, ports: &Ports, events: &mut Events) -> CoreResult<()> {
+        if !self.settle_birth_date(ports.clock.now_ms())? {
+            return Ok(());
+        }
+        let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            if !self.view(server)?.state.is_member(key) {
+                continue;
+            }
+            if let Some(claim) = self.age_claim(ports, server)? {
+                self.store(server, claim.clone())?;
+                ports.network.publish(&claim);
+            }
+        }
+        let identity = self.identity_json(self.me.as_ref().expect("checked above"))?;
+        events.push(Event::IdentityChanged(identity));
+        Ok(())
     }
 
     /// B6-p: every full record an accepted delete or edit replaced is pruned
@@ -1810,6 +3341,129 @@ impl Inner {
         Ok(self.view(server)?.summary(me, secret.as_deref()))
     }
 
+    /// The stored identity, opened, and every server opened for sync before
+    /// any command can publish to it (GAP-4; the sync loop also reopens them
+    /// each round).
+    fn open_stored(&mut self, ports: &Ports) -> CoreResult<()> {
+        let phrase = self.vault.open().map_err(vault_error)?;
+        self.me = Some(self.load_me(phrase)?);
+        unlock_cipher(ports, self.me.as_ref());
+        for server in self.db.servers()? {
+            self.load(server)?;
+            self.open_sync(ports, server)?;
+        }
+        Ok(())
+    }
+
+    /// QA on 0.4.5: the keychain was unavailable at startup (a Secret
+    /// Service that started after the core). Asks it again: still failing,
+    /// `keyring-unavailable`; working now, the flag clears and a stored
+    /// identity is opened as at startup.
+    fn recheck_keyring(&mut self, ports: &Ports) -> CoreResult<()> {
+        if !self.keyring_unavailable {
+            return Ok(());
+        }
+        let state = self.vault.state().map_err(vault_error)?;
+        self.keyring_unavailable = false;
+        if state == VaultState::Ready {
+            self.open_stored(ports)?;
+        }
+        Ok(())
+    }
+
+    /// Member relays (#368, slice 1): the setting, and what it comes to now.
+    /// Forced off, whatever the setting, by the first reason that applies:
+    /// the global flag (the signed `flags.json`, slice 3b), then a minor, then
+    /// relay-only, then a metered network (the shell's `setMetered`).
+    fn member_relay_now(&mut self, now: u64) -> CoreResult<MemberRelay> {
+        let setting = match self.db.get(KV_MEMBER_RELAY)?.as_deref() {
+            Some(b"on") => MemberRelaySetting::On,
+            Some(b"off") => MemberRelaySetting::Off,
+            _ => MemberRelaySetting::Auto,
+        };
+        let disclosure_seen = self.db.get(KV_MEMBER_RELAY_SEEN)?.is_some();
+        let daily_cap_mb = self
+            .db
+            .get(KV_MEMBER_RELAY_CAP)?
+            .and_then(|v| v.try_into().ok())
+            .map(u32::from_le_bytes)
+            .filter(|mb| MEMBER_RELAY_CAP_MB.contains(mb))
+            .unwrap_or(MEMBER_RELAY_CAP_DEFAULT_MB);
+        let role = self.relay_role()?;
+        // The age claim's rule: an adult only by a trusted birth date (a
+        // restored date isn't, until it agrees or its 30 days are up).
+        let adult = self.me.as_ref().is_some_and(|me| {
+            me.profile.birth_date_trusted && me.profile.effective_age(now).is_some_and(|age| age >= 18)
+        });
+        let global_off = self.db.get(KV_MEMBER_RELAY_GLOBAL_OFF)?.as_deref() == Some(b"1");
+        let reason = if global_off {
+            Some(MemberRelayReason::GlobalOff)
+        } else if self.me.is_some() && !adult {
+            Some(MemberRelayReason::Minor)
+        } else if relay_only_in(&self.db)? {
+            Some(MemberRelayReason::RelayOnly)
+        } else if self.metered {
+            Some(MemberRelayReason::Metered)
+        } else {
+            None
+        };
+        let wanted = match setting {
+            MemberRelaySetting::On => true,
+            MemberRelaySetting::Off => false,
+            MemberRelaySetting::Auto => role,
+        };
+        Ok(MemberRelay {
+            setting,
+            // PO on #387: never relaying before the one-time disclosure was
+            // acknowledged, whatever the setting (fails closed: slice 2's
+            // relay reads only `effective`).
+            effective: self.me.is_some() && reason.is_none() && wanted && disclosure_seen,
+            reason,
+            role,
+            disclosure_seen,
+            daily_cap_mb,
+        })
+    }
+
+    /// Owner or admin in at least one server I'm still a member of (not
+    /// closed, kicked or left), by the log as read so far.
+    fn relay_role(&mut self) -> CoreResult<bool> {
+        let Some(key) = self.me.as_ref().map(Me::key) else { return Ok(false) };
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() || self.load(server).is_err() {
+                continue;
+            }
+            let Ok(view) = self.view(server) else { continue };
+            let state = &view.state;
+            // Kicked is checked on its own too (Security Lead on #389), not
+            // only through membership.
+            let current = state.is_member(key) && !state.kicked.contains(&key);
+            if state.closed.is_none() && current && state.role(key) >= authority::Role::Admin {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `memberRelay.changed` when the value differs from the last one
+    /// announced (a role read from the log, a join or leave, relay-only, the
+    /// birth date, the setting). Called after every command and sync round.
+    fn check_member_relay(&mut self, ports: &Ports, events: &mut Events) {
+        match self.member_relay_now(ports.clock.now_ms()) {
+            Ok(now) if self.member_relay.as_ref() != Some(&now) => {
+                if self.member_relay.is_some() {
+                    events.push(Event::MemberRelayChanged(now.clone()));
+                }
+                // Slice 2: the network relays for members only while this
+                // says so (the first check, at start, sets it too).
+                ports.network.set_member_relay(now.effective, now.daily_cap_mb, now.role);
+                self.member_relay = Some(now);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("mvs-core: the member relay state wasn't read: {:?}", e.code),
+        }
+    }
+
     /// Syncs a loaded server members-only (GAP-4) with its secret and the
     /// channels authority knows. Harmless to repeat; a server without a
     /// stored secret (from before GAP-4) isn't synced.
@@ -1855,18 +3509,35 @@ impl Inner {
         events: &mut Events,
     ) -> CoreResult<()> {
         let me = self.me.as_ref().map(Me::key);
+        let members = self.view(server)?.state.members.clone();
+        // Channels with a new message from someone else: their unread
+        // counts changed (owner bug, v0.4.1: without these events the UI's
+        // dots drifted from the read marker and stuck).
+        let mut fresh = Vec::new();
         for channel in self.known(server)? {
             let shown = self.shown(cipher, server, channel)?;
             let seen = self.announced.entry(server).or_default();
             for (index, s) in shown.iter().enumerate() {
                 let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
-                let event = match seen.insert(s.record.id(), state) {
+                let event = match seen.insert(s.record.id(), state.clone()) {
+                    None if Some(s.record.author()) != me && !fresh.contains(&channel) => {
+                        fresh.push(channel);
+                        Event::MessageAdded(message_json(
+                            s,
+                            index,
+                            channel,
+                            me,
+                            &Status { net: &*self.net, db: &self.db },
+                            &members,
+                        ))
+                    }
                     None => Event::MessageAdded(message_json(
                         s,
                         index,
                         channel,
                         me,
                         &Status { net: &*self.net, db: &self.db },
+                        &members,
                     )),
                     Some(old) if old != state => Event::MessageUpdated(message_json(
                         s,
@@ -1874,23 +3545,152 @@ impl Inner {
                         channel,
                         me,
                         &Status { net: &*self.net, db: &self.db },
+                        &members,
                     )),
                     Some(_) => continue,
                 };
                 events.push(event);
             }
         }
+        if !fresh.is_empty() {
+            let mut channels: Vec<Channel> = self.view(server)?.channels(me);
+            channels.retain(|c| {
+                model::parse_hex32(&c.id).is_some_and(|id| fresh.contains(&ChannelId::from_bytes(id)))
+            });
+            self.fill_unread(cipher, server, &mut channels)?;
+            events.extend(channels.into_iter().map(Event::ChannelUpdated));
+            events.push(Event::ServerUpdated(self.counted_summary(cipher, server)?));
+        }
         Ok(())
+    }
+
+    /// The server's summary with its unread dot and mention badge (G-21,
+    /// G-24): what `listServers` returns and `server.updated` carries after
+    /// new messages or `markRead`.
+    fn counted_summary(&mut self, cipher: &dyn GroupCipher, server: ServerId) -> CoreResult<ServerSummary> {
+        let mut summary = self.summary(server)?;
+        let me = self.me.as_ref().map(Me::key);
+        let mut channels = self.view(server)?.channels(me);
+        self.fill_unread(cipher, server, &mut channels)?;
+        summary.unread = channels.iter().any(|c| c.unread);
+        summary.mentions = channels.iter().map(|c| c.mentions).fold(0, u32::saturating_add);
+        Ok(summary)
     }
 
     /// Seals `text` for `channel`'s members. If no key is usable yet, a
     /// moderator or above rotates first; anyone else gets `not-allowed`.
+    /// Whether a refused seal in `server` only means the key hasn't reached
+    /// me yet: I'm a current member of an open server who can't rotate
+    /// (`seal`'s `not-allowed` for anyone else is final).
+    /// Holds a message until its channel key reaches me (`send_message`),
+    /// shown after the channel's stored messages.
+    fn hold_for_key(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        channel: ChannelId,
+        body: &str,
+    ) -> CoreResult<Message> {
+        let author = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        // Bounded (tech lead): past the cap, the plain refusal.
+        if self.key_pending.iter().filter(|p| p.channel == channel && !p.failed).count() >= MAX_KEY_PENDING {
+            return Err(ErrorCode::NotAllowed.into());
+        }
+        let mut tag = [0u8; 8];
+        OsRng.fill_bytes(&mut tag);
+        let held = KeyPending {
+            id: format!("{KEY_PENDING_PREFIX}{}", hex::encode(tag)),
+            server,
+            channel,
+            author,
+            body: Zeroizing::new(body.to_owned()),
+            created_at: ports.clock.now_ms(),
+            failed: false,
+        };
+        let index = self.message_count(&*ports.cipher, server, channel)?
+            + self.key_pending.iter().filter(|p| p.channel == channel).count();
+        let message = held.message(index);
+        self.key_pending.push(held);
+        Ok(message)
+    }
+
+    /// The sync loop's part (`sync_now`): each held message whose key has
+    /// come is sealed and sent (`message.updated` with `replaces`, then
+    /// listed like any other); one still without it after
+    /// [`KEY_PENDING_FOR`], or that can no longer be sent (kicked, left,
+    /// closed), turns `failed` (`message.updated`, `notice: rekey-waiting`)
+    /// and stays listed until a restart.
+    fn send_key_pending(&mut self, ports: &Ports, events: &mut Events) -> CoreResult<()> {
+        let now = ports.clock.now_ms();
+        let mut i = 0;
+        while i < self.key_pending.len() {
+            if self.key_pending[i].failed {
+                i += 1;
+                continue;
+            }
+            let (server, channel) = (self.key_pending[i].server, self.key_pending[i].channel);
+            let body = self.key_pending[i].body.clone();
+            let waiting = self.db.has_server(server)? && {
+                self.load(server)?;
+                match self.seal(ports, server, channel, body.as_bytes()) {
+                    Ok(sealed) => {
+                        let held = self.key_pending.remove(i);
+                        let record =
+                            self.sign_in_channel(ports, server, channel, None, Kind::Message, sealed)?;
+                        self.store(server, record.clone())?;
+                        ports.network.publish(&record);
+                        let mut message = self.message(&*ports.cipher, server, channel, record.id())?;
+                        message.replaces = Some(held.id);
+                        events.push(Event::MessageUpdated(message));
+                        continue;
+                    }
+                    Err(e) => e.code == ErrorCode::NotAllowed && self.awaiting_key(server)?,
+                }
+            };
+            let held = &self.key_pending[i];
+            let expired = now.saturating_sub(held.created_at) >= KEY_PENDING_FOR.as_millis() as u64;
+            if !waiting || expired {
+                self.key_pending[i].failed = true;
+                let index = self.message_count(&*ports.cipher, server, channel)?
+                    + self.key_pending[..i].iter().filter(|p| p.channel == channel).count();
+                events.push(Event::MessageUpdated(self.key_pending[i].message(index)));
+                events.push(Event::Notice {
+                    kind: NoticeKind::RekeyWaiting,
+                    server_id: model::hex_id(server.as_bytes()),
+                });
+            }
+            i += 1;
+        }
+        // Failed ones are bounded too (sec-lead): beyond MAX_KEY_PENDING in
+        // a channel, the oldest are dropped, their text with them.
+        let channels: BTreeSet<ChannelId> = self.key_pending.iter().map(|p| p.channel).collect();
+        for channel in channels {
+            let failed = self.key_pending.iter().filter(|p| p.channel == channel && p.failed).count();
+            let mut extra = failed.saturating_sub(MAX_KEY_PENDING);
+            self.key_pending.retain(|p| {
+                let drop = extra > 0 && p.channel == channel && p.failed;
+                extra -= usize::from(drop);
+                !drop
+            });
+        }
+        Ok(())
+    }
+
+    fn awaiting_key(&self, server: ServerId) -> CoreResult<bool> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        let view = self.view(server)?;
+        Ok(view.state.is_member(me)
+            && !view.is_kicked(&me)
+            && view.state.closed.is_none()
+            && view.state.role(me) < authority::Role::Moderator)
+    }
+
     fn seal(
         &mut self,
         ports: &Ports,
         server: ServerId,
         channel: ChannelId,
-        text: &str,
+        plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
@@ -1900,12 +3700,12 @@ impl Inner {
         let auth_deps = auth_deps(&view);
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        match cipher.encrypt(server, channel, text.as_bytes()) {
+        match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).
                 self.rotate_channel(ports, server, channel, &members, &auth_deps)
                     .map_err(|_| CoreError::from(ErrorCode::NotAllowed))?;
-                cipher.encrypt(server, channel, text.as_bytes()).map_err(cipher_error)
+                cipher.encrypt(server, channel, plaintext).map_err(cipher_error)
             }
             other => other.map_err(cipher_error),
         }
@@ -2009,7 +3809,8 @@ impl Inner {
         // Announced by the command itself; sync won't repeat it.
         let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
         self.announced.entry(server).or_default().insert(s.record.id(), state);
-        Ok(message_json(s, index, channel, me, &Status { net: &*self.net, db: &self.db }))
+        let members = self.view(server)?.state.members.clone();
+        Ok(message_json(s, index, channel, me, &Status { net: &*self.net, db: &self.db }, &members))
     }
 
     /// A fresh key for `channel`, for `members` (we must be a moderator or
@@ -2137,11 +3938,6 @@ impl Inner {
     /// other. Loads the server.
     /// The server a channel of mine is in, 18+ ones included (whether I may
     /// use it is the caller's check).
-    /// The server of mine whose voice room is `room`, if any.
-    fn room_server(&self, room: ChannelId) -> CoreResult<Option<ServerId>> {
-        Ok(self.db.servers()?.into_iter().find(|server| voice::room_id(*server) == room))
-    }
-
     fn channel_server(&mut self, channel: ChannelId) -> CoreResult<ServerId> {
         for server in self.db.servers()? {
             self.load(server)?;
@@ -2189,11 +3985,57 @@ impl Inner {
         server: ServerId,
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
+        let now = self.clock.now_ms();
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log))
+        Ok(chat::messages(cipher, server, channel, log, now))
+    }
+
+    /// G-21: my read marker in `channel`: the last message I read, as
+    /// (time, ID). Never read: from when this device joined the server, so
+    /// history from before isn't unread.
+    fn read_marker(&self, server: ServerId, channel: ChannelId) -> CoreResult<(u64, [u8; 32])> {
+        let key = format!("{KV_READ_PREFIX}{}", model::hex_id(channel.as_bytes()));
+        if let Some(raw) = self.db.get(&key)? {
+            if let Ok((ts, id)) = serde_json::from_slice::<(u64, String)>(&raw) {
+                if let Some(id) = model::parse_hex32(&id) {
+                    return Ok((ts, id));
+                }
+            }
+        }
+        Ok((self.db.joined_at(server)?.unwrap_or(0), [0; 32]))
+    }
+
+    /// G-21: `firstUnreadIndex` and `unreadCount` for each of `channels`
+    /// (of `server`): the messages after my read marker, in `getMessages`
+    /// order, that aren't mine. Local only: the stored records, no network
+    /// and no paging.
+    fn fill_unread(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+        channels: &mut [Channel],
+    ) -> CoreResult<()> {
+        let Some(me) = self.me.as_ref().map(Me::key) else { return Ok(()) };
+        for json in channels {
+            let Some(channel) = model::parse_hex32(&json.id).map(ChannelId::from_bytes) else {
+                continue;
+            };
+            let marker = self.read_marker(server, channel)?;
+            let shown = self.shown(cipher, server, channel)?;
+            let after = |s: &chat::Shown| (s.record.ts(), *s.record.id().as_bytes()) > marker;
+            let unread = |s: &&chat::Shown| after(s) && s.record.author() != me;
+            let count = shown.iter().filter(unread).count() as u64;
+            json.unread_count = Some(count);
+            json.first_unread_index = shown.iter().position(|s| unread(&s)).map(|i| i as u64);
+            json.unread = count > 0;
+            // G-24: unread messages that mention me (the badge).
+            let mentions = shown.iter().filter(unread).filter(|s| model::mention_tokens(&s.text).contains(&me));
+            json.mentions = u32::try_from(mentions.count()).unwrap_or(u32::MAX);
+        }
+        Ok(())
     }
 
     fn message_count(
@@ -2245,6 +4087,25 @@ impl Inner {
         self.me_from(phrase, identity, profile)
     }
 
+    /// Device link: what the approving device sends. The words come from the
+    /// keychain (they are gone from memory once the recovery check passed).
+    fn link_payload(&self) -> CoreResult<devicelink::Payload> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let phrase = self.vault.open().map_err(vault_error)?;
+        let p = &me.profile;
+        Ok(devicelink::Payload {
+            seed: Zeroizing::new(phrase.words().join(" ")),
+            profile: devicelink::PayloadProfile {
+                display_name: p.display_name.clone(),
+                avatar_small: p.avatar_small.clone().filter(|a| !a.is_empty()),
+                color: p.color.clone().filter(|c| !c.is_empty()),
+            },
+            birth_date: p.birth_date.clone(),
+            birth_date_trusted: p.birth_date_trusted,
+            country: p.country.clone(),
+        })
+    }
+
     fn identity_json(&self, me: &Me) -> CoreResult<Identity> {
         let key = me.key();
         Ok(Identity {
@@ -2253,11 +4114,103 @@ impl Inner {
             display_name: me.profile.display_name.clone(),
             avatar_color: model::color_for(key.as_bytes()),
             avatar_data_url: me.profile.avatar_data_url.clone(),
+            color: me.profile.color.clone(),
             bio: me.profile.bio.clone(),
             country: me.profile.country.clone(),
             birth_date: me.profile.birth_date.clone(),
+            pending_birth_date: me.profile.pending_birth_date.as_ref().map(|p| PendingBirthDate {
+                date: p.date.clone(),
+                effective_at: p.effective_at,
+            }),
             recovery_checked: self.vault.recovery_check_done(&me.identity).map_err(vault_error)?,
         })
+    }
+
+    /// #354, #378: a pending profile change goes out at once while the burst
+    /// lasts ([`PROFILE_POST_BURST`]), then once per [`PROFILE_POST_EVERY_MS`]
+    /// (coalesced: the latest values). Called on a change and every sync
+    /// round; the pending flag is stored.
+    fn flush_profile(&mut self, ports: &Ports) -> CoreResult<()> {
+        let pending = self.db.get(KV_PROFILE_PENDING)?.is_some();
+        // Servers whose last profile post was refused (Tech Lead on #359):
+        // only they are tried again, so one refusing server doesn't send
+        // every other server a new post every 10 minutes.
+        let retry: BTreeSet<ServerId> = self
+            .db
+            .get(KV_PROFILE_RETRY)?
+            .and_then(|json| serde_json::from_slice::<Vec<String>>(&json).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| model::parse_hex32(id).map(ServerId::from_bytes))
+            .collect();
+        if !pending && retry.is_empty() {
+            return Ok(());
+        }
+        // GCRA (#378): each post moves `tat` on by the interval; one may go
+        // while `tat` is at most BURST − 1 intervals ahead of now.
+        let now = ports.clock.now_ms();
+        let tat = self
+            .db
+            .get(KV_PROFILE_POST_TAT)?
+            .and_then(|v| v.try_into().ok())
+            .map_or(0, u64::from_le_bytes);
+        if tat > now.saturating_add((PROFILE_POST_BURST - 1) * PROFILE_POST_EVERY_MS) {
+            return Ok(());
+        }
+        let (sent, failed) = self.post_profile_everywhere(ports, (!pending).then_some(&retry))?;
+        // Counted once a post was made or tried (sign-up sets a name before
+        // I'm in any server: nothing either way).
+        if sent > 0 || !failed.is_empty() {
+            let tat = tat.max(now).saturating_add(PROFILE_POST_EVERY_MS);
+            self.db.set(KV_PROFILE_POST_TAT, &tat.to_le_bytes())?;
+        }
+        let failed: Vec<String> = failed.iter().map(|s| model::hex_id(s.as_bytes())).collect();
+        self.db.set(KV_PROFILE_RETRY, &serde_json::to_vec(&failed).expect("plain list"))?;
+        self.db.delete(KV_PROFILE_PENDING)
+    }
+
+    /// My profile (name, small picture, colour) as one profile post per
+    /// server I'm still a member of (not closed, not kicked, not left), or
+    /// only to `only`. A server that refuses it is logged. Returns how many
+    /// went out and the servers that refused. A database error is returned
+    /// (Tech Lead on #361), so the pending change stays for the next round.
+    fn post_profile_everywhere(
+        &mut self,
+        ports: &Ports,
+        only: Option<&BTreeSet<ServerId>>,
+    ) -> CoreResult<(usize, Vec<ServerId>)> {
+        let mut servers = self.db.servers()?;
+        if let Some(only) = only {
+            servers.retain(|s| only.contains(s));
+        }
+        let Some(me) = self.me.as_ref() else { return Ok((0, Vec::new())) };
+        let (mut sent, mut failed) = (0, Vec::new());
+        let key = me.key();
+        let p = &me.profile;
+        let action = model::profile_action_with(&p.display_name, p.avatar_small.as_deref(), p.color.as_deref());
+        for server in servers {
+            let posted = (|| -> CoreResult<bool> {
+                if self.db.closed_at(server)?.is_some() {
+                    return Ok(false);
+                }
+                self.load(server)?;
+                let view = self.view(server)?;
+                if view.state.closed.is_some() || !view.state.is_member(key) {
+                    return Ok(false);
+                }
+                self.publish_control(ports, server, &action)?;
+                Ok(true)
+            })();
+            match posted {
+                Ok(true) => sent += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    failed.push(server);
+                    eprintln!("mvs-core: a profile post wasn't published: {:?}", e.code);
+                }
+            }
+        }
+        Ok((sent, failed))
     }
 
     /// Signs `action` on our heads in loaded `server`, dry-runs it on the
@@ -2334,7 +4287,7 @@ impl Inner {
         if matches!(state, Some(SendState::Sent | SendState::Received)) {
             return finish(&self.db);
         }
-        if !gate_open(&view, me) || state == Some(SendState::Pending) {
+        if !gate_open(&view, me, model::SERVER_LIFECYCLE_CAP) || state == Some(SendState::Pending) {
             return Ok(());
         }
         ports.network.publish(leave);
@@ -2356,30 +4309,35 @@ impl Inner {
         Ok(())
     }
 
-    /// Server lifecycle's rollout gate (#229): `update-needed` unless every
-    /// other current member's latest profile post carries
-    /// `server-lifecycle-v1` (no profile post counts as needing an update).
+    /// A rollout gate (server lifecycle #229, reactions G-26):
+    /// `update-needed` unless every other current member's latest profile
+    /// post carries `cap` (no profile post counts as needing an update).
     /// This version reads them itself. Checked before anything is signed.
-    fn lifecycle_gate(&self, server: ServerId) -> CoreResult<()> {
+    fn cap_gate(&self, server: ServerId, cap: &str) -> CoreResult<()> {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
-        if !gate_open(&self.view(server)?, me) {
+        if !gate_open(&self.view(server)?, me, cap) {
             return Err(ErrorCode::UpdateNeeded.into());
         }
         Ok(())
     }
 
-    /// Release N of server lifecycle: my latest profile post in `server`
-    /// lacks the cap (posted by an older version), so post it again, once.
+    /// The release that adds a cap: my latest profile post in `server` lacks
+    /// one of [`model::CAPS`] (posted by an older version), so post it
+    /// again, once.
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());
+        // #359: the picture and colour too (None stays absent).
+        let (me_small, me_color) = (me.profile.avatar_small.clone(), me.profile.color.clone());
         let view = self.view(server)?;
         let member = view.state.is_member(key) && !view.state.kicked.contains(&key);
-        if !member || view.state.closed.is_some() || view.lifecycle_caps().get(&key) == Some(&true)
-        {
+        let has_all = model::CAPS.iter().all(|cap| view.caps(cap).get(&key) == Some(&true));
+        if !member || view.state.closed.is_some() || has_all {
             return Ok(());
         }
-        self.publish_control(ports, server, &model::profile_action(&name)).map(drop)
+        let (small, color) = (me_small, me_color);
+        let action = model::profile_action_with(&name, small.as_deref(), color.as_deref());
+        self.publish_control(ports, server, &action).map(drop)
     }
 
     /// Server lifecycle (#229, the security lead's rule 5): after I leave,
@@ -2525,7 +4483,22 @@ impl Inner {
         let reach = self.net.presence(view.id).unwrap_or_default();
         let server_id = model::hex_id(view.id.as_bytes());
         let mut out = Vec::new();
-        for member in view.members() {
+        let looks = view.looks();
+        // Profile save (#378): my own row shows my saved profile at once,
+        // not what my last profile post said (it may still be waiting).
+        let mine = self.me.as_ref().map(|me| {
+            let set = |v: &Option<String>| v.clone().filter(|v| !v.is_empty());
+            let p = &me.profile;
+            (p.display_name.clone(), set(&p.avatar_small), set(&p.color))
+        });
+        for mut member in view.members() {
+            let (mut avatar, mut color) = looks.get(&member.key).cloned().unwrap_or_default();
+            if let (Some((name, my_avatar, my_color)), true) = (&mine, Some(member.key) == me) {
+                if !name.is_empty() {
+                    member.display_name = name.clone();
+                }
+                (avatar, color) = (my_avatar.clone(), my_color.clone());
+            }
             let blocked = self.db.is_blocked(&member.key)?;
             out.push(Member {
                 id: model::hex_id(member.key.as_bytes()),
@@ -2549,6 +4522,8 @@ impl Inner {
                 role: member.role,
                 blocked: blocked.then_some(true),
                 bio: None,
+                avatar_data_url: avatar,
+                color,
             });
         }
         Ok(out)
@@ -2583,12 +4558,24 @@ impl Inner {
         if view.state.closed.is_some() {
             return Ok(JoinStatus::Closed { link });
         }
+        let key = me.key();
+        // Already a member (this device lost its copy, e.g. a restore on a
+        // new computer): no new join, and nothing that would overwrite what
+        // the server already holds about me.
+        let member = view.state.is_member(key);
         let required = view.genesis.age_restriction;
-        let age = model::age_on(&me.profile.birth_date, ports.clock.now_ms());
-        if required.min_age() > 0 && age.is_none_or(|age| age < required.min_age()) {
+        // As it counts now: at most 17 while a raise waits its 30 days.
+        let age = me.profile.effective_age(ports.clock.now_ms());
+        // A member's earlier age claim stands while this device has no birth
+        // date (a restore doesn't carry it yet); a known age too low still
+        // blocks.
+        let age_unknown_member = member && age.is_none();
+        if required.min_age() > 0
+            && !age_unknown_member
+            && age.is_none_or(|age| age < required.min_age())
+        {
             return Ok(JoinStatus::AgeBlocked { link, required });
         }
-        let key = me.key();
         if view.is_kicked(&key) {
             // TODO(ui): a "you were removed from this server" phase.
             return Ok(JoinStatus::Invalid { link });
@@ -2604,9 +4591,8 @@ impl Inner {
             )
             .map_err(|_| CoreError::from(ErrorCode::BadRequest))
         };
-        // Already a member (this device lost its copy): no new join needed.
         let mut mine = Vec::new();
-        if !view.state.is_member(key) {
+        if !member {
             // An invite we don't hold, revoked or used up: `authority`
             // refuses the join, and nothing is stored or sent.
             // TODO(ui): phases for "invite expired" and "invite used up".
@@ -2618,17 +4604,32 @@ impl Inner {
             mine.push(join);
         }
         let view = ServerView::build(server, &log).ok_or(ErrorCode::Internal)?;
-        let profile =
-            sign(&view, view.deps(None), &model::profile_action(&me.profile.display_name))?;
+        // A member without a name here (a restore) keeps the profile the
+        // server holds: an empty one would replace my name for everyone.
+        let post_profile = !(member && me.profile.display_name.trim().is_empty());
+        let profile = post_profile
+            .then(|| {
+                let p = &me.profile;
+                let action = model::profile_action_with(&p.display_name, p.avatar_small.as_deref(), p.color.as_deref());
+                sign(&view, view.deps(None), &action)
+            })
+            .transpose()?;
         for record in log.records.iter().chain(&log.channel) {
             self.db.put_record(record)?;
         }
         self.logs.insert(server, log);
-        mine.push(profile.clone());
-        self.store(server, profile)?;
-        let claim = self.sign_age_claim(ports, server)?;
-        mine.push(claim.clone());
-        self.store(server, claim)?;
+        if let Some(profile) = profile {
+            mine.push(profile.clone());
+            self.store(server, profile)?;
+        }
+        // Likewise a member without a birth date keeps its earlier claim:
+        // a claim from no date would say "not adult", which counts at once.
+        if !age_unknown_member {
+            if let Some(claim) = self.age_claim(ports, server)? {
+                mine.push(claim.clone());
+                self.store(server, claim)?;
+            }
+        }
         for record in &mine {
             ports.network.publish(record);
         }
@@ -2670,6 +4671,7 @@ impl ServerView<'_> {
     /// TODO(#116): hide 18+ channels from members without an 18+ claim.
     fn channels(&self, me: Option<PublicKey>) -> Vec<Channel> {
         let server_id = model::hex_id(self.id.as_bytes());
+        let positions = self.channel_positions();
         let channel = |id: ChannelId, name: &str, adult: bool, general: bool| Channel {
             id: model::hex_id(id.as_bytes()),
             server_id: server_id.clone(),
@@ -2678,18 +4680,37 @@ impl ServerView<'_> {
             unread: false,
             mentions: 0,
             is_default: general,
+            first_unread_index: None,
+            unread_count: None,
+            position: positions.get(&id).cloned(),
         };
         if self.state.channels.is_empty() && self.state.deleted_channels.is_empty() {
             return vec![channel(model::default_channel(self.id), model::GENERAL, false, true)];
         }
         // B7: 18+ channels only for members with an accepted 18+ claim.
         let adult = me.is_some_and(|me| self.state.adults.contains(&me));
-        self.state
-            .channels
-            .iter()
+        self.ordered_channels()
+            .into_iter()
+            .filter_map(|id| self.state.channels.get(&id).map(|c| (id, c)))
             .filter(|(_, c)| adult || !c.adult)
-            .map(|(id, c)| channel(*id, &c.name, c.adult, c.general))
+            .map(|(id, c)| channel(id, &c.name, c.adult, c.general))
             .collect()
+    }
+
+    /// G-11: every live channel in order. Placed ones first, by key (then
+    /// ID, for keys two admins happened to pick alike); the rest after, in
+    /// the order they were made (`creation_order`, #323).
+    fn ordered_channels(&self) -> Vec<ChannelId> {
+        let positions = self.channel_positions();
+        let created = self.creation_order();
+        let mut ids: Vec<ChannelId> = self.state.channels.keys().copied().collect();
+        ids.sort_by(|a, b| match (positions.get(a), positions.get(b)) {
+            (Some(x), Some(y)) => x.cmp(y).then(a.cmp(b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => created.get(a).cmp(&created.get(b)),
+        });
+        ids
     }
 }
 
@@ -2699,8 +4720,9 @@ fn auth_deps(view: &ServerView) -> Vec<RecordId> {
     heads[heads.len().saturating_sub(records::MAX_AUTH_DEPS)..].to_vec()
 }
 
-/// What was last announced of a message: edit time, deleted, my send state.
-type Announced = (Option<u64>, bool, Option<SendState>);
+/// What `message.updated` compares: the edit, the deletion, the send state
+/// and (G-26) the reactions shown.
+type Announced = (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>);
 
 /// Where my messages' send states come from: the network's live state and
 /// the last one stored, so a restart doesn't lose it.
@@ -2710,7 +4732,7 @@ struct Status<'a> {
 }
 
 fn announced(s: &chat::Shown, me: Option<PublicKey>, st: &Status) -> Announced {
-    (s.edited_at, s.deleted, send_state(s, me, st))
+    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone())
 }
 
 /// B6, on my own messages only: `pending` until it left this device,
@@ -2750,7 +4772,17 @@ fn message_json(
     channel: ChannelId,
     me: Option<PublicKey>,
     st: &Status,
+    members: &BTreeSet<PublicKey>,
 ) -> Message {
+    // G-24: `<@userId>` tokens; only current members are listed (the UI
+    // shows a former member's token as "Former member"), and "mentions me"
+    // from the token alone.
+    let tokens = model::mention_tokens(&s.text);
+    let listed: Vec<Id> = tokens
+        .iter()
+        .filter(|key| members.contains(*key))
+        .map(|key| model::hex_id(key.as_bytes()))
+        .collect();
     Message {
         id: model::hex_id(s.record.id().as_bytes()),
         channel_id: model::hex_id(channel.as_bytes()),
@@ -2761,9 +4793,25 @@ fn message_json(
         edited_at: s.edited_at,
         deleted: s.deleted.then_some(true),
         send_state: send_state(s, me, st),
+        replaces: None,
+        mentions: (!listed.is_empty()).then_some(listed),
+        mentions_me: me.filter(|me| tokens.contains(me)).map(|_| true),
+        reactions: reactions_json(&s.reactions, me),
     }
 }
 
+/// G-26: `Message.reactions`, absent when there are none.
+fn reactions_json(shown: &[(String, Vec<PublicKey>)], me: Option<PublicKey>) -> Option<Vec<ReactionCount>> {
+    let list: Vec<ReactionCount> = shown
+        .iter()
+        .map(|(emoji, authors)| ReactionCount {
+            emoji: emoji.clone(),
+            count: authors.len() as u32,
+            mine: me.is_some_and(|me| authors.contains(&me)),
+        })
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
 /// Can't write yet (no key, or a rotation only a moderator can make):
 /// `not-allowed`. No group encryption: `not-implemented`.
 fn cipher_error(error: CipherError) -> CoreError {
@@ -2783,5 +4831,176 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
         ports.cipher.unlock(Arc::new(MemberSecret::new(me.identity.signing_key())));
         // GAP-4: peer bindings with the identity key.
         ports.network.unlock(me.identity.signing_key());
+    }
+}
+
+/// A join status's name for the join log (no link, no IDs).
+/// G-91 (Security Lead on #457): whether a restore's join answer settles
+/// that server for good. Only a definite answer does:
+/// - `Joined`: it's back;
+/// - `Closed`: its owner closed it;
+/// - `Invalid` with evidence ([`removal_shown`]): the log shows an accepted
+///   kick or leave of me, so authority refuses the join.
+///
+/// Anything else waits for the next try: `NobodyOnline`, `Searching`,
+/// `AgeBlocked` (it depends on whether the log shows me as a member, which
+/// a partial log can miss: Security Lead on #457),
+/// `Invalid` without that evidence (a partial log), and every error
+/// (locked, network, internal). One bad round never loses a server.
+/// G-91 (Security Lead on #457): whether the fetched log shows I left this
+/// server: an accepted kick of me, or an accepted leave of mine. Only then
+/// is a restore's "invalid" final; a log missing my join (or the kick)
+/// proves nothing, and the server waits for a fuller answer.
+fn removal_shown(server: ServerId, me: PublicKey, fetched: &[Record]) -> bool {
+    let log = Log::new(server, fetched.iter().cloned());
+    let Some(view) = ServerView::build(server, &log) else { return false };
+    if view.state.is_member(me) {
+        return false;
+    }
+    view.is_kicked(&me)
+        || log.records.iter().any(|r| r.kind() == Kind::Leave && r.author() == me && log.accepted(&r.id()))
+}
+
+fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
+    match status {
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,
+        Ok(JoinStatus::Invalid { .. }) => judged,
+        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. } | JoinStatus::AgeBlocked { .. }) | Err(_) => false,
+    }
+}
+
+fn join_status_name(status: &JoinStatus) -> &'static str {
+    match status {
+        JoinStatus::Searching { .. } => "searching",
+        JoinStatus::NobodyOnline { .. } => "nobody-online",
+        JoinStatus::Joined { .. } => "joined",
+        JoinStatus::Invalid { .. } => "invalid",
+        JoinStatus::AgeBlocked { .. } => "age-blocked",
+        JoinStatus::Closed { .. } => "closed",
+    }
+}
+
+
+/// A device notice's label as shown: plain text, trimmed, at most 64
+/// characters, with no control characters; anything else, or empty, is
+/// left out (Security Lead on #415). Today the new device sends none; the
+/// cross-device notice will pass what it carries through here.
+fn notice_label(raw: Option<&str>) -> Option<String> {
+    let label = raw?.trim();
+    let ok = !label.is_empty() && label.chars().count() <= 64 && !label.chars().any(hidden_char);
+    ok.then(|| label.to_owned())
+}
+/// Characters a label must not hold: controls, plus the invisible format and
+/// direction marks `char::is_control` misses (zero-width, bidi embeddings,
+/// overrides and isolates, word joiner, line/paragraph separators, BOM),
+/// which could make a label render reversed or hide text.
+fn hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+fn device_notices(db: &Db) -> CoreResult<Vec<u64>> {
+    Ok(db.get(KV_DEVICE_NOTICES)?.and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default())
+}
+
+fn link_state(state: DeviceLinkPhase, sas: Option<String>, reason: Option<DeviceLinkReason>) -> Event {
+    Event::DeviceLinkState(DeviceLinkState { state, sas, reason })
+}
+
+fn link_error(e: DeviceLinkError) -> CoreError {
+    match e {
+        DeviceLinkError::NotFound => ErrorCode::NotFound.into(),
+        // Another device's Hello holds the link: someone else may be trying
+        // (Security Lead on #394; dev-ui shows "start again").
+        DeviceLinkError::Refused => ErrorCode::LockedOut.into(),
+        DeviceLinkError::Network => ErrorCode::Offline.into(),
+    }
+}
+
+#[cfg(test)]
+mod relay_only_tests {
+    use super::{stored_relay_only, Db, KV_RELAY_ONLY};
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mvs-relayonly-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Security lead (#272): stored_relay_only fails closed.
+    #[test]
+    fn the_stored_setting_fails_closed() {
+        let dir = dir("unit");
+        let db = dir.join("core.db");
+        // A fresh data dir: no setting yet, so off.
+        assert!(!stored_relay_only(&db));
+        // Off and on as stored; anything else is on.
+        for (value, on) in [(&[0u8][..], false), (&[1], true), (&[2], true), (b"", true)] {
+            Db::open(Some(&db)).unwrap().set(KV_RELAY_ONLY, value).unwrap();
+            assert_eq!(stored_relay_only(&db), on, "{value:?}");
+        }
+        // Can't be opened (its folder is missing) or isn't a database: on.
+        assert!(stored_relay_only(&dir.join("missing").join("core.db")));
+        let junk = dir.join("junk.db");
+        std::fs::write(&junk, vec![0x5a; 4096]).unwrap();
+        assert!(stored_relay_only(&junk));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod device_notice_tests {
+    use super::{notice_label, restore_settles, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+    use crate::types::{AgeRestriction, ErrorCode, JoinStatus};
+
+    /// G-91 (Security Lead on #457): only a definite answer drops a server
+    /// from a restore; a temporary one waits for the next try.
+    #[test]
+    fn only_definite_join_answers_settle_a_restored_server() {
+        let link = String::new;
+        let joined = JoinStatus::Joined { link: link(), server_id: "s".into() };
+        let blocked = JoinStatus::AgeBlocked { link: link(), required: AgeRestriction::Eighteen };
+        for status in [joined, JoinStatus::Closed { link: link() }] {
+            assert!(restore_settles(&Ok(status.clone()), false), "{status:?}");
+        }
+        assert!(!restore_settles(&Ok(blocked), true), "age-blocked waits: a partial log can miss my membership");
+        let invalid = JoinStatus::Invalid { link: link() };
+        assert!(restore_settles(&Ok(invalid.clone()), true), "kicked or not a member");
+        assert!(!restore_settles(&Ok(invalid), false), "a partial fetch: not yet");
+        for status in [JoinStatus::NobodyOnline { link: link() }, JoinStatus::Searching { link: link() }] {
+            assert!(!restore_settles(&Ok(status.clone()), true), "{status:?}");
+        }
+        for code in [ErrorCode::Internal, ErrorCode::NotFound, ErrorCode::NotAllowed, ErrorCode::BadRequest] {
+            assert!(!restore_settles(&Err(code.into()), true), "{code:?}");
+        }
+    }
+
+    /// Security Lead on #415: a label is plain text, at most 64 characters.
+    #[test]
+    fn labels_are_plain_short_text_or_left_out() {
+        assert_eq!(notice_label(Some("  Windows laptop ")).as_deref(), Some("Windows laptop"));
+        assert_eq!(notice_label(Some(&"א".repeat(64))).map(|l| l.chars().count()), Some(64));
+        assert_eq!(notice_label(Some(&"x".repeat(65))), None);
+        assert_eq!(notice_label(Some("bad\u{1b}[31m")), None);
+        assert_eq!(notice_label(Some("two\nlines")), None);
+        for bad in ["\u{202E}gpj.exe", "a\u{200B}b", "a\u{200F}", "\u{2066}x\u{2069}", "\u{FEFF}x", "x\u{061C}", "a\u{2028}b", "a\u{2060}b"] {
+            assert_eq!(notice_label(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(notice_label(Some("מחשב נייד")).as_deref(), Some("מחשב נייד"));
+        assert_eq!(notice_label(Some("   ")), None);
+        assert_eq!(notice_label(None), None);
+    }
+
+    /// Tech Lead on #415: the stored list keeps only the newest 32.
+    #[test]
+    fn the_notice_list_is_capped() {
+        let db = Db::open(None).unwrap();
+        let notices: Vec<u64> = (0..40).collect();
+        let extra = notices.len().saturating_sub(MAX_DEVICE_NOTICES);
+        let kept: Vec<u64> = notices[extra..].to_vec();
+        db.set(KV_DEVICE_NOTICES, &serde_json::to_vec(&kept).unwrap()).unwrap();
+        let stored = super::device_notices(&db).unwrap();
+        assert_eq!(stored.len(), 32);
+        assert_eq!((stored[0], stored[31]), (8, 39), "the newest are kept");
     }
 }

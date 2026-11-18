@@ -3,25 +3,44 @@ import { FormattedMessage, useIntl } from 'react-intl';
 import { ageOn, countryOptions, detectCountry, MIN_AGE, toBirthDate } from '../../app/age';
 import { useAppStore } from '../../app/App';
 import { useSettings } from '../../app/settings';
-import { isCoreError, useCore, useCoreEvent, type Identity, type Locale } from '../../core';
+import { isCoreError, useCore, useCoreEvent, type Identity, type ServerRestore } from '../../core';
 import type { CoreEvents } from '../../core/api';
 import { useUserTextProps } from '../../app/textDir';
 import { safeImageSrc } from '../../core/sanitize';
 import { Avatar, Code } from '../../components/common';
 import { CheckIcon } from '../../components/icons';
-import { LOCALES } from '../../i18n';
+import { LanguagePicker } from '../../components/LanguagePicker';
 import { RecoveryCheck, RecoveryWordsPanel } from './RecoveryWords';
 import { RestoreScreen } from './Restore';
+import { DeviceLinkScreen } from './DeviceLink';
 
-export type Step = 'language' | 'agreement' | 'country' | 'dob' | 'blocked' | 'preparing' | 'words' | 'check' | 'profile' | 'restore';
+export type Step =
+  | 'language'
+  | 'agreement'
+  | 'country'
+  | 'dob'
+  | 'blocked'
+  | 'preparing'
+  | 'words'
+  | 'check'
+  | 'profile'
+  | 'restore'
+  /** Device link: signed in from another device. */
+  | 'device'
+  | 'restored';
 
 /** Numbered steps shown as "step x of y"; blocked/preparing/restore are not counted. */
 const NUMBERED: Step[] = ['language', 'agreement', 'country', 'dob', 'words', 'check', 'profile'];
+/** A restore has its own count (B13 §3): no new words to write down or check. */
+const NUMBERED_RESTORE: Step[] = ['language', 'agreement', 'country', 'dob', 'restore', 'profile'];
 
 // Where onboarding resumes after a reload or a crash (QA-01, B19 spec §3).
 // Only the step name is stored, never the words.
 const RESUME_KEY = 'mvs.onboarding.v1';
-const RESUMABLE: Step[] = ['words', 'check', 'profile'];
+const RESUMABLE: Step[] = ['words', 'check', 'profile', 'restored'];
+// Set while a restore is under way (#290), so a reload after the words still
+// ends on the "servers don't come back" notice.
+const RESTORING_KEY = 'mvs.onboarding.restoring.v1';
 
 function storage(): Storage | null {
   try {
@@ -35,6 +54,7 @@ function storage(): Storage | null {
 export function resumeStep(identity: Identity | null): Step | null {
   const saved = storage()?.getItem(RESUME_KEY) as Step | null;
   if (!identity || !saved || !RESUMABLE.includes(saved)) return null;
+  if (saved === 'restored') return saved;
   return identity.recoveryChecked && saved !== 'profile' ? 'profile' : saved;
 }
 
@@ -42,7 +62,18 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
   const [step, setStep] = useState<Step>(initialStep ?? 'language');
   const onFinished = () => {
     storage()?.removeItem(RESUME_KEY);
+    storage()?.removeItem(RESTORING_KEY);
     finish();
+  };
+  // Restore asks the agreement, country and birth date again, as for a new
+  // account (spec, age: restore asks again), then the words, then the profile.
+  // Device link: this device got an existing account (agreement only).
+  const [linked, setLinked] = useState(false);
+  const [restoring, setRestoringState] = useState(() => storage()?.getItem(RESTORING_KEY) === '1');
+  const setRestoring = (on: boolean) => {
+    setRestoringState(on);
+    if (on) storage()?.setItem(RESTORING_KEY, '1');
+    else storage()?.removeItem(RESTORING_KEY);
   };
   useEffect(() => {
     if (RESUMABLE.includes(step)) storage()?.setItem(RESUME_KEY, step);
@@ -59,7 +90,8 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
     country: 'agreement',
     dob: 'country',
     check: 'words',
-    restore: 'language',
+    restore: 'dob',
+    device: 'language',
   };
 
   const createAccount = async (dob: string) => {
@@ -76,7 +108,8 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
     setStep('profile');
   };
 
-  const stepNo = NUMBERED.indexOf(step);
+  const numbered = restoring ? NUMBERED_RESTORE : NUMBERED;
+  const stepNo = numbered.indexOf(step);
 
   return (
     <main className="onboarding">
@@ -92,14 +125,37 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
             )}
             {stepNo >= 0 && (
               <span className="muted small">
-                <FormattedMessage id="onb.progress" values={{ step: stepNo + 1, total: NUMBERED.length }} />
+                <FormattedMessage id="onb.progress" values={{ step: stepNo + 1, total: numbered.length }} />
               </span>
             )}
           </div>
         )}
         <StepBody key={step}>
-          {step === 'language' && <LanguageStep onNext={() => setStep('agreement')} onRestore={() => setStep('restore')} />}
-          {step === 'agreement' && <AgreementStep onNext={() => setStep('country')} />}
+          {step === 'language' && (
+            <LanguageStep
+              onNext={() => {
+                setRestoring(false);
+                setStep('agreement');
+              }}
+              onRestore={() => {
+                setRestoring(true);
+                setStep('agreement');
+              }}
+              onDevice={() => setStep('device')}
+            />
+          )}
+          {step === 'device' && (
+            <DeviceLinkScreen
+              onLinked={() => {
+                // The same account: only the agreement is asked on this device.
+                setLinked(true);
+                void core.getIdentity().then((identity) => identity && store.setIdentity(identity));
+                setStep('agreement');
+              }}
+              onCancel={() => setStep('language')}
+            />
+          )}
+          {step === 'agreement' && <AgreementStep onNext={() => (linked ? setStep('restored') : setStep('country'))} />}
           {step === 'country' && <CountryStep value={country} onChange={setCountry} onNext={() => setStep('dob')} />}
           {step === 'dob' && (
             <DobStep
@@ -107,6 +163,7 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
               onNext={(dob) => {
                 setBirthDate(dob);
                 if (ageOn(dob) < MIN_AGE) setStep('blocked');
+                else if (restoring) setStep('restore');
                 else void createAccount(dob);
               }}
             />
@@ -133,18 +190,64 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
               />
             </>
           )}
-          {step === 'profile' && <ProfileStep onDone={onFinished} />}
+          {step === 'profile' && <ProfileStep onDone={restoring ? () => setStep('restored') : onFinished} />}
           {step === 'restore' && (
             <RestoreScreen
+              input={birthDate ? { locale: settings.locale, country, birthDate } : undefined}
               onRestored={(identity: Identity) => {
                 store.setIdentity(identity);
-                onFinished();
+                setStep('profile');
               }}
             />
           )}
+          {step === 'restored' && <RestoredStep onDone={onFinished} />}
         </StepBody>
       </div>
     </main>
+  );
+}
+
+/**
+ * After a restore or a device link (G-91, #457): my servers come back on their own once a
+ * member of each is reachable. Says honestly how far that is, and that an invite link
+ * still works for one that doesn't appear (PO #426 G-91, criterion 2).
+ */
+function RestoredStep({ onDone }: { onDone: () => void }) {
+  const core = useCore();
+  const [progress, setProgress] = useState<ServerRestore | null>(null);
+  useEffect(() => {
+    let live = true;
+    void core.getServerRestore().then((r) => live && setProgress((p) => p ?? r)).catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [core]);
+  useCoreEvent('serverRestore.changed', (r) => setProgress(r));
+  const state = progress?.state ?? 'searching';
+  return (
+    <div className="stack">
+      <h1>
+        <FormattedMessage id="onb.restored.title" />
+      </h1>
+      <p className="restore-progress" role="status">
+        {state !== 'done' && state !== 'none' && <span className="spinner small" aria-hidden="true" />}
+        {state === 'waiting' && progress ? (
+          <FormattedMessage id="onb.restored.waiting" values={{ found: progress.found, back: progress.found - progress.waiting }} />
+        ) : state === 'done' ? (
+          <FormattedMessage id={progress && progress.found > 0 ? 'onb.restored.done' : 'onb.restored.noneFound'} />
+        ) : state === 'searching' ? (
+          <FormattedMessage id="onb.restored.searching" />
+        ) : null}
+      </p>
+      <p className="muted">
+        <FormattedMessage id="onb.restored.servers" />
+      </p>
+      <div className="actions">
+        <button type="button" className="primary" autoFocus onClick={onDone}>
+          <FormattedMessage id="common.next" />
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -165,8 +268,7 @@ function StepBody({ children }: { children: ReactNode }) {
   );
 }
 
-function LanguageStep({ onNext, onRestore }: { onNext: () => void; onRestore: () => void }) {
-  const { settings, update } = useSettings();
+function LanguageStep({ onNext, onRestore, onDevice }: { onNext: () => void; onRestore: () => void; onDevice: () => void }) {
   const intl = useIntl();
   return (
     <>
@@ -179,28 +281,16 @@ function LanguageStep({ onNext, onRestore }: { onNext: () => void; onRestore: ()
       <p className="muted">
         <FormattedMessage id="onb.language.hint" />
       </p>
-      <div className="choice-list" role="radiogroup" aria-label={intl.formatMessage({ id: 'onb.language.title' })}>
-        {LOCALES.map((l: Locale) => (
-          <button
-            key={l}
-            type="button"
-            role="radio"
-            aria-checked={settings.locale === l}
-            className="choice"
-            lang={l}
-            onClick={() => update({ locale: l })}
-          >
-            <FormattedMessage id={`lang.${l}`} />
-            {settings.locale === l && <CheckIcon />}
-          </button>
-        ))}
-      </div>
+      <LanguagePicker label={intl.formatMessage({ id: 'onb.language.title' })} hideLabel />
       <div className="actions">
         <button type="button" className="primary" onClick={onNext}>
           <FormattedMessage id="common.next" />
         </button>
         <button type="button" className="link" onClick={onRestore}>
           <FormattedMessage id="onb.restoreLink" />
+        </button>
+        <button type="button" className="link" onClick={onDevice}>
+          <FormattedMessage id="deviceLink.start" />
         </button>
       </div>
     </>

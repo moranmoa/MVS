@@ -117,6 +117,27 @@ fn single_key_closed_alpha_flow() {
     ok(&["verify", "--manifest", &manifest, "--root", &root]);
 }
 
+/// Slice 3b: global flags are signed with the update key under their own
+/// context, and only verify as flags.
+#[test]
+fn global_flags_sign_and_verify_only_as_flags() {
+    let dir = TempDir::new("flags");
+    ok(&["keygen", "--out", dir.0.to_str().unwrap()]);
+    let root = dir.path("root.json");
+    ok(&["make-root", "--threshold", "1", "--pub", &dir.path("root.pub"), "--out", &root]);
+    let flags = dir.path("flags.json");
+    ok(&["sign-flags", "--key", &dir.path("root.key"), "--member-relay-off", "true", "--out", &flags]);
+    assert!(ok(&["verify-flags", "--flags", &flags, "--root", &root]).contains("memberRelayOff true"));
+    // Not a manifest, and not accepted under another root.
+    fails(&["verify", "--manifest", &flags, "--root", &root]);
+    let other = TempDir::new("flags-other");
+    ok(&["keygen", "--out", other.0.to_str().unwrap()]);
+    let other_root = other.path("root.json");
+    ok(&["make-root", "--threshold", "1", "--pub", &other.path("root.pub"), "--out", &other_root]);
+    fails(&["verify-flags", "--flags", &flags, "--root", &other_root]);
+    fails(&["sign-flags", "--key", &dir.path("root.key"), "--member-relay-off", "yes", "--out", &flags]);
+}
+
 #[test]
 fn keygen_refuses_git_checkouts_and_overwrites() {
     let dir = TempDir::new("keygen");

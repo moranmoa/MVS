@@ -5,7 +5,8 @@
 
 import { useSyncExternalStore } from 'react';
 import type { CoreApi } from '../core/api';
-import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom } from '../core/types';
+import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom, MemberRelay, DeviceAdded } from '../core/types';
+import { liveMutes, loadMutes, MUTE_DURATIONS, MUTE_FOREVER, nextExpiry, saveMutes, type MuteDuration, type MuteKey, type Mutes } from './mute';
 
 const PAGE = 100;
 
@@ -15,6 +16,7 @@ export class MessageWindow {
   ready = false;
   private messages = new Map<number, Message>();
   private loadingPages = new Set<number>();
+  private loadedPages = new Set<number>();
 
   constructor(
     private core: CoreApi,
@@ -37,7 +39,7 @@ export class MessageWindow {
     const first = Math.floor(Math.max(0, start) / PAGE);
     const last = Math.floor(Math.max(0, Math.min(end, this.count) - 1) / PAGE);
     for (let p = first; p <= last; p++) {
-      if (this.loadingPages.has(p) || this.messages.has(p * PAGE)) continue;
+      if (this.loadingPages.has(p) || this.loadedPages.has(p)) continue;
       this.loadingPages.add(p);
       void this.core.getMessages(this.channelId, p * PAGE, (p + 1) * PAGE).then((r) => {
         r.messages.forEach((m) => {
@@ -45,14 +47,56 @@ export class MessageWindow {
           if (!this.messages.has(m.index)) this.messages.set(m.index, m);
         });
         this.loadingPages.delete(p);
+        this.loadedPages.add(p);
         this.notify();
       });
     }
   }
 
   apply(m: Message): void {
+    if (m.replaces) return this.replace(m);
     this.messages.set(m.index, m);
     if (m.index >= this.count) this.count = m.index + 1;
+    this.notify();
+  }
+
+  /**
+   * A held message was sent (#288): drop the `pending-…` entry wherever it
+   * sits, put the real one at its index, and re-read what may have moved. The
+   * real index can differ, since the key may have brought other messages first.
+   */
+  private replace(m: Message): void {
+    const { replaces, ...real } = m;
+    let from = m.index;
+    for (const [i, x] of this.messages) if (x.id === replaces) from = Math.min(from, i);
+    this.forgetFrom(from, m.index);
+    this.messages.set(m.index, real);
+    if (m.index >= this.count) this.count = m.index + 1;
+    this.notify();
+    void this.recount();
+  }
+
+  /**
+   * A held message was discarded (#288, discardMessage fires no event): it
+   * leaves the list, and what came after it moves up one.
+   */
+  removeHeld(id: Id): void {
+    const at = [...this.messages].find(([, x]) => x.id === id)?.[0];
+    if (at === undefined) return void this.recount();
+    this.forgetFrom(at);
+    this.count = Math.max(0, this.count - 1);
+    this.notify();
+    void this.recount();
+  }
+
+  /** Drops what is cached from `from` on (but `keep`), to be loaded again. */
+  private forgetFrom(from: number, keep?: number): void {
+    for (const i of [...this.messages.keys()]) if (i >= from && i !== keep) this.messages.delete(i);
+    for (const p of [...this.loadedPages]) if ((p + 1) * PAGE > from) this.loadedPages.delete(p);
+  }
+
+  private async recount(): Promise<void> {
+    this.count = await this.core.getMessageCount(this.channelId);
     this.notify();
   }
 }
@@ -65,6 +109,8 @@ export interface StoreState {
   identity: Identity | null;
   /** A server left this device (left, closed and purged, or a kick): its name, for a toast. */
   serverGone: { name: string; reason: 'left' | 'closed' | 'kicked'; at: number } | null;
+  /** Muted servers and channels on this device (G-03, G-17), by mute key; see app/mute.ts. */
+  mutes: Mutes;
   servers: ServerSummary[];
   channels: Record<Id, Channel[]>;
   members: Record<Id, Member[]>;
@@ -72,19 +118,28 @@ export interface StoreState {
   notice: { kind: 'encryption-renewed'; serverId: Id; at: number } | null;
   /** Shown once: a new version was installed, or the previous one is back. */
   updateNote: UpdateNote | null;
+  /** "A new device was added to your account", until answered. */
+  deviceNotices: DeviceAdded[];
   /** My current call (voice v1), or null. */
   call: CallState | null;
   /** Why the last joinCall failed, until the next try or dismissal. */
   callError: string | null;
   /** Each server's voice room (who is in it), by server id. */
-  voiceRooms: Record<Id, VoiceRoom>;
+  /** Voice rooms (0.4.3): each server's live rooms, oldest first. */
+  voiceRooms: Record<Id, VoiceRoom[]>;
   /**
-   * Calls are off because relay-only is on. The core doesn't say so up front, so
-   * this is learned from a join refused with relay-only and lasts the session.
+   * Relay-only is on (#272): calls are off. Read up front from AppInfo and every
+   * voice room, and also learned from a call ended or a join refused for it.
    */
   relayOnly: boolean;
+  /** G-74: the shell's answer to the push-to-talk settings ('unsupported' outside the desktop app). */
+  pttStatus: 'ok' | 'invalid' | 'shortcut-taken' | 'unsupported' | 'pending';
+  /** Member relays (slice 1, #368); null until read. */
+  memberRelay: MemberRelay | null;
+  /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
+  settingsRequest: { section: string; at: number } | null;
   /** A short confirmation toast (an i18n id), e.g. "Copied" after a menu copy. */
-  flash: { id: string; at: number } | null;
+  flash: { id: string; values?: Record<string, string>; at: number } | null;
   /** Bumped when any message window changes, so readers re-render. */
   messagesVersion: number;
 }
@@ -98,12 +153,17 @@ export class Store {
     update: null,
     notice: null,
     updateNote: null,
+    deviceNotices: [],
     call: null,
     callError: null,
     voiceRooms: {},
     relayOnly: false,
+    pttStatus: 'pending',
+    memberRelay: null,
     flash: null,
+    settingsRequest: null,
     serverGone: null,
+    mutes: loadMutes(),
     messagesVersion: 0,
   };
   private listeners = new Set<() => void>();
@@ -112,7 +172,12 @@ export class Store {
   /** While my own leaveCall runs: that end of the call isn't news. */
   private leaving = false;
 
-  constructor(readonly core: CoreApi) {}
+  /** Fires when the next timed mute ends, so muted marks go away on time. */
+  private muteTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(readonly core: CoreApi) {
+    this.scheduleMuteExpiry();
+  }
 
   /** Subscribes to core events; returns the matching cleanup. */
   start(): () => void {
@@ -136,14 +201,13 @@ export class Store {
       on('server.closed', ({ serverId }) =>
         this.set({ servers: this.state.servers.map((x) => (x.id === serverId ? { ...x, closed: true } : x)) }),
       ),
-      on('channel.updated', (c) =>
-        this.set({
-          channels: {
-            ...this.state.channels,
-            [c.serverId]: (this.state.channels[c.serverId] ?? []).map((x) => (x.id === c.id ? c : x)),
-          },
-        }),
-      ),
+      on('channel.updated', (c) => {
+        const list = this.state.channels[c.serverId] ?? [];
+        const moved = list.find((x) => x.id === c.id)?.position !== c.position;
+        this.set({ channels: { ...this.state.channels, [c.serverId]: list.map((x) => (x.id === c.id ? c : x)) } });
+        // G-11: the order is the core's list order; a new position means re-read it.
+        if (moved) this.reloadChannels(c.serverId);
+      }),
       on('channel.added', (c) =>
         this.set({
           channels: {
@@ -166,15 +230,22 @@ export class Store {
       on('update.installed', (u) => this.set({ updateNote: { kind: 'installed', ...u } })),
       on('call.state', (c) => {
         const ended = !c.participants.length && !!this.state.call && !this.leaving;
+        const relayOnly = this.state.relayOnly || c.relayOnly === true;
         this.set({
           call: c.participants.length ? c : null,
+          relayOnly,
           // The core ends my call when relay-only goes on (#232 V3.4): say why.
-          ...(ended && this.state.relayOnly ? { callError: 'relay-only' } : {}),
+          ...(ended && relayOnly ? { callError: 'relay-only' } : {}),
         });
       }),
-      on('voice.room', (r) => this.set({ voiceRooms: { ...this.state.voiceRooms, [r.serverId]: r } })),
+      on('voice.rooms', (p) => this.setRooms(p.serverId, p.rooms)),
+      on('memberRelay.changed', (r) => this.setMemberRelay(r)),
+      on('account.deviceAdded', (d) =>
+        this.set({ deviceNotices: [...this.state.deviceNotices.filter((x) => x.at !== d.at), d].sort((a, b) => a.at - b.at) }),
+      ),
       on('update.rolledBack', (u) => this.set({ updateNote: { kind: 'rolledBack', ...u } })),
-      on('notice', (n) => this.set({ notice: { ...n, at: Date.now() } })),
+      // rekey-waiting: the failed message's own line says why; no toast (UX, #289).
+      on('notice', (n) => n.kind !== 'rekey-waiting' && this.set({ notice: { ...n, kind: n.kind, at: Date.now() } })),
     );
     return () => {
       this.unsubs.forEach((u) => u());
@@ -185,6 +256,11 @@ export class Store {
   async init(): Promise<void> {
     const identity = await this.core.getIdentity();
     this.set({ identity });
+    // Relay-only is per device and needs no identity (#272).
+    const info = await this.core.getAppInfo().catch(() => null);
+    if (info) this.set({ relayOnly: info.relayOnly === true });
+    const relay = await this.core.getMemberRelay().catch(() => null);
+    if (relay) this.set({ memberRelay: relay });
     if (identity) await this.loadServers();
   }
 
@@ -201,13 +277,50 @@ export class Store {
       channels: { ...this.state.channels, [id]: channels },
       members: { ...this.state.members, [id]: members },
     });
-    await this.loadVoiceRoom(id);
+    await this.loadVoiceRooms(id);
   }
 
-  /** Re-reads a server's voice room (events are hints): on start and on server switch. */
-  async loadVoiceRoom(serverId: Id): Promise<void> {
-    const room = await this.core.getVoiceRoom(serverId).catch(() => null);
-    if (room) this.set({ voiceRooms: { ...this.state.voiceRooms, [serverId]: room } });
+  /** Re-reads a server's voice rooms (events are hints): on start and on server switch. */
+  async loadVoiceRooms(serverId: Id): Promise<void> {
+    const rooms = await this.core.listVoiceRooms(serverId).catch(() => null);
+    if (rooms) this.setRooms(serverId, rooms);
+  }
+
+  /** Every room carries the device's relay-only flag (#272), so "Join" is off before trying; no rooms says nothing. */
+  private setRooms(serverId: Id, rooms: VoiceRoom[]): void {
+    this.set({
+      voiceRooms: { ...this.state.voiceRooms, [serverId]: rooms },
+      ...(rooms.length ? { relayOnly: rooms.some((r) => r.relayOnly === true) } : {}),
+    });
+    // No rooms carry no flag, yet the core sends this list when relay-only
+    // changes (QA V3.1 on 0.4.4): ask the device setting instead.
+    if (!rooms.length) {
+      void this.core
+        .getAppInfo()
+        .then((info) => this.set({ relayOnly: info.relayOnly === true }))
+        .catch(() => {});
+    }
+  }
+
+  private reloadTimers = new Map<Id, ReturnType<typeof setTimeout>>();
+  /** Re-reads a server's channel list (coalesced: one move updates several channels). */
+  reloadChannels(serverId: Id): void {
+    clearTimeout(this.reloadTimers.get(serverId));
+    this.reloadTimers.set(
+      serverId,
+      setTimeout(() => {
+        this.reloadTimers.delete(serverId);
+        void this.core
+          .listChannels(serverId)
+          .then((channels) => this.set({ channels: { ...this.state.channels, [serverId]: channels } }))
+          .catch(() => {});
+      }, 0),
+    );
+  }
+
+  /** G-11: sets the order the core answered a move with. */
+  setChannels(serverId: Id, channels: Channel[]): void {
+    this.set({ channels: { ...this.state.channels, [serverId]: channels } });
   }
 
   window(channelId: Id): MessageWindow {
@@ -220,20 +333,62 @@ export class Store {
     return w;
   }
 
+  /** #304: this computer forgot the identity. Back to "create or restore". */
+  signedOut(): void {
+    this.windows.clear();
+    this.set({ identity: null, servers: [], channels: {}, members: {}, call: null, callError: null, voiceRooms: {}, notice: null });
+  }
+
   setIdentity(identity: Identity | null): void {
     this.set({ identity });
+  }
+
+  /** "It was me": the core stops re-sending it. */
+  dismissDeviceNotice(at: number): void {
+    this.set({ deviceNotices: this.state.deviceNotices.filter((d) => d.at !== at) });
+    void this.core.ackDeviceNotice(at).catch(() => {});
   }
 
   clearNotice(): void {
     this.set({ notice: null });
   }
 
-  showFlash(id: string): void {
-    this.set({ flash: { id, at: Date.now() } });
+  showFlash(id: string, values?: Record<string, string>): void {
+    this.set({ flash: { id, values, at: Date.now() } });
+  }
+
+  openSettings(section: string): void {
+    this.set({ settingsRequest: { section, at: Date.now() } });
   }
 
   clearFlash(): void {
     this.set({ flash: null });
+  }
+
+  /** Mutes a server or channel (a key from app/mute.ts), on this device only. */
+  mute(key: MuteKey, duration: MuteDuration): void {
+    const ms = MUTE_DURATIONS[duration];
+    this.setMutes({ ...liveMutes(this.state.mutes), [key]: ms === MUTE_FOREVER ? MUTE_FOREVER : Date.now() + ms });
+  }
+
+  unmute(key: MuteKey): void {
+    const { [key]: _gone, ...rest } = this.state.mutes;
+    this.setMutes(liveMutes(rest));
+  }
+
+  private setMutes(mutes: Mutes): void {
+    saveMutes(mutes);
+    this.set({ mutes });
+    this.scheduleMuteExpiry();
+  }
+
+  private scheduleMuteExpiry(): void {
+    if (this.muteTimer) clearTimeout(this.muteTimer);
+    this.muteTimer = null;
+    const next = nextExpiry(this.state.mutes);
+    if (next === null) return;
+    // setTimeout caps at about 24.8 days; a 24-hour mute is well inside.
+    this.muteTimer = setTimeout(() => this.setMutes(liveMutes(this.state.mutes)), Math.max(0, next - Date.now()) + 50);
   }
 
   clearServerGone(): void {
@@ -250,9 +405,18 @@ export class Store {
    * nothing staged there is nothing to restart into.
    */
   async joinCall(channelId: Id): Promise<void> {
+    await this.callWith(() => this.core.joinCall(channelId));
+  }
+
+  /** Voice rooms (0.4.3): opens a new room in a server and joins it (leaving any call). */
+  async createVoiceRoom(serverId: Id): Promise<void> {
+    await this.callWith(() => this.core.createVoiceRoom(serverId));
+  }
+
+  private async callWith(start: () => Promise<CallState>): Promise<void> {
     this.set({ callError: null });
     try {
-      const call = await this.core.joinCall(channelId);
+      const call = await start();
       this.set({ call: call.participants.length ? call : null });
     } catch (e) {
       const code = (e as { code?: string })?.code ?? 'internal';
@@ -270,9 +434,18 @@ export class Store {
     this.set({ call: null });
   }
 
-  /** Relay-only is on (or off): until the core reports it up front, only a refused join says so. */
-  setRelayOnly(on: boolean): void {
-    this.set({ relayOnly: on });
+  /** Settings → Privacy (#272). The core ends a call in progress when it goes on. */
+  setMemberRelay(memberRelay: MemberRelay): void {
+    this.set({ memberRelay });
+  }
+
+  setPttStatus(pttStatus: StoreState['pttStatus']): void {
+    if (pttStatus !== this.state.pttStatus) this.set({ pttStatus });
+  }
+
+  async setRelayOnly(on: boolean): Promise<void> {
+    await this.core.setRelayOnly(on);
+    this.set({ relayOnly: on, ...(on ? {} : { callError: this.state.callError === 'relay-only' ? null : this.state.callError }) });
   }
 
   clearCallError(): void {
@@ -293,8 +466,28 @@ export class Store {
 
   private set(patch: Partial<StoreState>): void {
     this.state = { ...this.state, ...patch };
+    // Profile save (docs/ux/specs/profile-save.md): every place that shows me
+    // renders from my identity, not from my member row, which only follows
+    // once my profile post comes back. So a save shows everywhere at once.
+    if (patch.identity !== undefined || patch.members !== undefined) this.state.members = withMe(this.state.members, this.state.identity);
     this.listeners.forEach((l) => l());
   }
+}
+
+/** My row in every server, with my name, colour and picture from my identity. Unchanged objects when nothing differs. */
+export function withMe(members: Record<Id, Member[]>, me: Identity | null): Record<Id, Member[]> {
+  if (!me) return members;
+  let out = members;
+  for (const [serverId, list] of Object.entries(members)) {
+    const i = list.findIndex((m) => m.id === me.id);
+    if (i < 0) continue;
+    const m = list[i];
+    const mine: Member = { ...m, displayName: me.displayName || m.displayName, color: me.color, avatarDataUrl: me.avatarDataUrl };
+    if (mine.displayName === m.displayName && mine.color === m.color && mine.avatarDataUrl === m.avatarDataUrl) continue;
+    if (out === members) out = { ...members };
+    out[serverId] = list.map((x, j) => (j === i ? mine : x));
+  }
+  return out;
 }
 
 export function useStore<T>(store: Store, select: (s: StoreState) => T): T {

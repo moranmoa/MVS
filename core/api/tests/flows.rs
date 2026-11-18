@@ -570,7 +570,7 @@ fn restore_and_identity_rules() {
     let world = World::new();
     let peer = world.peer();
     let err = peer.core.restore_identity(vec!["legal".into(); 11]).unwrap_err();
-    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]) });
+    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]), servers: None });
     let words: Vec<String> = LEGAL.split(' ').map(String::from).collect();
     let restored = peer.core.restore_identity(words.clone()).unwrap();
     assert!(restored.recovery_checked);
@@ -3248,6 +3248,7 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     assert!(guest.events.take().contains(&Event::ServerRemoved {
         server_id: server.id.clone(),
         reason: Some(RemovedReason::Left),
+        required: None,
     }));
     assert!(guest.core.list_servers().unwrap().is_empty());
     assert_eq!(guest.core.get_messages(&channel, 0, 9).unwrap_err().code, ErrorCode::NotFound);
@@ -3304,7 +3305,7 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     *world.clock.0.lock().unwrap() += 20_000;
     third.core.sync_now().unwrap();
     let removed =
-        Event::ServerRemoved { server_id: server.id.clone(), reason: Some(RemovedReason::Closed) };
+        Event::ServerRemoved { server_id: server.id.clone(), reason: Some(RemovedReason::Closed), required: None };
     assert!(third.events.take().contains(&removed));
     assert!(third.core.list_servers().unwrap().is_empty());
     assert_eq!(third.core.list_channels(&server.id).unwrap_err().code, ErrorCode::NotFound);
@@ -3444,6 +3445,7 @@ fn a_leave_waits_in_the_outbox_until_the_gate_opens() {
         assert!(peer.events.take().contains(&Event::ServerRemoved {
             server_id: server.id.clone(),
             reason: Some(RemovedReason::Left),
+            required: None,
         }));
         assert!(peer.core.list_servers().unwrap().is_empty());
         assert_eq!(leaves_by(&world, server_key, id), 0, "a Leave went out past the gate");

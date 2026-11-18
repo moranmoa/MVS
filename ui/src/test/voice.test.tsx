@@ -18,6 +18,8 @@ const fakeEngine = vi.hoisted(() => ({
   stunUrls: [] as unknown[],
   picked: [] as string[],
   level: 0.42,
+  /** G-82: everyone the fake engine hears as speaking. */
+  speakingAll: false,
   deafened: false,
   selfMonitor: false,
   fallback: null as null | { kind: 'input' | 'output'; label: string | null; at: number },
@@ -33,7 +35,8 @@ vi.mock('../voice', () => ({
     fakeEngine.stunUrls.push(options?.stunUrl);
     return {
     ready: true,
-    speaking: {},
+    // G-82: with speakingAll, every id the proxy is asked about is speaking.
+    speaking: fakeEngine.speakingAll ? new Proxy({}, { get: () => true }) : {},
     peerFailed: fakeEngine.peerFailed,
     setMicMuted: () => {},
     inputs: [
@@ -289,6 +292,27 @@ describe('G-64: a sound when someone joins or leaves my call', () => {
       expect(played, label).not.toHaveBeenCalled();
       expect(bar.querySelector('[aria-live="polite"]')?.textContent, label).toMatch(/joined the call$/);
       cleanup();
+    }
+  });
+});
+
+describe('G-82: the speaking ring', () => {
+  it('rings who is speaking in my room, but never someone muted (or deafened)', async () => {
+    fakeEngine.speakingAll = true;
+    try {
+      const { entry } = await setup();
+      await click(entry());
+      await screen.findByRole('region', { name: 'Voice call' });
+      const roster = screen.getAllByRole('list', { name: 'In the voice chat' })[0]!;
+      const items = within(roster).getAllByRole('listitem');
+      const muted = items.filter((li) => within(li).queryByRole('img', { name: 'Microphone off' }));
+      const open = items.filter((li) => !within(li).queryByRole('img', { name: 'Microphone off' }));
+      expect(muted.length).toBeGreaterThan(0);
+      expect(open.length).toBeGreaterThan(0);
+      expect(muted.every((li) => !li.classList.contains('speaking'))).toBe(true);
+      expect(open.every((li) => li.classList.contains('speaking'))).toBe(true);
+    } finally {
+      fakeEngine.speakingAll = false;
     }
   });
 });

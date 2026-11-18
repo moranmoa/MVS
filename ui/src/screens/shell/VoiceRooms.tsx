@@ -244,7 +244,8 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
                     return (
                       <li
                         key={p.userId}
-                        className={callHere && engine.speaking[p.userId] ? 'speaking' : undefined}
+                        // G-82: a muted (or deafened, which mutes) person never shows as speaking.
+                        className={callHere && engine.speaking[p.userId] && !p.muted ? 'speaking' : undefined}
                         {...(callHere && p.userId !== myId
                           ? { tabIndex: 0, ...bind(intl.formatMessage({ id: 'voice.personMenu' }, { name: who }), () => personItems(p.userId, who)) }
                           : {})}

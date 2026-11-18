@@ -58,6 +58,7 @@ use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
 use crate::typing::{TypingError, TypingLimits, MAX_TYPING_BLOB};
+use crate::voice_media::{SendQueue, VoiceFrame};
 use crate::voice::{VoiceError, VoiceLimits, MAX_VOICE_BLOB};
 use crate::{
     log_name, log_of, valid_log_name, Append, Authorizer, ChannelId, NoStubs, Record, RecordId, Scope, ServerId, Store,
@@ -333,6 +334,11 @@ pub enum NodeEvent {
     /// G-29: a typing signal (`/mvs/typing/1`) from a verified current
     /// member, as [`NodeEvent::VoiceSignal`]. Ephemeral. See `typing`.
     TypingSignal { from: PublicKey, bytes: Vec<u8> },
+    /// G-81: a voice frame from a participant of my current call, past the
+    /// gate, the caps and the sequence checks (`voice_media`).
+    VoiceFrame { from: PublicKey, frame: VoiceFrame },
+    /// G-81: how my voice frames reach a call peer now changed.
+    VoicePath { identity: PublicKey, path: VoicePath },
     /// An invite publication (`/mvs/invite-pub/1`) from a verified current
     /// member of `server`, `from` its identity. Opaque here: the api
     /// verifies it (C1) and calls [`Node::serve_invite`] if it holds.
@@ -406,6 +412,7 @@ enum Command {
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
     TypingSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), TypingError>> },
+    VoiceCall { call: Option<VoiceCall> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
     DropServerInvites { server: ServerId },
@@ -516,6 +523,8 @@ struct Behaviour {
     voice: crate::voice::VoiceBehaviour,
     /// G-29 typing (`/mvs/typing/1`), with verified members only (`typing`).
     typing: crate::typing::TypingBehaviour,
+    /// G-81 voice media (`/mvs/voice-media/1`), per chosen connection (`voice_media`).
+    voice_media: crate::voice_media::VoiceMedia,
     /// Invite publications between members (`/mvs/invite-pub/1`).
     invite_pub: crate::invite::PublishBehaviour,
     /// Envelope asks, from anyone (`/mvs/invite/1`).
@@ -635,11 +644,47 @@ fn log_of_topic(topic: &TopicHash) -> Option<&str> {
     topic.as_str().strip_prefix("log/").filter(|log| valid_log_name(log))
 }
 
+/// G-81: my current call, as the api tells it ([`Node::set_voice_call`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceCall {
+    pub call_id: [u8; 16],
+    /// Everyone in the call but me: the only ones whose frames are taken.
+    pub participants: Vec<PublicKey>,
+    /// The participants my frames go to over libp2p (not on LAN WebRTC).
+    pub targets: Vec<PublicKey>,
+}
+
+/// G-81: how my frames reach a call peer (#509 §2.3, `path_to`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoicePath {
+    Lan,
+    Direct,
+    Circuit,
+    MemberCircuit,
+    None,
+}
+
+/// G-81 caps (#509 §2.3, SL B2): frames per second from one peer, and from
+/// all peers together; frames to send waiting in the node.
+const VOICE_PER_PEER: u32 = 60;
+const VOICE_ALL: u32 = 480;
+const VOICE_FRAMES_IN: usize = 64;
+/// Read frames waiting for the node, all substreams together.
+const VOICE_READ_QUEUE: usize = 256;
+/// SL (#530): a sequence further ahead of a sender's last than this is
+/// refused (a jitter buffer must never be pushed that far).
+const VOICE_SEQ_JUMP: u32 = 1 << 16;
+/// A5: after a move to a better path, the old one also gets frames this
+/// long (receivers drop duplicates by sequence), then stops.
+const VOICE_OVERLAP: Duration = Duration::from_secs(1);
+
 /// Handle to a running node. Dropping it does not stop the node; call
 /// [`Node::shutdown`].
 pub struct Node {
     peer_id: PeerId,
     commands: mpsc::UnboundedSender<Command>,
+    /// G-81: frames to send, bounded; full drops the frame (`voice_frame`).
+    voice_frames: mpsc::Sender<VoiceFrame>,
 }
 
 impl Node {
@@ -735,6 +780,8 @@ impl Node {
         let (answers, answer_rx) = mpsc::unbounded_channel();
         let (decoded, decoded_rx) = mpsc::unbounded_channel();
         let (beacons, beacon_rx) = mpsc::channel(64);
+        let (voice_frames, voice_frame_rx) = mpsc::channel(VOICE_FRAMES_IN);
+        let (voice_in_tx, voice_in_rx) = mpsc::channel(VOICE_READ_QUEUE);
         let link_peers = swarm.behaviour().guard.link_peers.clone();
         let mut task = Task {
             swarm,
@@ -803,6 +850,18 @@ impl Node {
             pending_stubs: HashMap::new(),
             voice_limits: VoiceLimits::new(),
             typing_limits: TypingLimits::new(),
+            voice_call: None,
+            voice_out: HashMap::new(),
+            voice_in: HashMap::new(),
+            voice_seq: HashMap::new(),
+            voice_in_tx,
+            voice_in_rx,
+            voice_rate_peer: RateLimiter::new(VOICE_PER_PEER, VOICE_PER_PEER, MAX_TRACKED_PEERS),
+            voice_rate_all: RateLimiter::new(VOICE_ALL, VOICE_ALL, 1),
+            voice_rate_out: RateLimiter::new(VOICE_PER_PEER, VOICE_PER_PEER, 1),
+            voice_conns: HashMap::new(),
+            voice_paths: HashMap::new(),
+            voice_dirty: false,
             invites: HashMap::new(),
             invite_limits: InviteLimits::new(),
             fetches: HashMap::new(),
@@ -850,8 +909,8 @@ impl Node {
         for log in config.logs {
             task.open(log, None);
         }
-        tokio::spawn(task.run(command_rx, answer_rx, decoded_rx, beacon_rx));
-        Ok((Node { peer_id, commands }, event_rx))
+        tokio::spawn(task.run(command_rx, answer_rx, decoded_rx, beacon_rx, voice_frame_rx));
+        Ok((Node { peer_id, commands, voice_frames }, event_rx))
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -1210,6 +1269,21 @@ impl Node {
         Ok(rx.await?)
     }
 
+    /// G-81: my current call, or none. From now on frames to or from anyone
+    /// else, or under another call ID, are dropped; a new call ID starts
+    /// every sender's sequence afresh.
+    pub fn set_voice_call(&self, call: Option<VoiceCall>) -> Result<()> {
+        self.send(Command::VoiceCall { call })
+    }
+
+    /// G-81: one of my frames, for every target of my current call. Never
+    /// waits: a full queue drops it (counted, never logged).
+    pub fn voice_frame(&self, frame: VoiceFrame) {
+        if self.voice_frames.try_send(frame).is_err() {
+            crate::voice_media::DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn send(&self, command: Command) -> Result<()> {
         self.commands.send(command).ok().context("node has stopped")
     }
@@ -1316,6 +1390,7 @@ async fn build_swarm(
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
                 typing: crate::typing::behaviour(),
+                voice_media: crate::voice_media::VoiceMedia::default(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
                 backup: crate::backup::behaviour(),
@@ -1535,6 +1610,21 @@ struct Task {
     voice_limits: VoiceLimits,
     /// G-29: caps on accepted typing signals (their own, not voice's).
     typing_limits: TypingLimits,
+    /// G-81 voice media: my current call; per target, the substream my
+    /// frames go out on; per participant, the one theirs come in on; each
+    /// sender's last sequence; the caps; and each open connection's kind.
+    voice_call: Option<VoiceCall>,
+    voice_out: HashMap<PublicKey, VoiceOut>,
+    voice_in: HashMap<PublicKey, VoiceIn>,
+    voice_seq: HashMap<PublicKey, u32>,
+    voice_in_tx: mpsc::Sender<(PublicKey, ConnectionId, VoiceFrame)>,
+    voice_in_rx: mpsc::Receiver<(PublicKey, ConnectionId, VoiceFrame)>,
+    voice_rate_peer: RateLimiter<PublicKey>,
+    voice_rate_all: RateLimiter<()>,
+    voice_rate_out: RateLimiter<()>,
+    voice_conns: HashMap<ConnectionId, VoicePath>,
+    voice_paths: HashMap<PublicKey, VoicePath>,
+    voice_dirty: bool,
     /// T8-02: envelope handle → the server and publication we serve.
     invites: HashMap<[u8; 32], (ServerId, Vec<u8>)>,
     invite_limits: InviteLimits,
@@ -1662,6 +1752,7 @@ impl Task {
         mut answers: mpsc::UnboundedReceiver<Answer>,
         mut decoded: mpsc::UnboundedReceiver<Decoded>,
         mut beacon_rx: mpsc::Receiver<(std::net::IpAddr, Vec<u8>)>,
+        mut voice_frame_rx: mpsc::Receiver<VoiceFrame>,
     ) {
         let mut anti_entropy = tokio::time::interval(ANTI_ENTROPY);
         // The first discovery runs as soon as the relay connection is up;
@@ -1680,10 +1771,17 @@ impl Task {
                     Some(command) => self.on_command(command),
                     None => return,
                 },
-                event = self.swarm.select_next_some() => self.on_swarm_event(event),
+                event = self.swarm.select_next_some() => {
+                    self.on_swarm_event(event);
+                    if self.voice_dirty {
+                        self.voice_reroute();
+                    }
+                }
                 Some(answer) = answers.recv() => self.send_answer(answer),
                 Some((key, records, more, acked)) = decoded.recv() => self.on_decoded(key, records, more, acked),
                 Some((ip, packet)) = beacon_rx.recv() => self.on_beacon(ip, packet),
+                Some(frame) = voice_frame_rx.recv() => self.voice_out_frame(frame),
+                Some((identity, connection, frame)) = self.voice_in_rx.recv() => self.voice_in_frame(identity, connection, frame),
                 _ = soon.tick() => {
                     // T24: send what the outgoing rate held back.
                     let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
@@ -1699,6 +1797,7 @@ impl Task {
                     self.expire_fetches();
                     self.link_tick();
                     self.lan_beacon_tick();
+                    self.voice_reroute();
                     self.check_remembered();
                     let gone = self.presence.expire(Instant::now());
                     self.went_offline(gone);
@@ -1819,6 +1918,7 @@ impl Task {
             Command::VoiceSend { to, bytes, reply } => {
                 let _ = reply.send(self.voice_send(to, bytes));
             }
+            Command::VoiceCall { call } => self.set_voice_call(call),
             Command::TypingSend { to, bytes, reply } => {
                 let _ = reply.send(self.typing_send(to, bytes));
             }
@@ -3023,6 +3123,19 @@ impl Task {
     }
 
     fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        // G-81: each connection's kind, for choosing voice paths.
+        match &event {
+            SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. } => {
+                let kind = self.voice_kind(endpoint);
+                self.voice_conns.insert(*connection_id, kind);
+                self.voice_dirty = true;
+            }
+            SwarmEvent::ConnectionClosed { connection_id, .. } => {
+                self.voice_conns.remove(connection_id);
+                self.voice_dirty = true;
+            }
+            _ => {}
+        }
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                 self.dial_backoff.lock().unwrap().connected(&peer_id);
@@ -3341,6 +3454,7 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::Voice(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "voice signal not delivered"),
+            SwarmEvent::Behaviour(BehaviourEvent::VoiceMedia(event)) => self.on_voice_media(event),
             SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Request { request, channel, .. },
@@ -4487,6 +4601,281 @@ fn incoming_ip(endpoint: &ConnectedPoint) -> Option<std::net::IpAddr> {
 /// (which would leave none). `we_dialed`: we dialled this connection.
 fn keep_relayed(local: &PeerId, peer: &PeerId, we_dialed: bool) -> bool {
     if we_dialed { local < peer } else { peer < local }
+}
+
+/// G-81: where one target's frames go: the substream in use, one being
+/// opened on a better connection, and the previous one during the
+/// [`VOICE_OVERLAP`] after a move.
+#[derive(Default)]
+struct VoiceOut {
+    current: Option<(ConnectionId, SendQueue)>,
+    opening: Option<(u64, ConnectionId)>,
+    old: Option<(SendQueue, Instant)>,
+}
+
+impl VoiceOut {
+    fn close(self) {
+        for queue in self.current.map(|(_, q)| q).into_iter().chain(self.old.map(|(q, _)| q)) {
+            queue.close();
+        }
+    }
+}
+
+/// G-81: the substream one participant's frames come in on.
+struct VoiceIn {
+    peer: PeerId,
+    connection: ConnectionId,
+    reader: tokio::task::AbortHandle,
+}
+
+impl Task {
+    /// What kind of path a new connection is, for voice: a circuit through
+    /// one of our relays or a member's, or direct (LAN when the remote
+    /// address is LAN scope).
+    fn voice_kind(&self, endpoint: &ConnectedPoint) -> VoicePath {
+        if is_relayed(endpoint) {
+            let addr = match endpoint {
+                ConnectedPoint::Dialer { address, .. } => address,
+                ConnectedPoint::Listener { local_addr, .. } => local_addr,
+            };
+            let mut relay = None;
+            let mut last = None;
+            for p in addr.iter() {
+                match p {
+                    Protocol::P2pCircuit => {
+                        relay = last;
+                        break;
+                    }
+                    Protocol::P2p(peer) => last = Some(peer),
+                    _ => {}
+                }
+            }
+            return match relay {
+                Some(relay) if self.is_our_relay(&relay) => VoicePath::Circuit,
+                _ => VoicePath::MemberCircuit,
+            };
+        }
+        let remote = match endpoint {
+            ConnectedPoint::Dialer { address, .. } => address,
+            ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+        };
+        let lan = remote.iter().any(|p| matches!(p, Protocol::Ip4(ip) if crate::lan_beacon::lan_scope(ip)));
+        if lan {
+            VoicePath::Lan
+        } else {
+            VoicePath::Direct
+        }
+    }
+
+    /// The best open connection to `identity` for voice (#509 §2.4, TL):
+    /// LAN, then direct, then a circuit through our relays, then a member's
+    /// circuit only when none of ours exists. Relay-only: our circuits
+    /// only. Never a dial.
+    fn voice_route(&self, identity: PublicKey) -> Option<(PeerId, ConnectionId, VoicePath)> {
+        let peer = self.member_peer(identity)?;
+        let rank = |path: VoicePath| match path {
+            VoicePath::Lan => 0,
+            VoicePath::Direct => 1,
+            VoicePath::Circuit => 2,
+            VoicePath::MemberCircuit => 3,
+            VoicePath::None => 4,
+        };
+        [&self.direct, &self.relayed, &self.parked]
+            .into_iter()
+            .filter_map(|conns| conns.get(&peer))
+            .flatten()
+            .filter_map(|c| self.voice_conns.get(c).map(|path| (*c, *path)))
+            .filter(|(_, path)| !self.relay_only || *path == VoicePath::Circuit)
+            .min_by_key(|(c, path)| (rank(*path), *c))
+            .map(|(c, path)| (peer, c, path))
+    }
+
+    /// My current call changed. A new call ID (or none) ends every voice
+    /// substream and starts sequences afresh; a participant who left loses
+    /// theirs.
+    fn set_voice_call(&mut self, call: Option<VoiceCall>) {
+        let same = self.voice_call.as_ref().map(|c| c.call_id) == call.as_ref().map(|c| c.call_id);
+        if !same {
+            for (_, out) in self.voice_out.drain() {
+                out.close();
+            }
+            for (_, reader) in self.voice_in.drain() {
+                reader.reader.abort();
+            }
+            self.voice_seq.clear();
+            self.voice_paths.clear();
+        }
+        self.voice_call = call;
+        let participants: HashSet<PublicKey> =
+            self.voice_call.iter().flat_map(|c| c.participants.iter().copied()).collect();
+        self.voice_in.retain(|identity, reader| {
+            let keep = participants.contains(identity);
+            if !keep {
+                reader.reader.abort();
+            }
+            keep
+        });
+        self.voice_reroute();
+    }
+
+    /// Every second, on a connection change and on a call change: each
+    /// target's frames go on its best path (A5: a better one is opened
+    /// first, the old one keeps frames for [`VOICE_OVERLAP`]); a target
+    /// with no path, or no longer a member, gets none.
+    fn voice_reroute(&mut self) {
+        self.voice_dirty = false;
+        let now = Instant::now();
+        let Some(call) = self.voice_call.clone() else { return };
+        let targets: Vec<PublicKey> =
+            call.targets.iter().filter(|t| call.participants.contains(t)).copied().collect();
+        self.voice_out.retain(|identity, out| {
+            let keep = targets.contains(identity);
+            if !keep {
+                std::mem::take(out).close();
+            }
+            keep
+        });
+        for identity in targets {
+            let route = self.voice_route(identity);
+            let path = route.map_or(VoicePath::None, |(_, _, path)| path);
+            if self.voice_paths.get(&identity) != Some(&path) {
+                self.voice_paths.insert(identity, path);
+                self.emit(NodeEvent::VoicePath { identity, path });
+            }
+            let out = self.voice_out.entry(identity).or_default();
+            // A writer whose substream failed is no path.
+            if out.current.as_ref().is_some_and(|(_, q)| q.is_closed()) {
+                out.current = None;
+            }
+            if let Some((queue, until)) = &out.old {
+                if now >= *until || queue.is_closed() {
+                    queue.close();
+                    out.old = None;
+                }
+            }
+            let Some((peer, connection, _)) = route else {
+                std::mem::take(out).close();
+                continue;
+            };
+            let current = out.current.as_ref().map(|(c, _)| *c);
+            let opening = out.opening.map(|(_, c)| c);
+            if current == Some(connection) || opening == Some(connection) {
+                continue;
+            }
+            if let Some(id) = self.swarm.behaviour_mut().voice_media.open(peer, connection) {
+                self.voice_out.entry(identity).or_default().opening = Some((id, connection));
+            }
+        }
+        // A sender no longer a member (kicked, or our read gate changed)
+        // loses its substream.
+        let gone: Vec<PublicKey> = self
+            .voice_in
+            .iter()
+            .filter(|(identity, reader)| self.member_identity(reader.peer) != Some(**identity))
+            .map(|(identity, _)| *identity)
+            .collect();
+        for identity in gone {
+            if let Some(reader) = self.voice_in.remove(&identity) {
+                reader.reader.abort();
+            }
+        }
+    }
+
+    fn on_voice_media(&mut self, event: crate::voice_media::Event) {
+        use crate::voice_media::Event;
+        match event {
+            Event::Opened { connection, id, stream } => {
+                let Some(out) = self.voice_out.values_mut().find(|o| o.opening.map(|(i, _)| i) == Some(id)) else {
+                    return; // stale: dropping it closes the substream
+                };
+                out.opening = None;
+                let queue = SendQueue::default();
+                tokio::spawn(crate::voice_media::write_loop(stream, queue.clone()));
+                if let Some((_, previous)) = out.current.replace((connection, queue)) {
+                    if let Some((older, _)) = out.old.replace((previous, Instant::now() + VOICE_OVERLAP)) {
+                        older.close();
+                    }
+                }
+            }
+            Event::OpenFailed { id } => {
+                if let Some(out) = self.voice_out.values_mut().find(|o| o.opening.map(|(i, _)| i) == Some(id)) {
+                    out.opening = None;
+                }
+            }
+            Event::Inbound { peer, connection, stream } => self.on_voice_inbound(peer, connection, stream),
+        }
+    }
+
+    /// The gate, before a byte is read (#509 §2.3, SL B1, TL): a peer bound
+    /// to a current member who is a participant of my current call. At most
+    /// one substream per participant: one on another connection replaces
+    /// it (a migration), a second on the same connection is refused.
+    /// Refused ones are dropped, which closes them.
+    fn on_voice_inbound(&mut self, peer: PeerId, connection: ConnectionId, stream: libp2p::Stream) {
+        let Some(identity) = self.member_identity(peer) else {
+            debug!(%peer, "voice media from a non-member refused");
+            return;
+        };
+        if !self.voice_call.as_ref().is_some_and(|c| c.participants.contains(&identity)) {
+            debug!(%peer, "voice media from outside my call refused");
+            return;
+        }
+        if let Some(existing) = self.voice_in.get(&identity) {
+            // A reader that ended (the peer closed, or a rule broke) no
+            // longer holds the place.
+            if existing.connection == connection && !existing.reader.is_finished() {
+                debug!(%peer, "a second voice substream on one connection refused");
+                return;
+            }
+            existing.reader.abort();
+        }
+        let tx = self.voice_in_tx.clone();
+        let reader = tokio::spawn(crate::voice_media::read_loop(identity, connection, stream, tx)).abort_handle();
+        self.voice_in.insert(identity, VoiceIn { peer, connection, reader });
+    }
+
+    /// A frame read from `identity`'s substream: only from its current one,
+    /// under my call ID, within the caps and the sequence rules (SL #530:
+    /// no jump over [`VOICE_SEQ_JUMP`]; nothing old or repeated).
+    fn voice_in_frame(&mut self, identity: PublicKey, connection: ConnectionId, frame: VoiceFrame) {
+        if self.voice_in.get(&identity).map(|r| r.connection) != Some(connection) {
+            return;
+        }
+        if !self.voice_call.as_ref().is_some_and(|c| c.call_id == frame.call_id && c.participants.contains(&identity)) {
+            return;
+        }
+        if let Some(last) = self.voice_seq.get(&identity) {
+            let ahead = frame.seq.wrapping_sub(*last);
+            if ahead == 0 || ahead > VOICE_SEQ_JUMP {
+                return;
+            }
+        }
+        let now = Instant::now();
+        if !self.voice_rate_peer.allow(identity, now) || !self.voice_rate_all.allow((), now) {
+            crate::voice_media::DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        self.voice_seq.insert(identity, frame.seq);
+        self.emit(NodeEvent::VoiceFrame { from: identity, frame });
+    }
+
+    /// One of my frames: to every target's substream (and the old one
+    /// during an overlap), under my call ID and my own cap.
+    fn voice_out_frame(&mut self, frame: VoiceFrame) {
+        if !self.voice_call.as_ref().is_some_and(|c| c.call_id == frame.call_id) {
+            return;
+        }
+        if !self.voice_rate_out.allow((), Instant::now()) {
+            crate::voice_media::DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let Some(wire) = frame.encode() else { return };
+        for out in self.voice_out.values() {
+            for queue in out.current.iter().map(|(_, q)| q).chain(out.old.iter().map(|(q, _)| q)) {
+                queue.push(wire.clone());
+            }
+        }
+    }
 }
 
 fn is_relayed(endpoint: &ConnectedPoint) -> bool {

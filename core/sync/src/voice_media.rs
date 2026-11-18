@@ -35,10 +35,13 @@ use std::time::Duration;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::core::upgrade::ReadyUpgrade;
 use libp2p::core::{transport::PortUse, Endpoint};
-use libp2p::swarm::handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound};
+use libp2p::swarm::handler::{
+    ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
+};
 use libp2p::swarm::{
-    ConnectionDenied, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm, NetworkBehaviour,
-    NotifyHandler, Stream, SubstreamProtocol, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+    ConnectionDenied, ConnectionHandler, ConnectionHandlerEvent, ConnectionId, FromSwarm,
+    NetworkBehaviour, NotifyHandler, Stream, SubstreamProtocol, THandler, THandlerInEvent,
+    THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 
@@ -83,7 +86,9 @@ impl VoiceFrame {
 
 /// Reads one frame: `Ok(None)` at a clean end between frames; an error for
 /// a short read or a length over [`MAX_OPUS`] (the caller closes).
-pub(crate) async fn read_frame<R: futures::AsyncRead + Unpin>(io: &mut R) -> io::Result<Option<VoiceFrame>> {
+pub(crate) async fn read_frame<R: futures::AsyncRead + Unpin>(
+    io: &mut R,
+) -> io::Result<Option<VoiceFrame>> {
     let mut header = [0u8; HEADER];
     let mut got = 0;
     while got < HEADER {
@@ -144,6 +149,11 @@ impl SendQueue {
         self.inner.1.notify_one();
     }
 
+    /// Closed: by [`Self::close`], or because its substream failed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.0.lock().expect("not poisoned").closed
+    }
+
     async fn next(&self) -> Option<Vec<u8>> {
         loop {
             {
@@ -172,15 +182,37 @@ pub(crate) async fn write_loop(mut stream: Stream, queue: SendQueue) {
     let _ = stream.close().await;
 }
 
+/// Reads an accepted substream's frames into `to`, tagged with who sent
+/// them and on which connection, until it ends, breaks a rule (closed), or
+/// stays silent for [`IDLE`]. A full `to` drops the frame (counted).
+pub(crate) async fn read_loop<K: Copy + Send + 'static>(
+    who: K,
+    connection: ConnectionId,
+    mut stream: Stream,
+    to: tokio::sync::mpsc::Sender<(K, ConnectionId, VoiceFrame)>,
+) {
+    loop {
+        match tokio::time::timeout(IDLE, read_frame(&mut stream)).await {
+            Ok(Ok(Some(frame))) => {
+                if to.try_send((who, connection, frame)).is_err() {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // The end, a broken rule, or silence: dropping closes it.
+            _ => return,
+        }
+    }
+}
+
 /// What the behaviour reports to the node.
 #[derive(Debug)]
 pub(crate) enum Event {
     /// A negotiated inbound substream, unread: gate it or drop it.
     Inbound { peer: PeerId, connection: ConnectionId, stream: Stream },
     /// [`VoiceMedia::open`] `id` succeeded on `connection`.
-    Opened { peer: PeerId, connection: ConnectionId, id: u64, stream: Stream },
+    Opened { connection: ConnectionId, id: u64, stream: Stream },
     /// It didn't (protocol refused, or the connection closed).
-    OpenFailed { peer: PeerId, connection: ConnectionId, id: u64 },
+    OpenFailed { id: u64 },
 }
 
 #[derive(Default)]
@@ -246,11 +278,16 @@ impl NetworkBehaviour for VoiceMedia {
         }
     }
 
-    fn on_connection_handler_event(&mut self, peer: PeerId, connection: ConnectionId, event: THandlerOutEvent<Self>) {
+    fn on_connection_handler_event(
+        &mut self,
+        peer: PeerId,
+        connection: ConnectionId,
+        event: THandlerOutEvent<Self>,
+    ) {
         let event = match event {
             HandlerOut::Inbound(stream) => Event::Inbound { peer, connection, stream },
-            HandlerOut::Opened(id, stream) => Event::Opened { peer, connection, id, stream },
-            HandlerOut::OpenFailed(id) => Event::OpenFailed { peer, connection, id },
+            HandlerOut::Opened(id, stream) => Event::Opened { connection, id, stream },
+            HandlerOut::OpenFailed(id) => Event::OpenFailed { id },
         };
         self.queued.push_back(ToSwarm::GenerateEvent(event));
     }
@@ -326,14 +363,20 @@ impl ConnectionHandler for Handler {
         event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol, (), u64>,
     ) {
         match event {
-            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound { protocol: stream, .. }) => {
+            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
+                protocol: stream,
+                ..
+            }) => {
                 // Undecided ones are bounded: a peer opening many is cut.
                 let held = self.out.iter().filter(|o| matches!(o, HandlerOut::Inbound(_))).count();
                 if held < MAX_HELD_INBOUND {
                     self.out.push_back(HandlerOut::Inbound(stream));
                 }
             }
-            ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound { protocol: stream, info: id }) => {
+            ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
+                protocol: stream,
+                info: id,
+            }) => {
                 self.out.push_back(HandlerOut::Opened(id, stream));
             }
             ConnectionEvent::DialUpgradeError(DialUpgradeError { info: id, .. }) => {

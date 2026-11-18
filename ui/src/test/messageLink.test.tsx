@@ -54,8 +54,14 @@ describe('the link format', () => {
     act(() => {
       emit({ serverId: 's', channelId: '', messageId: 'm' });
       emit({ serverId: 's', channelId: 'c', messageId: 'm', extra: 'x' });
+      // Only 64 lower-case hex (or the demo's short ids): no case, slashes, spaces or URLs.
+      for (const bad of ['S', 'a/b', 'a b', 'mvs://x', 'x'.repeat(65), 'ABCDEF'.repeat(11)]) emit({ serverId: bad, channelId: 'c', messageId: 'm' });
+      emit({ serverId: 'a'.repeat(64), channelId: 'b'.repeat(64), messageId: 'c'.repeat(64) });
     });
-    expect(seen).toEqual([{ serverId: 's', channelId: 'c', messageId: 'm' }]);
+    expect(seen).toEqual([
+      { serverId: 's', channelId: 'c', messageId: 'm' },
+      { serverId: 'a'.repeat(64), channelId: 'b'.repeat(64), messageId: 'c'.repeat(64) },
+    ]);
     const [server] = await core.listServers();
     const [channel] = await core.listChannels(server.id);
     const { index } = await guarded.locateMessage(server.id, channel.id, `${channel.id}#3`);

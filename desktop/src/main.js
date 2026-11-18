@@ -28,6 +28,7 @@ const ptt = require('./ptt');
 const badge = require('./badge');
 const applock = require('./applock');
 const demo = require('./demo');
+const voiceframe = require('./voiceframe');
 
 /** T8-04: the mock demo (MVS_DEMO), checkout only; null otherwise. */
 const DEMO = demo.demoFor({ packaged: app.isPackaged, env: process.env });
@@ -222,6 +223,23 @@ function toPages(name, payload) {
   }
 }
 
+/**
+ * G-81 (SL B3): voice frames, page <-> core, on their own channel with the
+ * §2.3 size and rate caps. Out only in a call and unlocked (the lock forces
+ * the mic off); in during a call, unlocked or behind a path B lock (the
+ * call's audio keeps playing). Never core:invoke, never logged.
+ */
+const voiceFrames = voiceframe.createVoiceFrames({
+  canSend: () => callGate.inCall && lockOpen(),
+  canReceive: () => callGate.inCall && (lockOpen() || (appLock.state.locked && appLock.state.path === 'B')),
+  send: (frame) => (core ? core.send('voiceFrame', frame) : false),
+  deliver: (frame) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('voice:frame', frame);
+    }
+  },
+});
+
 function setCoreStatus(status) {
   callGate.onCoreStatus(status);
   syncCall();
@@ -283,6 +301,11 @@ function startCore() {
     bootstrap,
     extraArgs: update.coreArgs(UPDATE),
     onEvent: (name, payload) => {
+      // G-81: audio frames take their own channel (voiceframe.js), never the generic one.
+      if (name === 'voice.frame') {
+        voiceFrames.fromCore(payload);
+        return;
+      }
       callGate.onEvent(name, payload);
       syncCall();
       if (appLock.forwards(name)) toPages(name, payload);
@@ -347,6 +370,11 @@ function serveCoreIpc() {
     const frame = event.senderFrame;
     return !!frame && frame === event.sender.mainFrame && sec.isInternalUrl(frame.url);
   };
+  // G-81: a voice frame from the page, fire-and-forget (ipcRenderer.send).
+  ipcMain.on('voice:frame', (event, frame) => {
+    if (!fromUs(event)) return;
+    voiceFrames.fromPage(frame);
+  });
   let lastRetry = 0;
   ipcMain.handle('core:retry', (event) => {
     if (!fromUs(event) || DEMO) return false;

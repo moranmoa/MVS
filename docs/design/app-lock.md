@@ -2,8 +2,8 @@
 
 **Status:** design only, no code.
 - **Security Lead:** APPROVED, with conditions (§8).
-- **Tech Lead:** APPROVED, with one change: leave the call on lock.
-- **Re-confirmation:** the SL is asked to re-confirm the merged decisions in §8.
+- **Tech Lead:** APPROVED, with the two-path design for a lock during a call (§5).
+- **Re-verdict:** both leads are asked to re-verdict this head.
 
 **Background:**
 - G-78 is in `docs/ux/GAPS.md` §1.7. It comes from spec question 6: "recovery words + OS keychain + an optional app lock".
@@ -29,6 +29,7 @@
 - **Anyone with my OS account's files or a process running as me.** The keychain stays unlocked for my OS session. The SQLite store is plaintext (GAP-11). The lock settings could be edited out of the profile. This is the TB1 line: the lock narrows "anyone at the keyboard", not "anything running as me".
 - **The core working in the background.** Sync, relaying, keeping my servers' data, voice-room presence and receiving messages all go on while locked. Locking doesn't sign me out or take me offline.
 - **A stolen, powered-off laptop.** That needs disk encryption (BitLocker, FileVault, LUKS) plus GAP-11. The UI should say so in one line when the lock is turned on.
+- **Content behind a locked call.** During a call, MVS keeps the call's audio running behind the lock. The page's earlier content stays in memory, hidden, until the call ends (§5 path B). The setting shows this as one more line.
 
 ## 2. How to unlock
 
@@ -71,30 +72,52 @@
 | Lock now | A "Lock now" item in the user menu, plus a shortcut. Ctrl+L (⌘L) is the candidate, but it still has to be checked against the app's existing shortcuts and the composer (TL). If it clashes, use Ctrl+Shift+L. It's a window shortcut, never a global one | – |
 
 - **Never during a call by idle.** Idle time doesn't lock while I'm in a call, because people listen without touching anything.
-- **Manual lock or OS lock during a call: MVS leaves the call first, then locks.** This is the TL's change. The voice engine lives in the renderer, so the reload in §5.1 would drop the audio anyway. Main does it in this order:
-  1. sends `leaveCall` to the core;
-  2. closes the call gate;
-  3. reloads into the lock screen.
+- **Manual lock or OS lock during a call: the call goes on, with my mic off** (the manager's decision). This is path B in §5. Main mutes me in the core with `setMuted(true)`, and the page turns the mic track off. While locked:
+  - unmuting (`setMuted(false)`) is refused;
+  - push-to-talk and the global mute toggle are off;
+  - any open mic test (`mic:test`) is closed and refused.
 
-  After unlock, the page shows "You left the call because MVS locked." / "יצאת מהשיחה כי MVS ננעלה." There's no open mic while locked, by construction. Push-to-talk and the global mute toggle are off. Any open mic test (`mic:test`) is closed on lock and refused while locked.
+  The lock overlay shows "in a call" with a **Leave** button.
 - Changing the lock settings, or turning the lock off, needs the current passcode (or OS auth).
 
 ## 5. Enforcement: in main, not in the page
 
-A lock that the page enforces is only as good as the page's state. So **main** owns the lock state, and while locked:
+A lock that the page enforces is only as good as the page's state. So **main** owns the lock state. There are two paths, because the voice engine lives in the renderer and a reload would end a call.
+
+**Path A, locked when not in a call: reload.**
 
 1. **The page is reloaded into the lock screen** with `?locked`. Its in-memory store (messages, members) is thrown away with the old renderer state, not hidden behind an overlay.
 2. **`core:invoke` refuses** every command except a short allow-list:
    - `getAppInfo`, for the version on the lock screen;
-   - the unlock and forgot-passcode commands;
-   - `leaveCall`, harmless. Main already left the call on lock, but a call joined by another of my devices doesn't matter here.
+   - the unlock and forgot-passcode commands.
 
-   Everything else answers `{ error: { code: 'locked' } }`. This lives in main's handler, so it doesn't depend on the page's code. `exportDiagnostics` stays off the list unless it's proven free of names and IDs (SL).
-3. **Core events aren't forwarded** to the page, except `core.status` and the new `lock.state`. `lock.state` carries `leftCall: true` once, so that after unlock the page can show the notice. **Only the latest** `link.open` (an mvs:// invite) is held, and it's delivered after unlock. A second launch of MVS while locked (`second-instance`) focuses the lock screen, and its link is held the same way.
-4. **Notifications:** `notify:show` is refused while locked, and the page can't produce any anyway (it gets no message events). Main shows **nothing**: no generic "new message" toast either, because even that reveals activity (SL: Q2).
-5. **Taskbar badge** (G-62): cleared on lock (`badge.set(0)`), and `badge:set` is refused until unlock.
-6. **Push-to-talk** (G-74): `pushToTalk.reset()` on lock. `ptt:set` and the key watch are off, and the global mute shortcut is unregistered.
-7. **Clipboard and window:** `clipboard:write` is refused. The window title stays "MVS", with no server or channel name.
+   Everything else answers `{ error: { code: 'locked' } }`. This lives in main's handler, so it doesn't depend on the page's code. `exportDiagnostics` stays off the list (SL and TL).
+3. **Core events aren't forwarded** to the page, except `core.status` and the new `lock.state`. **Only the latest** `link.open` (an mvs:// invite) is held, and it's delivered after unlock. A second launch of MVS while locked (`second-instance`) focuses the lock screen, and its link is held the same way.
+
+**Path B, locked during a call: overlay, no reload.**
+
+- **The page stays loaded** so the call's audio keeps running. Main sends `lock.state { locked: true, inCall: true }`.
+- **The page hides the app:** it sets `inert` and `aria-hidden="true"` on the app root, and shows a focus-trapped overlay with:
+  - "in a call" and the call's member count, with no names;
+  - **Leave**;
+  - unlock.
+- **Main mutes me in the core** with `setMuted(true)`, and the page turns the mic track off.
+- **`core:invoke` allows only:**
+  - the lock commands;
+  - `leaveCall`;
+  - `setMuted` with `true` only. `setMuted(false)` is refused;
+  - `sendSignal`, for the engine's WebRTC signalling.
+- **Forwarded events:** only `call.signal`, `call.state` (in full, because the engine needs it), `core.status` and `lock.state`. Push-to-talk, the global toggle and `mic:test` are off.
+- **When the call ends while locked**, by Leave or by the others, main switches to path A and reloads into `?locked`, which drops the in-memory content.
+- **On unlock**, the page removes `inert` and re-syncs its store from the core, since it got no events while locked. The mic stays muted until I unmute.
+- **Residual:** while a call goes on behind the lock, the page's earlier content (messages, members) **stays in renderer memory, hidden but not wiped**, until the call ends. This is recorded in `core/api/CONFORMANCE.md` under TB1. The §1 disclaimer gets the line "During a call, MVS keeps the call's audio running behind the lock."
+- **e2e:** behind the overlay, Tab, Ctrl+F and the reload/DevTools shortcuts do nothing. `setMuted(false)` and any other command are refused.
+
+**On both paths:**
+1. **Notifications:** `notify:show` is refused while locked, and the page can't produce any anyway (it gets no message events). Main shows **nothing**: no generic "new message" toast either, because even that reveals activity (SL: Q2).
+2. **Taskbar badge** (G-62): cleared on lock (`badge.set(0)`), and `badge:set` is refused until unlock.
+3. **Push-to-talk** (G-74): `pushToTalk.reset()` on lock. `ptt:set` and the key watch are off, and the global mute shortcut is unregistered.
+4. **Clipboard and window:** `clipboard:write` is refused. The window title stays "MVS", with no server or channel name.
 
 **Fail closed at start.** Until `getAppLock` answers, the page loads as a neutral **"Loading…"** screen (`?locked=pending`), with no data and the same IPC gating as locked. This satisfies both the TL's "Loading…" and the SL's "fail closed":
 - **Lock off:** the normal load follows.
@@ -143,12 +166,10 @@ That's the "stolen powered-off laptop" protection, and the design of the G-78 v1
 - It would be offered as a separate, later setting, "Encrypt on this computer", with a strong passphrase. It would never be the PIN.
 - When both are on, the vault passphrase entered at start also unlocks the screen lock. One prompt, not two.
 
-## 8. Decisions (SL and TL, both APPROVE on 6afd790)
-
-Where the two reviews differed, the TL's version is used here, and the SL is asked to re-confirm this head.
+## 8. Decisions (SL APPROVE on 6afd790; TL APPROVE on c80f785; manager's call on Q1)
 
 **Answers to the open questions:**
-1. **Locking during a call:** **leave the call**, then lock, and show a notice after unlock. This is the TL's change; the SL had proposed keeping the call with the mic muted. The renderer reload would drop the call's audio anyway, and leaving removes the unattended-mic risk entirely. Idle still never locks during a call.
+1. **Locking during a call:** **keep the call**, with my mic off in the core and on the track, and Leave on the overlay. This was the manager's decision, matching the SL's answer. The TL's two-path design makes it work: path A reloads when not in a call; path B uses an inert overlay with no reload during a call (§5). Idle still never locks during a call.
 2. **Notifications while locked:** nothing at all.
 3. **Windows Hello:** the v1.1 spike is OK, after the passcode ships, under these conditions:
    - consent only;
@@ -167,7 +188,7 @@ Where the two reviews differed, the TL's version is used here, and the SL is ask
    - The inspect and RunAsNode fuses are off; they already are, see `desktop/build/fuses.js`.
    - An e2e check confirms these shortcuts do nothing while locked.
 5. **The passcode stays out of logs and reports.** It never reaches IPC logging, file logs or crash reports. Main checks its length and normalises it to NFC before forwarding.
-6. **Docs:** the §1 disclaimer goes in the UI, and the core's CONFORMANCE file gets a note on TB1.
+6. **Docs:** the §1 disclaimer goes in the UI, including the line about the call. The core's CONFORMANCE file gets a note on TB1 and on path B's residual: content stays in renderer memory until the call ends.
 
 ## 9. Size
 

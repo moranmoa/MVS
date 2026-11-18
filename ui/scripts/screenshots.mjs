@@ -1201,7 +1201,9 @@ for (const [query, name, opts] of [
   await p.close();
 }
 {
-  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x', { width: 375, height: 812, phone: true });
+  const p = await page('?demo=1&still=1&lang=he&theme=light&update=999999', { width: 375, height: 812, phone: true });
+  await p.getByRole('button', { name: /^כללי/ }).click();
+  await p.getByRole('article').first().waitFor();
   await p.getByRole('button', { name: "הוספת אמוג'י לטקסט" }).click();
   await p.locator('.emoji-picker.sheet [role=gridcell]').first().waitFor();
   await p.waitForTimeout(200);

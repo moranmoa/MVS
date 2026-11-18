@@ -29,7 +29,7 @@ function pageOverflow(page: Page) {
 async function joinDemoServer(page: Page, link = 'mvs://join/qa-explore') {
   await page.getByRole('button', { name: /^הצטרפות בלינק/ }).click();
   await page.getByLabel(he.joinLink).fill(link);
-  await page.getByRole('button', { name: he.join, exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: he.join, exact: true }).click();
   await expect(composer(page)).toBeVisible({ timeout: 10_000 });
 }
 
@@ -248,7 +248,7 @@ test.describe('servers', () => {
     await page.getByRole('button', { name: /^הצטרפות בלינק/ }).click();
     for (const link of ['hello', 'https://example.com', 'mvs://join/', 'javascript:alert(1)']) {
       await page.getByLabel(he.joinLink).fill(link);
-      await page.getByRole('button', { name: he.join, exact: true }).click();
+      await page.getByRole('dialog').getByRole('button', { name: he.join, exact: true }).click();
       await expect(page.getByText('זה לא נראה כמו לינק הזמנה')).toBeVisible();
     }
   });
@@ -258,7 +258,7 @@ test.describe('servers', () => {
     await onboard(page);
     await page.getByRole('button', { name: /^הצטרפות בלינק/ }).click();
     await page.getByLabel(he.joinLink).fill('mvs://join/offline-server');
-    await page.getByRole('button', { name: he.join, exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: he.join, exact: true }).click();
     await page.getByRole('button', { name: 'להמשיך לחפש ברקע' }).click({ timeout: 10_000 });
     // Expected: something on screen says a join is still in progress.
     await expect(page.getByText(/מחפשים|ממתין|בהמתנה/)).toBeVisible({ timeout: 2_000 });

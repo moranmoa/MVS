@@ -50,6 +50,8 @@ export function MemberSearchField({
         <input
           id={MEMBER_SEARCH_ID}
           type="search"
+          // A Latin query lines up left in the Hebrew UI, and the other way round (UX on #492).
+          dir="auto"
           className="member-search-input"
           value={query}
           onChange={(e) => onQuery(e.target.value)}

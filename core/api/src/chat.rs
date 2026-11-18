@@ -132,8 +132,37 @@ fn adult_ok(resolver: &Resolver, kind: Kind, scope: Scope, author: PublicKey, au
     if resolver.adult_at(author, auth_deps) != Ok(true) {
         return false;
     }
-    let reaches = state.adult_edits.get(&channel).is_some_and(|edit| resolver.reaches(*edit, auth_deps));
+    let reaches = state.adult_edits.get(&channel).is_some_and(|edit| reaches_cached(resolver, *edit, auth_deps));
     reaches || state.adults.contains(&author)
+}
+
+thread_local! {
+    /// B7-k (Security Lead nit on #551): `reaches` answers by (edit,
+    /// auth_deps), so a fold doesn't walk the control DAG per record. The
+    /// answer is pure ancestry between records already joined: a record
+    /// joins only once its deps have, and `adult_ok` asks only after
+    /// `adult_at` found every dep held. So it never changes. Bounded.
+    static REACHES: std::cell::RefCell<HashMap<(RecordId, Vec<RecordId>), bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Entries the [`REACHES`] memo holds before it starts over.
+const REACHES_MAX: usize = 16_384;
+
+fn reaches_cached(resolver: &Resolver, edit: RecordId, auth_deps: &[RecordId]) -> bool {
+    let key = (edit, auth_deps.to_vec());
+    REACHES.with(|memo| {
+        if let Some(known) = memo.borrow().get(&key) {
+            return *known;
+        }
+        let answer = resolver.reaches(edit, auth_deps);
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= REACHES_MAX {
+            memo.clear();
+        }
+        memo.insert(key, answer);
+        answer
+    })
 }
 
 /// The channels authority knows for `server`: those its accepted
@@ -573,6 +602,12 @@ mod adult_rule_tests {
         assert!(!w.counts(1, NIGHT, before_flip), "pre-flip, now not adult: hidden (the accepted cost)");
         // And deps after the lowering fail (a).
         assert!(!w.counts(1, NIGHT, w.head));
+
+        // A rename of the 18+ channel doesn't move the transition (Security
+        // Lead on #551): 1's post after the flip still counts.
+        w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "late".into() });
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip));
+        assert!(w.counts(1, NIGHT, after_flip), "rename, then lower: the history stays");
 
         // Off and on again: the latest flip counts for (b).
         w.control(1, Action::AgeClaim { adult: true });

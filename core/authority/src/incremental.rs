@@ -714,11 +714,12 @@ impl Resolver {
                 }
                 Some(Action::ChannelEdit { adult, name, .. }) => {
                     if let Some(entry) = entry.as_mut() {
-                        entry.name = name.clone();
-                        entry.adult = *adult;
-                        if *adult {
+                        // Only plain → 18+, as `apply_channel`.
+                        if *adult && !entry.adult {
                             adult_edit = Some(*op);
                         }
+                        entry.name = name.clone();
+                        entry.adult = *adult;
                     }
                 }
                 Some(Action::ChannelDelete { .. }) => {

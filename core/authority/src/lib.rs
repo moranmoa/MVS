@@ -807,8 +807,9 @@ pub struct State {
     /// G-14: live channels' topics, the latest accepted in linear order;
     /// a cleared or never-set topic is absent.
     pub topics: BTreeMap<ChannelId, String>,
-    /// B7-k: per live channel, the latest accepted `ChannelCreate` or
-    /// `ChannelEdit` in linear order that set it 18+. A channel turned plain
+    /// B7-k: per live channel, the latest accepted plain → 18+ transition in
+    /// linear order: an 18+ `ChannelCreate`, or a `ChannelEdit` that turned it 18+
+    /// (renaming an 18+ channel doesn't move it). A channel turned plain
     /// keeps its entry (the next 18+ edit replaces it); a deleted channel's
     /// goes. `core/api` drops 18+ channel records whose deps don't reach it
     /// unless their author is an adult now.
@@ -1120,11 +1121,14 @@ fn apply_channel(state: &mut State, record: &Record, action: &Action) {
         }
         Action::ChannelEdit { channel, adult, name } => {
             if let Some(entry) = state.channels.get_mut(channel) {
-                entry.name = name.clone();
-                entry.adult = *adult;
-                if *adult {
+                // Only a plain → 18+ transition is recorded: renaming a
+                // channel that's already 18+ doesn't move it (Security Lead
+                // on #551).
+                if *adult && !entry.adult {
                     state.adult_edits.insert(*channel, record.id());
                 }
+                entry.name = name.clone();
+                entry.adult = *adult;
             }
         }
         Action::ChannelDelete { channel } => {

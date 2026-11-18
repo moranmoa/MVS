@@ -61,7 +61,15 @@ fn the_latest_adult_edit_is_kept_through_toggles_and_dropped_on_delete() {
     let state = all_orders(&records);
     assert_eq!(state.adult_edits.get(&NIGHT), Some(&again.id()), "off → on: the latest edit");
 
-    let delete = rec(0, 6, vec![again.id()], Action::ChannelDelete { channel: NIGHT });
+    // Renaming a channel that's already 18+ doesn't move it (Security Lead
+    // on #551): only plain → 18+ counts.
+    let rename = rec(0, 6, vec![again.id()], Action::ChannelEdit { channel: NIGHT, adult: true, name: "late".into() });
+    records.push(rename.clone());
+    let state = all_orders(&records);
+    assert_eq!(state.channels[&NIGHT].name, "late");
+    assert_eq!(state.adult_edits.get(&NIGHT), Some(&again.id()), "a rename keeps the transition");
+
+    let delete = rec(0, 7, vec![rename.id()], Action::ChannelDelete { channel: NIGHT });
     records.push(delete);
     let state = all_orders(&records);
     assert!(state.adult_edits.is_empty());

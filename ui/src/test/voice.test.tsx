@@ -481,10 +481,21 @@ describe('voice rooms (0.4.3)', () => {
         await join();
         const dialog = await screen.findByRole('dialog', { name: 'Before your first call' });
         const body = document.getElementById(dialog.getAttribute('aria-describedby')!)!.textContent!;
-        expect(body).toContain('With relay-only on, calls go through the MVS relay');
+        expect(body).toContain('computers connect directly when they can');
+        expect(body).toContain('In relay-only mode, the call goes through the MVS relay'); // both paragraphs are read out
         expect(body).not.toContain('turns calls off');
         await click(within(dialog).getByRole('button', { name: 'Got it' }));
         expect(localStorage.getItem('mvs.notices.voiceIp.v3')).toBe('1');
+      });
+
+      it('relay-only: with the flag on, a room can be joined and the v3 notice shows; with it off, it stays blocked', async () => {
+        const on = await setup({ voiceP2p: true, relayOnly: true }, { ipNoticeSeen: false });
+        await waitFor(() => expect(on.entry().getAttribute('aria-disabled')).toBeNull());
+        await on.join();
+        expect(await screen.findByRole('dialog', { name: 'Before your first call' })).toBeTruthy();
+        cleanup();
+        const off = await setup({ relayOnly: true }, { ipNoticeSeen: false });
+        await waitFor(() => expect(off.entry().getAttribute('aria-disabled')).toBe('true'));
       });
 
       it('with the flag off (every build today): v2, unchanged', async () => {

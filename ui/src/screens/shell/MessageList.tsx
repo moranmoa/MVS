@@ -718,7 +718,7 @@ function useNewMessageAnnouncement(
       const body = (p.last.body ?? '').replace(/\s+/g, ' ').trim();
       setText(
         preview && body
-          ? intl.formatMessage({ id: 'a11y.newMessage' }, { name, text: body.length > ANNOUNCE_CHARS ? body.slice(0, ANNOUNCE_CHARS) + '…' : body })
+          ? intl.formatMessage({ id: 'a11y.newMessage' }, { name, phrase: body.length > ANNOUNCE_CHARS ? body.slice(0, ANNOUNCE_CHARS) + '…' : body })
           : intl.formatMessage({ id: 'a11y.newMessageFrom' }, { name }),
       );
     };

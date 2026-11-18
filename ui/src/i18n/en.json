@@ -247,7 +247,7 @@
   "msglink.copy": "Copy message link",
   "msglink.copied": "Link copied",
   "msglink.notMember.title": "A message in another server",
-  "msglink.notMember.body": "This link is to a message in a server you're not in. To see it, you need an invite from a member.",
+  "msglink.notMember.body": "This link is to a message in a server you're not in. To see it, you need an invite from someone who's in it.",
   "msglink.notFound": "That message isn't on this computer. It may not have arrived yet, or it was deleted.",
   "msglink.ok": "OK",
   "menu.forMessage": "Actions for \u2068{name}\u2069's message",

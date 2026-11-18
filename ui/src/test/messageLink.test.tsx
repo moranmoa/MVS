@@ -61,7 +61,7 @@ describe('the link format', () => {
     const { index } = await guarded.locateMessage(server.id, channel.id, `${channel.id}#3`);
     expect(index).toBe(3);
     await expect(guarded.locateMessage(server.id, channel.id, `${channel.id}#999999`)).rejects.toMatchObject({ code: 'not-found' });
-    await expect(guarded.locateMessage('nope', channel.id, `${channel.id}#3`)).rejects.toMatchObject({ code: 'not-allowed' });
+    await expect(guarded.locateMessage('nope', channel.id, `${channel.id}#3`)).rejects.toMatchObject({ code: 'not-found' });
   });
 });
 
@@ -109,6 +109,27 @@ describe('Copy message link and opening a link (G-30)', () => {
     act(() => core.simulateMessageLink(servers[0].id, channel.id, `${channel.id}#999999`));
     expect(await screen.findByText(/That message isn't on this computer/)).toBeTruthy();
     expect(document.querySelector('.row.target')).toBeNull();
+  });
+
+  it('a channel I am not given (hidden or missing) looks exactly like a message not found, and opens nothing new (SL R1)', async () => {
+    const { core, servers } = await setup();
+    const box = screen.getByRole('textbox', { name: /^Message / });
+    const before = box.getAttribute('aria-label');
+    act(() => core.simulateMessageLink(servers[0].id, 'not-a-channel-of-mine', 'not-a-channel-of-mine#1'));
+    expect(await screen.findByText(/That message isn't on this computer/)).toBeTruthy();
+    expect(screen.getByRole('textbox', { name: /^Message / }).getAttribute('aria-label')).toBe(before);
+    expect(screen.queryByRole('dialog', { name: 'A message in another server' })).toBeNull();
+  });
+
+  it('the index is a snapshot: if the id there moved, it locates again', async () => {
+    const { core, servers } = await setup();
+    const [channel] = await core.listChannels(servers[0].id);
+    const real = core.locateMessage.bind(core);
+    const locate = vi.spyOn(core, 'locateMessage').mockImplementationOnce(async () => ({ index: 2 }));
+    locate.mockImplementation(real);
+    act(() => core.simulateMessageLink(servers[0].id, channel.id, `${channel.id}#7`));
+    await waitFor(() => expect(document.querySelector('.row.target')).not.toBeNull());
+    expect(locate).toHaveBeenCalledTimes(2);
   });
 
   it('a link into a server I am not in: one dialog, no ids shown, nothing opened', async () => {

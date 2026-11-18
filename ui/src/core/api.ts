@@ -185,8 +185,10 @@ export interface CoreCommands {
   getServerRestore(): Promise<ServerRestore>;
   /**
    * G-30: where a linked message is, from the local store only (no network).
-   * The three ids must agree. Errors: not-found (not here, or a mismatch),
-   * not-allowed (not a member, or a channel I don't see).
+   * The three ids must agree. Errors: not-found for everything I can't see
+   * (not a member, a hidden or missing channel, a mismatch, not here, unreadable,
+   * still sending), bad-request for an id that isn't 64 hex. The index is a
+   * snapshot: check the id there.
    */
   locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }>;
   // Voice v1 (#223)

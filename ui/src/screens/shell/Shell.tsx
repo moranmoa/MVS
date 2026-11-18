@@ -7,7 +7,7 @@ import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
-import { isCoreError, useCore, useCoreEvent, type Id } from '../../core';
+import { useCore, useCoreEvent, type Id } from '../../core';
 import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
@@ -201,28 +201,33 @@ export function Shell() {
     // Never over the join dialog (the same rule as invites, #80).
     if (dialogNow.current === 'join') return;
     const seq = ++linkSeq.current;
+    // Not in my server list: the one case the UI tells apart, from its own data.
     if (!store.getState().servers.some((s) => s.id === sid)) return setLinkNotMember(true);
-    core.locateMessage(sid, cid, messageId).then(
-      ({ index }) => {
-        if (seq !== linkSeq.current) return; // a newer link won
-        setSettingsOpen(false);
-        setServerId(sid);
+    /** The index is a snapshot (a sync can shift it): check the id there, and locate once more if it moved. */
+    const locate = async (): Promise<number | null> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { index } = await core.locateMessage(sid, cid, messageId);
+        const range = await core.getMessages(cid, index, index + 1);
+        if (range.messages[0]?.id === messageId) return index;
+      }
+      return null;
+    };
+    const open = (index: number | null) => {
+      if (seq !== linkSeq.current) return; // a newer link won
+      setSettingsOpen(false);
+      setServerId(sid);
+      // Not found looks the same whether the channel is hidden from me or doesn't
+      // exist (SL R1): only a channel in my list opens.
+      const known = (store.getState().channels[sid] ?? []).some((c) => c.id === cid);
+      if (index !== null || known) {
         setChannelByServer((m) => ({ ...m, [sid]: cid }));
         goPhone('chat');
-        store.goToMessage(cid, index);
-      },
-      (e) => {
-        if (seq !== linkSeq.current) return;
-        if (isCoreError(e) && e.code === 'not-found') {
-          // The channel opens as usual; the message isn't on this computer.
-          setSettingsOpen(false);
-          setServerId(sid);
-          setChannelByServer((m) => ({ ...m, [sid]: cid }));
-          goPhone('chat');
-          store.showFlash('msglink.notFound');
-        } else setLinkNotMember(true);
-      },
-    );
+      }
+      if (index !== null) store.goToMessage(cid, index);
+      else store.showFlash('msglink.notFound');
+    };
+    // Every error is "not found": the core answers the same for all I can't see.
+    locate().then(open, () => open(null));
   });
   // G-61: a click on a desktop notification opens its channel.
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {

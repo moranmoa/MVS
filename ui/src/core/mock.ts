@@ -863,7 +863,8 @@ export class MockCore implements CoreApi {
   // ---- G-30: links to a message -------------------------------------------------
 
   async locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }> {
-    if (!this.servers.has(serverId)) throw err({ code: 'not-allowed' });
+    // One answer for all I can't see (SL R1): not a member, a hidden or missing channel, a mismatch.
+    if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
     const ch = this.channelIndex.get(channelId);
     if (!ch || ch.channel.serverId !== serverId) throw err({ code: 'not-found' });
     const at = messageId.lastIndexOf('#');

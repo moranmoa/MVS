@@ -4860,7 +4860,9 @@ impl Core {
         let stored = app_lock_stored(&inner.db)?;
         let wait = app_lock_attempts(&inner.db)?.wait_ms(now);
         Ok(AppLock {
-            enabled: stored.is_some(),
+            // Any record counts, readable or not: an unreadable one is a lock
+            // that no passcode opens (Security Lead on #476), never "off".
+            enabled: app_lock_present(&inner.db)?,
             method: stored.as_ref().map_or(AppLockMethod::Passcode, |s| s.method),
             idle_minutes: stored.as_ref().map_or(applock::DEFAULT_IDLE_MINUTES, |s| s.idle_minutes),
             lock_on_sleep: stored.as_ref().is_none_or(|s| s.lock_on_sleep),
@@ -4871,7 +4873,7 @@ impl Core {
     /// G-78 `verifyAppLock`. With no lock set there's nothing to check: `ok`.
     pub fn verify_app_lock(&self, passcode: Zeroizing<String>) -> CoreResult<AppLockAnswer> {
         let _gate = self.app_lock_gate.lock().expect("not poisoned");
-        if app_lock_stored(&self.lock().db)?.is_none() {
+        if !app_lock_present(&self.lock().db)? {
             return Ok(AppLockAnswer { result: AppLockResult::Ok, retry_after: None });
         }
         self.app_lock_attempt(LockCheck::Passcode(passcode))
@@ -4892,7 +4894,7 @@ impl Core {
             return Err(ErrorCode::BadRequest.into());
         }
         let _gate = self.app_lock_gate.lock().expect("not poisoned");
-        if app_lock_stored(&self.lock().db)?.is_some() {
+        if app_lock_present(&self.lock().db)? {
             let current = current.ok_or(ErrorCode::BadRequest)?;
             let answer = self.app_lock_attempt(LockCheck::Passcode(current))?;
             if answer.result != AppLockResult::Ok {
@@ -4922,7 +4924,7 @@ impl Core {
     /// G-78 `clearAppLock`: turns the lock off after `current` checks out.
     pub fn clear_app_lock(&self, current: Zeroizing<String>) -> CoreResult<AppLockAnswer> {
         let _gate = self.app_lock_gate.lock().expect("not poisoned");
-        if app_lock_stored(&self.lock().db)?.is_none() {
+        if !app_lock_present(&self.lock().db)? {
             return Ok(AppLockAnswer { result: AppLockResult::Ok, retry_after: None });
         }
         let answer = self.app_lock_attempt(LockCheck::Passcode(current))?;
@@ -4985,8 +4987,17 @@ impl Core {
     }
 }
 
+/// The stored lock, if it parses. A record that doesn't (or has another
+/// `v`) is still a lock: see [`app_lock_present`].
 fn app_lock_stored(db: &Db) -> CoreResult<Option<applock::Stored>> {
     Ok(db.get(KV_APP_LOCK)?.and_then(|json| serde_json::from_slice(&json).ok()))
+}
+
+/// Whether any app-lock record is stored. An unreadable one still means
+/// "on": verify, set and clear then answer `wrong` (counted), and only the
+/// 12 words clear it. Fail closed (Security Lead on #476).
+fn app_lock_present(db: &Db) -> CoreResult<bool> {
+    Ok(db.get(KV_APP_LOCK)?.is_some())
 }
 
 fn app_lock_attempts(db: &Db) -> CoreResult<applock::Attempts> {

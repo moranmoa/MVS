@@ -167,3 +167,30 @@ fn my_words_clear_the_lock() {
     let long = "x".repeat(1025);
     assert_eq!(call(&peer, "clearAppLockWithWords", json!({ "words": long })).unwrap_err(), "bad-request");
 }
+
+/// Security Lead on #476: an app-lock record that doesn't parse (or has
+/// another version) is still a lock. It reads as enabled; verify, set and
+/// clear answer `wrong` (counted); only my 12 words clear it. Fail closed.
+#[test]
+fn an_unreadable_lock_record_stays_locked() {
+    let world = World::new();
+    let (peer, secrets, db, words) = setup(&world, "broken");
+    assert_eq!(result(&set(&peer, None, "2468")), "ok");
+    drop(peer);
+    for bad in [&b"not json"[..], br#"{"v":2,"salt":"00","mKib":1,"t":1,"p":1,"hash":"00","method":"passcode","idleMinutes":5,"lockOnSleep":true}"#] {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE kv SET value = ?1 WHERE key = 'app-lock'", [bad]).unwrap();
+        drop(conn);
+        let peer = peer_at(&world, &secrets, &db);
+        assert_eq!(call(&peer, "getAppLock", json!({})).unwrap()["enabled"], true, "never off");
+        assert_eq!(result(&call(&peer, "verifyAppLock", json!({ "passcode": "2468" }))), "wrong");
+        assert_eq!(result(&set(&peer, Some("2468"), "13579")), "wrong");
+        assert_eq!(result(&call(&peer, "clearAppLock", json!({ "current": "2468" }))), "wrong");
+        assert_eq!(call(&peer, "getAppLock", json!({})).unwrap()["enabled"], true);
+        // The words still clear it.
+        assert_eq!(result(&call(&peer, "clearAppLockWithWords", json!({ "words": words.join(" ") }))), "ok");
+        assert_eq!(call(&peer, "getAppLock", json!({})).unwrap()["enabled"], false);
+        assert_eq!(result(&set(&peer, None, "2468")), "ok");
+        drop(peer);
+    }
+}

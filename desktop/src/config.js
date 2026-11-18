@@ -6,7 +6,8 @@
 //   { "relay": "/dns4/<host>/tcp/443/wss/p2p/<peer id>",
 //     "relays": ["/dns4/<host>/…/p2p/<id>", …],                  (optional, 1-4;
 //                                     multi-relay: preferred over "relay")
-//     "bootstrap": ["/dns4/<host>/tcp/4001/p2p/<peer id>"],   (optional)
+//     "bootstrap": ["/dns4/<host>/tcp/4001/p2p/<peer id>",        (optional)
+//                   "/dns4/<host>/udp/4001/quic-v1/p2p/<peer id>"],
 //     "stun": "stun:<host>:3478" }                            (optional, voice)
 //
 // Anything malformed is ignored with a warning: the app then runs without a
@@ -116,8 +117,10 @@ const MAX_BOOTSTRAP = 4;
 /**
  * The relay's direct addresses to give the core as `--bootstrap` (#219): the
  * `bootstrap` list of mvs-config.json, or MVS_BOOTSTRAP (comma-separated) in
- * a checkout. Each must pass the same check as the relay; bad entries are
- * dropped with a warning, and a list that isn't one is ignored.
+ * a checkout. List the relay's QUIC address (`/udp/4001/quic-v1`) too: only a
+ * QUIC connection to it shows us our public UDP address, which hole punching
+ * over QUIC (#243) needs. Each must pass the same check as the relay; bad
+ * entries are dropped with a warning, and a list that isn't one is ignored.
  * @param {{ packaged: boolean, resourcesPath?: string, env?: object, warn?: (m: string) => void }} o
  * @returns {string[]}
  */

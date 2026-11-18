@@ -10,22 +10,33 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
-## [0.4.6] - 2026-11-17
+## [0.4.7] - 2026-11-18
+
+This version replaces 0.4.6, which was never published. It includes everything planned for 0.4.6 plus the changes below.
 
 ### New
 - **Approve a new device from your other device:** to sign in on a new computer, choose "Sign in with another device" there and approve it on a device that's already signed in (Settings → Devices → Add a device). Both screens show the same short code, so you can check it's really you before anything is copied. If something goes wrong, MVS tells you why.
-- **Member relays:** members of a server can help each other connect when the main relay can't be reached. You choose in Settings → Privacy, and it only starts after you read and accept a one-time explanation. Everything relayed stays encrypted. Relaying is capped at 2 GB a day by default, and you can set the cap anywhere from 0.25 to 50 GB.
-- **Member relays stay off on metered connections** (for example a phone hotspot), and the MVS team can turn them off for everyone if needed.
-- **A notice when a device is added to your account**, kept until you dismiss it.
+- **A notice when a device is added to your account**, on all your devices, kept until you dismiss it.
+- **Your servers come back after a restore:** after restoring with your 12 words, your servers return on their own once a member of each server is online. A server you were removed from, or that was closed, doesn't come back. An invite link still works too.
+- **Member relays:** members of a server can help each other connect when the main relay can't be reached. You choose in Settings → Privacy, and it only starts after you read and accept a one-time explanation. Everything relayed stays encrypted. Relaying is capped at 2 GB a day by default, and you can set the cap anywhere from 0.25 to 50 GB. Member relays stay off on metered connections (for example a phone hotspot), and the MVS team can turn them off for everyone if needed.
+- **Members reach each other when the relay is down:** MVS remembers how to reach members you've connected to before and tries them directly when the relay can't be reached.
+- **Voice settings:** choose your microphone and speakers, with a live microphone level, during a call (the gear on the call bar). Settings → Voice lets you pick speakers and play a test sound at any time. Your choice is remembered on this computer, and if a device is unplugged MVS switches to the system default and tells you which one.
+- **Deafen:** the headphones button silences the call and mutes you. Others on 0.4.7 see that you're deafened.
+- **Volume per person:** set anyone's volume from 0 to 200%, from Voice settings or by right-clicking them in the call. "Mute for me" silences someone only for you.
+- **Push-to-talk:** in Settings → Voice, choose a key to hold while talking (works while the MVS window is in front). You can also set a shortcut that mutes and unmutes you from any app.
+- **Join and leave sounds:** a short sound when someone joins or leaves your call. You can turn it off in Settings → Voice.
+- **Unread count on the taskbar icon.** Muted servers and channels aren't counted, and you can turn it off in Settings → Notifications.
+- **Date dividers in chat:** messages are grouped by day, and each message shows just its time (hover for the full date).
 
 ### Fixed
 - **Joining a server is faster:** channels load as soon as you connect.
-- **Safer network lookups:** MVS no longer looks up web addresses that other members' devices send it.
+- **Safer networking:** MVS no longer looks up web addresses that other members' devices send it, and includes a security fix in its networking library.
 - **Signing in on Linux:** if your keyring is locked or starts after MVS, MVS now waits for it instead of treating you as a new user.
 - **Steadier connections:** a relay connection that stops responding is closed and reopened within a minute.
+- **↑ to edit your last message** now works only with a plain ↑ in an empty message box, so Alt+↑ (switching channels) no longer opens an edit.
 
 ### Known
-- **The "new device added" notice shows only on the device that approved it** for now. Your other devices will show it in a later version.
+- **Turning someone above 100% on speakers may cause echo for others.** If it happens, use headphones or keep the volume at 100% or below.
 - **Voice calls are officially supported only when everyone is on the same network** (for example the same Wi-Fi). Calls across networks are on the way.
 - **Everyone needs 0.4.4 or later for voice rooms.**
 

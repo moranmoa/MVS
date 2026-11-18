@@ -2,9 +2,8 @@
 
 **Status:** design only, no code.
 - **Security Lead:** APPROVED, with conditions (§8).
-- **Tech Lead:** review pending.
-
-The build starts after both OK it.
+- **Tech Lead:** APPROVED, with one change: leave the call on lock.
+- **Re-confirmation:** the SL is asked to re-confirm the merged decisions in §8.
 
 **Background:**
 - G-78 is in `docs/ux/GAPS.md` §1.7. It comes from spec question 6: "recovery words + OS keychain + an optional app lock".
@@ -69,10 +68,15 @@ The build starts after both OK it.
 | MVS starts | Locked from the first frame, before the page gets any data | always, when the lock is on |
 | Idle N minutes | `powerMonitor.getSystemIdleTime()` checked every 15 s. This is system-wide idle: typing in another app counts as activity | N = 5; choices 1, 5, 15, 30, 60 |
 | OS locks or sleeps | `powerMonitor` `lock-screen` and `suspend` | on |
-| Lock now | A "Lock now" item in the user menu, and Ctrl+L (⌘L) | – |
+| Lock now | A "Lock now" item in the user menu, plus a shortcut. Ctrl+L (⌘L) is the candidate, but it still has to be checked against the app's existing shortcuts and the composer (TL). If it clashes, use Ctrl+Shift+L. It's a window shortcut, never a global one | – |
 
 - **Never during a call by idle.** Idle time doesn't lock while I'm in a call, because people listen without touching anything.
-- **Manual lock or OS lock during a call:** the call goes on and the mic is **forced muted**. Push-to-talk and the global mute toggle are ignored while locked, so an unattended open mic can't happen. The lock screen shows an "in a call" notice and a **Leave** button (SL: Q1). Any open mic test (`mic:test`) is closed on lock and refused while locked.
+- **Manual lock or OS lock during a call: MVS leaves the call first, then locks.** This is the TL's change. The voice engine lives in the renderer, so the reload in §5.1 would drop the audio anyway. Main does it in this order:
+  1. sends `leaveCall` to the core;
+  2. closes the call gate;
+  3. reloads into the lock screen.
+
+  After unlock, the page shows "You left the call because MVS locked." / "יצאת מהשיחה כי MVS ננעלה." There's no open mic while locked, by construction. Push-to-talk and the global mute toggle are off. Any open mic test (`mic:test`) is closed on lock and refused while locked.
 - Changing the lock settings, or turning the lock off, needs the current passcode (or OS auth).
 
 ## 5. Enforcement: in main, not in the page
@@ -83,16 +87,21 @@ A lock that the page enforces is only as good as the page's state. So **main** o
 2. **`core:invoke` refuses** every command except a short allow-list:
    - `getAppInfo`, for the version on the lock screen;
    - the unlock and forgot-passcode commands;
-   - `leaveCall`, for the Leave button.
+   - `leaveCall`, harmless. Main already left the call on lock, but a call joined by another of my devices doesn't matter here.
 
    Everything else answers `{ error: { code: 'locked' } }`. This lives in main's handler, so it doesn't depend on the page's code. `exportDiagnostics` stays off the list unless it's proven free of names and IDs (SL).
-3. **Core events aren't forwarded** to the page, except `core.status`, the new `lock.state`, and `call.state` reduced to "in a call: yes/no" for the lock screen's notice. **Only the latest** `link.open` (an mvs:// invite) is held, and it's delivered after unlock.
+3. **Core events aren't forwarded** to the page, except `core.status` and the new `lock.state`. `lock.state` carries `leftCall: true` once, so that after unlock the page can show the notice. **Only the latest** `link.open` (an mvs:// invite) is held, and it's delivered after unlock. A second launch of MVS while locked (`second-instance`) focuses the lock screen, and its link is held the same way.
 4. **Notifications:** `notify:show` is refused while locked, and the page can't produce any anyway (it gets no message events). Main shows **nothing**: no generic "new message" toast either, because even that reveals activity (SL: Q2).
 5. **Taskbar badge** (G-62): cleared on lock (`badge.set(0)`), and `badge:set` is refused until unlock.
 6. **Push-to-talk** (G-74): `pushToTalk.reset()` on lock. `ptt:set` and the key watch are off, and the global mute shortcut is unregistered.
 7. **Clipboard and window:** `clipboard:write` is refused. The window title stays "MVS", with no server or channel name.
 
-**Fail closed.** If the lock config can't be read at start (the core is down or still starting), main starts **locked**. The "core unavailable" screen (T8-01) stays reachable from the lock screen, because it shows no user data.
+**Fail closed at start.** Until `getAppLock` answers, the page loads as a neutral **"Loading…"** screen (`?locked=pending`), with no data and the same IPC gating as locked. This satisfies both the TL's "Loading…" and the SL's "fail closed":
+- **Lock off:** the normal load follows.
+- **Lock on:** the lock screen follows.
+- **No answer in 10 s,** or the core is down: the lock screen follows.
+
+The "core unavailable" screen (T8-01) stays reachable from it, because it shows no user data.
 
 **Unlocking:**
 - The page sends `lock:unlock { passcode }` (or `{ os: true }`, which starts the OS prompt in main).
@@ -134,21 +143,24 @@ That's the "stolen powered-off laptop" protection, and the design of the G-78 v1
 - It would be offered as a separate, later setting, "Encrypt on this computer", with a strong passphrase. It would never be the PIN.
 - When both are on, the vault passphrase entered at start also unlocks the screen lock. One prompt, not two.
 
-## 8. Decisions (Security Lead, APPROVE on 6afd790; TL pending)
+## 8. Decisions (SL and TL, both APPROVE on 6afd790)
+
+Where the two reviews differed, the TL's version is used here, and the SL is asked to re-confirm this head.
 
 **Answers to the open questions:**
-1. **Locking during a call:** the call goes on with the mic forced muted. The lock screen shows "in a call" and a Leave button.
+1. **Locking during a call:** **leave the call**, then lock, and show a notice after unlock. This is the TL's change; the SL had proposed keeping the call with the mic muted. The renderer reload would drop the call's audio anyway, and leaving removes the unattended-mic risk entirely. Idle still never locks during a call.
 2. **Notifications while locked:** nothing at all.
-3. **Windows Hello:** the v1.1 spike is OK, under these conditions:
+3. **Windows Hello:** the v1.1 spike is OK, after the passcode ships, under these conditions:
    - consent only;
    - built from source in CI and signed with the app;
+   - licence-scanned;
    - no npm prebuilt binaries.
 4. **Idle:** system-wide.
-5. **Start-up:** show the lock screen (fail closed).
+5. **Start-up:** a neutral "Loading…" screen with no data (the TL's answer). It becomes the lock screen if the lock is on, or if the core gives no answer within 10 s, which keeps the SL's fail-closed rule (§5).
 
 **Conditions for the build:**
 1. **One attempt counter.** One persistent counter and backoff covers `verifyAppLock` and the `current` checks in `setAppLock` and `clearAppLock`. The 12-words path (`clearAppLockWithWords`) is rate-limited too.
-2. **Locked allow-list:** no `exportDiagnostics` unless it's proven free of names and IDs. `leaveCall` is allowed.
+2. **Locked allow-list:** `exportDiagnostics` is left off, because nobody has shown its output to be free of names, IDs and content (SL and TL). `leaveCall` is allowed.
 3. **Mic test and links:** `mic:test` is refused while locked, and an open test session is closed on lock. Only the latest `link.open` is held.
 4. **No way around the lock screen:**
    - In packaged builds, DevTools, the reload menu items and their accelerators are off.

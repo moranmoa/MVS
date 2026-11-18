@@ -13,6 +13,7 @@ import type {
   Id,
   Identity,
   Invite,
+  RemovedMember,
   JoinStatus,
   Member,
   Message,
@@ -154,6 +155,13 @@ export interface CoreCommands {
   // Safety
   blockUser(userId: Id): Promise<void>;
   kickMember(serverId: Id, userId: Id): Promise<void>;
+  /** G-53: owner only (`not-allowed` for anyone else): the accounts removed from the server, in no set order. */
+  listRemovedMembers(serverId: Id): Promise<RemovedMember[]>;
+  /**
+   * G-53: owner only. Lets a removed account join again through an invite
+   * (it isn't made a member). `not-allowed` for anyone else or someone not removed.
+   */
+  undoKick(serverId: Id, userId: Id): Promise<void>;
   // Device link (device-link-slice.md)
   /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
   startDeviceLink(): Promise<DeviceLinkOffer>;

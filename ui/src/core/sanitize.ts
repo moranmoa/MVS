@@ -15,6 +15,7 @@ import type {
   Channel,
   Identity,
   Invite,
+  RemovedMember,
   JoinStatus,
   Member,
   Message,
@@ -241,6 +242,16 @@ export function cleanInvite(i: Invite): Invite {
     maxUses: count(i.maxUses),
     uses: count(i.uses),
     revoked: i.revoked === true,
+  };
+}
+
+/** G-53: a removed account from the core. */
+export function cleanRemovedMember(r: RemovedMember): RemovedMember {
+  return {
+    id: cleanHexId(r?.id),
+    shortCode: cleanCode(r?.shortCode),
+    displayName: cleanName(r?.displayName),
+    removedAt: when(r?.removedAt) ?? 0,
   };
 }
 
@@ -618,6 +629,7 @@ export function guardCore(core: CoreApi): CoreApi {
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listRemovedMembers: wrap(core.listRemovedMembers, (l) => (Array.isArray(l) ? l.map(cleanRemovedMember) : [])),
     joinServer: wrap(core.joinServer, cleanJoin),
     joinCall: wrap(core.joinCall, cleanCall),
     listVoiceRooms: (serverId: Id) =>

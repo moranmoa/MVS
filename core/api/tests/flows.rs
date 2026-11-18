@@ -4585,6 +4585,8 @@ struct FarServers {
     hidden: std::sync::atomic::AtomicBool,
     /// Peers answer without the genesis (a partial fetch).
     partial: std::sync::atomic::AtomicBool,
+    /// Peers answer without this member's join records.
+    hide_joins_of: std::sync::Mutex<Option<PublicKey>>,
     fetches: std::sync::atomic::AtomicUsize,
     server_fetches: std::sync::atomic::AtomicUsize,
 }
@@ -4596,6 +4598,7 @@ impl FarServers {
             reachable: Default::default(),
             hidden: Default::default(),
             partial: Default::default(),
+            hide_joins_of: Default::default(),
             fetches: Default::default(),
             server_fetches: Default::default(),
         })
@@ -4612,6 +4615,9 @@ impl Network for FarServers {
             let mut records = self.world.fetch(server);
             if self.partial.load(std::sync::atomic::Ordering::SeqCst) {
                 records.retain(|r| r.kind() != Kind::Genesis);
+            }
+            if let Some(hidden) = *self.hide_joins_of.lock().unwrap() {
+                records.retain(|r| !(r.kind() == Kind::Join && r.author() == hidden));
             }
             records
         } else {
@@ -5617,4 +5623,48 @@ fn a_waiting_restore_pauses_while_locked_and_resumes_after() {
     assert!(load(&net.fetches) > fetches, "the backup is fetched again after unlock");
     assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
     assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): a log that has the genesis but lacks my
+/// join makes the join look refused ("invalid"), yet proves nothing: the
+/// server keeps waiting, and comes back once a full log arrives. Only an
+/// accepted kick or leave of me (or a close) drops it.
+#[test]
+fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let server = bob.core.create_server("Bob's", AgeRestriction::None).unwrap();
+    me.core.join_server(&server.invite_link).unwrap();
+    me.core.sync_now().unwrap();
+    let my_key = peer_key(&me);
+
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    *net.hide_joins_of.lock().unwrap() = Some(my_key);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(created.words).unwrap();
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "not dropped");
+
+    *net.hide_joins_of.lock().unwrap() = None;
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    let back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(back, [server.id]);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+fn peer_key(peer: &Peer) -> PublicKey {
+    let id = peer.core.get_identity().unwrap().unwrap().id;
+    PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
 }

@@ -63,6 +63,17 @@ contextBridge.exposeInMainWorld('mvs', {
    * number 0..9999; 0 clears it. Resolves true if accepted.
    */
   setUnreadCount: (count) => ipcRenderer.invoke('badge:set', count),
+  /**
+   * G-78: the app lock. `state()` -> { enabled, locked, pending, path:
+   * 'A'|'B'|null, inCall, retryAfter? } (also the `lock.state` event).
+   * `unlock({ passcode })` or `unlock({ words })` (forgot) -> 'ok' | 'wrong'
+   * | 'rate-limited' | 'invalid'. `now()` locks (true if the lock is on).
+   */
+  lock: Object.freeze({
+    state: () => ipcRenderer.invoke('lock:state'),
+    unlock: (input) => ipcRenderer.invoke('lock:unlock', input),
+    now: () => ipcRenderer.invoke('lock:now'),
+  }),
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

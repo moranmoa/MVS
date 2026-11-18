@@ -222,6 +222,12 @@ impl SyncNetwork {
         let (node, mut events) = runtime.block_on(Node::start_with(config, access))?;
         let notice_key = Arc::new(NoticeKey::default());
         node.set_notice_signer(Some(notice_key.clone()))?;
+        // Relay-down resilience: co-members on this LAN find us by the
+        // member-only beacon (it stays quiet while relay-only or "LAN
+        // allowed" is off). The node works without it.
+        if !runtime.block_on(node.start_lan_beacon(sync::LAN_BEACON_PORT)).unwrap_or(false) {
+            eprintln!("mvs-core: no LAN beacon");
+        }
         // Events are only hints: a stored record wakes the core's sync loop
         // (`Core::run_sync_loop`), which re-reads the store. Coalesced (one
         // pending hint is enough) and drained, so the node never blocks.

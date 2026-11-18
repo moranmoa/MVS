@@ -10,6 +10,9 @@
 //   joinCall          -> call.state, then the CallState (me alone); channel
 //                        'e'x64 is ended by the core 300 ms later
 //   leaveCall         -> call.state with no participants, then null
+//   getAppLock        -> <data-dir>/fake-applock.json if there is one (G-78
+//                        e2e); else the default echo, which reads as "off"
+//   verifyAppLock     -> ok for the passcode '2468', else wrong
 'use strict';
 
 const WORDS = ['fake', 'words', 'never', 'logged'];
@@ -79,6 +82,19 @@ process.stdin.on('data', (chunk) => {
         break;
       case 'checkRecoveryWords':
         out({ type: 'response', id: m.id, error: { code: 'invalid-words', positions: [2, 'x', 5], secret: 'dropped' } });
+        break;
+      case 'getAppLock': {
+        let cfg = null;
+        try {
+          cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'fake-applock.json'), 'utf8'));
+        } catch {
+          // no lock file: fall through to the echo ("off")
+        }
+        out({ type: 'response', id: m.id, ok: cfg ?? m.args ?? null });
+        break;
+      }
+      case 'verifyAppLock':
+        out({ type: 'response', id: m.id, ok: { result: m.args && m.args.passcode === '2468' ? 'ok' : 'wrong' } });
         break;
       default:
         out({ type: 'response', id: m.id, ok: m.args ?? null });

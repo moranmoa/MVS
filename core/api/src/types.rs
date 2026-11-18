@@ -24,8 +24,10 @@ pub struct Identity {
     pub bio: Option<String>,
     pub country: String,
     pub birth_date: String,
-    /// B7 §9: a correction that raises my age, waiting its 30 days
-    /// (decision 18). Until `effectiveAt` I count as under 18.
+    /// B7 §9: a raise of my age waiting its 30 days (decision 18). Until
+    /// `effectiveAt` my age counts from `birthDate`: a correction's new date
+    /// (G-77) only then replaces it. After a restore, the waiting date is
+    /// `birthDate` itself and I count as under 18 until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_birth_date: Option<PendingBirthDate>,
     pub recovery_checked: bool,
@@ -287,6 +289,10 @@ pub struct CoreError {
     /// 1-based word positions that were not recognised (restore).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<usize>>,
+    /// G-77 `owns-restricted-server`: the names of the servers I own whose
+    /// age restriction is above the corrected age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub servers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +325,12 @@ pub enum ErrorCode {
     /// rename, leave or delete (no `server-lifecycle-v1` cap); nothing was
     /// signed.
     UpdateNeeded,
+    /// G-77 (B7 §2): a birth-date correction to under 16. Nothing changed.
+    TooYoung,
+    /// G-77 (PO): a lowering below the restriction of a server I own (an
+    /// owner can't leave, and its restriction is never lifted for me).
+    /// `servers` names them. Nothing changed.
+    OwnsRestrictedServer,
     /// Rust addition: malformed command JSON or arguments.
     BadRequest,
     /// Rust addition: in the contract, not done by this core yet.
@@ -344,7 +356,7 @@ pub enum ErrorCode {
 
 impl CoreError {
     pub fn new(code: ErrorCode) -> CoreError {
-        CoreError { code, positions: None }
+        CoreError { code, positions: None, servers: None }
     }
 }
 
@@ -505,17 +517,31 @@ pub enum Event {
         server_id: Id,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         reason: Option<RemovedReason>,
+        /// G-77: with `reason: 'age'`, the restriction I'm now under.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        required: Option<AgeRestriction>,
     },
     #[serde(rename = "channel.added")]
     ChannelAdded(Channel),
     #[serde(rename = "channel.removed", rename_all = "camelCase")]
-    ChannelRemoved { server_id: Id, channel_id: Id, name: String },
+    ChannelRemoved {
+        server_id: Id,
+        channel_id: Id,
+        name: String,
+        /// G-77 (additive): `deleted` or `age`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        reason: Option<ChannelRemovedReason>,
+    },
     #[serde(rename = "channel.updated")]
     ChannelUpdated(Channel),
     #[serde(rename = "members.changed", rename_all = "camelCase")]
     MembersChanged { server_id: Id, members: Vec<Member> },
     #[serde(rename = "join.status")]
     JoinStatus(JoinStatus),
+    /// G-47: my block list changed (`setBlocked`, `blockUser`); the whole
+    /// list, as `listBlocked` returns it.
+    #[serde(rename = "blocks.changed")]
+    BlocksChanged { blocked: Vec<BlockedUser> },
     #[serde(rename = "message.updated")]
     MessageUpdated(Message),
     #[serde(rename = "message.added")]
@@ -579,6 +605,20 @@ pub struct RemovedMember {
     pub display_name: String,
     /// When it was kicked (the kick's claimed time).
     pub removed_at: Timestamp,
+}
+
+/// G-47 (`listBlocked`): an account I blocked, whether or not we share a
+/// server now. `name`: its display name where we share a server, else the
+/// one known when I blocked it; absent if none was ever known.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedUser {
+    pub user_id: Id,
+    /// G-47b (UX-19): the identity code, as `Member.shortCode`, derived
+    /// from `userId`, so two rows without a name can be told apart.
+    pub short_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Rust addition (`createInvite`, #208): the new invite and its link.
@@ -652,6 +692,61 @@ pub enum RemovedReason {
     /// The owner closed (deleted) it, mine or read; sent when its 30 days
     /// are up and the rest of it is purged.
     Closed,
+    /// G-77 (B7 §2, §5): I corrected my birth date below the server's age
+    /// restriction (`required` says which); I left it.
+    Age,
+}
+
+/// G-77: why `channel.removed` fired (additive; older events had none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelRemovedReason {
+    Deleted,
+    /// An 18+ channel I no longer count as adult for (B7 §4).
+    Age,
+}
+
+/// G-77 `previewBirthDateCorrection` / `correctBirthDate` (B7 §2, §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgeCorrectionKind {
+    /// My age as it counts now doesn't change.
+    Same,
+    /// Lower: at once.
+    Lower,
+    /// Higher: pending for 30 days (`effectiveAt`).
+    Raise,
+    /// Under 16: refused (`correctBirthDate` rejects with `too-young`).
+    TooYoung,
+    /// A lowering below the restriction of a server I own: refused
+    /// (`owns-restricted-server`); `blockedBy` lists them.
+    OwnsRestrictedServer,
+}
+
+/// G-77: a server or channel a lowering would take away.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeLoss {
+    pub server_id: Id,
+    /// The server's name.
+    pub name: String,
+    /// An 18+ channel's name; absent when the whole server goes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub channel: Option<String>,
+}
+
+/// G-77: what a birth-date correction does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeCorrectionPreview {
+    pub kind: AgeCorrectionKind,
+    /// For `raise`: when it takes effect.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub effective_at: Option<Timestamp>,
+    pub loses: Vec<AgeLoss>,
+    /// For `owns-restricted-server`: my servers in the way (no `channel`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub blocked_by: Vec<AgeLoss>,
 }
 
 /// Voice rooms: a live room and who is in it, from verified hellos (soft

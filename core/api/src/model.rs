@@ -580,6 +580,30 @@ pub(crate) fn age_on(birth_date: &str, now_ms: u64) -> Option<u32> {
     u32::try_from(age).ok()
 }
 
+/// G-77: a birth date as `YYYY-MM-DD`, a real calendar day from 1900 on,
+/// not after today (UTC).
+pub(crate) fn valid_birth_date(birth_date: &str, now_ms: u64) -> bool {
+    let parts: Vec<&str> = birth_date.split('-').collect();
+    let [y, m, d] = parts.as_slice() else { return false };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 || !birth_date.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return false;
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) else { return false };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if y < 1900 || !(1..=days).contains(&d) {
+        return false;
+    }
+    let today = civil_from_days((now_ms / 86_400_000) as i64);
+    (y, m, d) <= today
+}
+
 /// Days since 1970-01-01 to (year, month, day). Howard Hinnant's algorithm.
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
@@ -907,6 +931,20 @@ mod tests {
         assert_eq!(age_on("2008-11-04", nov_3_2026), Some(17));
         assert_eq!(age_on("bad", nov_3_2026), None);
         assert_eq!(age_on("2030-01-01", nov_3_2026), None);
+    }
+
+    #[test]
+    fn birth_dates_are_strict() {
+        let nov_3_2026 = 20_760 * 86_400_000;
+        for ok in ["2008-11-03", "2026-11-03", "1900-01-01", "2000-02-29", "1990-12-31"] {
+            assert!(valid_birth_date(ok, nov_3_2026), "{ok}");
+        }
+        for bad in [
+            "2026-11-04", "1899-12-31", "2001-02-29", "1900-02-29", "1990-13-01", "1990-00-10", "1990-04-31",
+            "1990-4-01", "90-04-01", "1990-04-01x", "+990-04-01", "1990/04/01", "", "1990-04",
+        ] {
+            assert!(!valid_birth_date(bad, nov_3_2026), "{bad}");
+        }
     }
 
     #[test]

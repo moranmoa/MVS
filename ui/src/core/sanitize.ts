@@ -362,9 +362,27 @@ export function cleanMessage(m: Message): Message {
   };
 }
 
-function cleanJoin(j: JoinStatus): JoinStatus {
-  const link = cleanLink(j.link);
-  return j.phase === 'age-blocked' ? { ...j, link, required: age(j.required) } : { ...j, link };
+/**
+ * A join status with only the fields of its phase. A phase this version
+ * doesn't know (a newer core) becomes 'invalid', so the join dialog always
+ * ends with something to say instead of waiting forever.
+ */
+export function cleanJoin(j: JoinStatus): JoinStatus {
+  const link = cleanLink(j?.link);
+  switch (j?.phase) {
+    case 'searching':
+    case 'nobody-online':
+    case 'invalid':
+    case 'removed':
+    case 'closed':
+      return { phase: j.phase, link };
+    case 'joined':
+      return { phase: 'joined', link, serverId: id(j.serverId) };
+    case 'age-blocked':
+      return { phase: 'age-blocked', link, required: age(j.required) };
+    default:
+      return { phase: 'invalid', link };
+  }
 }
 
 const cleanRange = (r: MessageRange): MessageRange => ({ ...r, messages: r.messages.map(cleanMessage) });

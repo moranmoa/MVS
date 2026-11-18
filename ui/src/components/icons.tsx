@@ -58,6 +58,12 @@ export const CrownIcon = (p: IconProps) => (
     <path d="M4 18h16M5 15l-1-9 5 4 3-6 3 6 5-4-1 9z" />
   </Icon>
 );
+/** G-27: the composer's emoji button. */
+export const SmileIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M12 20a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM9 10h.01M15 10h.01M8.5 14.5a4.5 4.5 0 0 0 7 0" />
+  </Icon>
+);
 /** G-26: add a reaction (a smiley with a plus). */
 export const SmilePlusIcon = (p: IconProps) => (
   <Icon {...p}>

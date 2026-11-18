@@ -168,6 +168,22 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the in-app updater (hourly check) narrows the window;
     - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
+- Channel topic (G-14; design `docs/design/channel-topic.md`):
+  - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
+  - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.
+  - **The text rule** (`authority::channel_topic_ok`): one line, trimmed, 1–256 code points and at most 1024 bytes, and the strict name rule (no bidi controls, other control characters, line breaks included, or zero-width characters).
+  - Errors, with nothing signed:
+    - `bad-request`: the topic fails the rule.
+    - `not-found`: an unknown or deleted channel.
+    - `not-allowed`: I'm not the owner or an admin.
+    - `update-needed`: a current member's latest profile post lacks `channel-topic-v1`. `getUpdateNeeded(serverId, "channel-topic-v1")` says who. Clearing a topic that isn't set signs nothing, so it isn't gated.
+  - **Record:** `Kind::ChannelTopic = 22`, control scope, at most 1057 bytes: `channel (32) ‖ history u8 (0, reserved for D30) ‖ topic UTF-8`. A body that fails the rule never parses, so it's never accepted.
+  - **Authority:** the owner or an admin, on a live channel. It's privileged, so a revoke (the only demotion) or a kick voids the author's concurrent topics. The latest accepted topic in linear order counts, per channel, and deleting the channel drops it.
+  - **Plaintext:** like channel names, topics sit unsealed in the control log, so every member can read them. An 18+ channel is listed only to members with an 18+ claim, and its topic with it; every output goes through one function (`ServerView::channels`). That hiding is display-only (GAP-22: a modified client reads it), so the UI says "visible to every member of the server".
+  - **Rendering:** plain text only: no Markdown (G-25), no HTML, and no auto-links outside the messages' link guard.
+  - **History byte:** frozen at 0 for this kind; any future use needs a new cap.
+  - **Older members:** an older core refuses kind 22 on decode and would stall on the control records after it, hence the gate. The residual is the same as for `server-lifecycle-v1`: someone who joins later on an older version can't read past a topic until they update.
+
 - New-messages divider (G-21, option A):
   - `Channel.unreadCount?: number` and `Channel.firstUnreadIndex?: number` (additive) count the messages after my read marker that aren't mine, in `getMessages` order. `firstUnreadIndex` is the `getMessages` index of the first of them, and is absent when there are none. `Channel.unread` is `unreadCount > 0`. They appear in `listChannels` and `channel.updated`.
   - `markRead(channelId)` returns `null` and moves the marker to the channel's last message. It emits `channel.updated` with `unreadCount: 0` and no `firstUnreadIndex`.
@@ -462,7 +478,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - Each sync round it goes out once the rollout gate is open, and is retried until a member has it (B6 `sent`). Then the secret and subscription go too, and the others re-key.
     - If I'm kicked first, the `Leave` is dropped.
     - The leaver isn't banned, and comes back through a new invite as a plain member.
-  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). Any other cap name is `bad-request`. An empty list means the gate is open.
+  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). With `"channel-topic-v1"`: who blocks topics (G-14). Any other cap name is `bad-request`. An empty list means the gate is open.
   - `closeServer(serverId)` returns `null`. The owner deletes the server for good: the core syncs first, then sends the close.
     - On the owner's core, and on every member's when it reads the close, the server is closed, not purged at once. `server.closed { serverId }` fires; any call there ends; its keys and sync subscription go, and it's no longer synced. It stays in `listServers`, read-only, with `ServerSummary.closed: true` (additive).
     - 30 days (`CLOSED_RETENTION_MS`) after the close was received, the rest is purged and `server.removed { serverId, reason: 'closed' }` fires. Its genesis and close record are kept forever, so the server reads as closed, never unknown.
@@ -474,7 +490,13 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+- Blocked accounts (G-47):
+  - `listBlocked()` returns `BlockedUser[]`, `{ userId, name? }`, ordered by `userId`: everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
+  - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.
+  - `blockUser(userId)` stays a toggle, for older shells.
+  - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
+  - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

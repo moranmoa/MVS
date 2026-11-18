@@ -148,6 +148,14 @@ struct UpdateChannelArgs {
     input: ChannelInput,
 }
 
+/// G-14 `setChannelTopic(channelId, topic)`; an empty topic clears it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetChannelTopicArgs {
+    channel_id: String,
+    topic: String,
+}
+
 /// G-11 `moveChannel(serverId, channelId, before?, after?)`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,6 +270,13 @@ struct UserArg {
 #[derive(Deserialize)]
 struct DateArg {
     date: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBlockedArgs {
+    user_id: String,
+    blocked: bool,
 }
 
 #[derive(Deserialize)]
@@ -458,6 +473,11 @@ impl Core {
             "previewBirthDateCorrection" => ok(self.preview_birth_date_correction(&args::<DateArg>(raw)?.date)),
             "correctBirthDate" => ok(self.correct_birth_date(&args::<DateArg>(raw)?.date)),
             "cancelBirthDateCorrection" => ok(self.cancel_birth_date_correction()),
+            "setBlocked" => {
+                let a: SetBlockedArgs = args(raw)?;
+                ok(self.set_blocked(&a.user_id, a.blocked))
+            }
+            "listBlocked" => ok(self.list_blocked()),
             // Server lifecycle (#251).
             "renameServer" => {
                 let a: RenameServerArgs = args(raw)?;
@@ -487,6 +507,10 @@ impl Core {
                 ok(self.update_channel(&a.channel_id, a.input.name.as_deref(), a.input.adult))
             }
             "deleteChannel" => ok(self.delete_channel(&args::<ChannelIdArg>(raw)?.channel_id)),
+            "setChannelTopic" => {
+                let a: SetChannelTopicArgs = args(raw)?;
+                ok(self.set_channel_topic(&a.channel_id, &a.topic))
+            }
             "moveChannel" => {
                 let a: MoveChannelArgs = args(raw)?;
                 ok(self.move_channel(&a.server_id, &a.channel_id, a.before.as_deref(), a.after.as_deref()))

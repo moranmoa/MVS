@@ -1,6 +1,10 @@
 # App lock, G-78 (design note, for the Security Lead and Tech Lead)
 
-**Status:** design only, no code. Build starts after the SL and TL OK this note.
+**Status:** design only, no code.
+- **Security Lead:** APPROVED, with conditions (§8).
+- **Tech Lead:** review pending.
+
+The build starts after both OK it.
 
 **Background:**
 - G-78 is in `docs/ux/GAPS.md` §1.7. It comes from spec question 6: "recovery words + OS keychain + an optional app lock".
@@ -68,7 +72,7 @@
 | Lock now | A "Lock now" item in the user menu, and Ctrl+L (⌘L) | – |
 
 - **Never during a call by idle.** Idle time doesn't lock while I'm in a call, because people listen without touching anything.
-- **Manual lock or OS lock during a call:** the call goes on and the mic is **forced muted**. Push-to-talk and the global mute toggle are ignored while locked, so an unattended open mic can't happen. **SL/TL to confirm** (open question 1).
+- **Manual lock or OS lock during a call:** the call goes on and the mic is **forced muted**. Push-to-talk and the global mute toggle are ignored while locked, so an unattended open mic can't happen. The lock screen shows an "in a call" notice and a **Leave** button (SL: Q1). Any open mic test (`mic:test`) is closed on lock and refused while locked.
 - Changing the lock settings, or turning the lock off, needs the current passcode (or OS auth).
 
 ## 5. Enforcement: in main, not in the page
@@ -76,9 +80,14 @@
 A lock that the page enforces is only as good as the page's state. So **main** owns the lock state, and while locked:
 
 1. **The page is reloaded into the lock screen** with `?locked`. Its in-memory store (messages, members) is thrown away with the old renderer state, not hidden behind an overlay.
-2. **`core:invoke` refuses** every command except a short allow-list: `getAppInfo` (the version on the lock screen), the unlock and forgot-passcode commands, and `exportDiagnostics`. Everything else answers `{ error: { code: 'locked' } }`. This lives in main's handler, so it doesn't depend on the page's code.
-3. **Core events aren't forwarded** to the page, except `core.status` and the new `lock.state`. `link.open` (an mvs:// invite) waits until unlock.
-4. **Notifications:** `notify:show` is refused while locked, and the page can't produce any anyway (it gets no message events). Main shows **nothing**: no generic "new message" toast either, because even that reveals activity. **SL/TL to confirm** (open question 2).
+2. **`core:invoke` refuses** every command except a short allow-list:
+   - `getAppInfo`, for the version on the lock screen;
+   - the unlock and forgot-passcode commands;
+   - `leaveCall`, for the Leave button.
+
+   Everything else answers `{ error: { code: 'locked' } }`. This lives in main's handler, so it doesn't depend on the page's code. `exportDiagnostics` stays off the list unless it's proven free of names and IDs (SL).
+3. **Core events aren't forwarded** to the page, except `core.status`, the new `lock.state`, and `call.state` reduced to "in a call: yes/no" for the lock screen's notice. **Only the latest** `link.open` (an mvs:// invite) is held, and it's delivered after unlock.
+4. **Notifications:** `notify:show` is refused while locked, and the page can't produce any anyway (it gets no message events). Main shows **nothing**: no generic "new message" toast either, because even that reveals activity (SL: Q2).
 5. **Taskbar badge** (G-62): cleared on lock (`badge.set(0)`), and `badge:set` is refused until unlock.
 6. **Push-to-talk** (G-74): `pushToTalk.reset()` on lock. `ptt:set` and the key watch are off, and the global mute shortcut is unregistered.
 7. **Clipboard and window:** `clipboard:write` is refused. The window title stays "MVS", with no server or channel name.
@@ -125,13 +134,28 @@ That's the "stolen powered-off laptop" protection, and the design of the G-78 v1
 - It would be offered as a separate, later setting, "Encrypt on this computer", with a strong passphrase. It would never be the PIN.
 - When both are on, the vault passphrase entered at start also unlocks the screen lock. One prompt, not two.
 
-## 8. Open questions for SL/TL
+## 8. Decisions (Security Lead, APPROVE on 6afd790; TL pending)
 
-1. **Locking during a call:** keep the call with the mic forced muted (proposed), or end the call?
-2. **Notifications while locked:** nothing at all (proposed), or a fixed "MVS: new activity" with no names, behind a setting?
-3. **Windows Hello:** OK to spike our own small N-API addon (C++/WinRT, built and signed in CI) for v1.1? Or wait for the strong lock instead?
-4. **Idle:** system-wide idle (proposed: matches the OS screen lock), or MVS-window-only idle?
-5. **Fail closed at start** when the core is slow: OK that someone with the lock on sees the lock screen for a moment even when the core later says it's off? The alternative is a short "Loading…" with no data until the core answers. The UX is the same; it's only a question of which screen shows.
+**Answers to the open questions:**
+1. **Locking during a call:** the call goes on with the mic forced muted. The lock screen shows "in a call" and a Leave button.
+2. **Notifications while locked:** nothing at all.
+3. **Windows Hello:** the v1.1 spike is OK, under these conditions:
+   - consent only;
+   - built from source in CI and signed with the app;
+   - no npm prebuilt binaries.
+4. **Idle:** system-wide.
+5. **Start-up:** show the lock screen (fail closed).
+
+**Conditions for the build:**
+1. **One attempt counter.** One persistent counter and backoff covers `verifyAppLock` and the `current` checks in `setAppLock` and `clearAppLock`. The 12-words path (`clearAppLockWithWords`) is rate-limited too.
+2. **Locked allow-list:** no `exportDiagnostics` unless it's proven free of names and IDs. `leaveCall` is allowed.
+3. **Mic test and links:** `mic:test` is refused while locked, and an open test session is closed on lock. Only the latest `link.open` is held.
+4. **No way around the lock screen:**
+   - In packaged builds, DevTools, the reload menu items and their accelerators are off.
+   - The inspect and RunAsNode fuses are off; they already are, see `desktop/build/fuses.js`.
+   - An e2e check confirms these shortcuts do nothing while locked.
+5. **The passcode stays out of logs and reports.** It never reaches IPC logging, file logs or crash reports. Main checks its length and normalises it to NFC before forwarding.
+6. **Docs:** the §1 disclaimer goes in the UI, and the core's CONFORMANCE file gets a note on TB1.
 
 ## 9. Size
 

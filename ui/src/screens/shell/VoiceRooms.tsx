@@ -337,6 +337,28 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
           <FormattedMessage id="call.ipNotice.body" />
         </p>
         <div className="actions">
+          {/* v2: to the relay-only switch; neither joins nor remembers (like Cancel). */}
+          <button
+            type="button"
+            className="link ip-notice-settings"
+            onClick={() => {
+              setPending(null);
+              returnTo.current?.focus(); // where focus comes back when Settings closes
+              store.openSettings('privacy');
+            }}
+          >
+            <FormattedMessage id="call.ipNotice.settings" />
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => {
+              setPending(null);
+              returnTo.current?.focus();
+            }}
+          >
+            <FormattedMessage id="common.cancel" />
+          </button>
           <button
             type="button"
             className="primary"
@@ -350,16 +372,6 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
             }}
           >
             <FormattedMessage id="call.ipNotice.ok" />
-          </button>
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => {
-              setPending(null);
-              returnTo.current?.focus();
-            }}
-          >
-            <FormattedMessage id="common.cancel" />
           </button>
         </div>
       </Dialog>

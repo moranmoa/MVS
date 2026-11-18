@@ -73,7 +73,7 @@ locateMessage(serverId: Id, channelId: Id, messageId: Id)
   - IDs that don't agree: the message isn't in `channelId`, or the channel isn't in `serverId`;
   - a message that isn't here, or doesn't open (unreadable). Today those are filtered out (TODO #21). Once #21 adds placeholders, a placeholder returns its index;
   - a message still waiting to send (`pending-…` IDs aren't records).
-- **A closed server** (read-only, still listed) locates normally.
+- **A closed server** (read-only, still listed) answers as its `getMessages` does. The keys go at the close, so its messages no longer open and are `not-found` (dev-identity, #533).
 - **The index** is the one `getMessages` and `replyTo.index` use: messages sorted by (record ts, id). An edited message keeps its place, a deleted one keeps its place as a tombstone and returns that index, and a blocked author's message returns its index.
 - **The index is a snapshot.** A message with an earlier ts can arrive by sync later and shift everything after it, so the UI checks it (§5).
 - **Desktop allow-list:** `locateMessage: ['serverId', 'channelId', 'messageId']`. It's read-only and returns no text. While locked it's refused like everything else.

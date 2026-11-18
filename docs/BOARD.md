@@ -93,6 +93,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | F4 | Sync: `make_room` scans all 4,096 buckets per new peer when full; switch to LRU if the limit grows | dev-sync | todo | – | #5 | S | – |
 | GAP-4 | Answer sync only for members: peer-ID ↔ identity binding, secret-derived topic names | dev-sync | done | #96 #142 #143 #144 | B4 (member set), B4-sync | M | M2 |
 | T23 | Sync: control-log pulls send our binding to unbound peers only while no member of that server is bound, plus a re-probe of unbound peers at most every 10 min per server. Test: two existing members who meet late still bind. Narrows the GAP-4b residual (`core/sync/PRESENCE.md`). sec-lead reviews | dev-sync | done (also T24 pacing #366, hard cap #360, re-probe reset #357) | #318 #328 #357 #360 #366 | #310 | S | done |
+| T24 | Sync: pace outgoing pulls per peer (about burst 20, then 8/s) plus a 1 s queue drain. Opening many servers back to back while an unbound peer is connected bursts about 40 control pulls past its 30-burst, and refused ones are re-asked (51 for 40). Failing test on `claude/sync-outbound-pacing-wip` (reviews: tech-lead, sec-lead) | dev-sync | todo (after the 2026-11-17 reset) | – | #360 | S | – |
 | GAP-4b-seal | Sealed bindings: AEAD under `derive_key("mvs/binding-seal/v1", server secret)` over identity ‖ signature, so non-members can't read who pulls (the binding is already tied to the peer ID, so replay is useless). Changes the pull request format: a versioned `/mvs/sync` protocol, old format kept through a compatibility window. sec-lead + tech-lead review | dev-sync | todo | – | T23 | M | open alpha |
 | GAP-6 | Clients: Kademlia client mode, filter private addresses, `/mvs/kad/1.0.0` (relay side in T4a; ship together) | dev-sync | done (identify announces only global/circuit addresses #190; relay-only #195 #274) | #190 #195 #274 | B4-sync | S | M2 |
 | GAP-6r | **Relay-only, user-facing setting**: two **blockers** for dev-sync first (sec-lead/tech-lead on #195): (1) close existing direct connections when relay-only turns on, with a test (closing trips a `libp2p-request-response` `debug_assert`); (2) in relay-only mode `GlobalIdentify` announces only circuits through our relay, never confirmed global external addresses (our public IP), with a test. Then the api (dev-identity) and the UI switch (dev-ui). **Must not ship before both blockers** | dev-sync → dev-identity → dev-ui | done (sync #195 #274, api #272, UI #273, voice follow-up #383) | #195 #272 #273 #274 #383 | R-P0 | M | M2 |
@@ -170,6 +171,8 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 
 **Condition on every UI PR from now on:** AA contrast (G-112, B20) and reduced motion (G-114, B21). A UI PR that breaks either is not accepted.
 
+**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-53 → G-14 → G-51 · voice-c G-48 → G-47 → G-41 · voice-d G-25 · dev-ui G-27 → G-78 UI → G-30. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
+
 | ID | Title | Owner | Status | PR | Depends on | Size | MS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | **0.4.0** | **"Order and attention" (P0)** | | | | | | |
@@ -177,6 +180,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-11 | Channel order, the same for all members (signed record, GAPS §2.2) (reviews: tech-lead, sec-lead (records), product-lead) | dev-records (record) → dev-identity (api) → dev-ui | done | #323 #325 #372 | B4 | M | 0.4.0 |
 | G-21 | New-messages divider and jump to it (local + core index, GAPS §2.3) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui + dev-identity (index) | done | #327 #329 #334 #351 #352 | – | M | 0.4.0 |
 | G-21c | Unread count cache: `fill_unread` rebuilds the shown list per channel on each `listChannels` call; cache the count per channel, updated on message store and `markRead`. Only when profiling shows it (reviews: tech-lead) | dev-identity | todo | – | #327 | S | P3 |
+| G-PR1 | Profile post: retry only to the servers that refused it (a stored set of server IDs instead of the single pending flag). Today one refusing server makes every server get a fresh ~4 KB profile post every 10 minutes (reviews: tech-lead) | dev-identity | todo (after the 2026-11-17 reset) | – | #359 | S | – |
 | G-24 | @mentions (UI + core format, GAPS §2.5) (reviews: tech-lead, product-lead (+ ux visual), sec-lead (format)) | dev-ui + dev-identity (format) | done | #330 #331 #338 #342 | – | M | 0.4.0 |
 | G-05 | Mention badge in the rail, separate from the new-messages dot (`mentionsMe` exists) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo | – | G-24 | S | 0.4.0 |
 | G-61 | Notifications and mute (local + shell, GAPS §2.4) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui + dev-voice-shell | done | #336 | – | M | 0.4.0 |
@@ -190,37 +194,37 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; restore progress part 1 #457; phase B buddies in review #461, dev-identity (sync side "BUDDIES on" by dev-sync only after multi-relay part B); restore screen in review #458) | #292 #317 #339 #340 #367 #457 #461 #458 | – | L | 0.4.x |
 | **0.5.0** | **"Conversation" (P1)** | | | | | | |
 | G-23 | Date divider (B16, UX-12) | dev-ui | done | #439 #449 | – | S | 0.5.0 |
-| G-29 | "Is typing…" (ephemeral, not stored) | dev-updater (core, spec `g29-typing-design.md`) + dev-ui | in progress (UI on the mock in review, #447, dev-ui; core now assigned to dev-updater) | #447 | – | M | 0.5.0 |
-| G-25 | Basic Markdown (mind direction, B17) | dev-ui | todo | – | – | M | 0.5.0 |
-| G-26 | Emoji reactions (signed record) | dev-updater (records + api) → dev-ui | in progress (design `g26-reactions-design.md` + Amendment 1, security lead OK; core done #454; UI in review #463, dev-ui) | #454 #463 | – | M | 0.5.0 |
-| G-27 | Emoji picker | dev-ui | todo | – | – | M | 0.5.0 |
+| G-29 | "Is typing…" (ephemeral, not stored) | dev-updater (core, spec `g29-typing-design.md`) + dev-ui | in progress (UI #447 accepted; core #475) | #447 #475 | – | M | 0.5.0 |
+| G-25 | Basic Markdown (mind direction, B17) | voice-d | todo (voice-d) | – | – | M | 0.5.0 |
+| G-26 | Emoji reactions (signed record) | dev-updater (records + api) → dev-ui | done, accepted | #454 #463 | – | M | 0.5.0 |
+| G-27 | Emoji picker | dev-ui | todo (dev-ui 1st) | – | – | M | 0.5.0 |
 | G-32 | ↑ to edit the last message (check `onEditLast`) | dev-ui | done | #441 | – | S | 0.5.0 |
 | G-33 | Jump to latest message button | dev-ui | done | #441 | – | S | 0.5.0 |
-| G-30 | Link to a message | dev-ui + dev-identity | todo | – | – | M | 0.5.0 |
-| G-63 | Notification sound | voice-c | todo | – | – | S | 0.5.0 |
+| G-30 | Link to a message | dev-ui + dev-identity | todo (dev-ui after G-27, G-78 UI) | – | – | M | 0.5.0 |
+| G-63 | Notification sound | voice-c | done, accepted | #468 | – | S | 0.5.0 |
 | G-62 | Taskbar unread count | dev-voice-shell | done | #430 #442 | G-61 ✔ | S | 0.5.0 |
-| G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | todo | – | – | S | 0.5.0 |
+| G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | done, accepted | #470 | – | S | 0.5.0 |
 | G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
-| G-53 | Removed accounts list + undo-kick UI (core ready, #110) | dev-ui | todo | – | – | S | 0.5.x |
+| G-53 | Removed accounts list + undo-kick UI (core ready, #110) | dev-updater | todo (dev-updater 1st) | – | – | S | 0.5.x |
 | G-52 | Age restriction setting (B7 §6; read-only today) | dev-ui | todo | – | – | S | 0.5.x |
-| G-51 | Server icon and description (signed record) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
+| G-51 | Server icon and description (signed record) | dev-updater | todo (dev-updater 3rd) | – | – | M | 0.5.x |
 | G-12 | Channel categories (signed record) | dev-records → dev-ui | todo | – | G-11 | L | 0.5.x |
 | G-13 | Collapse categories (local) | dev-ui | todo | – | G-12 | S | 0.5.x |
-| G-14 | Channel topic (signed record) | dev-records → dev-ui | todo | – | – | S | 0.5.x |
+| G-14 | Channel topic (signed record) | dev-updater | todo (dev-updater 2nd) | – | – | S | 0.5.x |
 | G-18 | Write-only-for-owners channel (signed record, channel permissions) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
-| G-47 | Blocked list with unblock (local) | dev-ui | todo | – | – | S | 0.5.x |
-| G-48 | Report to the owners (signed record) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
-| G-41 | Search members (30+ member servers) | dev-ui | todo | – | – | S | 0.5.x |
+| G-47 | Blocked list with unblock (local) | voice-c | todo (voice-c 2nd) | – | – | S | 0.5.x |
+| G-48 | Report to the owners (signed record) | voice-c | todo (voice-c 1st) | – | – | M | 0.5.x |
+| G-41 | Search members (30+ member servers) | voice-c | todo (voice-c 3rd) | – | – | S | 0.5.x |
 | G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | todo | – | – | S | 0.5.x |
 | **0.6.0** | **"Voice like Discord" (P1)** | | | | | | |
 | G-16 | Additional voice channels (record + core) | dev-records + dev-identity → dev-ui | built as voice rooms (join to create; dev-ui verifies against GAPS scope) | #355 #369 #371 #375 | – | L | 0.4.3 |
-| G-72 | Microphone/speaker choice and mic test | voice-c | done | #429 #436 #438 | – | M | 0.6.0 |
+| G-72 | Microphone/speaker choice and mic test | voice-c | done (parts accepted, #438) | #429 #436 #438 | – | M | 0.6.0 |
 | G-73 | Per-person volume | voice-c | done | #434 #440 | – | S | 0.6.0 |
 | G-84 | Deafen | voice-c | done | #432 | – | S | 0.6.0 |
 | G-84b | Others see my "deafened" state, not only muted (UX follow-up on #432): a `deafened` flag in the voice hello, shown in the room roster | voice-c + core voice | done | #451 | G-84 ✔ | S | 0.6.0 |
 | G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | done (shell #444, UI #450) | #444 #450 | – | M | 0.6.0 |
-| G-64 | Join/leave notification sound | dev-ui | done | #456 | – | S | 0.6.0 |
+| G-64 | Join/leave notification sound | dev-ui | done, accepted | #456 | – | S | 0.6.0 |
 | G-83 | Participant count on room rows (covered by the voice rooms shipped in 0.4.3) | dev-identity → dev-ui | done | #369 #371 #375 | – | S | 0.6.0 |
 | G-78 | Optional app lock (design note first) | dev-voice-shell | in review (design note #466, approved by the tech lead with one change; awaiting the security lead) | #466 | – | M | – |
 | **P2** | **P2 backlog, after the closed alpha: see [`docs/ux/GAPS.md`](ux/GAPS.md)** (G-28 files, G-31 search, G-34 link previews, G-15 pins, G-42 roles, G-43, G-44, G-45 DM, G-46, G-55, G-71, G-75, G-76, G-78, G-93, G-02, G-101–G-103, G-111, G-115) | product-lead | todo | – | – | – | – |

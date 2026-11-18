@@ -8,6 +8,7 @@ import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Dialog, Name } from '../../components/common';
+import { VoiceDiagnostics } from './VoiceDiagnostics';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
@@ -438,6 +439,8 @@ function VoiceSettings({
           <VolumeTicks />
         </fieldset>
       )}
+      {/* G-81: connection diagnostics (types and timings, never addresses). */}
+      <VoiceDiagnostics read={engine.diagnostics} names={Object.fromEntries(others.map((o) => [o.id, o.name]))} />
     </Dialog>
   );
 }

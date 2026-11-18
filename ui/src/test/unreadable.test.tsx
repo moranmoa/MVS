@@ -48,7 +48,8 @@ describe('placeholder rows (core #527)', () => {
       expect(r).not.toBeNull();
       return r!;
     });
-    expect(row.textContent).toContain("This message can't be opened on this computer yet.");
+    expect(row.textContent).toContain("This message can't be opened on this computer yet. It may open later.");
+    expect(row.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
     expect(row.closest('[data-index]')!.querySelector('[role="toolbar"]')).toBeNull();
     fireEvent.contextMenu(row.closest('[role="article"]') ?? row);
     expect(screen.queryByRole('menu')).toBeNull();
@@ -65,6 +66,7 @@ describe('placeholder rows (core #527)', () => {
       expect(r).not.toBeNull();
       return r!;
     });
-    expect(row.textContent).toBe("A message whose sender can't be verified. It isn't shown.");
+    expect(row.textContent).toBe("A message whose sender can't be verified, so it isn't shown.");
+    expect(row.classList.contains('untrusted')).toBe(true);
   });
 });

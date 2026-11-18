@@ -19,7 +19,8 @@ import {
   EditIcon,
   ReplyIcon,
   TrashIcon,
-  ShieldIcon,
+  LockIcon,
+  ShieldAlertIcon,
   SmilePlusIcon,
 } from '../../components/icons';
 import { textDir, useUiDir } from '../../app/textDir';
@@ -539,14 +540,16 @@ const MessageRow = memo(function MessageRow({
   // Core #527: a message that can't be opened here: a muted line, no actions.
   if (m.unreadable) {
     return (
-      <div className="msg unreadable">
-        <ShieldIcon />
+      <div className={`msg unreadable ${m.unreadable}`}>
+        {/* A lock: waiting for its key here; a shield with "!": the sender can't be verified (UX). */}
+        {m.unreadable === 'no-key' ? <LockIcon /> : <ShieldAlertIcon />}
         <span className="muted small">
+          {/* Screen readers hear only the text (PO); the name is for the eye. */}
           {m.unreadable === 'no-key' && author && (
-            <>
+            <span aria-hidden="true">
               <Name>{name}</Name>
               {' · '}
-            </>
+            </span>
           )}
           <FormattedMessage id={m.unreadable === 'no-key' ? 'msg.unreadable.noKey' : 'msg.unreadable.untrusted'} />
         </span>

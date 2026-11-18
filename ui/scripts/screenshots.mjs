@@ -1147,7 +1147,7 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
-// ---- G-26 reactions (444-445, chat-and-voice-extras.md §2-3) -----------------------
+// ---- G-26 reactions (441-442, chat-and-voice-extras.md §2-3) -----------------------
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
   const row = p.locator('[role=article]:has(.msg:not(.skeleton))').last();
@@ -1159,12 +1159,12 @@ for (const [query, name, opts] of [
   }
   await row.locator('.reactions').waitFor();
   await p.mouse.move(1, 1);
-  await shot(p, '444-reactions-he');
+  await shot(p, '441-reactions-he');
   await row.hover();
   await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
   await p.getByRole('dialog').waitFor();
   await p.waitForTimeout(200);
-  await shot(p, '445-emoji-picker-he');
+  await shot(p, '442-emoji-picker-he');
   await p.close();
 }
 

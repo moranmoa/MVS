@@ -50,9 +50,9 @@ describe('reactions (G-26)', () => {
     fireEvent.contextMenu(row);
     await click(within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Add reaction' }));
     await click(within(picker()).getByRole('button', { name: 'fire' }));
-    await within(row).findByRole('group', { name: 'Reactions' });
+    await within(row).findByRole('group', { name: 'Reactions on this message' });
     const react = vi.spyOn(core, 'react');
-    await click(within(within(row).getByRole('group', { name: 'Reactions' })).getByRole('button', { name: 'Add reaction' }));
+    await click(within(within(row).getByRole('group', { name: 'Reactions on this message' })).getByRole('button', { name: 'Add reaction' }));
     await click(within(picker()).getByRole('button', { name: 'party popper' }));
     expect(react).toHaveBeenLastCalledWith(expect.any(String), '🎉', true);
   });
@@ -79,6 +79,6 @@ describe('reactions (G-26)', () => {
     vi.spyOn(core, 'react').mockRejectedValueOnce({ code: 'bad-request' });
     await click(within(row).getByRole('button', { name: 'Add reaction' }));
     await click(within(picker()).getByRole('button', { name: 'thumbs up' }));
-    expect(await screen.findByText('You can add up to 10 different emoji to a message.')).toBeTruthy();
+    expect(await screen.findByText('You can add up to 10 different emoji of your own to a message.')).toBeTruthy();
   });
 });

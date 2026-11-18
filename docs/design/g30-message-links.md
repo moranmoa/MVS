@@ -44,12 +44,13 @@ mvs://m/<server id>/<channel id>/<message id>
 - **`linkFromArgv`:** it replaces `inviteFromArgv` and accepts either kind. The first `mvs://` argument decides; if it's neither kind, it's ignored.
 - **In main:** the same path as an invite. Restore and focus the window.
   - **Hold the link** until the UI is up and unlocked. Only the latest held link is kept, invite or message, per G-78 §5.
-  - **Then send `link.open { link }`.** It's the same event, so the preload's kept-until-subscribed handling (`KEPT`) and the lock's holding work unchanged.
+  - **Then send `link.message { serverId, channelId, messageId }`**, the three IDs main already parsed, not the link string. Invites keep `link.open { link }`.
+    - Add `link.message` to the preload's kept-until-subscribed set (`KEPT`) and to the lock's held-link slot (one slot for either kind).
+    - Keeping the strict parse at the OS boundary means the UI never re-parses a URL from outside. Inside the app the IDs are handled like `notify.click`'s.
   - **Never log it.** The IDs are metadata.
-- **In the UI:** guardCore's `link.open` cleaner accepts either exact form (`cleanInviteLink` or a new `cleanMessageLink`) and blanks everything else. Shell routes it as follows:
-  - an invite opens the join dialog, as today;
-  - a message link goes through §5.
+- **In the UI:** guardCore's `link.message` cleaner keeps the three IDs (strings, all present) and drops the event otherwise. Shell then goes through §5.
   - **The join-dialog rule stays:** a link never replaces an open join dialog. A message link that arrives while the join dialog is open is dropped.
+  - A newer link wins over one still being located.
 - **Links inside messages:** the message renderer (G-25 Markdown) linkifies an `mvs://m/…` link of the exact form.
   - A click is handled inside the app (§5), with no round trip through the OS.
   - Any other `mvs://` text stays plain text. An invite inside a message keeps today's behaviour.
@@ -154,7 +155,7 @@ There's no gendered second person and no "מפתח". Shot range: UX to assign (4
   - the exact form, upper case, a trailing `/`, and too long;
   - a fourth segment, a query, a fragment and `%`-escapes;
   - mixed args where only the first `mvs://` arg counts.
-- **guardCore:** `link.open` with a message link, an invite, garbage, and a link with spaces or a newline.
+- **guardCore:** `link.message` with all three IDs, a missing ID, extra fields, and non-strings.
 - **UI:**
   - copy, plus the menu item hidden on pending, held and unreadable rows;
   - opening while loaded and while not loaded (skeleton, then highlight);

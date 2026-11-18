@@ -400,6 +400,8 @@ type TipHandlers = Pick<HTMLAttributes<HTMLButtonElement>, 'onPointerEnter' | 'o
 function useRailTip() {
   const [tip, setTip] = useState<{ text: string; top: number; start: number } | null>(null);
   const timer = useRef<number | undefined>(undefined);
+  /** Set by a pointer press, so the focus that follows it doesn't show the tooltip (keyboard focus does). */
+  const pressed = useRef(false);
   const hide = () => {
     window.clearTimeout(timer.current);
     setTip(null);
@@ -428,16 +430,21 @@ function useRailTip() {
       window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => show(el, text), TIP_DELAY_MS);
     },
-    onPointerLeave: hide,
-    onPointerDown: hide,
+    onPointerLeave: () => {
+      pressed.current = false;
+      hide();
+    },
+    onPointerDown: () => {
+      // A click focuses the button too: that focus shows no tooltip.
+      pressed.current = true;
+      hide();
+    },
     onFocus: (e) => {
-      let keyboard = true;
-      try {
-        keyboard = e.currentTarget.matches(':focus-visible');
-      } catch {
-        // No :focus-visible support: show it.
+      if (pressed.current) {
+        pressed.current = false;
+        return;
       }
-      if (keyboard) show(e.currentTarget, text);
+      show(e.currentTarget, text);
     },
     onBlur: hide,
   });

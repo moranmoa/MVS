@@ -45,7 +45,8 @@ describe('server rail (G-05, G-06)', () => {
 
   it('G-06: keyboard focus shows the full name beside the button (visual only); Esc and blur hide it', async () => {
     const { core, rail } = await setup();
-    const longName = 'A server with a really long name that goes on, 48';
+    // 48 characters, the longest a server name can be.
+    const longName = 'A server with a very long name that goes on and!';
     const id = serverButtons(rail)[0].getAttribute('data-server-id')!;
     await act(async () => {
       await core.renameServer(id, longName);

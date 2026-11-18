@@ -753,7 +753,7 @@ impl Core {
     }
 
     pub fn create_identity(&self, input: NewIdentityInput) -> CoreResult<CreatedIdentity> {
-        self.run(|inner, _, events| inner.set_blocked(user, blocked, events))|inner, ports, events| {
+        self.run(|inner, ports, events| {
             inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());

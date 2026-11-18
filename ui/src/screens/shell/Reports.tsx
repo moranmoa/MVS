@@ -12,7 +12,7 @@ import { useCore, useCoreEvent, type CoreError, type Member, type ReportEvidence
 import { SENSITIVE_REASONS } from '../../core/types';
 import { Name } from '../../components/common';
 import { displayName, ProfileCard } from './MemberList';
-import { MinorHelpLine } from './ReportDialog';
+import { MinorHelpLine, SelfHarmHelpLine } from './ReportDialog';
 import './report.css';
 
 const NO_MEMBERS: Member[] = [];
@@ -154,6 +154,7 @@ function ReportItem({ report: r, server, onChanged }: { report: ReportSummary; s
         </p>
       )}
       {minor && <MinorHelpLine />}
+      {r.reason === 'self-harm' && <SelfHarmHelpLine />}
 
       {r.target.kind === 'message' && !evidence && (
         <button type="button" className="secondary small" onClick={show}>

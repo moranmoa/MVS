@@ -6,7 +6,7 @@ import { useEffect, useId, useState, type FormEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useCore, type CoreError, type Id, type ReportReason, type ReportTargetInput } from '../../core';
 import { REPORT_REASONS } from '../../core/types';
-import { REPORT_TEXT_MAX } from '../../core/sanitize';
+import { cleanAbuseAddress, REPORT_TEXT_MAX } from '../../core/sanitize';
 import { Dialog, Name } from '../../components/common';
 import './report.css';
 
@@ -17,12 +17,51 @@ export interface ReportRequest {
   name: string;
 }
 
-/** G-48 (PO 3): the line for reason 6, to the reporter and to staff. */
+/** G-48 (B24): the build's abuse-report address, when it has one (never hard-coded). */
+function useAbuseAddress(): string {
+  const core = useCore();
+  const [address, setAddress] = useState('');
+  useEffect(() => {
+    let live = true;
+    core.getAppInfo().then(
+      (info) => live && setAddress(cleanAbuseAddress(info?.abuseAddress)),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [core]);
+  return address;
+}
+
+/** G-48 (PO 3): the line for reason 6, to the reporter and to staff, with the abuse address when set. */
 export function MinorHelpLine() {
+  const address = useAbuseAddress();
   return (
-    <p className="report-minor-help" role="note">
-      <FormattedMessage id="report.minorHelp" />
-    </p>
+    <div className="report-help" role="note">
+      <p>
+        <FormattedMessage id="report.minorHelp" />
+      </p>
+      {address && (
+        <p>
+          <FormattedMessage id="report.abuseLine" />{' '}
+          <bdi dir="ltr" className="report-abuse-address">
+            {address}
+          </bdi>
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** G-48 (PO, UX): the line for self-harm, shown like the reason-6 line. Plain text, no tel: links. */
+export function SelfHarmHelpLine() {
+  return (
+    <div className="report-help" role="note">
+      <p>
+        <FormattedMessage id="report.selfHarmHelp" />
+      </p>
+    </div>
   );
 }
 
@@ -73,6 +112,7 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
             <FormattedMessage id="report.sent" />
           </p>
           {reason === 'minor' && <MinorHelpLine />}
+          {reason === 'self-harm' && <SelfHarmHelpLine />}
           <div className="actions">
             <button type="button" className="primary" autoFocus onClick={onClose}>
               <FormattedMessage id="common.close" />
@@ -99,6 +139,7 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
               ))}
             </fieldset>
             {reason === 'minor' && <MinorHelpLine />}
+            {reason === 'self-harm' && <SelfHarmHelpLine />}
             <label className="field">
               <span>
                 <FormattedMessage id="report.note" />

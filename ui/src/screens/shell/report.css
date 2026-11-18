@@ -19,7 +19,9 @@
   min-height: 2rem;
   cursor: pointer;
 }
-.report-minor-help {
+.report-help {
+  display: grid;
+  gap: 0.25rem;
   margin: 0;
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius-s);
@@ -83,4 +85,11 @@
 }
 .report-actions {
   flex-wrap: wrap;
+}
+.report-help p {
+  margin: 0;
+}
+.report-abuse-address {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }

@@ -308,6 +308,21 @@ export function cleanReportSummary(r: ReportSummary): ReportSummary | null {
 const cleanReports = (l: unknown): ReportSummary[] =>
   Array.isArray(l) ? l.map(cleanReportSummary).filter((r): r is ReportSummary => r !== null) : [];
 
+/**
+ * G-48 (B24): the build's abuse-report address from getAppInfo, or '' unless
+ * it is a plain e-mail address or an https URL (short, no spaces or controls).
+ */
+export function cleanAbuseAddress(raw: unknown): string {
+  if (typeof raw !== 'string' || raw.length > 254 || /[\s\p{C}]/u.test(raw)) return '';
+  if (/^[^@/]+@[^@/]+\.[a-z]{2,}$/i.test(raw)) return raw;
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && !u.username && !u.password ? u.href : '';
+  } catch {
+    return '';
+  }
+}
+
 /** G-48: the reported message, as plain text (the UI never parses it as Markdown or HTML). */
 export function cleanReportEvidence(e: ReportEvidence): ReportEvidence {
   const text = typeof e?.text === 'string' ? cleanText(e.text).text : undefined;

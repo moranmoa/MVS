@@ -216,3 +216,54 @@ describe("G-48: the owner's Reports page", () => {
     await waitFor(() => expect(within(panel).getAllByText('Handled').length).toBe(1));
   });
 });
+
+describe('G-48: help lines', () => {
+  it('self-harm: the 101 / ERAN line in the dialog and on the Reports page (PO, UX)', async () => {
+    await setup((core) => {
+      vi.spyOn(core, 'listReports').mockResolvedValue([summary({ reason: 'self-harm' })]);
+    });
+    const dialog = await reportFirstOthersMessage();
+    const line = /call 101 \(Magen David Adom\)\. For emotional support, you can call ERAN at 1201\./;
+    expect(within(dialog).queryByText(line)).toBeNull();
+    await click(within(dialog).getByRole('radio', { name: 'Self-harm' }));
+    expect(within(dialog).getByText(line).closest('[role="note"]')).toBeTruthy();
+    // No tel: links.
+    expect(dialog.querySelector('a[href^="tel:"]')).toBeNull();
+    await click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    const panel = await openReports();
+    const item = await within(panel).findByRole('listitem');
+    expect(within(item).getByText(line)).toBeTruthy();
+  });
+
+  it("reason 6: the build's abuse address beside the 105 line, only when it's a plain address", async () => {
+    await setup((core) => {
+      vi.spyOn(core, 'getAppInfo').mockResolvedValue({ version: '1', updateChannel: 'stable', abuseAddress: 'abuse@example.org' } as never);
+    });
+    const dialog = await reportFirstOthersMessage();
+    await click(within(dialog).getByRole('radio', { name: 'Involves a minor' }));
+    expect(await within(dialog).findByText('abuse@example.org')).toBeTruthy();
+    expect(within(dialog).getByText('You can also contact the MVS team:')).toBeTruthy();
+  });
+
+  it('no address in the build (or a bad one): the 105 line alone', async () => {
+    await setup((core) => {
+      vi.spyOn(core, 'getAppInfo').mockResolvedValue({ version: '1', updateChannel: 'stable', abuseAddress: 'javascript:alert(1)' } as never);
+    });
+    const dialog = await reportFirstOthersMessage();
+    await click(within(dialog).getByRole('radio', { name: 'Involves a minor' }));
+    await act(async () => {});
+    expect(within(dialog).getByText(/105 hotline/)).toBeTruthy();
+    expect(within(dialog).queryByText('You can also contact the MVS team:')).toBeNull();
+  });
+
+  it('cleanAbuseAddress: e-mail or https only', async () => {
+    const { cleanAbuseAddress } = await import('../core/sanitize');
+    expect(cleanAbuseAddress('abuse@example.org')).toBe('abuse@example.org');
+    expect(cleanAbuseAddress('https://example.org/report')).toBe('https://example.org/report');
+    expect(cleanAbuseAddress('http://example.org')).toBe('');
+    expect(cleanAbuseAddress('javascript:alert(1)')).toBe('');
+    expect(cleanAbuseAddress('https://user:pw@example.org')).toBe('');
+    expect(cleanAbuseAddress('a b@example.org')).toBe('');
+    expect(cleanAbuseAddress(undefined)).toBe('');
+  });
+});

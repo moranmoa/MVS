@@ -258,6 +258,8 @@ export interface AppInfo {
   updateChannel: UpdateChannel;
   /** Relay-only (GAP-6r, #272): this device is reached only through the relay; calls are off. */
   relayOnly?: boolean;
+  /** G-48 (B24): where to report abuse to the MVS team, set at build time; absent when unset. */
+  abuseAddress?: string;
 }
 
 /** G-48 (core #515): why something is reported. 'sexual' and 'minor' are reasons 5 and 6. */

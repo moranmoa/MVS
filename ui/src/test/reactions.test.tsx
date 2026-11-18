@@ -79,6 +79,6 @@ describe('reactions (G-26)', () => {
     vi.spyOn(core, 'react').mockRejectedValueOnce({ code: 'bad-request' });
     await click(within(row).getByRole('button', { name: 'Add reaction' }));
     await click(within(picker()).getByRole('button', { name: 'thumbs up' }));
-    expect(await screen.findByText('You can add up to 10 different emoji of your own to a message.')).toBeTruthy();
+    expect(await screen.findByText('You can add up to 10 emoji to one message.')).toBeTruthy();
   });
 });

@@ -363,7 +363,7 @@
   "reactions.add": "Add reaction",
   "reactions.label": "Reactions on this message",
   "reactions.pill": "\u2068{emoji}\u2069, \u2068{count}\u2069",
-  "reactions.tooMany": "You can add up to 10 different emoji of your own to a message.",
+  "reactions.tooMany": "You can add up to 10 emoji to one message.",
   "reactions.updateNeeded": "Some members of this server need to update MVS before reactions can be added.",
   "reactions.slowDown": "Too many reactions in a short time. Try again in a moment.",
   "emoji.search": "Search emoji",

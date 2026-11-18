@@ -136,6 +136,7 @@ async fn handle(peer: &Arc<Peer>, command: Command) -> Result<Value> {
             }
             let config = NodeConfig {
                 relay: peer.relay.parse()?,
+                more_relays: vec![],
                 data_dir: peer.data_dir.clone().into(),
                 logs: Vec::new(),
                 // The harness measures sync, not permissions.

@@ -202,7 +202,7 @@ fn descriptions_are_up_to_five_plain_lines() {
     let long = "ש".repeat(MAX_SERVER_DESCRIPTION + 1);
     for bad in [
         "", " lead", "trail\n", "\nfirst blank", "a\n\n\nb", "1\n2\n3\n4\n5\n6", "a\r\nb", "a\u{2028}b", "a\u{2029}b",
-        "a\u{202E}b", "a\u{200B}b", "a\tb", long.as_str(),
+        "a\u{202E}b", "a\u{200B}b", "a\tb", "trailing \nspace", "a\n \nb", long.as_str(),
     ] {
         assert!(!server_description_ok(bad), "{bad:?}");
     }

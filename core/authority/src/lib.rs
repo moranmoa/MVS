@@ -612,7 +612,8 @@ pub const MAX_SERVER_DESCRIPTION_LINES: usize = 5;
 ///   no `\r` or U+2028/2029 (the strict rule refuses them);
 /// - no leading or trailing blank line, and at most one empty line in a
 ///   row;
-/// - every line passes the strict [`display_text_ok`].
+/// - every line passes the strict [`display_text_ok`], with no trailing
+///   whitespace (Tech Lead on #553: one encoding per description).
 ///
 /// An empty description (clearing it) is checked by the caller.
 pub fn server_description_ok(text: &str) -> bool {
@@ -625,8 +626,10 @@ pub fn server_description_ok(text: &str) -> bool {
     }
     let lines: Vec<&str> = text.split('\n').collect();
     lines.len() <= MAX_SERVER_DESCRIPTION_LINES
-        && lines.windows(2).all(|w| !(w[0].trim().is_empty() && w[1].trim().is_empty()))
-        && lines.iter().all(|line| display_text_ok(line) && !line.contains(['\u{2028}', '\u{2029}']))
+        && lines.windows(2).all(|w| !(w[0].is_empty() && w[1].is_empty()))
+        && lines.iter().all(|line| {
+            line.trim_end() == *line && display_text_ok(line) && !line.contains(['\u{2028}', '\u{2029}'])
+        })
 }
 
 /// Most Unicode code points in a server name, the same limit as

@@ -858,7 +858,7 @@ impl Node {
             voice_in_rx,
             voice_rate_peer: RateLimiter::new(VOICE_PER_PEER, VOICE_PER_PEER, MAX_TRACKED_PEERS),
             voice_rate_all: RateLimiter::new(VOICE_ALL, VOICE_ALL, 1),
-            voice_rate_out: RateLimiter::new(VOICE_PER_PEER, VOICE_PER_PEER, 1),
+            voice_rate_out: RateLimiter::new(VOICE_PER_PEER, VOICE_PER_PEER, MAX_TRACKED_PEERS),
             voice_conns: HashMap::new(),
             voice_paths: HashMap::new(),
             voice_dirty: false,
@@ -1621,7 +1621,7 @@ struct Task {
     voice_in_rx: mpsc::Receiver<(PublicKey, ConnectionId, VoiceFrame)>,
     voice_rate_peer: RateLimiter<PublicKey>,
     voice_rate_all: RateLimiter<()>,
-    voice_rate_out: RateLimiter<()>,
+    voice_rate_out: RateLimiter<PublicKey>,
     voice_conns: HashMap<ConnectionId, VoicePath>,
     voice_paths: HashMap<PublicKey, VoicePath>,
     voice_dirty: bool,
@@ -2753,6 +2753,8 @@ impl Task {
             return;
         }
         self.relay_only = on;
+        // G-81: a voice path relay-only now forbids ends at once (TL fix 1).
+        self.voice_dirty = true;
         // No hole punching either way while relay-only (GAP-6).
         self.swarm.behaviour_mut().punch.set_enabled(!on);
         if on {
@@ -4610,22 +4612,43 @@ fn keep_relayed(local: &PeerId, peer: &PeerId, we_dialed: bool) -> bool {
 struct VoiceOut {
     current: Option<(ConnectionId, SendQueue)>,
     opening: Option<(u64, ConnectionId)>,
-    old: Option<(SendQueue, Instant)>,
+    old: Option<(ConnectionId, SendQueue, Instant)>,
 }
 
 impl VoiceOut {
+    /// Ends both substreams at once; nothing queued leaves (SL 3).
     fn close(self) {
-        for queue in self.current.map(|(_, q)| q).into_iter().chain(self.old.map(|(q, _)| q)) {
+        for queue in self.current.map(|(_, q)| q).into_iter().chain(self.old.map(|(_, q, _)| q)) {
             queue.close();
         }
     }
 }
 
-/// G-81: the substream one participant's frames come in on.
+/// G-81: the substreams one participant's frames come in on: at most two,
+/// the newest last, so a move to another connection is make-before-break
+/// (TL fix 2). The older one goes after [`VOICE_OVERLAP`], or when it ends.
 struct VoiceIn {
     peer: PeerId,
-    connection: ConnectionId,
-    reader: tokio::task::AbortHandle,
+    readers: Vec<(ConnectionId, tokio::task::AbortHandle, Instant)>,
+}
+
+impl VoiceIn {
+    fn abort(self) {
+        for (_, reader, _) in self.readers {
+            reader.abort();
+        }
+    }
+}
+
+/// G-81: the order paths are preferred in (#509 §2.4, decision (c)).
+fn voice_rank(path: VoicePath) -> u8 {
+    match path {
+        VoicePath::Lan => 0,
+        VoicePath::Direct => 1,
+        VoicePath::Circuit => 2,
+        VoicePath::MemberCircuit => 3,
+        VoicePath::None => 4,
+    }
 }
 
 impl Task {
@@ -4667,32 +4690,31 @@ impl Task {
         }
     }
 
+    /// Whether voice may use `connection` now: it is open, and relay-only
+    /// (SL B5) allows only our circuits.
+    fn voice_allowed(&self, connection: ConnectionId) -> bool {
+        self.voice_conns.get(&connection).is_some_and(|path| !self.relay_only || *path == VoicePath::Circuit)
+    }
+
     /// The best open connection to `identity` for voice (#509 §2.4, TL):
     /// LAN, then direct, then a circuit through our relays, then a member's
     /// circuit only when none of ours exists. Relay-only: our circuits
     /// only. Never a dial.
     fn voice_route(&self, identity: PublicKey) -> Option<(PeerId, ConnectionId, VoicePath)> {
         let peer = self.member_peer(identity)?;
-        let rank = |path: VoicePath| match path {
-            VoicePath::Lan => 0,
-            VoicePath::Direct => 1,
-            VoicePath::Circuit => 2,
-            VoicePath::MemberCircuit => 3,
-            VoicePath::None => 4,
-        };
         [&self.direct, &self.relayed, &self.parked]
             .into_iter()
             .filter_map(|conns| conns.get(&peer))
             .flatten()
+            .filter(|c| self.voice_allowed(**c))
             .filter_map(|c| self.voice_conns.get(c).map(|path| (*c, *path)))
-            .filter(|(_, path)| !self.relay_only || *path == VoicePath::Circuit)
-            .min_by_key(|(c, path)| (rank(*path), *c))
+            .min_by_key(|(c, path)| (voice_rank(*path), *c))
             .map(|(c, path)| (peer, c, path))
     }
 
     /// My current call changed. A new call ID (or none) ends every voice
-    /// substream and starts sequences afresh; a participant who left loses
-    /// theirs.
+    /// substream at once and starts sequences afresh; a participant who
+    /// left loses theirs, and their sequence (TL fix 4).
     fn set_voice_call(&mut self, call: Option<VoiceCall>) {
         let same = self.voice_call.as_ref().map(|c| c.call_id) == call.as_ref().map(|c| c.call_id);
         if !same {
@@ -4700,7 +4722,7 @@ impl Task {
                 out.close();
             }
             for (_, reader) in self.voice_in.drain() {
-                reader.reader.abort();
+                reader.abort();
             }
             self.voice_seq.clear();
             self.voice_paths.clear();
@@ -4708,20 +4730,21 @@ impl Task {
         self.voice_call = call;
         let participants: HashSet<PublicKey> =
             self.voice_call.iter().flat_map(|c| c.participants.iter().copied()).collect();
-        self.voice_in.retain(|identity, reader| {
-            let keep = participants.contains(identity);
-            if !keep {
-                reader.reader.abort();
+        let left: Vec<PublicKey> = self.voice_in.keys().filter(|id| !participants.contains(id)).copied().collect();
+        for identity in left {
+            if let Some(reader) = self.voice_in.remove(&identity) {
+                reader.abort();
             }
-            keep
-        });
+        }
+        self.voice_seq.retain(|identity, _| participants.contains(identity));
         self.voice_reroute();
     }
 
     /// Every second, on a connection change and on a call change: each
     /// target's frames go on its best path (A5: a better one is opened
-    /// first, the old one keeps frames for [`VOICE_OVERLAP`]); a target
-    /// with no path, or no longer a member, gets none.
+    /// first, the old one keeps frames for [`VOICE_OVERLAP`]). A path the
+    /// policy no longer allows (relay-only) ends at once, with no overlap
+    /// (TL fix 1); a target with no path, or no longer a member, gets none.
     fn voice_reroute(&mut self) {
         self.voice_dirty = false;
         let now = Instant::now();
@@ -4742,15 +4765,25 @@ impl Task {
                 self.voice_paths.insert(identity, path);
                 self.emit(NodeEvent::VoicePath { identity, path });
             }
+            let current_ok = self
+                .voice_out
+                .get(&identity)
+                .and_then(|o| o.current.as_ref())
+                .map(|(c, q)| !q.is_closed() && self.voice_allowed(*c));
+            let old_ok = self
+                .voice_out
+                .get(&identity)
+                .and_then(|o| o.old.as_ref())
+                .map(|(c, q, until)| now < *until && !q.is_closed() && self.voice_allowed(*c));
             let out = self.voice_out.entry(identity).or_default();
-            // A writer whose substream failed is no path.
-            if out.current.as_ref().is_some_and(|(_, q)| q.is_closed()) {
-                out.current = None;
-            }
-            if let Some((queue, until)) = &out.old {
-                if now >= *until || queue.is_closed() {
+            if current_ok == Some(false) {
+                if let Some((_, queue)) = out.current.take() {
                     queue.close();
-                    out.old = None;
+                }
+            }
+            if old_ok == Some(false) {
+                if let Some((_, queue, _)) = out.old.take() {
+                    queue.close();
                 }
             }
             let Some((peer, connection, _)) = route else {
@@ -4766,17 +4799,37 @@ impl Task {
                 self.voice_out.entry(identity).or_default().opening = Some((id, connection));
             }
         }
-        // A sender no longer a member (kicked, or our read gate changed)
-        // loses its substream.
-        let gone: Vec<PublicKey> = self
-            .voice_in
-            .iter()
-            .filter(|(identity, reader)| self.member_identity(reader.peer) != Some(**identity))
-            .map(|(identity, _)| *identity)
-            .collect();
-        for identity in gone {
-            if let Some(reader) = self.voice_in.remove(&identity) {
-                reader.reader.abort();
+        // Inbound: a sender no longer a member (kicked, or our read gate
+        // changed) loses its substreams; one on a connection the policy now
+        // forbids loses that one; the older of two goes after the overlap.
+        let identities: Vec<PublicKey> = self.voice_in.keys().copied().collect();
+        for identity in identities {
+            let Some(reader) = self.voice_in.get(&identity) else { continue };
+            if self.member_identity(reader.peer) != Some(identity) {
+                if let Some(reader) = self.voice_in.remove(&identity) {
+                    reader.abort();
+                }
+                continue;
+            }
+            let allowed: Vec<bool> = reader.readers.iter().map(|(c, _, _)| self.voice_allowed(*c)).collect();
+            let reader = self.voice_in.get_mut(&identity).expect("just seen");
+            let newest = reader.readers.last().map(|(_, _, at)| *at);
+            let mut i = 0;
+            reader.readers.retain(|(_, handle, _)| {
+                let ok = allowed[i];
+                i += 1;
+                let keep = ok && !handle.is_finished();
+                if !keep {
+                    handle.abort();
+                }
+                keep
+            });
+            if reader.readers.len() == 2 && newest.is_some_and(|at| now >= at + VOICE_OVERLAP) {
+                let (_, older, _) = reader.readers.remove(0);
+                older.abort();
+            }
+            if reader.readers.is_empty() {
+                self.voice_in.remove(&identity);
             }
         }
     }
@@ -4785,14 +4838,18 @@ impl Task {
         use crate::voice_media::Event;
         match event {
             Event::Opened { connection, id, stream } => {
+                let allowed = self.voice_allowed(connection);
                 let Some(out) = self.voice_out.values_mut().find(|o| o.opening.map(|(i, _)| i) == Some(id)) else {
                     return; // stale: dropping it closes the substream
                 };
                 out.opening = None;
+                if !allowed {
+                    return; // relay-only came on meanwhile
+                }
                 let queue = SendQueue::default();
                 tokio::spawn(crate::voice_media::write_loop(stream, queue.clone()));
-                if let Some((_, previous)) = out.current.replace((connection, queue)) {
-                    if let Some((older, _)) = out.old.replace((previous, Instant::now() + VOICE_OVERLAP)) {
+                if let Some((previous_at, previous)) = out.current.replace((connection, queue)) {
+                    if let Some((_, older, _)) = out.old.replace((previous_at, previous, Instant::now() + VOICE_OVERLAP)) {
                         older.close();
                     }
                 }
@@ -4807,9 +4864,10 @@ impl Task {
     }
 
     /// The gate, before a byte is read (#509 §2.3, SL B1, TL): a peer bound
-    /// to a current member who is a participant of my current call. At most
-    /// one substream per participant: one on another connection replaces
-    /// it (a migration), a second on the same connection is refused.
+    /// to a current member who is a participant of my current call, on a
+    /// connection the policy allows (relay-only: our circuits). At most
+    /// one substream per connection, two per participant during a move;
+    /// a fresh one (no other live) starts the sequence afresh (a rejoin).
     /// Refused ones are dropped, which closes them.
     fn on_voice_inbound(&mut self, peer: PeerId, connection: ConnectionId, stream: libp2p::Stream) {
         let Some(identity) = self.member_identity(peer) else {
@@ -4820,25 +4878,37 @@ impl Task {
             debug!(%peer, "voice media from outside my call refused");
             return;
         }
-        if let Some(existing) = self.voice_in.get(&identity) {
-            // A reader that ended (the peer closed, or a rule broke) no
-            // longer holds the place.
-            if existing.connection == connection && !existing.reader.is_finished() {
-                debug!(%peer, "a second voice substream on one connection refused");
-                return;
-            }
-            existing.reader.abort();
+        if !self.voice_allowed(connection) {
+            debug!(%peer, "voice media on a connection relay-only forbids refused");
+            return;
+        }
+        let entry = self.voice_in.entry(identity).or_insert_with(|| VoiceIn { peer, readers: Vec::new() });
+        entry.readers.retain(|(_, handle, _)| !handle.is_finished());
+        if entry.readers.iter().any(|(c, _, _)| *c == connection) {
+            debug!(%peer, "a second voice substream on one connection refused");
+            return;
+        }
+        let fresh = entry.readers.is_empty();
+        if entry.readers.len() >= 2 {
+            let (_, oldest, _) = entry.readers.remove(0);
+            oldest.abort();
         }
         let tx = self.voice_in_tx.clone();
-        let reader = tokio::spawn(crate::voice_media::read_loop(identity, connection, stream, tx)).abort_handle();
-        self.voice_in.insert(identity, VoiceIn { peer, connection, reader });
+        let reader =
+            tokio::spawn(crate::voice_media::read_loop(identity, connection, stream, tx, VOICE_PER_PEER)).abort_handle();
+        entry.peer = peer;
+        entry.readers.push((connection, reader, Instant::now()));
+        if fresh {
+            self.voice_seq.remove(&identity);
+        }
     }
 
-    /// A frame read from `identity`'s substream: only from its current one,
-    /// under my call ID, within the caps and the sequence rules (SL #530:
-    /// no jump over [`VOICE_SEQ_JUMP`]; nothing old or repeated).
+    /// A frame read from one of `identity`'s substreams: under my call ID,
+    /// within the caps and the sequence rules (SL #530: no jump over
+    /// [`VOICE_SEQ_JUMP`]; nothing old or repeated, which also drops the
+    /// copies a move sends twice).
     fn voice_in_frame(&mut self, identity: PublicKey, connection: ConnectionId, frame: VoiceFrame) {
-        if self.voice_in.get(&identity).map(|r| r.connection) != Some(connection) {
+        if !self.voice_in.get(&identity).is_some_and(|r| r.readers.iter().any(|(c, _, _)| *c == connection)) {
             return;
         }
         if !self.voice_call.as_ref().is_some_and(|c| c.call_id == frame.call_id && c.participants.contains(&identity)) {
@@ -4846,7 +4916,11 @@ impl Task {
         }
         if let Some(last) = self.voice_seq.get(&identity) {
             let ahead = frame.seq.wrapping_sub(*last);
-            if ahead == 0 || ahead > VOICE_SEQ_JUMP {
+            // The sender's engine restarted mid-call (SL nit on #554): a
+            // low seq far behind the last one starts afresh. A forward jump
+            // over the bound is never taken.
+            let restart = frame.seq <= VOICE_SEQ_JUMP && last.wrapping_sub(frame.seq) > VOICE_SEQ_JUMP;
+            if !restart && (ahead == 0 || ahead > VOICE_SEQ_JUMP) {
                 return;
             }
         }
@@ -4859,21 +4933,39 @@ impl Task {
         self.emit(NodeEvent::VoiceFrame { from: identity, frame });
     }
 
-    /// One of my frames: to every target's substream (and the old one
-    /// during an overlap), under my call ID and my own cap.
+    /// One of my frames: to every target's substream, and the old one
+    /// during an overlap (checked per send, each copy counted against my
+    /// cap: TL nit 5), under my call ID.
     fn voice_out_frame(&mut self, frame: VoiceFrame) {
         if !self.voice_call.as_ref().is_some_and(|c| c.call_id == frame.call_id) {
             return;
         }
-        if !self.voice_rate_out.allow((), Instant::now()) {
-            crate::voice_media::DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
         let Some(wire) = frame.encode() else { return };
-        for out in self.voice_out.values() {
-            for queue in out.current.iter().map(|(_, q)| q).chain(out.old.iter().map(|(q, _)| q)) {
+        let now = Instant::now();
+        let mut reroute = false;
+        for (identity, out) in self.voice_out.iter_mut() {
+            if out.old.as_ref().is_some_and(|(_, q, until)| now >= *until || q.is_closed()) {
+                if let Some((_, queue, _)) = out.old.take() {
+                    queue.close();
+                }
+            }
+            let queues = out.current.iter().map(|(_, q)| q).chain(out.old.iter().map(|(_, q, _)| q));
+            for queue in queues {
+                if queue.is_closed() {
+                    reroute = true;
+                    continue;
+                }
+                if !self.voice_rate_out.allow(*identity, now) {
+                    crate::voice_media::DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 queue.push(wire.clone());
             }
+        }
+        // A substream that died (the far side's idle cutoff, a closed
+        // circuit): reopen now, not at the next tick (TL nit 7).
+        if reroute {
+            self.voice_reroute();
         }
     }
 }
@@ -5241,6 +5333,14 @@ mod tests {
     use super::*;
     use crate::testutil::{channel, message_chain, server};
     use crate::AcceptAll;
+
+    /// G-81 path order (#509 §2.4, decision (c)): LAN, direct, our circuit,
+    /// a member's circuit last.
+    #[test]
+    fn voice_paths_rank_lan_direct_ours_then_a_members() {
+        let order = [VoicePath::Lan, VoicePath::Direct, VoicePath::Circuit, VoicePath::MemberCircuit, VoicePath::None];
+        assert!(order.windows(2).all(|w| voice_rank(w[0]) < voice_rank(w[1])));
+    }
 
     fn chan() -> String {
         log_name(server(), Scope::Channel(channel()))

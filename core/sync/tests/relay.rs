@@ -832,7 +832,8 @@ async fn call_participants_exchange_voice_frames_relayed_and_on_a_lan() {
         assert!(got.iter().all(|(from, f)| *from == voice_id(31) && f.call_id == [1; 16]));
         assert!(seqs.windows(2).all(|w| w[0] < w[1]), "out of order or repeated: {seqs:?}");
         let missing = (seq - first) as usize - seqs.len();
-        assert!(missing <= 5, "{missing} frames lost of {}", seq - first);
+        // Make-before-break (TL fix 2): nothing lost, even across the move.
+        assert_eq!(missing, 0, "{missing} frames lost of {}", seq - first);
 
         let (_, paths) = voice_media(&mut ea, Duration::from_millis(200)).await;
         let want = if lan { VoicePath::Lan } else { VoicePath::Circuit };
@@ -942,6 +943,115 @@ async fn voice_frames_keep_their_sequence_rules_and_caps() {
     let (got, _) = voice_media(&mut eb, Duration::from_secs(2)).await;
     let allowed = 60 + 60 * start.elapsed().as_secs_f64().ceil() as usize;
     assert!(!got.is_empty() && got.len() <= allowed, "{} arrived, at most {allowed}", got.len());
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// Relay-only switched on mid-call (TL fix 1, SL B5): a LAN call leaves its
+/// direct path at once and goes on over our relay's circuit.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_only_mid_call_moves_voice_off_the_direct_path() {
+    let (relay, _relay) = voice_relay();
+    let (a, mut ea) = bound_node_events("media-mid-a", &relay, 40, true, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-mid-b", &relay, 41, true, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(40), voice_id(41), true).await;
+    a.set_voice_call(Some(voice_call(6, &[voice_id(41)]))).unwrap();
+    b.set_voice_call(Some(voice_call(6, &[voice_id(40)]))).unwrap();
+    let mut seq = voice_until_flowing(&a, &mut eb, 6, 1).await;
+    let (_, paths) = voice_media(&mut ea, Duration::from_millis(300)).await;
+    assert_eq!(paths.last(), Some(&VoicePath::Lan), "{paths:?}");
+
+    a.set_relay_only(true).unwrap();
+    let start = Instant::now();
+    let mut circuit = false;
+    while !circuit {
+        assert!(start.elapsed() < Duration::from_secs(20), "never moved to the circuit");
+        let (_, paths) = voice_media(&mut ea, Duration::from_millis(200)).await;
+        circuit = paths.last() == Some(&VoicePath::Circuit);
+    }
+    assert!(a.direct_peers().await.unwrap().is_empty(), "relay-only kept a direct link");
+    seq = voice_until_flowing(&a, &mut eb, 6, seq + 10).await;
+    let (_, paths) = voice_media(&mut ea, Duration::from_millis(300)).await;
+    assert!(paths.iter().all(|p| *p == VoicePath::Circuit), "{paths:?} after seq {seq}");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL fix 4: a participant who leaves and rejoins the same call is heard at
+/// once, though its sequence starts again from 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_to_the_same_call_is_heard_at_once() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-rejoin-a", &relay, 42, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-rejoin-b", &relay, 43, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(42), voice_id(43), false).await;
+    a.set_voice_call(Some(voice_call(7, &[voice_id(43)]))).unwrap();
+    b.set_voice_call(Some(voice_call(7, &[voice_id(42)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 7, 5000).await;
+
+    // A leaves; B's call goes on without A; then A comes back.
+    a.set_voice_call(None).unwrap();
+    b.set_voice_call(Some(voice_call(7, &[]))).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(200)).await;
+    b.set_voice_call(Some(voice_call(7, &[voice_id(42)]))).unwrap();
+    a.set_voice_call(Some(voice_call(7, &[voice_id(43)]))).unwrap();
+    let start = Instant::now();
+    voice_until_flowing(&a, &mut eb, 7, 1).await;
+    assert!(start.elapsed() < Duration::from_secs(5), "silence after the rejoin: {:?}", start.elapsed());
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL fix 3: a flooding participant doesn't crowd out another's frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flooding_participant_does_not_silence_another() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-flood-a", &relay, 44, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-flood-b", &relay, 45, false, Arc::new(AcceptAll)).await;
+    let (c, _ec) = bound_node_events("media-flood-c", &relay, 46, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(44), voice_id(45), false).await;
+    voice_meet(&c, &b, voice_id(46), voice_id(45), false).await;
+    b.set_voice_call(Some(voice_call(8, &[voice_id(44), voice_id(46)]))).unwrap();
+    a.set_voice_call(Some(voice_call(8, &[voice_id(45)]))).unwrap();
+    c.set_voice_call(Some(voice_call(8, &[voice_id(45)]))).unwrap();
+    let mut seq = voice_until_flowing(&a, &mut eb, 8, 1).await;
+    voice_until_flowing(&c, &mut eb, 8, 1).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(300)).await;
+
+    // C floods for 2 s while A talks at 25 a second.
+    let first = seq;
+    for tick in 0..50u32 {
+        for n in 0..40 {
+            c.voice_frame(vframe(8, 1000 + tick * 40 + n));
+        }
+        a.voice_frame(vframe(8, seq));
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(1)).await;
+    let from_a = got.iter().filter(|(from, f)| *from == voice_id(44) && f.seq >= first).count();
+    assert!(from_a >= 48, "only {from_a} of 50 of A's frames arrived during C's flood");
+    for node in [a, b, c] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// SL nit on #554: a sender whose engine restarts mid-call (its seq back to
+/// 1 on the same substream) is heard again at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_senders_restart_mid_call_is_heard_at_once() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-restart-a", &relay, 47, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-restart-b", &relay, 48, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(47), voice_id(48), false).await;
+    a.set_voice_call(Some(voice_call(9, &[voice_id(48)]))).unwrap();
+    b.set_voice_call(Some(voice_call(9, &[voice_id(47)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 9, 200_000).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(300)).await;
+    let start = Instant::now();
+    voice_until_flowing(&a, &mut eb, 9, 1).await;
+    assert!(start.elapsed() < Duration::from_secs(2), "the restart went unheard for {:?}", start.elapsed());
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }

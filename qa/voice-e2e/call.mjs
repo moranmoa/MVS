@@ -137,6 +137,22 @@ async function watchPeerConnections() {
   });
 }
 
+/** G-63/G-64: records every tone the UI plays (its cues are oscillator notes). */
+async function watchTones() {
+  await page.evaluate(() => {
+    if (window.__tones) return;
+    window.__tones = [];
+    const start = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (...a) {
+      window.__tones.push({ f: Math.round(this.frequency.value), at: Date.now() });
+      return start.apply(this, a);
+    };
+  });
+}
+const tonesSince = (at) => page.evaluate((t) => (window.__tones ?? []).filter((x) => x.at >= t).map((x) => x.f), at);
+const CUE = { join: [523, 784], leave: [659, 440] };
+const heard = (fs, cue) => cue.every((f) => fs.includes(f));
+
 /** Per live connection: state, the SDP's fingerprint, the presented cert, and audio counters. */
 function connectionReport() {
   return page.evaluate(async () => {
@@ -444,6 +460,7 @@ try {
 
   await openServer();
   log('server open in the UI');
+  await watchTones();
 
   await check('V1.1', 'one pinned "Join chat" row with the speaker icon in the sidebar', async () => {
     const n = await entry().count();
@@ -470,6 +487,18 @@ try {
   }
 
   await check('V1.4', 'both people show in the roster', () => until('2 in roster', () => rosterHas([NAME.a, NAME.b]), 30_000));
+  if (ROLE === 'a') {
+    await check('G64.1', 'A hears the join cue (two rising notes) when B joins', () =>
+      until('join cue', async () => heard(await tonesSince(0), CUE.join) && (await tonesSince(0)).join(','), 10_000),
+    );
+  } else {
+    await check('G64.2', 'B hears no join cue for its own join', async () => {
+      await sleep(1500);
+      const f = await tonesSince(0);
+      if (heard(f, CUE.join)) throw new Error(f.join(','));
+      return f.join(',') || 'no tones';
+    });
+  }
   await check('V2.1', 'the call bar is up with Mute and Leave', async () => {
     await page.locator('.call-bar .call-mute').waitFor({ timeout: 5000 });
     await page.locator('.call-bar .call-leave').waitFor({ timeout: 5000 });
@@ -636,6 +665,73 @@ try {
     put('saw-unmute');
   }
 
+  // G-74 push to talk: A picks it in Settings → Voice with the key T. Idle,
+  // B hears nothing; while A holds T, B hears A. Then A goes back to open.
+  const voiceSettings = async (mode) => {
+    await page.locator('.me-profile').click();
+    const dlg = page.locator('.settings-dialog');
+    await dlg.getByRole('button', { name: /^(Voice|קול)$/ }).click();
+    await dlg.getByRole('radio', { name: mode === 'ptt' ? /Push to talk|לחיצה לדיבור/ : /Voice activity|פתוח לדיבור/ }).check();
+    if (mode === 'ptt') {
+      const cap = dlg.locator('.key-capture').first();
+      if (!(await cap.locator('kbd').count())) {
+        await cap.click();
+        await page.keyboard.press('KeyT');
+        await until('key captured', async () => (await cap.locator('kbd').count()) === 1, 5000);
+      }
+    }
+    await dlg.getByRole('button', { name: /^(Close|סגירה)$/ }).first().click();
+    await dlg.waitFor({ state: 'hidden', timeout: 5000 });
+  };
+  const energyOver = async (ms) => {
+    const a = (await live()).find((x) => x.state === 'connected');
+    await sleep(ms);
+    const b = (await live()).find((x) => x.state === 'connected');
+    return (b?.energyIn ?? 0) - (a?.energyIn ?? 0);
+  };
+  if (ROLE === 'a') {
+    const set = await check('G74.1', 'A turns on push to talk with the key T (Settings → Voice)', async () => {
+      await voiceSettings('ptt');
+      if ((await page.locator('.call-mute').getAttribute('aria-pressed')) === 'true') throw new Error('the mute button turned on');
+      return 'mute button still off';
+    });
+    put('ptt-idle', { set });
+    await take('ptt-measured');
+    if (set) {
+      await page.keyboard.down('KeyT');
+      await check('G74.2', 'holding T shows A as talking on the mute button', () =>
+        until('talking', async () => /\btalking\b/.test((await page.locator('.call-mute').getAttribute('class')) ?? ''), 5000),
+      );
+    }
+    put('ptt-held');
+    await take('ptt-heard');
+    if (set) {
+      await page.keyboard.up('KeyT');
+      await check('G74.3', 'letting go of T ends talking (after the release delay)', () =>
+        until('not talking', async () => !/\btalking\b/.test((await page.locator('.call-mute').getAttribute('class')) ?? ''), 3000),
+      );
+      await check('G74.4', 'A goes back to voice activity', () => voiceSettings('open').then(() => 'open'));
+    }
+    put('ptt-done');
+  } else {
+    const { set } = await take('ptt-idle');
+    await sleep(1500);
+    const idle = await energyOver(3000);
+    put('ptt-measured');
+    await take('ptt-held');
+    await sleep(1500);
+    const held = await energyOver(3000);
+    put('ptt-heard');
+    if (set) {
+      await check('G74.5', 'B hears nothing from A while push to talk is idle, and hears A while T is held', () => {
+        if (!(held > 0)) throw new Error(`no energy while held: ${held}`);
+        if (idle > held * 0.05) throw new Error(`idle ${idle} vs held ${held}`);
+        return `energy idle ${idle.toExponential(2)}, held ${held.toExponential(2)}`;
+      });
+    }
+    await take('ptt-done');
+  }
+
   // Leave: B leaves first; then A leaves while B watches from outside the call.
   if (ROLE === 'b') {
     await page.locator('.call-bar .call-leave').click();
@@ -670,6 +766,9 @@ try {
       await until('B gone', () => rosterHas([NAME.a]), 15_000);
       return `about ${((Date.now() - at) / 1000).toFixed(1)} s after B's click`;
     });
+    await check('G64.3', 'A hears the leave cue (two falling notes) when B leaves', () =>
+      until('leave cue', async () => heard(await tonesSince(at - 2000), CUE.leave) && (await tonesSince(at - 2000)).join(','), 10_000),
+    );
     await check('V2.4', 'A\'s connection to B ends', () =>
       until('no live connection', async () => !(await live()).some((c) => c.state === 'connected'), 30_000),
     );

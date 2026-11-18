@@ -7,7 +7,7 @@ import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
-import { useCore, useCoreEvent, type Id } from '../../core';
+import { isCoreError, useCore, useCoreEvent, type Id } from '../../core';
 import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
@@ -193,6 +193,37 @@ export function Shell() {
     setPhoneMembers(false);
     setPhoneView('nav');
   };
+  // G-30: an mvs://m/… link (main parsed it strictly). It only navigates: the
+  // right server and channel, then the message list scrolls and highlights.
+  const [linkNotMember, setLinkNotMember] = useState(false);
+  const linkSeq = useRef(0);
+  useCoreEvent('link.message', ({ serverId: sid, channelId: cid, messageId }) => {
+    // Never over the join dialog (the same rule as invites, #80).
+    if (dialogNow.current === 'join') return;
+    const seq = ++linkSeq.current;
+    if (!store.getState().servers.some((s) => s.id === sid)) return setLinkNotMember(true);
+    core.locateMessage(sid, cid, messageId).then(
+      ({ index }) => {
+        if (seq !== linkSeq.current) return; // a newer link won
+        setSettingsOpen(false);
+        setServerId(sid);
+        setChannelByServer((m) => ({ ...m, [sid]: cid }));
+        goPhone('chat');
+        store.goToMessage(cid, index);
+      },
+      (e) => {
+        if (seq !== linkSeq.current) return;
+        if (isCoreError(e) && e.code === 'not-found') {
+          // The channel opens as usual; the message isn't on this computer.
+          setSettingsOpen(false);
+          setServerId(sid);
+          setChannelByServer((m) => ({ ...m, [sid]: cid }));
+          goPhone('chat');
+          store.showFlash('msglink.notFound');
+        } else setLinkNotMember(true);
+      },
+    );
+  });
   // G-61: a click on a desktop notification opens its channel.
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
     setSettingsOpen(false);
@@ -338,6 +369,16 @@ export function Shell() {
       </main>
       {showMembers && <MemberList server={server} onClose={phone ? toggleMembers : undefined} />}
 
+      <Dialog open={linkNotMember} onClose={() => setLinkNotMember(false)} title={<FormattedMessage id="msglink.notMember.title" />} className="msglink-dialog">
+        <p>
+          <FormattedMessage id="msglink.notMember.body" />
+        </p>
+        <div className="actions">
+          <button type="button" className="primary" onClick={() => setLinkNotMember(false)} autoFocus>
+            <FormattedMessage id="msglink.ok" />
+          </button>
+        </div>
+      </Dialog>
       <CreateServerDialog
         open={dialog === 'create'}
         onClose={() => setDialog(null)}

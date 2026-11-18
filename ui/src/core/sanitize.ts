@@ -587,6 +587,11 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       : null,
   'join.status': cleanJoin,
   'link.open': (p) => ({ link: cleanInviteLink(p?.link) }),
+  // G-30: three ids, like notify.click; a missing one drops the event.
+  'link.message': (p) =>
+    typeof p?.serverId === 'string' && typeof p.channelId === 'string' && typeof p.messageId === 'string' && p.serverId && p.channelId && p.messageId
+      ? { serverId: id(p.serverId), channelId: id(p.channelId), messageId: id(p.messageId) }
+      : null,
   'window.state': (p) => ({ maximized: p?.maximized === true, fullScreen: p?.fullScreen === true }),
   'window.closeRequest': () => ({}),
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
@@ -664,6 +669,13 @@ export function guardCore(core: CoreApi): CoreApi {
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
     getSettings: () => core.getSettings().then(cleanCoreSettings),
+    // G-30: an index, nothing else; anything malformed is the core's error.
+    locateMessage: (serverId: Id, channelId: Id, messageId: Id) =>
+      core.locateMessage(serverId, channelId, messageId).then((r) => {
+        const index = r?.index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) throw { code: 'internal' };
+        return { index };
+      }),
     getServerRestore: () =>
       core.getServerRestore().then((r) => {
         const clean = cleanServerRestore(r);

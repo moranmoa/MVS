@@ -9,7 +9,7 @@ const listeners = new Set();
 // Shell events can arrive before the UI has subscribed: `link.open` (an
 // mvs:// invite, e.g. on the first launch) and `core.status` (sent at load).
 // The latest of each is kept for the first subscriber.
-const KEPT = new Set(['link.open', 'core.status']);
+const KEPT = new Set(['link.open', 'link.message', 'core.status']);
 const pending = new Map();
 
 ipcRenderer.on('core:event', (_e, name, payload) => {

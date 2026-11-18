@@ -420,6 +420,11 @@
   "connection.direct.title": "Connected directly (for example, on the same network)",
   "connection.relay.title": "Connected through an MVS relay. It passes encrypted messages along and can't read them.",
   "members.me": "(you)",
+  "members.search": "Search members",
+  "members.search.placeholder": "Search",
+  "members.search.count": "{count, plural, one {1 result} other {# results}}",
+  "members.search.none": "No members match.",
+  "members.search.clear": "Clear search",
   "members.open": "\u2068{name}\u2069's profile",
 
   "profile.code": "Identity code",

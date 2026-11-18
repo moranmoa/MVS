@@ -122,19 +122,21 @@ export const FAILURE_TEXT: Record<PeerFailure, [text: string, hint: string]> = {
 /**
  * docs/ux/specs/voice-ip-notice.md: shown once per computer, before the first
  * join. v2 (G-81, STUN: co-callers can see my public IP): everyone sees it
- * once more; v1 is no longer read.
+ * once more; v1 is no longer read. v3 (G-81 B, behind `voiceP2p`): calls
+ * also go over the P2P network, so relay-only no longer turns them off; the
+ * wording changes and everyone sees it once more.
  */
-const IP_NOTICE_KEY = 'mvs.notices.voiceIp.v2';
-export function ipNoticeSeen(): boolean {
+const ipNoticeKey = (p2p: boolean) => (p2p ? 'mvs.notices.voiceIp.v3' : 'mvs.notices.voiceIp.v2');
+export function ipNoticeSeen(p2p = false): boolean {
   try {
-    return localStorage.getItem(IP_NOTICE_KEY) === '1';
+    return localStorage.getItem(ipNoticeKey(p2p)) === '1';
   } catch {
     return false; // no storage: explain every time rather than join unexplained
   }
 }
-export function rememberIpNotice(): void {
+export function rememberIpNotice(p2p = false): void {
   try {
-    localStorage.setItem(IP_NOTICE_KEY, '1');
+    localStorage.setItem(ipNoticeKey(p2p), '1');
   } catch {
     // Shown again next time.
   }

@@ -3898,3 +3898,8 @@ input.switch:disabled {
 .ip-notice .ip-notice-settings {
   margin-inline-end: auto;
 }
+
+/* Voice IP notice v3: two paragraphs (direct, relay-only). */
+.ip-notice p + p {
+  margin-block-start: 0.5rem;
+}

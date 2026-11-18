@@ -3,7 +3,7 @@
 **Status:** design only, no code.
 - **Security Lead:** APPROVED, with conditions (§8).
 - **Tech Lead:** APPROVED, with the two-path design for a lock during a call (§5).
-- **Re-verdict:** both leads are asked to re-verdict this head.
+- **Both leads approved 6f32a67.** The SL's path B conditions are folded into §5. Building can start, core first.
 
 **Background:**
 - G-78 is in `docs/ux/GAPS.md` §1.7. It comes from spec question 6: "recovery words + OS keychain + an optional app lock".
@@ -29,7 +29,7 @@
 - **Anyone with my OS account's files or a process running as me.** The keychain stays unlocked for my OS session. The SQLite store is plaintext (GAP-11). The lock settings could be edited out of the profile. This is the TB1 line: the lock narrows "anyone at the keyboard", not "anything running as me".
 - **The core working in the background.** Sync, relaying, keeping my servers' data, voice-room presence and receiving messages all go on while locked. Locking doesn't sign me out or take me offline.
 - **A stolen, powered-off laptop.** That needs disk encryption (BitLocker, FileVault, LUKS) plus GAP-11. The UI should say so in one line when the lock is turned on.
-- **Content behind a locked call.** During a call, MVS keeps the call's audio running behind the lock. The page's earlier content stays in memory, hidden, until the call ends (§5 path B). The setting shows this as one more line.
+- **Content behind a locked call.** During a call, MVS keeps the call's audio running behind the lock, and incoming audio keeps playing. The page's earlier content stays in memory, though not on screen or in the DOM, until the call ends (§5 path B). The setting shows this as one more line.
 
 ## 2. How to unlock
 
@@ -97,7 +97,7 @@ A lock that the page enforces is only as good as the page's state. So **main** o
 **Path B, locked during a call: overlay, no reload.**
 
 - **The page stays loaded** so the call's audio keeps running. Main sends `lock.state { locked: true, inCall: true }`.
-- **The page hides the app:** it sets `inert` and `aria-hidden="true"` on the app root, and shows a focus-trapped overlay with:
+- **The page unmounts the content** (SL). Only the voice engine and the lock overlay stay rendered, so the DOM holds no message, member, server or channel text. The page also keeps `inert` and `aria-hidden="true"` on the app root, and shows a focus-trapped overlay with:
   - "in a call" and the call's member count, with no names;
   - **Leave**;
   - unlock.
@@ -110,8 +110,13 @@ A lock that the page enforces is only as good as the page's state. So **main** o
 - **Forwarded events:** only `call.signal`, `call.state` (in full, because the engine needs it), `core.status` and `lock.state`. Push-to-talk, the global toggle and `mic:test` are off.
 - **When the call ends while locked**, by Leave or by the others, main switches to path A and reloads into `?locked`, which drops the in-memory content.
 - **On unlock**, the page removes `inert` and re-syncs its store from the core, since it got no events while locked. The mic stays muted until I unmute.
-- **Residual:** while a call goes on behind the lock, the page's earlier content (messages, members) **stays in renderer memory, hidden but not wiped**, until the call ends. This is recorded in `core/api/CONFORMANCE.md` under TB1. The §1 disclaimer gets the line "During a call, MVS keeps the call's audio running behind the lock."
-- **e2e:** behind the overlay, Tab, Ctrl+F and the reload/DevTools shortcuts do nothing. `setMuted(false)` and any other command are refused.
+- **Main checks call commands strictly** (SL). It passes `setMuted` only when the args are exactly `{ muted: true }`, and `sendSignal` only while the call gate says I'm in a call.
+- **Residual:** while a call goes on behind the lock:
+  - the page's earlier content (the store's messages and members) **stays in renderer memory, unmounted from the DOM but not wiped**, until the call ends;
+  - **incoming call audio keeps playing**.
+
+  This is recorded in `core/api/CONFORMANCE.md` under TB1. The §1 disclaimer gets the line "During a call, MVS keeps the call's audio running behind the lock."
+- **e2e:** behind the overlay, these do nothing: Tab, Ctrl+F, print and Ctrl+P, and the reload and DevTools shortcuts. `setMuted(false)` and any other command are refused. The DOM holds none of the test's message or member text.
 
 **On both paths:**
 1. **Notifications:** `notify:show` is refused while locked, and the page can't produce any anyway (it gets no message events). Main shows **nothing**: no generic "new message" toast either, because even that reveals activity (SL: Q2).
@@ -168,7 +173,7 @@ That's the "stolen powered-off laptop" protection, and the design of the G-78 v1
 - It would be offered as a separate, later setting, "Encrypt on this computer", with a strong passphrase. It would never be the PIN.
 - When both are on, the vault passphrase entered at start also unlocks the screen lock. One prompt, not two.
 
-## 8. Decisions (SL APPROVE on 6afd790; TL APPROVE on c80f785; manager's call on Q1)
+## 8. Decisions (SL APPROVE on 6f32a67; TL APPROVE on 6f32a67; the manager decided Q1)
 
 **Answers to the open questions:**
 1. **Locking during a call:** **keep the call**, with my mic off in the core and on the track, and Leave on the overlay. This was the manager's decision, matching the SL's answer. The TL's two-path design makes it work: path A reloads when not in a call; path B uses an inert overlay with no reload during a call (§5). Idle still never locks during a call.

@@ -192,8 +192,10 @@ class FakePC {
     this.closed = true;
     this.connectionState = 'closed';
   }
+  /** ICE never connects again (a network with no path to the peer); signalling still works. */
+  neverConnect = false;
   private maybeConnect() {
-    if (this.signalingState !== 'stable' || !this.localDescription || !this.remoteDescription) return;
+    if (this.neverConnect || this.signalingState !== 'stable' || !this.localDescription || !this.remoteDescription) return;
     setTimeout(() => {
       if (this.closed) return;
       if (this.remoteSends()) this.ontrack?.({ track: new FakeTrack(), streams: [new FakeStream()] });
@@ -291,10 +293,13 @@ interface Harness {
   asked: (string | undefined)[];
   /** Plugs devices in or out, then fires devicechange. */
   changeDevices: (list: MediaDeviceInfo[]) => Promise<void>;
+  /** Fires the network-change event (online / another interface). */
+  changeNetwork: () => void;
 }
 
 function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } } = {}): Harness {
   let onChange: (() => void) | null = null;
+  let onNet: (() => void) | null = null;
   const h: Harness = {
     mics: [],
     contexts: [],
@@ -311,6 +316,7 @@ function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } }
       onChange?.();
       await flush();
     },
+    changeNetwork: () => onNet?.(),
   };
   h.env = {
     createPeerConnection: (config) => {
@@ -334,6 +340,12 @@ function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } }
       onChange = cb;
       return () => {
         onChange = null;
+      };
+    },
+    onNetworkChange: (cb) => {
+      onNet = cb;
+      return () => {
+        onNet = null;
       };
     },
     createAudioContext: () => {
@@ -1347,5 +1359,179 @@ describe('voice engine with TURN', () => {
     const types = await ex.connectionTypes();
     expect(types).toEqual({ [B]: { local: 'relay', remote: 'srflx' } });
     expect(JSON.stringify(types)).not.toMatch(/\d+\.\d+\.\d+\.\d+/);
+  });
+});
+
+// ---- ICE restart: a call that survives a network change ---------------------------
+
+describe('voice engine: ICE restart on a network change', () => {
+  /** The connection's ICE path drops, as on a Wi-Fi/LAN switch or a VPN toggle. */
+  const drop = (pc: FakePC, state: RTCPeerConnectionState = 'disconnected') => {
+    pc.connectionState = state;
+    (pc.onconnectionstatechange as (() => void) | null)?.();
+  };
+
+  async function connectedPair() {
+    vi.useFakeTimers();
+    const p = pair();
+    const errors = record<VoiceError>((cb) => p.ex.on('error', cb));
+    const errorsY = record<VoiceError>((cb) => p.ey.on('error', cb));
+    const partsX = record<VoiceParticipant[]>((cb) => p.ex.on('participants', cb));
+    await p.ex.attach(p.cx.state(), A);
+    await p.ey.attach(p.cy.state(), B);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(p.hx.pcs[0]!.connectionState).toBe('connected');
+    expect(p.cx.sent.map((s) => s.kind)).toEqual(['offer']);
+    return { ...p, errors, errorsY, partsX };
+  }
+
+  it('a dropped call restarts ICE on the same connection and comes back', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors, errorsY, partsX } = await connectedPair();
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(1_900); // within the 2 s grace: nothing yet
+    expect(hx.pcs[0]!.restarts).toBe(0);
+    const before = partsX.length;
+    await vi.advanceTimersByTimeAsync(150);
+    // Shown as reconnecting while it restarted.
+    expect(partsX.slice(before).some((list) => list.some((p) => p.identity === B && p.state === 'connecting'))).toBe(true);
+    // The offerer (A, the lower identity) restarted and re-offered; B answered on the same connection.
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(hy.pcs[0]!.restarts).toBe(0);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer', 'offer']);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
+    expect(hx.pcs).toHaveLength(1);
+    expect(hy.pcs).toHaveLength(1);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    expect(partsX.at(-1)).toContainEqual({ identity: B, state: 'connected' });
+    expect(hx.audios).toHaveLength(1); // the same audio, not a second player
+    // Recovered: no give-up later.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(errors).toEqual([]);
+    expect(errorsY).toEqual([]);
+    expect(cx.sent).toHaveLength(2);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a network change (online, another interface) restarts at once, before ICE notices', async () => {
+    const { hx, cx, cy, ex, ey, errors } = await connectedPair();
+    hx.changeNetwork();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer', 'offer']);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('the answerer never offers (glare): it waits for the offerer, whose restart brings it back', async () => {
+    const { hx, hy, cy, ex, ey, errorsY } = await connectedPair();
+    drop(hy.pcs[0]!);
+    hy.changeNetwork();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(hy.pcs[0]!.restarts).toBe(0);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer']);
+    // The offerer's side notices too and restarts (after its 2 s grace).
+    drop(hx.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(2_050);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
+    expect(hy.pcs[0]!.connectionState).toBe('connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(errorsY).toEqual([]); // the answerer's give-up timer was cleared
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a short "disconnected" that comes back within 2 s restarts nothing', async () => {
+    const { hx, hy, cx, ex, ey, errors } = await connectedPair();
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(1_000);
+    drop(hx.pcs[0]!, 'connected');
+    drop(hy.pcs[0]!, 'connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(hx.pcs[0]!.restarts).toBe(0);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer']);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a restart answer naming another certificate is refused before it is applied (pinned fingerprint)', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors } = await connectedPair();
+    // B's side answers the restart with another certificate (a man in the middle).
+    const realSend = cy.sendSignal.bind(cy);
+    cy.wire = null;
+    cy.sendSignal = async (to, kind, payload) => {
+      const swapped = payload.replace(/a=fingerprint:sha-256 \S+/, `a=fingerprint:sha-256 ${newFingerprint()}`);
+      setTimeout(() => cx.emitSignal({ from: B, kind, payload: swapped, fingerprintVerified: true }), 0);
+      return realSend(to, kind, payload);
+    };
+    const offerer = hx.pcs[0]!;
+    const remoteBefore = offerer.remoteDescription;
+    drop(offerer, 'failed');
+    drop(hy.pcs[0]!, 'failed');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(offerer.restarts).toBe(1);
+    expect(errors).toEqual([{ code: 'fingerprint-mismatch', peer: B }]);
+    expect(offerer.closed).toBe(true);
+    expect(offerer.remoteDescription).toBe(remoteBefore); // never applied
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('"failed" after a working call restarts too, instead of a new connection', async () => {
+    const { hx, hy, cx, ex, ey, errors } = await connectedPair();
+    drop(hx.pcs[0]!, 'failed');
+    drop(hy.pcs[0]!, 'failed');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(hx.pcs).toHaveLength(1);
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer', 'offer']);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('no path back: a fresh restart offer every 5 s, then after 15 s "no voice connection" on both sides', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors, errorsY } = await connectedPair();
+    // The new network can't reach the other side: signalling still works, ICE never connects.
+    hx.pcs[0]!.neverConnect = true;
+    hy.pcs[0]!.neverConnect = true;
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(2_050); // the 2 s grace, then the first restart
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(hx.pcs[0]!.restarts).toBe(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(hx.pcs[0]!.restarts).toBe(3);
+    expect(errors).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5_000); // 15 s after the restart began
+    expect(errors).toEqual([{ code: 'peer-failed', peer: B }]);
+    expect(errorsY).toEqual([{ code: 'peer-failed', peer: A }]);
+    expect(hx.pcs[0]!.closed && hy.pcs[0]!.closed).toBe(true);
+    // Gone for good: no more offers.
+    const offers = cx.sent.length;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(cx.sent.length).toBe(offers);
+    expect(cy.sent.every((s) => s.kind === 'answer')).toBe(true);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a network change outside a call does nothing', async () => {
+    const h = fakeEnv();
+    const core = new FakeCore(A, [A, B]);
+    const engine = createVoiceEngine(core, { env: h.env });
+    h.changeNetwork();
+    expect(h.pcs).toHaveLength(0);
+    expect(core.sent).toEqual([]);
+    engine.dispose();
   });
 });

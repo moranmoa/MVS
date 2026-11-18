@@ -360,6 +360,8 @@
   "channel.cannotDeleteDefault": "אי אפשר למחוק את הערוץ הראשון של השרת, אבל אפשר לשנות לו שם.",
   "channel.save": "שמירה",
   "channel.topic.label": "נושא הערוץ",
+  "channel.topic.button": "נושא הערוץ: \u2068{topic}\u2069",
+  "channel.topic.counter": "\u2068{n}\u2069/256",
   "channel.topic.add": "הוספת נושא",
   "channel.topic.edit": "עריכת הנושא",
   "channel.topic.hint": "הנושא גלוי לכל חברי השרת.",

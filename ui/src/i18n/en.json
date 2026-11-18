@@ -360,6 +360,8 @@
   "channel.cannotDeleteDefault": "The server's first channel can't be deleted, but you can rename it.",
   "channel.save": "Save",
   "channel.topic.label": "Channel topic",
+  "channel.topic.button": "Channel topic: {topic}",
+  "channel.topic.counter": "{n}/256",
   "channel.topic.add": "Add a topic",
   "channel.topic.edit": "Edit topic",
   "channel.topic.hint": "The topic is visible to every member of the server.",

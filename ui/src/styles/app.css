@@ -3935,3 +3935,12 @@ input.switch:disabled {
 .topic-field {
   width: 100%;
 }
+
+/* G-14 on a phone: the channel name opens the topic. */
+.chat-title-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+}

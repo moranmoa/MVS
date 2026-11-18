@@ -92,9 +92,9 @@ describe('channel topic (G-14)', () => {
     fireEvent.click(within(await screen.findByRole('dialog', { name: 'Channel topic' })).getByRole('button', { name: 'Edit topic' }));
     const field = screen.getByRole('textbox', { name: 'Channel topic' });
     fireEvent.change(field, { target: { value: 'x'.repeat(199) } });
-    expect(screen.queryByText('199 / 256')).toBeNull();
+    expect(screen.queryByText('199/256')).toBeNull();
     fireEvent.change(field, { target: { value: 'x'.repeat(257) } });
-    expect(screen.getByText('257 / 256')).toBeTruthy();
+    expect(screen.getByText('257/256')).toBeTruthy();
     expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
   });
 

@@ -144,26 +144,35 @@ export function ChatView({
         )}
         <HashIcon />
         <h2 className="chat-title" tabIndex={-1}>
-          <bdi>{channelName}</bdi>
+          {/* G-14 (UX): on a phone the topic isn't in the header; the name opens it. */}
+          {onBack && channel?.topic ? (
+            <button type="button" className="chat-title-button" onClick={() => setTopicOpen(true)} aria-label={intl.formatMessage({ id: 'channel.topic.button' }, { topic: channel.topic })}>
+              <bdi>{channelName}</bdi>
+            </button>
+          ) : (
+            <bdi>{channelName}</bdi>
+          )}
         </h2>
         {channel?.adult && (
           <span className="adult-tag" title={intl.formatMessage({ id: 'channel.adult' })}>
             18+
           </span>
         )}
-        {channel?.topic ? (
-          <button type="button" className="chat-topic" onClick={() => setTopicOpen(true)} aria-label={`${intl.formatMessage({ id: 'channel.topic.label' })}: ${channel.topic}`}>
-            <bdi>{channel.topic}</bdi>
-          </button>
-        ) : (
-          isOwner &&
-          channel &&
-          !server.closed && (
-            <button type="button" className="chat-topic add" onClick={() => setTopicOpen(true)}>
-              <FormattedMessage id="channel.topic.add" />
+        {!onBack &&
+          (channel?.topic ? (
+            <button type="button" className="chat-topic" onClick={() => setTopicOpen(true)} aria-label={intl.formatMessage({ id: 'channel.topic.button' }, { topic: channel.topic })}>
+              {/* An English topic keeps its direction in the Hebrew UI. */}
+              <bdi dir="auto">{channel.topic}</bdi>
             </button>
-          )
-        )}
+          ) : (
+            isOwner &&
+            channel &&
+            !server.closed && (
+              <button type="button" className="chat-topic add" onClick={() => setTopicOpen(true)}>
+                <FormattedMessage id="channel.topic.add" />
+              </button>
+            )
+          ))}
         <span className="spacer" />
         <button
           type="button"

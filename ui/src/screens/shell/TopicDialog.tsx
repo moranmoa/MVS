@@ -94,8 +94,9 @@ export function TopicDialog({
             {length >= COUNT_FROM && (
               <>
                 {' '}
-                <span className={tooLong ? 'error' : undefined} dir="ltr">
-                  <FormattedMessage id="chat.charCount" values={{ count: length, max: CHANNEL_TOPIC_MAX }} />
+                {/* Only once it shows is it a live region (UX). */}
+                <span className={tooLong ? 'error' : undefined} aria-live="polite">
+                  <FormattedMessage id="channel.topic.counter" values={{ n: length }} />
                 </span>
               </>
             )}

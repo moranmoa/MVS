@@ -7,7 +7,8 @@
 //! - Every `auth_dep` must have joined the control log; otherwise the verdict
 //!   is [`Verdict::Pending`], never accept.
 //! - The author must be a member there (not kicked).
-//! - `Message`: any member. `MessageEdit`: the original author only.
+//! - `Message` and `Reaction`: any member. `MessageEdit`: the original
+//!   author only.
 //!   `MessageDelete`: the original author, or a moderator or above who
 //!   outranks them. `KeyRotation`: [`may_rotate`], moderator or above.
 //!   Edits and deletes name a `Message`, which must be in their deps.
@@ -347,7 +348,9 @@ impl Context<'_> {
         }
 
         let privileged = match (record.kind(), record.full()) {
-            (Kind::Message, _) => false,
+            // A reaction (G-26) is judged like a message: its target and
+            // emoji are sealed, so `core/api` checks them after opening.
+            (Kind::Message | Kind::Reaction, _) => false,
             // A pruned edit: its target went with the body. Something
             // accepted replaced it, and an edit is its author's own.
             (Kind::MessageEdit, None) => false,

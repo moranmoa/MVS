@@ -70,3 +70,27 @@ describe('placeholder rows (core #527)', () => {
     expect(row.classList.contains('untrusted')).toBe(true);
   });
 });
+
+describe('a placeholder that opens later (PO rule on #558)', () => {
+  it('is new to me once: the store tells the notifier, and an edit after that does not', async () => {
+    const { Store } = await import('../app/store');
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const store = new Store(core);
+    const stop = store.start();
+    await store.init();
+    const [server] = await core.listServers();
+    const [channel] = await core.listChannels(server.id);
+    const opened = vi.fn();
+    store.onPlaceholderOpened(opened);
+    core.simulateUnreadable(channel.id, 3, 'no-key');
+    expect(opened).not.toHaveBeenCalled();
+    core.simulateUnreadable(channel.id, 3, null);
+    expect(opened).toHaveBeenCalledTimes(1);
+    expect(opened.mock.calls[0][0]).toMatchObject({ channelId: channel.id, index: 3 });
+    expect(opened.mock.calls[0][0].unreadable).toBeUndefined();
+    // Another update of the same, now readable, message isn't "new" again.
+    core.simulateUnreadable(channel.id, 3, null);
+    expect(opened).toHaveBeenCalledTimes(1);
+    stop();
+  });
+});

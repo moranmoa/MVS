@@ -67,7 +67,7 @@ export function useDesktopNotifications(viewing: Id | null, open: (serverId: Id,
   // G-63: one sound per 2 s at most, whatever arrives.
   const soundGate = useRef(createSoundGate());
 
-  useCoreEvent('message.added', (m) => {
+  const onNew = (m: Message) => {
     // Core #527: nothing to say about a message that can't be opened.
     if (m.unreadable) return;
     const where = lookup(m.channelId);
@@ -86,7 +86,12 @@ export function useDesktopNotifications(viewing: Id | null, open: (serverId: Id,
     if (shellNotify() && shouldNotify(m, c)) grouper.current?.add(m.channelId, m);
     const inCall = (where.s.call?.participants.length ?? 0) > 0;
     if (shouldSound(m, { ...c, inCall }) && soundGate.current(c.now)) void playMessageCue(loadDevices().output).catch(() => {});
-  });
+  };
+  useCoreEvent('message.added', onNew);
+  // PO rule (#558): a placeholder that opens later notifies once, like a new message.
+  const onNewRef = useRef(onNew);
+  onNewRef.current = onNew;
+  useEffect(() => store.onPlaceholderOpened((m) => onNewRef.current(m)), [store]);
 
   useCoreEvent('notify.click', ({ channelId }) => {
     const where = lookup(channelId);

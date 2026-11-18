@@ -71,6 +71,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::CallState(_) => "call.state",
             Event::CallSignal { .. } => "call.signal",
             Event::VoiceRooms { .. } => "voice.rooms",
+            Event::Typing { .. } => "typing",
             Event::MemberRelayChanged(_) => "memberRelay.changed",
             Event::ServerRestoreChanged(_) => "serverRestore.changed",
             Event::DeviceLinkState(_) => "deviceLink.state",
@@ -4584,6 +4585,8 @@ struct FarServers {
     hidden: std::sync::atomic::AtomicBool,
     /// Peers answer without the genesis (a partial fetch).
     partial: std::sync::atomic::AtomicBool,
+    /// Peers answer without this member's join records.
+    hide_joins_of: std::sync::Mutex<Option<PublicKey>>,
     fetches: std::sync::atomic::AtomicUsize,
     server_fetches: std::sync::atomic::AtomicUsize,
 }
@@ -4595,6 +4598,7 @@ impl FarServers {
             reachable: Default::default(),
             hidden: Default::default(),
             partial: Default::default(),
+            hide_joins_of: Default::default(),
             fetches: Default::default(),
             server_fetches: Default::default(),
         })
@@ -4611,6 +4615,9 @@ impl Network for FarServers {
             let mut records = self.world.fetch(server);
             if self.partial.load(std::sync::atomic::Ordering::SeqCst) {
                 records.retain(|r| r.kind() != Kind::Genesis);
+            }
+            if let Some(hidden) = *self.hide_joins_of.lock().unwrap() {
+                records.retain(|r| !(r.kind() == Kind::Join && r.author() == hidden));
             }
             records
         } else {
@@ -5559,6 +5566,154 @@ fn a_link_that_cant_be_stored_says_keyring() {
     assert!(new.get_identity().unwrap().is_none());
 }
 
+/// G-91 phase B: a network where `online` is who presence reports, for
+/// every server; everything else is the shared loopback world.
+struct OnlineNet {
+    world: Arc<LoopbackNetwork>,
+    online: std::sync::Mutex<BTreeSet<PublicKey>>,
+}
+
+impl Network for OnlineNet {
+    fn publish(&self, record: &records::Record) {
+        self.world.publish(record);
+    }
+    fn fetch(&self, server: ServerId) -> Vec<records::Record> {
+        self.world.fetch(server)
+    }
+    fn fetch_invite(&self, handle: [u8; 32]) -> Vec<Vec<u8>> {
+        self.world.fetch_invite(handle)
+    }
+    fn online(&self, _: ServerId) -> Option<BTreeSet<PublicKey>> {
+        Some(self.online.lock().unwrap().clone())
+    }
+    fn put_backup(&self, tag: [u8; 32], blob: &[u8]) {
+        self.world.put_backup(tag, blob);
+    }
+    fn put_backup_to(&self, tag: [u8; 32], blob: &[u8], members: &[PublicKey]) {
+        self.world.put_backup_to(tag, blob, members);
+    }
+    fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
+        self.world.fetch_backup(tag)
+    }
+}
+
+fn key_of(peer: &Peer) -> PublicKey {
+    let id = peer.core.get_identity().unwrap().unwrap().id;
+    PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
+}
+
+/// Four servers, each with its own owner and one more member, and me in
+/// all four. Presence shows only the second members, so they're the
+/// candidates: one per owner group.
+struct BuddyWorld {
+    world: World,
+    me: Peer,
+    net: Arc<OnlineNet>,
+    words: Vec<String>,
+    owners: Vec<Peer>,
+    seconds: Vec<Peer>,
+    servers: Vec<ServerSummary>,
+}
+
+fn buddy_world() -> BuddyWorld {
+    let world = World::new();
+    let net = Arc::new(OnlineNet { world: world.network.clone(), online: Default::default() });
+    let me = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let (mut owners, mut seconds, mut servers) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..4 {
+        let owner = world.peer();
+        sign_up(&owner, &format!("Owner {i}"));
+        let second = world.peer();
+        sign_up(&second, &format!("Second {i}"));
+        let server = owner.core.create_server(&format!("S{i}"), AgeRestriction::None).unwrap();
+        me.core.join_server(&server.invite_link).unwrap();
+        second.core.join_server(&server.invite_link).unwrap();
+        owners.push(owner);
+        seconds.push(second);
+        servers.push(server);
+        advance(&world, 1_000); // so I joined S0 first, then S1, …
+    }
+    *net.online.lock().unwrap() = seconds.iter().map(key_of).collect();
+    BuddyWorld { world, me, net, words: created.words, owners, seconds, servers }
+}
+
+impl BuddyWorld {
+    fn tag(&self) -> [u8; 32] {
+        identity::RecoveryPhrase::parse(&self.words.join(" ")).unwrap().identity().backup_keys().tag()
+    }
+
+    /// Rounds until the buddy check after the next one has run.
+    fn settle(&self) {
+        self.me.core.sync_now().unwrap();
+        advance(&self.world, api::BUDDY_CHECK_MS);
+        self.me.core.sync_now().unwrap();
+        self.me.core.sync_now().unwrap();
+    }
+
+    fn holding(&self) -> Vec<usize> {
+        let tag = self.tag();
+        (0..self.seconds.len())
+            .filter(|i| self.net.world.held_by(&key_of(&self.seconds[*i])).contains(&tag))
+            .collect()
+    }
+}
+
+/// G-91 phase B (Tech Lead's tests): three buddies, one per owner group,
+/// hold my backup; with the relay mailbox wiped, a restore on a clean
+/// computer still brings every server back from them.
+#[test]
+fn buddies_hold_my_backup_and_a_restore_works_with_the_mailbox_wiped() {
+    let b = buddy_world();
+    b.settle();
+    assert_eq!(b.holding(), [0, 1, 2], "the first three owner groups I joined");
+    for owner in &b.owners {
+        assert!(b.net.world.held_by(&key_of(owner)).is_empty(), "never seen: not picked");
+    }
+
+    b.world.network.wipe_mailbox();
+    let laptop = b.world.peer();
+    laptop.core.restore_identity(b.words.clone()).unwrap();
+    let mut back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    back.sort();
+    let mut mine: Vec<String> = b.servers.iter().map(|s| s.id.clone()).collect();
+    mine.sort();
+    assert_eq!(back, mine, "every server back from the buddies alone");
+}
+
+/// G-91 phase B: a buddy kicked from the server it was picked through is
+/// replaced at the next check (no daily wait), and the new buddy gets the
+/// current backup.
+#[test]
+fn a_kicked_buddy_is_replaced() {
+    let b = buddy_world();
+    b.settle();
+    assert_eq!(b.holding(), [0, 1, 2]);
+    let kicked = key_of(&b.seconds[0]);
+    b.owners[0].core.kick_member(&b.servers[0].id, &hex::encode(kicked.as_bytes())).unwrap();
+    b.owners[0].core.sync_now().unwrap();
+    b.settle();
+    // The kicked one still has its old copy (sealed, harmless); the fourth
+    // group's member now holds the current one too.
+    assert_eq!(b.holding(), [0, 1, 2, 3]);
+    let fresh = b.net.world.fetch_backup(b.tag());
+    assert!(fresh.len() >= 4, "mailbox plus the buddies");
+}
+
+/// G-91 phase B: unchanged buddies aren't re-picked on later checks, and
+/// nothing is written to them without a change.
+#[test]
+fn settled_buddies_stay() {
+    let b = buddy_world();
+    b.settle();
+    let before = b.holding();
+    for _ in 0..6 {
+        b.settle();
+    }
+    assert_eq!(b.holding(), before);
+}
+
 /// G-91 (Security Lead on #457): an answer that can't be judged (peers
 /// sent the log without its genesis) keeps the server waiting; the next
 /// full answer brings it back. One bad round never loses a server.
@@ -5616,4 +5771,48 @@ fn a_waiting_restore_pauses_while_locked_and_resumes_after() {
     assert!(load(&net.fetches) > fetches, "the backup is fetched again after unlock");
     assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
     assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): a log that has the genesis but lacks my
+/// join makes the join look refused ("invalid"), yet proves nothing: the
+/// server keeps waiting, and comes back once a full log arrives. Only an
+/// accepted kick or leave of me (or a close) drops it.
+#[test]
+fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let server = bob.core.create_server("Bob's", AgeRestriction::None).unwrap();
+    me.core.join_server(&server.invite_link).unwrap();
+    me.core.sync_now().unwrap();
+    let my_key = peer_key(&me);
+
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    *net.hide_joins_of.lock().unwrap() = Some(my_key);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(created.words).unwrap();
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "not dropped");
+
+    *net.hide_joins_of.lock().unwrap() = None;
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    let back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(back, [server.id]);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+fn peer_key(peer: &Peer) -> PublicKey {
+    let id = peer.core.get_identity().unwrap().unwrap().id;
+    PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
 }

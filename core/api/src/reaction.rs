@@ -451,10 +451,10 @@ mod tests {
             }
         }
         // Length limits.
-        assert!(normalize(&"👍\u{200D}".repeat(5).trim_end_matches('\u{200D}').to_owned()).is_some());
-        let eleven = vec!["👍"; 6].join("\u{200D}");
+        assert!(normalize("👍\u{200D}".repeat(5).trim_end_matches('\u{200D}')).is_some());
+        let eleven = ["👍"; 6].join("\u{200D}");
         assert!(normalize(&eleven).is_none(), "11 scalars");
-        let long = vec!["🫶"; 5].join("\u{200D}"); // 5*4 + 4*3 = 32 bytes, 9 scalars
+        let long = ["🫶"; 5].join("\u{200D}"); // 5*4 + 4*3 = 32 bytes, 9 scalars
         assert_eq!(long.len(), 32);
         assert!(normalize(&long).is_some());
         assert!(normalize(&format!("{long}\u{1F3FB}")).is_none(), "33 bytes");
@@ -471,7 +471,7 @@ mod tests {
             Reaction::decode(&short),
             Some(Reaction { target, on: true, emoji: "👍".into() })
         );
-        assert_eq!(Reaction::decode(&long).unwrap().on, false);
+        assert!(!Reaction::decode(&long).unwrap().on);
         // Non-zero padding, a bad length, a bad op, a wrong size, bad UTF-8,
         // an invalid emoji or a stored trailing VS16: refused.
         let mut padded = short.clone();

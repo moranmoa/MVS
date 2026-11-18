@@ -31,11 +31,13 @@
 //   their ttl, and refreshed then: every connection gets the new servers
 //   (setConfiguration) and the offerer restarts ICE on the same connection.
 //   See docs/design/voice-across-networks.md.
-// - Speaking: an AnalyserNode per stream, level over a threshold.
+// - Speaking: an AnalyserNode per stream, sampled 10 times a second through
+//   the G-82 state machine (speaking.ts: 150 ms to turn on, 400 ms to turn off).
 
 import type { CallSignal, CallState, Id } from '../core/types';
 import type { VoiceCore } from './adapter';
 import { cleanTurnCredentials, iceServersFor, normalizeFingerprint, soleFingerprint, type TurnCredentials } from './sdp';
+import { quiet, rms, stepSpeaking, type SpeakState } from './speaking';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'failed';
 
@@ -169,7 +171,6 @@ const MAX_PEERS = 4; // 5 in a call, me included
 const MAX_TRICKLED_ICE = 32;
 const OFFER_ATTEMPTS = 3;
 const SPEAKING_POLL_MS = 100;
-const SPEAKING_HOLD_MS = 300;
 
 interface Peer {
   id: Id;
@@ -201,7 +202,8 @@ interface Meter {
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
   buffer: Float32Array<ArrayBuffer>;
-  lastLoud: number;
+  /** G-82: the speaking state machine (speaking.ts). */
+  speak: SpeakState;
 }
 
 export function browserEnv(): VoiceEnv {
@@ -544,7 +546,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       const analyser = c.createAnalyser();
       analyser.fftSize = 512;
       source.connect(analyser); // not to the destination: the <audio> element plays it
-      return { source, analyser, buffer: new Float32Array(analyser.fftSize), lastLoud: -Infinity };
+      return { source, analyser, buffer: new Float32Array(analyser.fftSize), speak: quiet() };
     } catch {
       return null;
     }
@@ -558,19 +560,21 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     }
   }
 
+  /** G-82: one sample (at most every SPEAKING_POLL_MS) through the state machine. */
   function loud(m: Meter, now: number): boolean {
     m.analyser.getFloatTimeDomainData(m.buffer);
-    let sum = 0;
-    for (const v of m.buffer) sum += v * v;
-    if (Math.sqrt(sum / m.buffer.length) > threshold) m.lastLoud = now;
-    return now - m.lastLoud < SPEAKING_HOLD_MS;
+    m.speak = stepSpeaking(m.speak, rms(m.buffer), now, threshold);
+    return m.speak.on;
   }
 
   function pollSpeaking() {
     if (!active || !me) return;
     const now = Date.now();
     const next: Record<Id, boolean> = {};
-    next[me] = !micMuted && !!localMeter && loud(localMeter, now);
+    // My meter keeps sampling while muted (a disabled track is silent), so
+    // unmuting starts from an honest state; muted is never shown speaking.
+    const mine = !!localMeter && loud(localMeter, now);
+    next[me] = !micMuted && mine;
     for (const p of peers.values()) next[p.id] = p.verified && !!p.meter && loud(p.meter, now);
     const keys = new Set([...Object.keys(next), ...Object.keys(speaking)]);
     if ([...keys].some((k) => next[k] !== speaking[k])) {

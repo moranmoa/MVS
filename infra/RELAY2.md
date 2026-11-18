@@ -30,6 +30,28 @@ rewrites inbound source addresses to it, like relay-1's), then run the same
 command again. Relay-2's peer ID is in its first `relay node started` log
 line; keep it out of the repo.
 
+## One DHT for both relays (`PEER_RELAYS`)
+
+Each relay's `.env` names the other in `PEER_RELAYS` (comma-separated,
+pinned by `/p2p/`, **IP addresses only**: the relay has no DNS since #443).
+They then share one DHT: a client asking relay-2 about a backup tag only
+relay-1 holds is pointed at relay-1. On the same PC, each reaches the other
+through the Docker host, via its own network's gateway and the other's
+*host* port:
+
+```text
+relay-1 .env:  PEER_RELAYS=/ip4/<infra_default gateway>/tcp/4011/p2p/<relay-2 peer id>
+relay-2 .env:  PEER_RELAYS=/ip4/<infra2_default gateway>/tcp/4001/p2p/<relay-1 peer id>
+```
+
+The start-up log shows `peer relays peer_relays=1`; a bad entry is skipped
+with a warning naming its position only.
+
+**Ops rule (Security Lead):** `PEER_RELAYS` holds only the Docker network
+gateway address, **never the host's LAN IP**. The relay uses these addresses
+to dial only and removes them from its DHT once the other relay identifies
+itself, so they aren't served to clients (#459).
+
 ## Router (owner)
 
 Forward to this PC, next to relay-1's 4001 rules:

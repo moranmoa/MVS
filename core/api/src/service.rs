@@ -4966,7 +4966,7 @@ impl Inner {
                     Some(name) => Some(name),
                     None => self.db.get(&blocked_name_key(&user))?.and_then(|b| String::from_utf8(b).ok()),
                 };
-                Ok(BlockedUser { user_id: model::hex_id(user.as_bytes()), name })
+                Ok(BlockedUser { user_id: model::hex_id(user.as_bytes()), short_code: model::short_code(&user), name })
             })
             .collect()
     }

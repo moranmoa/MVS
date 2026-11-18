@@ -31,6 +31,7 @@ import type {
   VoiceRoom,
   CoreSettings,
   TypingState,
+  ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
@@ -172,6 +173,8 @@ export interface CoreCommands {
   setTyping(channelId: Id, on: boolean): Promise<null>;
   getSettings(): Promise<CoreSettings>;
   setTypingIndicator(on: boolean): Promise<null>;
+  /** G-91: how far my servers are from coming back after a restore. */
+  getServerRestore(): Promise<ServerRestore>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -266,6 +269,8 @@ export interface CoreEvents {
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
   /** G-29: who is typing in a channel (coalesced, at most 5; a typer drops 6 s after the last "on"). */
   typing: TypingState;
+  /** G-91: sent when anything in the restore progress changes. */
+  'serverRestore.changed': ServerRestore;
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
   /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */

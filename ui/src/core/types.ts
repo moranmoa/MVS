@@ -376,6 +376,16 @@ export interface CoreSettings {
   typingIndicator: boolean;
 }
 
+/**
+ * G-91: my servers coming back after a restore or a device link (#457).
+ * `found`: live servers the backup lists (0 until found); `waiting`: of those, not back yet.
+ */
+export interface ServerRestore {
+  state: 'none' | 'searching' | 'waiting' | 'done';
+  found: number;
+  waiting: number;
+}
+
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */
 export interface CallSignal {
   from: Id;

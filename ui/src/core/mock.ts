@@ -11,6 +11,7 @@ import type {
   CallState,
   VoiceRoom,
   CoreSettings,
+  ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
   MemberRelay,
@@ -94,6 +95,8 @@ export interface MockOptions {
   messageGapMs?: number;
   /** G-29: this many demo members are typing in the open channel (1-3). */
   typing?: number;
+  /** G-91: hold the restore progress at this state (screenshots); otherwise it plays out. */
+  restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -762,6 +765,7 @@ export class MockCore implements CoreApi {
     this.words = clean;
     this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
     this.save();
+    this.playRestore();
     return this.identity;
   }
 
@@ -828,6 +832,7 @@ export class MockCore implements CoreApi {
       this.save();
       this.emit('deviceLink.state', { state: 'done' });
       this.emit('identity.changed', this.identity);
+      this.playRestore();
       return;
     }
     this.emit('deviceLink.state', { state, ...(state === 'confirm' ? { sas: '482913' } : {}), ...(reason ? { reason } : {}) });
@@ -850,6 +855,32 @@ export class MockCore implements CoreApi {
     if (!this.approval) throw err({ code: 'bad-request' });
     this.approval = null;
     return null;
+  }
+
+  // ---- G-91: servers coming back after a restore ---------------------------------
+
+  private serverRestore: ServerRestore = { state: 'none', found: 0, waiting: 0 };
+
+  async getServerRestore(): Promise<ServerRestore> {
+    return { ...this.serverRestore };
+  }
+
+  /** Mock only: set the restore progress (and announce it). */
+  simulateServerRestore(next: ServerRestore): void {
+    this.serverRestore = next;
+    this.emit('serverRestore.changed', { ...next });
+  }
+
+  /** After a restore or a device link: searching, then 3 found with 2 waiting, then done. */
+  private playRestore(): void {
+    const hold = this.options.restore;
+    const states: ServerRestore[] = [
+      { state: 'searching', found: 0, waiting: 0 },
+      { state: 'waiting', found: 3, waiting: 2 },
+      { state: 'done', found: 3, waiting: 0 },
+    ];
+    const last = hold ? states.findIndex((s) => s.state === hold) : states.length - 1;
+    states.slice(0, last + 1).forEach((s, i) => this.timers.push(setTimeout(() => this.simulateServerRestore(s), i === 0 ? 0 : i * 1500)));
   }
 
   async signOut(words?: string[], withoutWords?: boolean): Promise<null> {

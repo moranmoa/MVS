@@ -65,6 +65,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     keyPending: (params.get('keyPending') as MockOptions['keyPending']) ?? undefined,
     relayOnly: params.has('relayOnly'),
     typing: params.has('typing') ? Number(params.get('typing')) || 1 : undefined,
+    restore: (['searching', 'waiting', 'done'] as const).find((s) => s === params.get('restore')),
     messageGapMs: params.has('gapHours') ? Math.max(0.01, Number(params.get('gapHours')) || 1) * 3_600_000 : undefined,
     deviceLinked: params.has('deviceLinked') ? (params.get('deviceLinked') ?? '') : undefined,
     deviceLink: (['confirm', 'expired', 'failed'] as const).find((s) => s === params.get('deviceLink')),

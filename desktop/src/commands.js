@@ -60,6 +60,8 @@ const COMMANDS = Object.freeze({
   setTyping: ['channelId', 'on'],
   getSettings: [],
   setTypingIndicator: ['on'],
+  // G-91: servers coming back after a restore
+  getServerRestore: [],
   // Voice (#223); voice rooms (0.4.3)
   listVoiceRooms: ['serverId'],
   createVoiceRoom: ['serverId'],

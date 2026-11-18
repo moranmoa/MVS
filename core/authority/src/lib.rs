@@ -807,6 +807,12 @@ pub struct State {
     /// G-14: live channels' topics, the latest accepted in linear order;
     /// a cleared or never-set topic is absent.
     pub topics: BTreeMap<ChannelId, String>,
+    /// B7-k: per live channel, the latest accepted `ChannelCreate` or
+    /// `ChannelEdit` in linear order that set it 18+. A channel turned plain
+    /// keeps its entry (the next 18+ edit replaces it); a deleted channel's
+    /// goes. `core/api` drops 18+ channel records whose deps don't reach it
+    /// unless their author is an adult now.
+    pub adult_edits: BTreeMap<ChannelId, RecordId>,
     /// Deleted channels: their IDs aren't created again.
     pub deleted_channels: BTreeSet<ChannelId>,
     /// The latest accepted rename in linear order; `None` keeps the genesis
@@ -1108,17 +1114,24 @@ fn apply_channel(state: &mut State, record: &Record, action: &Action) {
             let entry =
                 Channel { name: name.clone(), adult: *adult, general, created: record.id() };
             state.channels.insert(*channel, entry);
+            if *adult {
+                state.adult_edits.insert(*channel, record.id());
+            }
         }
         Action::ChannelEdit { channel, adult, name } => {
             if let Some(entry) = state.channels.get_mut(channel) {
                 entry.name = name.clone();
                 entry.adult = *adult;
+                if *adult {
+                    state.adult_edits.insert(*channel, record.id());
+                }
             }
         }
         Action::ChannelDelete { channel } => {
             state.channels.remove(channel);
             state.deleted_channels.insert(*channel);
             state.topics.remove(channel);
+            state.adult_edits.remove(channel);
         }
         // G-14: the latest accepted topic in linear order counts.
         Action::ChannelTopic { channel, topic } => {

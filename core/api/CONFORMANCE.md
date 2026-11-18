@@ -484,6 +484,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
+- 18+ channels, the receiver rule (B7-k, Tech Lead and Security Lead on #544). In a channel that is 18+ in my current fold, a Message, MessageEdit or Reaction counts only if:
+  - (a) its author is an adult at the record's causal position: their latest accepted age claim before its `auth_deps` (`Resolver::adult_at`); and
+  - (b) if its `auth_deps` don't reach the latest edit that made the channel 18+ (`State.adult_edits`, `Resolver::reaches`), its author is also an adult now.
+  - A failing record is dropped like a kicked author's: not shown, never unread, a mention or a notice. It stays in the log. A plain channel, or one turned plain, has no check. Nothing is cached per record: it's recomputed on every fold.
+  - So a minor's post with stale deps is dropped, and an adult who lowers their age keeps what they posted after the channel turned 18+. Posts from before the flip by someone who isn't an adult now are hidden: the accepted cost.
+  - **Accepted residual (Security Lead):** a former adult whose claim a modified client lowered can still post with stale deps that point at an adult moment after the edit. The claim is self-attested anyway (GAP-22).
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

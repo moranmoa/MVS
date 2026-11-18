@@ -75,10 +75,11 @@ describe('G-53: removed accounts', () => {
     });
     await waitFor(() => expect(within(panel).getAllByRole('listitem')).toHaveLength(1));
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith(server.id, b!.id);
+    // Sent as the 64-hex account id the core listed.
+    expect(spy).toHaveBeenCalledWith(server.id, expect.stringMatching(/^[0-9a-f]{64}$/));
     expect(document.activeElement).toBe(within(panel).getByRole('button', { name: /^Undo removal of / }));
     expect(await screen.findByText('Removal undone. They can join again with an invite link.')).toBeTruthy();
-    expect((await core.listRemovedMembers(server.id)).map((r) => r.id)).toEqual([a!.id]);
+    expect((await core.listRemovedMembers(server.id)).map((r) => r.displayName)).toEqual([a!.displayName]);
 
     // The last one: the empty line, focus on the page heading.
     await act(async () => {
@@ -109,7 +110,7 @@ describe('G-53: removed accounts', () => {
 
   it(`over ${REMOVED_PAGE}: the first ${REMOVED_PAGE}, then "Show all"`, async () => {
     const many = Array.from({ length: REMOVED_PAGE + 3 }, (_, i) => ({
-      id: `u${i}`,
+      id: i.toString(16).padStart(64, '0'),
       shortCode: `AAAA-${String(i).padStart(4, '0')}`,
       displayName: `Person ${i}`,
       removedAt: 1_700_000_000_000 + i,
@@ -124,6 +125,16 @@ describe('G-53: removed accounts', () => {
     expect(within(panel).getAllByRole('listitem')).toHaveLength(REMOVED_PAGE + 3);
   });
 
+  it('a kick while the page is open shows up (members.changed; the core sends no server.updated)', async () => {
+    const { core, server, others } = await setup();
+    const { panel } = await openRemoved();
+    expect(await within(panel).findByText('No removed accounts.')).toBeTruthy();
+    await act(async () => {
+      await core.kickMember(server.id, others[0]!.id);
+    });
+    expect(await within(panel).findByRole('button', { name: `Undo removal of ⁨${name(others[0]!)}⁩` })).toBeTruthy();
+  });
+
   it("the Invite page's hint links to the page", async () => {
     await setup();
     const dialog = openSettings();
@@ -136,7 +147,10 @@ describe('G-53: removed accounts', () => {
     expect(document.activeElement).toBe(within(dialog).getByRole('heading', { name: 'Removed accounts', level: 3 }));
   });
 
-  it('the sanitizer keeps only clean fields', () => {
+  it('the sanitizer drops entries without a 64-hex id (SL), and keeps only clean fields', () => {
+    expect(cleanRemovedMember({ id: 'u-tal', shortCode: 'ABCD-EFGH', displayName: 'Tal', removedAt: 1 })).toBeNull();
+    expect(cleanRemovedMember({ id: 'A'.repeat(64), shortCode: 'ABCD-EFGH', displayName: 'Tal', removedAt: 1 })).toBeNull();
+    expect(cleanRemovedMember(null as never)).toBeNull();
     expect(
       cleanRemovedMember({ id: 'a'.repeat(64), shortCode: 'abcd-efgh', displayName: 'Tal‮', removedAt: -5, extra: 1 } as never),
     ).toEqual({ id: 'a'.repeat(64), shortCode: expect.any(String), displayName: expect.not.stringContaining('‮'), removedAt: 0 });

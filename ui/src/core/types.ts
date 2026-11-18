@@ -256,7 +256,6 @@ export interface AppInfo {
   relayOnly?: boolean;
 }
 
-/** An invite to a server (#214). `maxUses` 0 is unlimited; no `expiresAt` is never. */
 /** G-53 (core `listRemovedMembers`): an account the owner removed, who can't rejoin until the owner undoes it. */
 export interface RemovedMember {
   id: Id;
@@ -267,6 +266,7 @@ export interface RemovedMember {
   removedAt: Timestamp;
 }
 
+/** An invite to a server (#214). `maxUses` 0 is unlimited; no `expiresAt` is never. */
 export interface Invite {
   id: Id;
   createdBy: Id;

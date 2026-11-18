@@ -61,6 +61,14 @@ function linkFromArgv(argv) {
   return null;
 }
 
+/**
+ * Does a command line try to open any mvs:// link, well-formed or not? Such a
+ * launch is throttled like a link (SL), not treated as a plain relaunch.
+ */
+function hasLinkArg(argv) {
+  return Array.isArray(argv) && argv.some((a) => typeof a === 'string' && a.toLowerCase().startsWith(`${SCHEME}://`));
+}
+
 /** The invite link in a command line, or null (an older name, kept for callers). */
 function inviteFromArgv(argv) {
   const l = linkFromArgv(argv);
@@ -80,4 +88,4 @@ function createFocusThrottle({ ms = FOCUS_EVERY_MS, now = Date.now } = {}) {
   };
 }
 
-module.exports = { SCHEME, FOCUS_EVERY_MS, parseInviteLink, parseMessageLink, parseLink, linkFromArgv, inviteFromArgv, createFocusThrottle };
+module.exports = { SCHEME, FOCUS_EVERY_MS, parseInviteLink, parseMessageLink, parseLink, linkFromArgv, hasLinkArg, inviteFromArgv, createFocusThrottle };

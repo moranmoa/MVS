@@ -747,11 +747,17 @@ app.whenReady().then(async () => {
 });
 
 app.on('second-instance', (_event, argv) => {
-  // A link brings the window forward itself (throttled); a plain relaunch always does.
+  // A link brings the window forward itself (throttled); so does a malformed
+  // mvs:// argument (SL), which is otherwise ignored. A plain relaunch always does.
   const link = deeplink.linkFromArgv(argv);
   if (link) return openLink(link);
   const win = BrowserWindow.getAllWindows()[0];
-  if (win) bringForward(win);
+  if (!win) return;
+  if (deeplink.hasLinkArg(argv)) {
+    if (linkFocus.allow()) bringForward(win);
+    return;
+  }
+  bringForward(win);
 });
 
 app.on('will-quit', () => {

@@ -3,7 +3,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { FOCUS_EVERY_MS, parseInviteLink, parseMessageLink, parseLink, linkFromArgv, inviteFromArgv, createFocusThrottle } = require('../src/deeplink');
+const { FOCUS_EVERY_MS, parseInviteLink, parseMessageLink, parseLink, linkFromArgv, hasLinkArg, inviteFromArgv, createFocusThrottle } = require('../src/deeplink');
 
 const S = 'a'.repeat(64);
 const I = '0123456789abcdef'.repeat(4);
@@ -108,6 +108,12 @@ test('G-30: in argv the first mvs:// argument decides, either kind', () => {
   assert.deepEqual(linkFromArgv([exe, MSG, GOOD]), { kind: 'message', ...IDS });
   assert.equal(linkFromArgv([exe, `--x=${MSG}`]), null);
   assert.equal(linkFromArgv(MSG), null);
+  // A malformed mvs:// argument is no link, but still counts as a link launch (throttled focus, SL).
+  assert.equal(hasLinkArg([exe, 'MVS://nonsense']), true);
+  assert.equal(hasLinkArg([exe, MSG]), true);
+  assert.equal(hasLinkArg([exe, '--x=mvs://m/1']), false);
+  assert.equal(hasLinkArg([exe]), false);
+  assert.equal(hasLinkArg('mvs://x'), false);
   // The old helper only ever gives an invite.
   assert.equal(inviteFromArgv([exe, MSG]), null);
 });

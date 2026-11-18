@@ -464,7 +464,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
 - Blocked accounts (G-47):
   - `listBlocked()` returns `BlockedUser[]`, `{ userId, name? }`, ordered by `userId`: everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
-  - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request`; an ID that isn't 64 hex is `not-found`.
+  - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.

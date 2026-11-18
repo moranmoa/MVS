@@ -123,6 +123,7 @@ fn block_user_still_toggles_and_self_or_bad_ids_are_refused() {
     assert!(me.core.list_blocked().unwrap().is_empty());
 
     assert_eq!(call(&me, "setBlocked", json!({ "userId": my_id, "blocked": true })).unwrap_err(), "bad-request");
+    assert_eq!(call(&me, "blockUser", json!({ "userId": my_id })).unwrap_err(), "bad-request", "the toggle too");
     assert_eq!(call(&me, "setBlocked", json!({ "userId": "zz", "blocked": true })).unwrap_err(), "not-found");
     assert!(call(&me, "setBlocked", json!({ "userId": other_id })).is_err(), "blocked is required");
     assert!(me.core.list_blocked().unwrap().is_empty());

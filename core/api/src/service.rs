@@ -753,7 +753,7 @@ impl Core {
     }
 
     pub fn create_identity(&self, input: NewIdentityInput) -> CoreResult<CreatedIdentity> {
-        self.run(|inner, ports, events| {
+        self.run(|inner, _, events| inner.set_blocked(user, blocked, events))|inner, ports, events| {
             inner.recheck_keyring(ports)?;
             if inner.me.is_some() {
                 return Err(ErrorCode::NotAllowed.into());
@@ -2606,12 +2606,7 @@ impl Core {
     /// `bad-request`.
     pub fn set_blocked(&self, user_id: &str, blocked: bool) -> CoreResult<()> {
         let user = parse_user(user_id)?;
-        self.run(|inner, _, events| {
-            if inner.me.as_ref().map(Me::key) == Some(user) {
-                return Err(ErrorCode::BadRequest.into());
-            }
-            inner.set_blocked(user, blocked, events)
-        })
+        self.run(|inner, _, events| inner.set_blocked(user, blocked, events))
     }
 
     /// G-47 `listBlocked()`: everyone I blocked, also those I share no
@@ -4793,6 +4788,10 @@ impl Inner {
     /// later), the members of servers it's in are re-sent, and
     /// `blocks.changed` carries the new list.
     fn set_blocked(&mut self, user: PublicKey, blocked: bool, events: &mut Events) -> CoreResult<()> {
+        // Never myself, from either command (Security Lead on #502).
+        if self.me.as_ref().map(Me::key) == Some(user) {
+            return Err(ErrorCode::BadRequest.into());
+        }
         let name = if blocked { self.known_names(&[user])?.remove(&user) } else { None };
         if !self.db.set_block(&user, blocked)? {
             return Ok(());

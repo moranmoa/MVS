@@ -5,7 +5,8 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { createContext, Fragment, memo, useCallback, useContext, useMemo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import type { MessageWindow } from '../../app/store';
-import type { Member, Message } from '../../core';
+import { isCoreError, useCore, type Member, type Message } from '../../core';
+import { EmojiPicker } from '../../components/EmojiPicker';
 import { isHeld } from '../../core/sanitize';
 import { MENTION, splitMentions } from '../../app/mentions';
 import { Avatar, Code, Name } from '../../components/common';
@@ -18,6 +19,7 @@ import {
   EditIcon,
   ReplyIcon,
   TrashIcon,
+  SmilePlusIcon,
 } from '../../components/icons';
 import { paragraphs, textDir, useUiDir } from '../../app/textDir';
 import { displayName, lookalikeIds, LookalikeTag } from './MemberList';
@@ -94,6 +96,20 @@ export function MessageList({
   const count = win.count;
   const flagged = useMemo(() => lookalikeIds([...memberMap.values()]), [memberMap]);
   const store = useAppStore();
+  const core = useCore();
+  // G-26: the message the emoji picker is open for.
+  const [pickerFor, setPickerFor] = useState<Message | null>(null);
+  const react = useCallback(
+    (m: Message, emoji: string, on: boolean) => {
+      core.react(m.id, emoji, on).catch((e) => {
+        const code = isCoreError(e) ? e.code : null;
+        store.showFlash(
+          code === 'bad-request' ? 'reactions.tooMany' : code === 'update-needed' ? 'reactions.updateNeeded' : code === 'rate-limited' ? 'reactions.slowDown' : 'error.generic',
+        );
+      });
+    },
+    [core, store],
+  );
   const { bind, menu } = useContextMenu();
   const announcement = useNewMessageAnnouncement(win, count, atBottom, myId, memberMap);
   // B25 §2: the message menu, the same actions as the row's toolbar. Deleted
@@ -116,6 +132,7 @@ export function MessageList({
           ]
         : [
           { key: 'reply', label: intl.formatMessage({ id: 'chat.reply' }), onSelect: () => handlers.onReply(m) },
+          ...((m.reactions?.length ?? 0) < REACTIONS_SHOWN ? [{ key: 'react', label: intl.formatMessage({ id: 'reactions.add' }), onSelect: () => setPickerFor(m) }] : []),
           {
             key: 'copy',
             label: intl.formatMessage({ id: 'menu.copyText' }),
@@ -364,6 +381,8 @@ export function MessageList({
                     onReveal={reveal}
                     onJumpToReply={jumpToReply}
                     {...handlers}
+                    onAddReaction={setPickerFor}
+                    onReact={react}
                   />
                 ) : (
                   <div className="msg skeleton" aria-hidden="true">
@@ -402,6 +421,47 @@ export function MessageList({
         </button>
       )}
       {menu}
+      <EmojiPicker open={!!pickerFor} onClose={() => setPickerFor(null)} onPick={(emoji) => pickerFor && react(pickerFor, emoji, true)} />
+    </div>
+  );
+}
+
+/** G-26: at most this many different emoji show under a message (the core's display cap). */
+const REACTIONS_SHOWN = 20;
+
+/** G-26: the chips under a message: the emoji and the count; mine is pressed. Click toggles mine. */
+function Reactions({ message: m, tab, onAdd, onReact }: { message: Message; tab: number; onAdd: (m: Message) => void; onReact: (m: Message, emoji: string, on: boolean) => void }) {
+  const intl = useIntl();
+  const list = m.reactions ?? [];
+  return (
+    <div className="reactions" role="group" aria-label={intl.formatMessage({ id: 'reactions.label' })}>
+      {list.map((r) => {
+        const label = intl.formatMessage({ id: 'reactions.pill' }, { emoji: r.emoji, count: r.count });
+        return (
+          <button
+            key={r.emoji}
+            type="button"
+            tabIndex={tab}
+            className={`reaction ${r.mine ? 'mine' : ''}`}
+            aria-pressed={r.mine}
+            aria-label={label}
+            title={label}
+            onClick={() => onReact(m, r.emoji, !r.mine)}
+          >
+            <span className="reaction-emoji" aria-hidden="true">
+              {r.emoji}
+            </span>
+            <bdi dir="ltr" className="reaction-count" aria-hidden="true">
+              {r.count}
+            </bdi>
+          </button>
+        );
+      })}
+      {list.length < REACTIONS_SHOWN && (
+        <button type="button" tabIndex={tab} className="reaction add" aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })} onClick={() => onAdd(m)}>
+          +
+        </button>
+      )}
     </div>
   );
 }
@@ -422,6 +482,8 @@ const MessageRow = memo(function MessageRow({
   onEdit,
   onDelete,
   onRetry,
+  onAddReaction,
+  onReact,
 }: {
   message: Message;
   author?: Member;
@@ -434,6 +496,9 @@ const MessageRow = memo(function MessageRow({
   revealed: boolean;
   onReveal: (authorId: string) => void;
   onJumpToReply: (index: number) => void;
+  /** G-26: open the picker for this message. */
+  onAddReaction: (m: Message) => void;
+  onReact: (m: Message, emoji: string, on: boolean) => void;
 } & Handlers) {
   const intl = useIntl();
   const uiDir = useUiDir();
@@ -530,6 +595,7 @@ const MessageRow = memo(function MessageRow({
               <FormattedMessage id="chat.clipped" />
             </p>
           )}
+          {!m.deleted && !isHeld(m) && !!m.reactions?.length && <Reactions message={m} tab={tab} onAdd={onAddReaction} onReact={onReact} />}
           {mine && m.sendState && <SendStateView message={m} onRetry={onRetry} tab={tab} />}
         </div>
       </div>
@@ -538,6 +604,11 @@ const MessageRow = memo(function MessageRow({
         <button type="button" tabIndex={tab} onClick={() => onReply(m)} aria-label={intl.formatMessage({ id: 'chat.reply' })} title={intl.formatMessage({ id: 'chat.reply' })}>
           <ReplyIcon />
         </button>
+        {!m.deleted && (m.reactions?.length ?? 0) < REACTIONS_SHOWN && (
+          <button type="button" tabIndex={tab} onClick={() => onAddReaction(m)} aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })}>
+            <SmilePlusIcon />
+          </button>
+        )}
         {mine && (
           <button type="button" tabIndex={tab} onClick={() => onEdit(m)} aria-label={intl.formatMessage({ id: 'chat.edit' })} title={intl.formatMessage({ id: 'chat.edit' })}>
             <EditIcon />

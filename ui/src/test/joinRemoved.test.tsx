@@ -37,3 +37,15 @@ describe('G-53: join as a removed account', () => {
     expect(screen.queryByRole('dialog', { name: 'Join a server' })).toBeNull();
   });
 });
+
+describe('join statuses from the core', () => {
+  it("keep only their phase's fields; an unknown phase becomes 'invalid'", async () => {
+    const { cleanJoin } = await import('../core/sanitize');
+    const link = 'mvs://join/abc';
+    expect(cleanJoin({ phase: 'removed', link, extra: 1 } as never)).toEqual({ phase: 'removed', link: expect.any(String) });
+    expect(cleanJoin({ phase: 'joined', link, serverId: 's1' } as never)).toMatchObject({ phase: 'joined', serverId: 's1' });
+    expect(cleanJoin({ phase: 'age-blocked', link, required: '18+' } as never)).toMatchObject({ phase: 'age-blocked', required: '18+' });
+    expect(cleanJoin({ phase: 'banned-forever', link } as never)).toEqual({ phase: 'invalid', link: expect.any(String) });
+    expect(cleanJoin(null as never).phase).toBe('invalid');
+  });
+});

@@ -227,7 +227,7 @@ pub const KEY_PENDING_FOR: Duration = Duration::from_secs(120);
 /// key they never get. Counted per channel from when those members were
 /// first seen missing; past it (no moderator online to re-key), messages go
 /// out under the current key again, and the joiners can't read those.
-pub const JOIN_KEY_WAIT: Duration = Duration::from_secs(20);
+pub const JOIN_KEY_WAIT: Duration = Duration::from_secs(0);
 /// Provisional IDs of messages held for their key.
 pub const KEY_PENDING_PREFIX: &str = "pending-";
 /// Messages held for their key per channel at once; more get `not-allowed`.

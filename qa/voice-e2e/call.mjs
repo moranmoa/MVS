@@ -29,6 +29,19 @@ const JOIN_ONLY = !!process.env.JOIN_ONLY;
 const EXPECT_PATH = process.env.EXPECT_PATH || '';
 const SETUP_MAX_MS = Number(process.env.SETUP_MAX_MS || 10_000);
 if (EXPECT_PATH && !['direct', 'relay'].includes(EXPECT_PATH)) throw new Error('EXPECT_PATH must be direct or relay');
+// G-81 two-NAT scenarios (run-two-nat.sh), inert unless set:
+// EXPECT_CONNECT=none: the call must fail ("no voice connection" within
+//   CONNECT_FAIL_MAX_MS, never a relay candidate); the audio checks are
+//   skipped and the run ends after the G81 checks (G81.3).
+// EXPECT_STUN=answered|unreachable: the voice settings' connection
+//   diagnostics show STUN as answered or unreachable (G81.4, needs #496).
+const EXPECT_CONNECT = process.env.EXPECT_CONNECT || '';
+const CONNECT_FAIL_MAX_MS = Number(process.env.CONNECT_FAIL_MAX_MS || 35_000);
+const EXPECT_STUN = process.env.EXPECT_STUN || '';
+if (EXPECT_CONNECT && EXPECT_CONNECT !== 'none') throw new Error('EXPECT_CONNECT must be none');
+if (EXPECT_STUN && !['answered', 'unreachable'].includes(EXPECT_STUN)) throw new Error('EXPECT_STUN must be answered or unreachable');
+/** Thrown to end an EXPECT_CONNECT=none run after its checks (not a failure). */
+const EARLY_END = Symbol('early end');
 /** When I pressed OK on the IP notice (the join), for the setup time. */
 let joinedAt = 0;
 const OTHER = ROLE === 'a' ? 'b' : 'a';
@@ -530,7 +543,25 @@ try {
   }
 
   let connectedAfterMs = 0;
-  const connected = await check('V2.2', 'the WebRTC connection to the other side reaches "connected"', async () => {
+  /** Local candidate types per connection, from the SDP: "udp host" etc. Never an address. */
+  const localCandidateTypes = () =>
+    page.evaluate(() =>
+      (window.__pcs ?? [])
+        .filter((pc) => pc.connectionState !== 'closed')
+        .map((pc) => (pc.localDescription?.sdp.match(/a=candidate:[^\r\n]*/g) ?? []).map((c) => { const f = c.split(' '); return `${f[2].toLowerCase()} ${f[7]}`; })),
+    );
+  if (EXPECT_CONNECT === 'none') {
+    const from = Date.now();
+    await check('G81.3', `the call fails cleanly: "no voice connection" within ${CONNECT_FAIL_MAX_MS / 1000} s, never connected, no relay candidate`, async () => {
+      await until('peer-failed shown', async () => (await page.locator('.call-peer-failed').count()) > 0, CONNECT_FAIL_MAX_MS, 250);
+      const took = `${((Date.now() - from) / 1000).toFixed(1)} s`;
+      if ((await live()).some((x) => x.state === 'connected')) throw new Error(`a connection reached "connected" (${took})`);
+      const types = (await localCandidateTypes()).flat();
+      if (types.some((t) => t.endsWith(' relay'))) throw new Error(`a relay candidate: ${types.join(', ')}`);
+      return `shown after ${took}; local ${[...new Set(types)].join(', ') || 'none'}`;
+    });
+  }
+  const connected = EXPECT_CONNECT === 'none' ? false : await check('V2.2', 'the WebRTC connection to the other side reaches "connected"', async () => {
     const c = await until('connected', async () => (await live()).find((x) => x.state === 'connected'), 45_000, 250);
     if (joinedAt) connectedAfterMs = Date.now() - joinedAt;
     return `${c.candidates}, dtls ${c.dtls}`;
@@ -600,6 +631,50 @@ try {
       if (!(c?.bytesOut > 0)) throw new Error(`bytesOut ${c?.bytesOut}; my side is the ${c?.role}: ${JSON.stringify(c?.transceivers)}`);
       return `${c.bytesOut} B out as the ${c.role}`;
     });
+  }
+
+  // N10 (Security Lead): STUN only, so my candidates are host and srflx, and
+  // one host per transport. Types only, never an address.
+  await check('G81.5', 'my local candidates are only host and srflx, one host per transport', async () => {
+    const per = await localCandidateTypes();
+    if (!per.length || per.every((l) => !l.length)) throw new Error('no local candidates');
+    for (const list of per) {
+      const bad = list.filter((t) => !/ (host|srflx)$/.test(t));
+      if (bad.length) throw new Error(`not host/srflx: ${bad.join(', ')}`);
+      const hosts = {};
+      for (const t of list.filter((x) => x.endsWith(' host'))) hosts[t.split(' ')[0]] = (hosts[t.split(' ')[0]] ?? 0) + 1;
+      const many = Object.entries(hosts).filter(([, n]) => n !== 1);
+      if (many.length) throw new Error(`hosts per transport: ${JSON.stringify(hosts)}`);
+    }
+    return per.map((l) => [...new Set(l)].join(' + ')).join('; ');
+  });
+
+  // G-81 STUN diagnostics (#496): the call bar's voice settings, "connection diagnostics".
+  if (EXPECT_STUN) {
+    await check('G81.4', `the connection diagnostics show STUN ${EXPECT_STUN}`, async () => {
+      await page.locator('.call-bar .call-settings').click();
+      const dlg = page.locator('dialog.voice-settings, .voice-settings[role="dialog"]').first();
+      await dlg.waitFor({ state: 'visible', timeout: 5000 });
+      const diag = dlg.locator('details.voice-diag');
+      if (!(await diag.count())) throw new Error('no details.voice-diag (needs #496)');
+      if (!(await diag.evaluate((d) => d.open))) await diag.locator('summary').click();
+      const stun = diag.locator('.diag-stun');
+      await stun.waitFor({ state: 'visible', timeout: 15_000 });
+      // Give a pending probe a moment to settle, then read the class only.
+      await sleep(2000);
+      const cls = (await stun.getAttribute('class')) ?? '';
+      const got = /\berror\b/.test(cls) ? 'unreachable' : 'answered';
+      await page.keyboard.press('Escape').catch(() => {});
+      if (got !== EXPECT_STUN) throw new Error(`got ${got} (class "${cls}")`);
+      return `class "${cls}"`;
+    });
+  }
+
+  if (EXPECT_CONNECT === 'none') {
+    // Nothing else can run without a connection: end here, together.
+    put('g81-done');
+    await take('g81-done', 60_000).catch(() => {});
+    throw EARLY_END;
   }
 
   // Permissions while in the call: microphone yes; camera, screen, desktop audio no.
@@ -924,9 +999,13 @@ try {
   });
   }
 } catch (e) {
-  ok = false;
-  record('FAIL', 'run', 'the scenario stopped', e?.message ?? String(e));
-  put('abort', { error: e?.message ?? String(e) });
+  if (e === EARLY_END) {
+    log('EXPECT_CONNECT=none: ended after the G81 checks');
+  } else {
+    ok = false;
+    record('FAIL', 'run', 'the scenario stopped', e?.message ?? String(e));
+    put('abort', { error: e?.message ?? String(e) });
+  }
 } finally {
   await page.screenshot({ path: join(RV, `${ROLE}-final.png`) }).catch(() => {});
   await sleep(2000);

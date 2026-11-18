@@ -101,6 +101,28 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `Channel.mentions` and `ServerSummary.mentions` count unread messages that mention me (after the read marker, not mine). `markRead` resets them. `ServerSummary.unread` is set when any channel has unread messages; both come from `listServers`.
   - No authority or sync change: mentions are read from the message body.
 
+- "Is typing…" (G-29; design `g29-typing-design.md` with Amendment 1). Ephemeral: never stored, never in a log, the backup or the logs, never unread.
+  - `setTyping(channelId, on: boolean)` returns `null`.
+    - `true` while typing: the first goes out at once, and repeats at most every 3 s while the UI keeps calling it.
+    - `false` on send or clear: `off` goes out once, if `on` went out. `off` also goes 4 s after the last `true`, and `sendMessage` sends it too.
+    - Errors: `not-found` (no channel I can see), `not-allowed` (I can't post there now).
+  - `getSettings()` returns `{ typingIndicator: boolean }`, settings this device keeps. `setTypingIndicator(on)` returns `null`.
+    - "Show others when I'm typing" is on by default and local only.
+    - Off: nothing is sent (turning it off sends `off` wherever I was typing), but others still show.
+  - Event `typing { channelId, userIds }`: who is typing there now, by key, at most 5; an empty list means nobody. It's sent when that set changes, at most one per channel per tick.
+    - A typer is dropped 6 s after their last `on`, at once on `off`, or when their message arrives.
+    - My own other computers (same identity) aren't shown.
+  - **Transport:** sync's `/mvs/typing/1`.
+    - One blob of at most 512 bytes; the answer is empty.
+    - Only to and from verified current members.
+    - Its own caps: per peer a burst of 3, then 1 every 2 s; all peers a burst of 30, then 10 a second.
+    - Older peers fail negotiation, harmlessly. No gate is needed, since nothing is stored.
+  - **Envelope:** `{ v: 1, from, server, channel, ts, nonce, on }`, signed by the identity under `mvs/typing/v1`, with `deny_unknown_fields` on the body and the wrapper. It's dropped quietly unless:
+    - it verifies, is version 1, is within 2 minutes of our clock, and isn't a replay;
+    - it's signed by the identity its peer is bound to;
+    - that identity can read and post in the channel now (a member, not kicked, the channel known, 18+ only with a claim), in one of my servers and a channel I can see.
+  - It's sent to the online members who can read that channel.
+
 - Emoji reactions (G-26; design `g26-reactions-design.md` with Amendment 1):
   - `react(messageId, emoji, on: boolean)` returns `null` and fires `message.updated` for the message. Nothing is signed when it's already so (an add of an emoji I have on, or a removal of one I don't).
   - `Message.reactions?: { emoji, count, mine }[]` (additive) lists at most 20 emoji: the 20 with the most members, ties going to the one that appeared first. They're listed in the order they first appeared, and the field is absent when there are none. A deleted message has none.
@@ -180,7 +202,8 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - **On `restoreIdentity`:** the core fetches the backup (`Network::fetch_backup`), keeps the newest valid one, and rejoins each live server as the same member (#290). It posts no new join, profile or age claim.
     - A server whose log no longer lists me isn't entered.
     - A restore still waiting is tried again. While no backup is found: backoff, after 1 min, doubling (2, 4, 8, 16, 32) up to once an hour. Once it is found: only the servers still waiting, every 30 s (`REJOIN_EVERY_MS`), with no new backup fetch, so each comes back within 2 minutes of a member of it being reachable. Nothing more once it is done. After a restart mid-restore the backup is searched for again.
-    - A server leaves the restore only on a definite answer: back (`Joined`), closed, refused as no longer mine (kicked, not a member: `Invalid` with the server's genesis in hand), or age-blocked. Anything else (nobody reachable, a partial answer, any error) waits for the next try, so one bad round never loses a server (Security Lead on #457).
+    - A server leaves the restore only on a definite answer: back (`Joined`), closed, or refused as no longer mine (`Invalid` with evidence: the log shows an accepted kick or leave of me). Anything else (nobody reachable, a partial answer, age-blocked, any error) waits for the next try, so one bad round never loses a server (Security Lead on #457).
+    - Accepted residual (Security Lead on #472): a partial log that has an old leave of mine but not my later rejoin still drops the server. That errs on the safe side, and an invite link brings it back.
     - The app lock (`Core::lock_keys`) drops the server secrets a waiting restore holds and pauses it; after `unlock_keys` the backup is fetched again. Otherwise, once found, a newer backup isn't fetched again until the next start or unlock.
   - **Progress (G-91):** `getServerRestore()` returns `ServerRestore { state, found, waiting }`. The event `serverRestore.changed` carries the same, sent only when something in it changed.
     - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).

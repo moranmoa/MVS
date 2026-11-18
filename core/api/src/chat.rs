@@ -126,8 +126,13 @@ fn in_known(record: &Record, known: &BTreeSet<ChannelId>) -> bool {
 /// a rotation it already holds is a no-op (`Applied::Duplicate`).
 /// TODO(perf): replay only after an unlock, once the core drives it.
 pub(crate) fn sync_cipher(cipher: &dyn GroupCipher, server: ServerId, log: &Log) {
-    let known = known_channels(server, log.resolver.state());
+    let state = log.resolver.state();
+    let known = known_channels(server, state);
     cipher.set_channels(server, &known);
+    // B7-k: an 18+ channel's key is for the adults among the members only.
+    let adult_channels: BTreeSet<ChannelId> =
+        known.iter().copied().filter(|c| state.channels.get(c).is_some_and(|c| c.adult)).collect();
+    cipher.set_adults(server, &state.adults, &adult_channels);
     let graph = Graph::new(&log.channel, &log.stubs);
     let rotations: Vec<&Record> = log
         .channel

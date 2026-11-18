@@ -478,6 +478,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
   - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+- 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
+  - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
+  - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
+  - Someone entering it (a new 18+ claim) is like a join: re-keyed through the GAP-8 bucket.
+  - Sending: an 18+ channel isn't listed to, or found by, a member without an 18+ claim, so the send is `not-found` (B7 §4: no hint it exists). A raise counts only after its 30 days (decision 18, already in force), so a raised claim never gets the key early.
+  - Not covered yet (follow-up for the TL and SL): receivers don't drop a message a modified minor client seals in an 18+ channel under a key it held before the channel turned 18+.
 - Blocked accounts (G-47):
   - `listBlocked()` returns `BlockedUser[]`, `{ userId, shortCode, name? }`, ordered by `userId` (`shortCode` is the identity code, as `Member.shortCode`, so rows without a name can be told apart, G-47b): everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
   - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.

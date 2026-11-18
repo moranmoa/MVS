@@ -18,7 +18,7 @@
 
 דיאלוג קטן ומודאלי (לא toast), באמצע המסך. בטלפון: bottom sheet.
 - **כותרת:** `call.ipNotice.title`
-- **טקסט:** שתי פסקאות: `call.ipNotice.body` (חיבור ישיר) ו-`call.ipNotice.relay` (ממסר בלבד). שתיהן ב-`aria-describedby`.
+- **טקסט:** שתי פסקאות: `call.ipNotice.bodyP2p` (חיבור ישיר) ו-`call.ipNotice.relay` (ממסר בלבד). שתיהן ב-`aria-describedby`.
 - **כפתורים:** "הבנתי" (`call.ipNotice.ok`, ראשי) ו"ביטול" (`common.cancel`). בצד ה-start של אותה שורה: כפתור-קישור "הגדרות פרטיות" (`call.ipNotice.settings`).
 
 ## 3. מקלדת וקורא מסך
@@ -33,7 +33,7 @@
 | מפתח | עברית | English |
 | --- | --- | --- |
 | `call.ipNotice.title` | `לפני השיחה הראשונה` | `Before your first call` |
-| `call.ipNotice.body` | `בשיחה המחשבים מתחברים ישירות כשאפשר. אז המשתתפים יכולים לראות את כתובת האינטרנט (IP) שלך, ומשתתפים שמחוברים לאותה רשת כמוך יכולים לראות גם את הכתובת המקומית שלך.` | `In a call, computers connect directly when they can. Then the people in it can see your internet address (IP), and anyone in the call on the same network as you can also see your local address.` |
+| `call.ipNotice.bodyP2p` (ב-v2 נשאר `call.ipNotice.body` לגרסאות בלי B) | `בשיחה המחשבים מתחברים ישירות כשאפשר. אז המשתתפים יכולים לראות את כתובת האינטרנט (IP) שלך, ומשתתפים שמחוברים לאותה רשת כמוך יכולים לראות גם את הכתובת המקומית שלך.` | `In a call, computers connect directly when they can. Then the people in it can see your internet address (IP), and anyone in the call on the same network as you can also see your local address.` |
 | `call.ipNotice.relay` | `במצב "ממסר בלבד" השיחה עוברת דרך הממסר של MVS: המשתתפים לא רואים את הכתובת שלך, אבל הממסר רואה מתי יש לך שיחה ומתי עובר ממך קול.` | `In relay-only mode, the call goes through the MVS relay: the people in it can't see your address, but the relay sees when you're in a call and when you're speaking.` |
 | `call.ipNotice.settings` | `הגדרות פרטיות` | `Privacy settings` |
 | `call.ipNotice.ok` | `הבנתי` | `Got it` |

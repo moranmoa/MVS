@@ -21,7 +21,7 @@ use x25519_dalek::StaticSecret;
 
 use crate::devicelink::Payload;
 use crate::recovery::{
-    combine, open_envelope, open_release, recovery_key, Order, Reshare, ShareRecord, MAX_HOLDERS,
+    combine, open_envelope, open_release, recovery_key, Order, Reshare, ShareRecord, CANCEL_WINDOW_MS, MAX_HOLDERS,
     RESHARE_GAP_MS, THRESHOLD,
 };
 
@@ -182,8 +182,16 @@ pub struct Outbox {
 }
 
 impl Outbox {
+    /// Strictly later than the last one, unless the last is far ahead of
+    /// `now` (one bad clock reading): then from `now` again. Otherwise every
+    /// later order would be over a holder's window and refused, and the
+    /// account would silently lose its cancel (Security Lead on #506).
     fn next_at(&mut self, now: u64) -> u64 {
-        self.last_at = now.max(self.last_at + 1);
+        self.last_at = if self.last_at > now.saturating_add(CANCEL_WINDOW_MS / 2) {
+            now
+        } else {
+            now.max(self.last_at + 1)
+        };
         self.last_at
     }
 
@@ -377,6 +385,35 @@ mod tests {
         hold.on_pending([7; 32], NOW);
         assert!(hold.on_cancel(at_a, NOW));
         assert!(hold.on_cancel(at_b, NOW), "the resend counts too");
+    }
+
+    /// One bad clock reading far ahead must not poison every later order:
+    /// past half the window ahead, the next `at` starts from `now` again, and
+    /// a holder on a right clock takes it.
+    #[test]
+    fn a_far_future_last_at_is_dropped() {
+        let record = ShareRecord::sign(&w(), 1, &split(&[3; 32], 3, 3).unwrap()[0], NOW);
+        let mut out = Outbox::default();
+        let (bad, _) = out.cancel(&w(), record.h, NOW + 365 * DAY_MS);
+        assert!(matches!(bad, Order::Cancel { at, .. } if at == NOW + 365 * DAY_MS));
+        let (next, sig) = out.cancel(&w(), record.h, NOW);
+        assert!(matches!(next, Order::Cancel { at, .. } if at == NOW), "{next:?}");
+        let mut hold = Hold::default();
+        hold.on_pending([7; 32], NOW);
+        assert!(next.verify(&sig, &record));
+        let Order::Cancel { at, .. } = next else { panic!("a cancel") };
+        assert!(hold.on_cancel(at, NOW), "a holder takes it");
+        // Deletes too.
+        out.owe_delete(2, &[[1; 32]]);
+        out.next_at(NOW + 365 * DAY_MS);
+        let due = out.deletes_due(&w(), record.h, NOW);
+        assert!(matches!(due[0].0, Order::Delete { at, .. } if at == NOW));
+
+        // A little ahead (within half the window) still counts: strictly later.
+        let mut out = Outbox::default();
+        out.cancel(&w(), record.h, NOW + CANCEL_WINDOW_MS / 2);
+        let (later, _) = out.cancel(&w(), record.h, NOW);
+        assert!(matches!(later, Order::Cancel { at, .. } if at == NOW + CANCEL_WINDOW_MS / 2 + 1));
     }
 
     fn below(o: &Order) -> u64 {

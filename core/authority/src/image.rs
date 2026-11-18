@@ -38,6 +38,9 @@ pub const MAX_PNG_CHUNKS: usize = 64;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
+/// PNG metadata chunks refused: an ICC profile, EXIF and text.
+const PNG_METADATA: [&[u8]; 5] = [b"iCCP", b"eXIf", b"tEXt", b"zTXt", b"iTXt"];
+
 /// The size of a still picture of type `kind` with each side within
 /// `1..=side_max`, or `None`. Strict:
 /// - **PNG:** the signature, IHDR first, at most [`MAX_PNG_CHUNKS`] chunks,
@@ -79,7 +82,9 @@ fn png_size(b: &[u8]) -> Option<(u32, u32)> {
         let len = be32(b, at)? as usize;
         let kind = b.get(at + 4..at + 8)?;
         let end = at.checked_add(12)?.checked_add(len)?;
-        if kind == b"acTL" || end > b.len() {
+        // No animation, and no metadata the canvas re-encode never writes
+        // (Security Lead on #553: a smaller decoder surface).
+        if kind == b"acTL" || PNG_METADATA.contains(&kind) || end > b.len() {
             return None;
         }
         if kind == b"IEND" {
@@ -93,6 +98,10 @@ fn png_size(b: &[u8]) -> Option<(u32, u32)> {
 
 fn webp_size(b: &[u8], side_max: u32) -> Option<(u32, u32)> {
     if b.get(..4)? != b"RIFF" || b.get(8..12)? != b"WEBP" {
+        return None;
+    }
+    // The RIFF size covers everything after itself (Security Lead on #553).
+    if (le32(b, 4)? as usize).checked_add(8)? != b.len() {
         return None;
     }
     let mut size: Option<(u32, u32)> = None;
@@ -111,7 +120,9 @@ fn webp_size(b: &[u8], side_max: u32) -> Option<(u32, u32)> {
         let len = le32(b, at + 4)? as usize;
         let data = b.get(at + 8..(at + 8).checked_add(len)?)?;
         match kind {
-            b"ANIM" | b"ANMF" => return None,
+            // Animation, and metadata (ICC profile, EXIF, XMP) the canvas
+            // re-encode never writes.
+            b"ANIM" | b"ANMF" | b"ICCP" | b"EXIF" | b"XMP " => return None,
             b"VP8X" => {
                 if data.first()? & 0x02 != 0 {
                     return None; // the animation flag

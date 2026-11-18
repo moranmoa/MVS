@@ -106,8 +106,8 @@ fn icons_are_still_png_or_webp_up_to_128_px() {
     let with_vp8x = riff(&[(b"VP8X", vp8x(100, 100, 0)), (b"VP8L", vp8l(100, 100))]);
     assert_eq!(still_size(&with_vp8x, ImageType::Webp, ICON_SIDE_MAX), Some((100, 100)));
 
-    let many_chunks: Vec<(&[u8; 4], Vec<u8>)> = (0..MAX_PNG_CHUNKS).map(|_| (b"tEXt", vec![b'a'])).collect();
-    let refused: [(&str, Vec<u8>, ImageType); 13] = [
+    let many_chunks: Vec<(&[u8; 4], Vec<u8>)> = (0..MAX_PNG_CHUNKS).map(|_| (b"pHYs", vec![b'a'])).collect();
+    let refused: [(&str, Vec<u8>, ImageType); 17] = [
         ("129 px", png(129, 10), ImageType::Png),
         ("0 px", png(0, 10), ImageType::Png),
         ("APNG", png_with(10, 10, &[(b"acTL", vec![0; 8])], &[]), ImageType::Png),
@@ -121,6 +121,10 @@ fn icons_are_still_png_or_webp_up_to_128_px() {
         ("VP8X disagrees", riff(&[(b"VP8X", vp8x(10, 10, 0)), (b"VP8L", vp8l(20, 20))]), ImageType::Webp),
         ("a small VP8X, a huge image", riff(&[(b"VP8X", vp8x(10, 10, 0)), (b"VP8L", vp8l(1000, 1000))]), ImageType::Webp),
         ("trailing bytes", [webp(10, 10), vec![0, 0]].concat(), ImageType::Webp),
+        ("an ICC profile (PNG)", png_with(10, 10, &[(b"iCCP", vec![0; 8])], &[]), ImageType::Png),
+        ("text (PNG)", png_with(10, 10, &[(b"tEXt", vec![b'a'])], &[]), ImageType::Png),
+        ("an ICC profile (WebP)", riff(&[(b"ICCP", vec![0; 8]), (b"VP8L", vp8l(10, 10))]), ImageType::Webp),
+        ("a RIFF size that lies", { let mut b = webp(10, 10); b[4] ^= 2; b }, ImageType::Webp),
     ];
     for (what, bytes, kind) in refused {
         assert_eq!(still_size(&bytes, kind, ICON_SIDE_MAX), None, "{what}");
@@ -223,7 +227,7 @@ fn malformed_bodies_do_not_parse() {
     assert!(parses(Kind::ServerDescription, b"\0text".to_vec()));
     assert!(parses(Kind::ServerDescription, vec![0]), "clears");
     // Over 8 KiB doesn't even sign: `records` caps the body first.
-    let too_big = png_with(16, 16, &[(b"tEXt", vec![b'a'; MAX_SERVER_ICON_BYTES])], &[]);
+    let too_big = png_with(16, 16, &[(b"pHYs", vec![b'a'; MAX_SERVER_ICON_BYTES])], &[]);
     let oversized = Draft {
         server: server(),
         scope: Scope::Control,

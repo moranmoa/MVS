@@ -244,7 +244,7 @@ jobs:
           ELECTRON_ENABLE_LOGGING: "1"
         run: |
           set -o pipefail
-          node --test --test-concurrency=1 test/e2e.test.mjs 2>&1 | tee "$RUNNER_TEMP/e2e-output.log"
+          npm run e2e 2>&1 | tee "$RUNNER_TEMP/e2e-output.log"
       - name: Collect e2e logs
         if: always()
         shell: bash
@@ -301,9 +301,20 @@ jobs:
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm ci --no-audit --no-fund
+      # `npm run e2e` names its files in desktop/package.json: a new e2e file
+      # left out of that list would never run. Fails on any that is.
+      - name: every e2e file is in npm run e2e
+        working-directory: desktop
+        run: |
+          missing=0
+          for f in test/e2e.test.mjs test/*.e2e.test.mjs; do
+            node -e 'const s = require("./package.json").scripts.e2e.split(/\s+/); process.exit(s.includes(process.argv[1]) ? 0 : 1)' "$f" \
+              || { echo "::error::$f is not in npm run e2e (desktop/package.json)"; missing=1; }
+          done
+          exit $missing
       - name: Electron e2e
         working-directory: desktop
-        run: xvfb-run -a node --test --test-concurrency=1 test/e2e.test.mjs
+        run: xvfb-run -a npm run e2e
 
   # B10: the qa/ smoke suite (onboarding -> send -> join by link) against a
   # production build of the UI with the mock core, as qa/compose.yaml runs it.

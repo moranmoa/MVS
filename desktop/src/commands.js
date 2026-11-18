@@ -49,6 +49,8 @@ const COMMANDS = Object.freeze({
   // Safety
   blockUser: ['userId'],
   kickMember: ['serverId', 'userId'],
+  listRemovedMembers: ['serverId'],
+  undoKick: ['serverId', 'userId'],
   // Device link (device-link-slice.md)
   startDeviceLink: [],
   cancelDeviceLink: [],

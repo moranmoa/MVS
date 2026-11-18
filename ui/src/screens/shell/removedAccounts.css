@@ -1,0 +1,57 @@
+/* G-53: server settings → Removed accounts. Theme colours only (AA); the spinner follows reduced motion. */
+.removed-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.removed-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding-block: 0.5rem;
+}
+.removed-row + .removed-row {
+  border-block-start: 1px solid var(--border);
+}
+.removed-who {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.removed-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.removed-when {
+  color: var(--text-muted);
+}
+.removed-undo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+.removed-undo .spinner {
+  width: 0.875rem;
+  height: 0.875rem;
+  border-width: 0.125rem;
+}
+.removed-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+/* Phone: name and code on top; date and a full-width 44px button below. */
+@media (max-width: 600px) {
+  .removed-who {
+    flex-basis: calc(100% - 2.75rem);
+  }
+  .removed-undo {
+    flex-basis: 100%;
+    min-height: 2.75rem;
+    justify-content: center;
+  }
+}

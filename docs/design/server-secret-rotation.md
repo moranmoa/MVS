@@ -1,6 +1,6 @@
 # Design note: rotate the server's sync secret on kick (T17)
 
-**Status:** draft, for the Tech Lead and the Security Lead. **No code** until a direction is chosen.
+**Status:** direction chosen by the Tech Lead (#557): option A. The Security Lead reviews the sealing and serving rules; no code until then.
 **Author:** dev-identity.
 **Follows:** T16 (#100, a kick re-keys every channel).
 
@@ -33,7 +33,7 @@ T17 closes that: after a kick, the remaining members move to a new secret the ki
   - No new wire data at all.
   - But it ties sync to #general's key schedule. A member who hasn't got the new key yet (offline, or no moderator online) can't follow until they do. The waiting-for-a-moderator path already exists for keys (`rekey-waiting`).
 
-**My recommendation is C,** with the SL's view on deriving a transport secret from a content key. It has no wire change and no cap gate, and the "can't follow until keyed" case maps onto the existing `rekey-waiting` state.
+**Decision (Tech Lead on #557): A**, not C. Channel keys rotate for joins, kicks and B7-k, so there is no single agreed "latest #general key", and concurrent rotations would split the server. An 18+ #general (or G-18 later) would strand members who can't read it. And C couples a transport secret to a content-key schedule.
 
 ## Questions
 1. **Distribution:** A, B or C?
@@ -52,3 +52,17 @@ T17 closes that: after a kick, the remaining members move to a new secret the ki
 - A member offline during the rotation catches up.
 - Old invite links behave per Q3.
 - The restore backup carries the current secret.
+
+## Decision and rules (Tech Lead on #557)
+- **Distribution: A.** A new control kind, `SecretRotation`:
+  - the new secret is sealed to each remaining member with groupkeys' per-member boxes, as `KeyRotation` does for channel keys;
+  - it's privileged (moderator and above), so a concurrent kick voids it;
+  - the latest accepted rotation in linear order wins, so concurrent rotations converge.
+- **Serving rule (new):** after a rotation, the old secret serves only a **frozen prefix**: the logs up to and including the rotation record, never anything signed after it. A member who was offline can still fetch the rotation (sealed to them) with the old secret. The kicked member gains nothing new.
+- **Q2, the switch:** members keep fetching on the old secret until every member they can see has posted under the new one, capped at 7 days.
+- **Q3, invites:** re-issue every open invite on rotation, with a notice to owners and admins to re-share links. Old links stop working.
+- **Q4, scope:** a kick or a leave triggers a rotation; a revoke doesn't.
+- **Q5, size:** M.
+- **Gate:** the first user of the `lv:N` cap scheme: `lv:1`. `SecretRotation` is sent only while every member's latest profile carries `lv:1` or higher.
+
+Next: the Security Lead reviews the sealing (the per-member box format, and who may rotate) and the serving rule (how sync enforces the frozen prefix for the old secret). The build follows as small PRs: records and authority first, then sync's serving rule (dev-sync), then core/api.

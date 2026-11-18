@@ -77,7 +77,23 @@ contextBridge.exposeInMainWorld('mvs', {
     state: () => ipcRenderer.invoke('lock:state'),
     unlock: (input) => ipcRenderer.invoke('lock:unlock', input),
     now: () => ipcRenderer.invoke('lock:now'),
+    /**
+     * Settings → Privacy (unlocked only). `config()` -> { enabled,
+     * idleMinutes, lockOnSleep, method } or null. `set({ current?, passcode,
+     * idleMinutes, lockOnSleep })` and `clear({ current })` -> { result:
+     * 'ok'|'wrong'|'rate-limited'|'invalid'|'busy'|'locked', retryAfter? }.
+     * The demo (no core) has no settings.
+     */
+    ...(DEMO
+      ? {}
+      : {
+          config: () => ipcRenderer.invoke('lock:config'),
+          set: (input) => ipcRenderer.invoke('lock:set', input),
+          clear: (input) => ipcRenderer.invoke('lock:clear', input),
+        }),
   }),
+  /** The OS (read-only): 'win32' | 'linux' | 'darwin'. */
+  platform: process.platform,
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

@@ -14,6 +14,7 @@ import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/not
 import { MemberRelaySetting } from './MemberRelay';
 import { DevicesSection } from './Devices';
 import { VoiceSection } from './Voice';
+import { AppLockSection } from '../../lock/AppLockSection';
 import { BlockedList } from './Blocked';
 
 type Section = 'account' | 'privacy' | 'devices' | 'voice' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
@@ -584,6 +585,7 @@ function PrivacySection({ focus, focusBlocked }: { focus?: number; focusBlocked?
         </p>
       )}
       <MemberRelaySetting />
+      <AppLockSection />
       <BlockedList focus={focusBlocked} />
     </div>
   );

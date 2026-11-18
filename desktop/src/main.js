@@ -419,6 +419,20 @@ function serveCoreIpc() {
     return appLock.unlock(input);
   });
   ipcMain.handle('lock:now', (event) => (fromUs(event) ? appLock.lock() : false));
+  // The settings (Settings → Privacy): our own top frame, unlocked only.
+  // setAppLock / clearAppLock are not on the core:invoke allow-list; only
+  // these reach them, one at a time, then main re-reads its config.
+  ipcMain.handle('lock:config', (event) => (fromUs(event) && lockOpen() ? appLock.config() : null));
+  ipcMain.handle('lock:set', async (event, input) => {
+    if (!fromUs(event)) return { result: 'invalid' };
+    if (!lockOpen()) return { result: 'locked' };
+    return appLock.set(input);
+  });
+  ipcMain.handle('lock:clear', async (event, input) => {
+    if (!fromUs(event)) return { result: 'invalid' };
+    if (!lockOpen()) return { result: 'locked' };
+    return appLock.clear(input);
+  });
   ipcMain.handle('badge:set', (event, count) => {
     if (!fromUs(event) || !lockOpen()) return false;
     return unread.set(count);

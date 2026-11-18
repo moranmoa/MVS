@@ -3,7 +3,7 @@
 // the IP notice, the join error line, the roster notes. The audio itself (microphone, WebRTC, speaking levels) is the
 // voice engine's, piece D in ui/src/voice.
 
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
@@ -83,6 +83,27 @@ export function useCallEngine(myId: Id): CallEngine {
   useEffect(() => store.setPttStatus(status), [store, status]);
   const ptt = voice.mode === 'ptt' && !!voice.pttKey;
   return { ...view, error, noMic, peerFailed, talking, ptt };
+}
+
+/**
+ * G-78: the one engine lives above the content (App, inside the lock gate),
+ * so a call keeps going while the lock unmounts everything else (path B).
+ * The context holds call state and controls only, no messages or members.
+ */
+const CallEngineContext = createContext<CallEngine | null>(null);
+
+export function CallEngineProvider({ children }: { children: ReactNode }) {
+  const store = useAppStore();
+  const myId = useStore(store, (s) => s.identity?.id ?? '');
+  const engine = useCallEngine(myId);
+  return <CallEngineContext.Provider value={engine}>{children}</CallEngineContext.Provider>;
+}
+
+/** The shared engine (CallEngineProvider). */
+export function useSharedCallEngine(): CallEngine {
+  const engine = useContext(CallEngineContext);
+  if (!engine) throw new Error('CallEngineProvider missing');
+  return engine;
 }
 
 /**
@@ -261,6 +282,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         <button
           type="button"
           className={`icon-button call-mute ${me?.muted ? 'muted' : ''} ${engine.ptt && engine.talking && !me?.muted ? 'talking' : ''}`}
+          data-call-mute=""
           aria-pressed={!!me?.muted}
           aria-disabled={noMic || undefined}
           aria-describedby={noMic ? 'call-no-mic' : undefined}

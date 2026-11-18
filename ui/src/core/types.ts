@@ -257,6 +257,16 @@ export interface AppInfo {
 }
 
 /** An invite to a server (#214). `maxUses` 0 is unlimited; no `expiresAt` is never. */
+/** G-53 (core `listRemovedMembers`): an account the owner removed, who can't rejoin until the owner undoes it. */
+export interface RemovedMember {
+  id: Id;
+  shortCode: string;
+  /** Its last display name; '' if it never posted one. */
+  displayName: string;
+  /** When it was removed (the kick's time). */
+  removedAt: Timestamp;
+}
+
 export interface Invite {
   id: Id;
   createdBy: Id;

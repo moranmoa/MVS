@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
-const { DEMO_ARG, demoFor } = require('../src/demo');
+const { DEMO_ARG, demoFor, demoProfile } = require('../src/demo');
 
 test('demoFor: a checkout with MVS_DEMO only; never packaged', () => {
   assert.equal(demoFor({ packaged: false, env: { MVS_DEMO: '1' } }), '1');
@@ -17,6 +17,11 @@ test('demoFor: a checkout with MVS_DEMO only; never packaged', () => {
   for (const bad of ['', ' 1', '1&fresh=1', 'a/b', 'x'.repeat(33), '1\n']) {
     assert.equal(demoFor({ packaged: false, env: { MVS_DEMO: bad } }), null, JSON.stringify(bad));
   }
+});
+
+test('demoProfile: a sibling of the real profile, never inside it', () => {
+  assert.equal(demoProfile('/home/u/.config/MVS'), '/home/u/.config/MVS-demo');
+  assert.equal(demoProfile('C:\\Users\\u\\AppData\\Roaming\\MVS\\'), 'C:\\Users\\u\\AppData\\Roaming\\MVS-demo');
 });
 
 test('the preload looks for the same argument main adds', () => {

@@ -182,6 +182,7 @@ async fn node_lan(name: &str, relay: &Multiaddr, allow_lan: bool) -> (Node, mpsc
     let _ = std::fs::remove_dir_all(&dir);
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir,
         logs: vec![log_name(server, Scope::Channel(channel))],
         authorizer: Arc::new(AcceptAll),
@@ -369,6 +370,7 @@ async fn bound_node_on_events(
     let _ = std::fs::remove_dir_all(&dir);
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir,
         logs: vec![],
         authorizer: Arc::new(AcceptAll),
@@ -1230,6 +1232,7 @@ async fn node_events(name: &str, relay: &Multiaddr) -> (Node, mpsc::Receiver<Nod
     let _ = std::fs::remove_dir_all(&dir);
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir,
         logs: vec![],
         authorizer: Arc::new(AcceptAll),
@@ -1508,6 +1511,7 @@ async fn member_in(name: &str, relay: &Multiaddr, key: u8, wipe: bool) -> (Node,
     }
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir.clone(),
         logs: vec![],
         authorizer: Arc::new(AcceptAll),
@@ -1732,6 +1736,82 @@ async fn members_meet_through_a_relay_named_by_dns() {
         assert!(start.elapsed() < Duration::from_secs(60), "members never met through a DNS-named relay");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    for node in [a, b] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Multi-relay part B: two members, each configured with both of our
+/// relays and relay-only (so every path is a relay circuit), meet; when the
+/// first relay goes away they meet again through the second, with no
+/// member relay involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_keep_meeting_when_one_of_two_relays_dies() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let mut relays = Vec::new();
+    let mut handles = Vec::new();
+    let mut counts = Vec::new();
+    for _ in 0..2 {
+        let key = identity::Keypair::generate_ed25519();
+        let port = free_port();
+        relays.push(format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(key.public())).parse::<Multiaddr>().unwrap());
+        let circuits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        handles.push(start_relay_counting(key, port, circuits.clone(), true));
+        counts.push(circuits);
+    }
+    let member = |name: &'static str, key: u8| {
+        let relays = relays.clone();
+        async move {
+            let (server, channel) = test_server();
+            let dir = std::env::temp_dir().join(format!("sync-relay-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let config = NodeConfig {
+                relay: relays[0].clone(),
+                more_relays: relays[1..].to_vec(),
+                data_dir: dir,
+                logs: vec![],
+                authorizer: Arc::new(AcceptAll),
+                listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+                bootstrap: vec![],
+                allow_lan: false,
+                relay_only: true,
+            };
+            let access = Access {
+                binder: Some(Arc::new(SigningKey::from_bytes(&[key; 32]))),
+                read_gate: Some(Arc::new(AcceptAll)),
+                ..Access::default()
+            };
+            let (node, _events) = Node::start_with(config, access).await.unwrap();
+            node.open_server(server, ServerSecret::from_bytes([42; 32])).unwrap();
+            node.open_channel(server, channel).await.unwrap();
+            node
+        }
+    };
+    let a = member("multi-a", 81).await;
+    let b = member("multi-b", 82).await;
+    let meet = |deadline: Duration| {
+        let (a, b) = (&a, &b);
+        async move {
+            let start = Instant::now();
+            while !a.peers().await.unwrap().contains(&b.peer_id()) {
+                assert!(start.elapsed() < deadline, "the members never met");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    meet(Duration::from_secs(60)).await;
+    // The first relay goes away: they meet again through the second.
+    handles.remove(0).abort();
+    let start = Instant::now();
+    while a.peers().await.unwrap().contains(&b.peer_id()) && start.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    meet(Duration::from_secs(90)).await;
+    let ids = [a.peer_id(), b.peer_id()];
+    assert!(
+        counts[1].lock().unwrap().iter().any(|(p, ok)| *ok && ids.contains(p)),
+        "the second relay carried no circuit between them"
+    );
     for node in [a, b] {
         node.shutdown().await.unwrap();
     }

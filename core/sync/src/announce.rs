@@ -18,19 +18,19 @@ use crate::node::{reachable, via_relay};
 /// Whether an address of ours may be announced to anyone: global, or a
 /// circuit through our relay. A circuit through any other relay (a member
 /// relay, #368 slice 2) never is: members learn of those in pull answers.
-pub(crate) fn announceable(addr: &Multiaddr, relay: &Multiaddr) -> bool {
+pub(crate) fn announceable(addr: &Multiaddr, relays: &[Multiaddr]) -> bool {
     let circuit = addr.iter().any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit);
-    via_relay(addr, relay) || (!circuit && reachable(addr, false))
+    relays.iter().any(|relay| via_relay(addr, relay)) || (!circuit && reachable(addr, false))
 }
 
 pub(crate) struct GlobalIdentify {
     inner: identify::Behaviour,
-    relay: Multiaddr,
+    relays: Vec<Multiaddr>,
 }
 
 impl GlobalIdentify {
-    pub fn new(inner: identify::Behaviour, relay: Multiaddr) -> Self {
-        GlobalIdentify { inner, relay }
+    pub fn new(inner: identify::Behaviour, relays: Vec<Multiaddr>) -> Self {
+        GlobalIdentify { inner, relays }
     }
 }
 
@@ -81,10 +81,10 @@ impl NetworkBehaviour for GlobalIdentify {
     fn on_swarm_event(&mut self, event: FromSwarm) {
         // Identify announces what it hears about here: drop the rest.
         let hidden = match &event {
-            FromSwarm::NewListenAddr(e) => !announceable(e.addr, &self.relay),
-            FromSwarm::ExpiredListenAddr(e) => !announceable(e.addr, &self.relay),
-            FromSwarm::ExternalAddrConfirmed(e) => !announceable(e.addr, &self.relay),
-            FromSwarm::ExternalAddrExpired(e) => !announceable(e.addr, &self.relay),
+            FromSwarm::NewListenAddr(e) => !announceable(e.addr, &self.relays),
+            FromSwarm::ExpiredListenAddr(e) => !announceable(e.addr, &self.relays),
+            FromSwarm::ExternalAddrConfirmed(e) => !announceable(e.addr, &self.relays),
+            FromSwarm::ExternalAddrExpired(e) => !announceable(e.addr, &self.relays),
             _ => false,
         };
         if !hidden {
@@ -118,10 +118,10 @@ mod tests {
             member_relay.as_str(),
         ];
         for a in yes {
-            assert!(announceable(&a.parse().unwrap(), &relay), "{a}");
+            assert!(announceable(&a.parse().unwrap(), std::slice::from_ref(&relay)), "{a}");
         }
         for a in no {
-            assert!(!announceable(&a.parse().unwrap(), &relay), "{a}");
+            assert!(!announceable(&a.parse().unwrap(), std::slice::from_ref(&relay)), "{a}");
         }
     }
 }

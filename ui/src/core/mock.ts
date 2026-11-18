@@ -21,6 +21,7 @@ import type {
   Channel,
   CreatedInvite,
   Invite,
+  RemovedMember,
   CoreError,
   Id,
   Identity,
@@ -137,6 +138,8 @@ interface ServerState {
   summary: ServerSummary;
   channels: ChannelState[];
   members: Member[];
+  /** G-53: removed by the owner, until undone. */
+  removed?: (RemovedMember & { member: Member })[];
 }
 
 /**
@@ -1520,10 +1523,33 @@ export class MockCore implements CoreApi {
     if (!s) throw err({ code: 'not-found' });
     if (s.summary.ownerId !== this.identity?.id || userId === this.identity.id) throw err({ code: 'not-allowed' });
     await this.wait(200);
+    const gone = s.members.find((m) => m.id === userId);
     s.members = s.members.filter((m) => m.id !== userId);
     for (const c of s.channels) c.memberIds = c.memberIds.filter((id) => id !== userId);
+    if (gone) {
+      s.removed = (s.removed ?? []).filter((r) => r.id !== userId);
+      s.removed.push({ id: gone.id, shortCode: gone.shortCode, displayName: gone.displayName, removedAt: Date.now(), member: gone });
+    }
     this.emit('members.changed', { serverId, members: s.members });
     this.emit('notice', { kind: 'encryption-renewed', serverId });
+    this.emit('server.updated', s.summary);
+  }
+
+  async listRemovedMembers(serverId: Id): Promise<RemovedMember[]> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
+    return (s.removed ?? []).map(({ member: _, ...r }) => ({ ...r }));
+  }
+
+  async undoKick(serverId: Id, userId: Id): Promise<void> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || !s.removed?.some((r) => r.id === userId)) throw err({ code: 'not-allowed' });
+    await this.wait(200);
+    // Let back, not made a member: they may join again with an invite.
+    s.removed = s.removed.filter((r) => r.id !== userId);
+    this.emit('server.updated', s.summary);
   }
 
   // ---- app -----------------------------------------------------------------

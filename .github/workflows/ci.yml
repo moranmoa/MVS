@@ -67,6 +67,10 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      # Leftover merge-conflict markers in any tracked text file (#447 had
+      # some in a script nothing runs). Cheap, so it runs first.
+      - name: no merge-conflict markers
+        run: bash .github/scripts/check-conflict-markers.sh
       - name: Install cargo-deny (checksum verified)
         run: .github/scripts/install-cargo-deny.sh
       - name: core workspace

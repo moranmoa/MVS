@@ -38,6 +38,10 @@ const DEMO = demo.demoFor({ packaged: app.isPackaged, env: process.env });
 // lock below, which lives in the profile.
 if (!app.isPackaged && process.env.MVS_TEST_USER_DATA && path.isAbsolute(process.env.MVS_TEST_USER_DATA)) {
   app.setPath('userData', process.env.MVS_TEST_USER_DATA);
+} else if (DEMO) {
+  // T8-04: the demo's mock keeps its state in its own profile, never in the
+  // checkout's real one (localStorage, logs).
+  app.setPath('userData', demo.demoProfile(app.getPath('userData')));
 }
 
 // One instance only: a second launch (e.g. an mvs:// link, B1-3) focuses this one.

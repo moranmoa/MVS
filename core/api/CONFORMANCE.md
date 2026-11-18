@@ -462,6 +462,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
   - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+- `JoinStatus` gains `{ phase: 'removed', link }` (the UI string `join.removed`): I was kicked from this server and not let back (`undoKick`). It's final, like `closed`: the join stops, nothing is signed or stored, and the server's subscription is closed again. It comes before the age gate. It tells me only what I already know, that my own account was removed; it carries no server name, ID or member, and someone else with the same link joins as usual. A restore treats it as a definite answer (the log holds the accepted kick). Before, this was `invalid`.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

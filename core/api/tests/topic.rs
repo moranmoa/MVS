@@ -10,17 +10,21 @@ use common::{Peer, World};
 use identity::MemoryStore;
 use records::{Kind, ServerId, SigningKey};
 
-fn adult() -> NewIdentityInput {
-    NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "1990-05-01".into() }
+fn born(birth_date: &str) -> NewIdentityInput {
+    NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: birth_date.into() }
 }
 
 fn member(world: &World, name: &str) -> (Peer, Identity) {
+    member_born(world, name, "1990-05-01")
+}
+
+fn member_born(world: &World, name: &str, birth_date: &str) -> (Peer, Identity) {
     let peer = world.peer_with(
         Arc::new(MemoryStore::new()),
         None,
         Arc::new(api::crypto::GroupKeysCipher::locked()),
     );
-    let created = peer.core.create_identity(adult()).unwrap();
+    let created = peer.core.create_identity(born(birth_date)).unwrap();
     let positions = peer.core.get_recovery_challenge().unwrap().positions;
     let answers: std::collections::BTreeMap<usize, String> =
         positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
@@ -248,4 +252,40 @@ fn set_channel_topic_through_the_dispatcher() {
     // Cleared: the field is absent, not null.
     let cleared = call("setChannelTopic", serde_json::json!({ "channelId": r.channel, "topic": "" }));
     assert!(cleared["ok"].get("topic").is_none(), "{cleared}");
+}
+
+/// The security lead's item 2: an 18+ channel's topic reaches only members
+/// with an 18+ claim, through the one withholding point
+/// (`ServerView::channels`): no `channel.updated` and no list entry for a
+/// minor. Display-only: the record itself is plaintext to every member.
+#[test]
+fn an_adult_channels_topic_never_reaches_a_minor() {
+    let world = World::new();
+    let (owner, _) = member(&world, "Owner");
+    // 17 on the test clock's 2026-11-03.
+    let (teen, _) = member_born(&world, "Teen", "2008-11-04");
+    let (grown, _) = member(&world, "Grown");
+    let server = owner.core.create_server("Mixed", AgeRestriction::None).unwrap();
+    teen.core.join_server(&server.invite_link).unwrap();
+    grown.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    let late = owner.core.create_channel(&server.id, "late-night", true).unwrap();
+    let general = owner.core.list_channels(&server.id).unwrap().remove(0).id;
+    for peer in [&teen, &grown, &owner, &teen, &grown] {
+        peer.core.sync_now().unwrap();
+    }
+    owner.core.set_channel_topic(&late.id, "after hours").unwrap();
+    owner.core.set_channel_topic(&general, "for everyone").unwrap();
+    for peer in [&teen, &grown] {
+        peer.events.take();
+        peer.core.sync_now().unwrap();
+    }
+    let seen = |peer: &Peer| -> Vec<(String, Option<String>)> {
+        channel_updates(peer).into_iter().map(|c| (c.id, c.topic)).collect()
+    };
+    assert_eq!(seen(&teen), [(general.clone(), Some("for everyone".into()))]);
+    let grown_saw = seen(&grown);
+    assert!(grown_saw.contains(&(late.id.clone(), Some("after hours".into()))), "{grown_saw:?}");
+    assert!(teen.core.list_channels(&server.id).unwrap().iter().all(|c| c.id != late.id));
+    assert_eq!(topic_of(&grown, &server, &late.id).as_deref(), Some("after hours"));
 }

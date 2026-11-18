@@ -157,7 +157,9 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `update-needed`: a current member's latest profile post lacks `channel-topic-v1`. `getUpdateNeeded(serverId, "channel-topic-v1")` says who. Clearing a topic that isn't set signs nothing, so it isn't gated.
   - **Record:** `Kind::ChannelTopic = 22`, control scope, at most 1057 bytes: `channel (32) ‖ history u8 (0, reserved for D30) ‖ topic UTF-8`. A body that fails the rule never parses, so it's never accepted.
   - **Authority:** the owner or an admin, on a live channel. It's privileged, so a revoke (the only demotion) or a kick voids the author's concurrent topics. The latest accepted topic in linear order counts, per channel, and deleting the channel drops it.
-  - **Plaintext:** like channel names, topics sit unsealed in the control log, so every member can read them. An 18+ channel is listed only to members with an 18+ claim, and its topic with it. That hiding is display-only: the UI must not suggest a topic is private.
+  - **Plaintext:** like channel names, topics sit unsealed in the control log, so every member can read them. An 18+ channel is listed only to members with an 18+ claim, and its topic with it; every output goes through one function (`ServerView::channels`). That hiding is display-only (GAP-22: a modified client reads it), so the UI says "visible to every member of the server".
+  - **Rendering:** plain text only: no Markdown (G-25), no HTML, and no auto-links outside the messages' link guard.
+  - **History byte:** frozen at 0 for this kind; any future use needs a new cap.
   - **Older members:** an older core refuses kind 22 on decode and would stall on the control records after it, hence the gate. The residual is the same as for `server-lifecycle-v1`: someone who joins later on an older version can't read past a topic until they update.
 
 - New-messages divider (G-21, option A):

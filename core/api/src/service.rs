@@ -1569,10 +1569,8 @@ impl Core {
     /// reads topics. The same topic again signs nothing. Never unread, a
     /// mention or a notification: only `channel.updated`.
     pub fn set_channel_topic(&self, channel_id: &str, topic: &str) -> CoreResult<Channel> {
-        let topic = topic.trim();
-        if !topic.is_empty() && !authority::channel_topic_ok(topic) {
-            return Err(ErrorCode::BadRequest.into());
-        }
+        let topic = authority::channel_topic(topic).ok_or(ErrorCode::BadRequest)?;
+        let topic = topic.as_str();
         let (server, channel, _) = self.live_channel(channel_id)?;
         let unchanged = {
             let mut inner = self.lock();
@@ -4736,6 +4734,12 @@ impl ServerView<'_> {
     /// The channels authority knows, with their names as created; a server
     /// from before #113 shows its derived #general.
     /// TODO(#116): hide 18+ channels from members without an 18+ claim.
+    ///
+    /// The one place 18+ channels, with their names and G-14 topics, are
+    /// withheld from members without an 18+ claim: `listChannels`, every
+    /// `channel.updated` (`channel_json`, `topic_events`) and anything later
+    /// that quotes a channel go through here. Display-only (GAP-22): the
+    /// control log is plaintext to every member.
     fn channels(&self, me: Option<PublicKey>) -> Vec<Channel> {
         let server_id = model::hex_id(self.id.as_bytes());
         let positions = self.channel_positions();

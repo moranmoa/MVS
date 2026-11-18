@@ -64,3 +64,9 @@ A new control-log kind, following the G-26 reactions pattern (a kind, a size cap
 4. **Cap name:** `getUpdateNeeded(serverId, "channel-topic-v1")` works; an unknown name is still `bad-request`.
 5. **No side effects:** a topic change is never unread, never a mention and never a notification. Only `channel.updated` fires.
 6. **CONFORMANCE:** the same PR documents the kind, the gate residual and the plaintext. The mock waits for dev-ui.
+
+## Security lead review (`sec-lead-g14-topic.md`)
+1. **One whitespace rule:** `authority::channel_topic` trims with `str::trim` (Unicode White_Space, `char::is_whitespace`) and checks with `channel_topic_ok`, which uses the same trim. The parser accepts a body only if `channel_topic` leaves it unchanged. U+2028 and U+2029 are refused inside a topic as well, so it stays one line.
+2. **18+ withholding in one place:** `ServerView::channels` is the only output path. `listChannels`, `channel.updated` for my change and for synced ones, and anything later that quotes a channel all go through it. **Residual (GAP-22):** the topic is plaintext in the control log, like the channel name, so a modified client reads 18+ topics. It is fixed only when 18+ metadata is sealed with the channel key. The UI hint says "visible to every member of the server".
+3. **Plain text:** the topic is never rendered as Markdown (G-25) or HTML. Nothing in it is auto-linked unless it goes through the same link guard as messages.
+4. **The history byte is frozen at 0** for this kind. Older peers refuse anything else, so any future use (D30) is a new wire format behind a new cap.

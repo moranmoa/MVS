@@ -5,7 +5,8 @@
 mod common;
 
 use authority::{
-    channel_topic_ok, resolve, Action, ChannelId, Record, RecordId, Resolver, Role, State,
+    channel_topic, channel_topic_ok, resolve, Action, ChannelId, Record, RecordId, Resolver, Role,
+    State,
     MAX_CHANNEL_TOPIC,
 };
 use common::{actor, founded, key, rec, server};
@@ -149,9 +150,72 @@ fn topics_are_one_short_line_of_plain_text() {
     let widest = "😀".repeat(MAX_CHANNEL_TOPIC);
     assert_eq!(widest.len(), MAX_CHANNEL_TOPIC_BYTES);
     assert!(channel_topic_ok(&widest));
-    for bad in ["", " lead", "trail ", "two\nlines", "a\rb", "a\tb", "a\u{202E}b", "a\u{200B}b"] {
+    for bad in [
+        "",
+        " lead",
+        "trail ",
+        "two\nlines",
+        "a\rb",
+        "a\tb",
+        "a\u{2028}b",
+        "a\u{2029}b",
+        "a\u{202E}b",
+        "a\u{200B}b",
+    ] {
         assert!(!channel_topic_ok(bad), "{bad:?}");
     }
+}
+
+/// One whitespace definition (Unicode White_Space, `str::trim`) for the
+/// API's trim and the parser: a topic of only such spaces is refused as a
+/// topic, and trimming it gives the empty one that clears.
+#[test]
+fn trim_and_the_rule_share_one_whitespace() {
+    for space in ['\u{00A0}', '\u{2028}', '\u{3000}', '\u{0085}', ' '] {
+        let only = space.to_string().repeat(3);
+        assert!(!channel_topic_ok(&only), "{only:?}");
+        assert_eq!(channel_topic(&only).as_deref(), Some(""), "{only:?} clears");
+        let padded = format!("{only}x{only}");
+        assert_eq!(channel_topic(&padded).as_deref(), Some("x"), "{padded:?}");
+        assert!(channel_topic_ok("x"));
+    }
+    assert_eq!(channel_topic("a\nb"), None);
+    assert_eq!(channel_topic(&"ש".repeat(MAX_CHANNEL_TOPIC + 1)), None);
+    // A body padded with White_Space never parses: the wire form is trimmed.
+    let (_, head) = staffed();
+    let body = [RANDOM.as_bytes().as_slice(), &[0], "x\u{3000}".as_bytes()].concat();
+    let record = Draft {
+        server: server(),
+        scope: Scope::Control,
+        seq: 50,
+        deps: vec![head],
+        auth_deps: vec![],
+        ts: 0,
+        kind: Kind::ChannelTopic,
+        body,
+    }
+    .sign(&key(0))
+    .unwrap();
+    assert_eq!(Action::from_record(&record), None);
+}
+
+/// The record layer's size bound: exactly `max_body` is a record, one byte
+/// more isn't.
+#[test]
+fn a_topic_body_fits_max_body_exactly() {
+    let draft = |len: usize| Draft {
+        server: server(),
+        scope: Scope::Control,
+        seq: 1,
+        deps: vec![],
+        auth_deps: vec![],
+        ts: 0,
+        kind: Kind::ChannelTopic,
+        body: vec![b'a'; len],
+    };
+    assert_eq!(Kind::ChannelTopic.max_body(), 32 + 1 + MAX_CHANNEL_TOPIC_BYTES);
+    assert!(draft(Kind::ChannelTopic.max_body()).sign(&key(0)).is_ok());
+    assert!(draft(Kind::ChannelTopic.max_body() + 1).sign(&key(0)).is_err());
 }
 
 /// Bodies `Action::body` never produces: never accepted.

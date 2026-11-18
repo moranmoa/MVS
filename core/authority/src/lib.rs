@@ -160,9 +160,10 @@ pub enum Action {
         channel: ChannelId,
     },
     /// G-14: the owner or an admin sets a live channel's topic; an empty
-    /// topic clears it. Body: the channel ID, `history u8` (reserved for
-    /// D30, must be 0), then the topic, which follows [`channel_topic_ok`]
-    /// or is empty.
+    /// topic clears it. Body: the channel ID, `history u8`, then the topic,
+    /// which follows [`channel_topic_ok`] or is empty. The history byte is
+    /// frozen at 0: older peers refuse anything else, so any future use
+    /// (D30) is a new wire format behind a new cap.
     ChannelTopic {
         channel: ChannelId,
         topic: String,
@@ -335,9 +336,10 @@ impl Action {
                 if *history != 0 {
                     return None;
                 }
+                // Already in wire form: `channel_topic` leaves it unchanged.
                 let topic = String::from_utf8(topic.to_vec())
                     .ok()
-                    .filter(|t| t.is_empty() || channel_topic_ok(t))?;
+                    .filter(|t| channel_topic(t).as_deref() == Some(t.as_str()))?;
                 Some(Action::ChannelTopic { channel: ChannelId::from_bytes(*channel), topic })
             }
             Kind::Unban => Some(Action::Unban { target: key(body)? }),
@@ -516,14 +518,26 @@ pub const MAX_CHANNEL_TOPIC: usize = 256;
 /// Whether `topic` can be a channel's topic: one line, trimmed, 1 to
 /// [`MAX_CHANNEL_TOPIC`] code points and at most
 /// `records::MAX_CHANNEL_TOPIC_BYTES` bytes, and the strict
-/// [`display_text_ok`], which also refuses line breaks. An empty topic
+/// [`display_text_ok`]. Trimmed means by `str::trim`, Unicode White_Space
+/// (`char::is_whitespace`), the one definition [`channel_topic`] uses too.
+/// One line: control characters are refused by `display_text_ok`, and the
+/// line and paragraph separators U+2028 and U+2029 here. An empty topic
 /// (clearing it) is checked by the caller.
 pub fn channel_topic_ok(topic: &str) -> bool {
     !topic.is_empty()
         && topic.trim() == topic
         && topic.len() <= records::MAX_CHANNEL_TOPIC_BYTES
         && topic.chars().count() <= MAX_CHANNEL_TOPIC
+        && !topic.contains(['\u{2028}', '\u{2029}'])
         && display_text_ok(topic)
+}
+
+/// What a user's topic becomes on the wire: trimmed the way
+/// [`channel_topic_ok`] checks it, `Some("")` to clear it, or `None` when
+/// it can't be a topic. The API and the parser share this one rule.
+pub fn channel_topic(raw: &str) -> Option<String> {
+    let topic = raw.trim();
+    (topic.is_empty() || channel_topic_ok(topic)).then(|| topic.to_owned())
 }
 
 /// Most Unicode code points in a server name, the same limit as

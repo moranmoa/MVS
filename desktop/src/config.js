@@ -190,6 +190,23 @@ function stunFor({ packaged, resourcesPath, env = process.env, warn = (m) => con
   return value.trim();
 }
 
+/**
+ * G-81 B (docs/design/g81-p2p-calls.md): calls over the P2P network, off
+ * until the owner's echo test and the notice v3. On only when
+ * mvs-config.json says `"voiceP2p": true` (packaged), or MVS_VOICE_P2P=1 in a
+ * checkout. Anything else is off.
+ * @param {{ packaged: boolean, resourcesPath?: string, env?: object }} o
+ * @returns {boolean}
+ */
+function voiceP2pFor({ packaged, resourcesPath, env = process.env }) {
+  if (!packaged) return env.MVS_VOICE_P2P === '1';
+  try {
+    return JSON.parse(fs.readFileSync(path.join(resourcesPath, 'mvs-config.json'), 'utf8')).voiceP2p === true;
+  } catch {
+    return false;
+  }
+}
+
 /** The host of a STUN URL (for the file log to hide), or null. */
 function stunHost(url) {
   const m = typeof url === 'string' && /^stuns?:(?:\[([^\]]+)\]|([^:]+))/i.exec(url);
@@ -206,4 +223,4 @@ function logHost(addr) {
   return m ? m[1] : null;
 }
 
-module.exports = { MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, relaysFor, bootstrapFor, logHost, validStun, stunFor, stunHost };
+module.exports = { MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, relaysFor, bootstrapFor, logHost, validStun, stunFor, stunHost, voiceP2pFor };

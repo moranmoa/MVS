@@ -4,7 +4,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import { Store } from '../app/store';
 import type { Settings } from '../app/settings';
@@ -472,6 +472,42 @@ describe('voice rooms (0.4.3)', () => {
       localStorage.removeItem('mvs.notices.voiceIp.v1');
     });
 
+    describe('v3 (G-81 B, behind voiceP2p)', () => {
+      afterEach(() => localStorage.removeItem('mvs.notices.voiceIp.v3'));
+
+      it('with the flag on: the v3 wording, and "Got it" stores v3', async () => {
+        // ipNoticeSeen: true stores v2 only, which v3 doesn't read: the notice shows once more.
+        const { join } = await setup({ voiceP2p: true });
+        await join();
+        const dialog = await screen.findByRole('dialog', { name: 'Before your first call' });
+        const body = document.getElementById(dialog.getAttribute('aria-describedby')!)!.textContent!;
+        expect(body).toContain('computers connect directly when they can');
+        expect(body).toContain('In relay-only mode, the call goes through the MVS relay'); // both paragraphs are read out
+        expect(body).not.toContain('turns calls off');
+        await click(within(dialog).getByRole('button', { name: 'Got it' }));
+        expect(localStorage.getItem('mvs.notices.voiceIp.v3')).toBe('1');
+      });
+
+      it('relay-only: with the flag on, a room can be joined and the v3 notice shows; with it off, it stays blocked', async () => {
+        const on = await setup({ voiceP2p: true, relayOnly: true }, { ipNoticeSeen: false });
+        await waitFor(() => expect(on.entry().getAttribute('aria-disabled')).toBeNull());
+        await on.join();
+        expect(await screen.findByRole('dialog', { name: 'Before your first call' })).toBeTruthy();
+        cleanup();
+        const off = await setup({ relayOnly: true }, { ipNoticeSeen: false });
+        await waitFor(() => expect(off.entry().getAttribute('aria-disabled')).toBe('true'));
+      });
+
+      it('with the flag off (every build today): v2, unchanged', async () => {
+        const { join } = await setup({}, { ipNoticeSeen: false });
+        await join();
+        const dialog = screen.getByRole('dialog', { name: 'Before your first call' });
+        expect(document.getElementById(dialog.getAttribute('aria-describedby')!)!.textContent).toContain('Relay-only mode turns calls off.');
+        await click(within(dialog).getByRole('button', { name: 'Got it' }));
+        expect(localStorage.getItem('mvs.notices.voiceIp.v3')).toBeNull();
+      });
+    });
+
     it('a full room shows no notice: the row is disabled', async () => {
       const { join } = await setup({ roomFull: true }, { ipNoticeSeen: false });
       await join();
@@ -868,6 +904,16 @@ describe('voice rooms (0.4.3)', () => {
       send(null);
       expect(seen).toEqual([{ serverId: id('a'), rooms: [ok] }]);
     });
+  });
+
+  it('G-81 B: core.status carries voiceP2p only for an exact true', () => {
+    const handlers = new Map<string, (p: unknown) => void>();
+    const bare = { on: (e: string, h: (p: unknown) => void) => (handlers.set(e, h), () => {}) } as unknown as Parameters<typeof guardCore>[0];
+    const seen: unknown[] = [];
+    guardCore(bare).on('core.status', (p) => seen.push(p));
+    const send = handlers.get('core.status')!;
+    for (const v of [true, 'true', 1, false, null, undefined]) send({ state: 'up', voiceP2p: v });
+    expect(seen.map((s) => (s as { voiceP2p?: boolean }).voiceP2p)).toEqual([true, undefined, undefined, undefined, undefined, undefined]);
   });
 
   it('drops a malformed call.signal instead of passing on a cleaned-up guess', () => {

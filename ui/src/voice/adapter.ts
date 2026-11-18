@@ -26,13 +26,22 @@ export interface VoiceCore {
    * without TURN. Whatever comes back is cleaned (cleanTurnCredentials).
    */
   getTurnCredentials?(): Promise<unknown>;
+  /**
+   * G-81 B (dev-sync 2a): the participants I have a live LAN WebRTC
+   * connection to. The core sends media frames to every other participant.
+   * Absent until the core has it; the engine then sends nothing to exclude.
+   */
+  setCallWebrtcPeers?(identities: Id[]): Promise<unknown>;
 }
 
 export function fromCoreApi(api: CoreApi): VoiceCore {
   // Not in CoreApi yet (G-81 step 4); bound only when the core has it.
   const turn = (api as Partial<{ getTurnCredentials(): Promise<unknown> }>).getTurnCredentials;
+  // G-81 B, dev-sync 2a: bound only when the core has it.
+  const webrtcPeers = (api as Partial<{ setCallWebrtcPeers(args: { identities: Id[] }): Promise<unknown> }>).setCallWebrtcPeers;
   return {
     ...(typeof turn === 'function' ? { getTurnCredentials: () => turn.call(api) } : {}),
+    ...(typeof webrtcPeers === 'function' ? { setCallWebrtcPeers: (identities: Id[]) => webrtcPeers.call(api, { identities }) } : {}),
     joinCall: (channelId) => api.joinCall(channelId),
     leaveCall: () => api.leaveCall(),
     setMuted: (muted) => api.setMuted(muted),

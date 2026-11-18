@@ -22,6 +22,7 @@ import type {
   Message,
   MessageRange,
   ServerSummary,
+  CallPath,
   CallState,
   VoiceRoom,
   CoreSettings,
@@ -435,12 +436,17 @@ export function cleanCall(c: CallState): CallState {
         muted: p?.muted === true,
         // G-84b: shown only together with muted.
         ...(p?.deafened === true && p?.muted === true ? { deafened: true } : {}),
+        // G-81 B: one of the known paths, or nothing.
+        ...(CALL_PATHS.includes(p?.path as CallPath) ? { path: p.path } : {}),
       }))
       .filter((p) => p.identity),
     full: c?.full === true,
     ...(c?.relayOnly === true ? { relayOnly: true } : {}),
+    ...(typeof c?.callId === 'string' && /^[0-9a-f]{32}$/.test(c.callId) ? { callId: c.callId } : {}),
   };
 }
+
+const CALL_PATHS: readonly CallPath[] = ['lan', 'direct', 'circuit', 'member-circuit', 'none'];
 
 /**
  * An id the UI accepts in a voice room: 64 lower-case hex from the real core, or a
@@ -649,6 +655,8 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       state: s?.state === 'up' || s?.state === 'down' ? s.state : 'starting',
       detail: (['missing', 'start-failed', 'crashed', 'crash-loop', 'keyring'] as const).find((d) => d === s?.detail),
       ...(stunUrl ? { stunUrl } : {}),
+      // G-81 B: on only for an exact true.
+      ...(s?.voiceP2p === true ? { voiceP2p: true } : {}),
     };
   },
   'update.ready': (u) => ({ version: cleanName(u.version, 32), waitingForCall: u.waitingForCall === true }),

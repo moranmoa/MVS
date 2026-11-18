@@ -34,7 +34,9 @@
 // - Speaking: an AnalyserNode per stream, sampled 10 times a second through
 //   the G-82 state machine (speaking.ts: 150 ms to turn on, 400 ms to turn off).
 
-import type { CallSignal, CallState, Id } from '../core/types';
+import type { CallPath, CallSignal, CallState, Id } from '../core/types';
+import { BITRATE_DIRECT, BITRATE_RELAYED, browserMediaEnv, MediaSession, type MediaEnv } from './media/session';
+import { bridgeTransport, voiceBridge, type MediaTransport } from './media/transport';
 import type { VoiceCore } from './adapter';
 import { cleanStunUrl, cleanTurnCredentials, iceServersFor, normalizeFingerprint, soleFingerprint, type TurnCredentials } from './sdp';
 import { quiet, rms, stepSpeaking, type SpeakState } from './speaking';
@@ -139,8 +141,20 @@ export interface VoiceEnv {
 export interface VoiceEngineOptions {
   /** The config's STUN URL (`stun:host:port`), if any. */
   stunUrl?: string | null;
-  /** Relay-only is on: the engine never starts a call (SL S1, G-81). */
+  /**
+   * Relay-only is on. Without `p2p` the engine never starts a call (SL S1);
+   * with it, the call runs on B only, over our relays: no RTCPeerConnection.
+   */
   relayOnly?: boolean;
+  /**
+   * G-81 B (the voiceP2p flag): peers the core reaches on my LAN get WebRTC;
+   * everyone else gets Opus over the P2P network (docs/design/g81-p2p-calls.md §2.2).
+   */
+  p2p?: boolean;
+  /** G-81 B: the frame transport and the WebCodecs env (tests: a loopback and fakes). */
+  media?: { transport(): MediaTransport | null; env: MediaEnv };
+  /** G-81 B: a LAN WebRTC attempt that hasn't connected in this long falls to B. Default 3 s (TL A7). */
+  lanFallbackMs?: number;
   env?: VoiceEnv;
   /** How long to wait for ICE gathering before sending the SDP anyway. */
   gatherTimeoutMs?: number;
@@ -285,6 +299,12 @@ async function selectedPair(pc: RTCPeerConnection): Promise<{ local: CandidateTy
   }
 }
 
+/** G-81 B: the shell's frame channel (#526), or null without it. */
+function defaultTransport(): MediaTransport | null {
+  const bridge = voiceBridge();
+  return bridge ? bridgeTransport(bridge) : null;
+}
+
 export function browserEnv(): VoiceEnv {
   return {
     createPeerConnection: (config) => new RTCPeerConnection(config),
@@ -373,6 +393,26 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const peers = new Map<Id, Peer>();
   /** Dropped for a security reason; not reconnected until the call ends. */
   const refused = new Set<Id>();
+
+  // ---- G-81 B state ----------------------------------------------------------
+  const p2p = options.p2p === true;
+  const lanFallbackMs = options.lanFallbackMs ?? 3_000;
+  /** This call's id for media frames (CallState.callId, from 2a). */
+  let callId: string | null = null;
+  /** The core's path to each participant (absent: unknown). */
+  let paths = new Map<Id, CallPath | undefined>();
+  /** Peers on B (media over the P2P network), with when they went there. */
+  const bPeers = new Map<Id, number>();
+  /** LAN peers whose WebRTC failed or never connected: B for the rest of the call. */
+  const fellBack = new Set<Id>();
+  const lanTimers = new Map<Id, ReturnType<typeof setTimeout>>();
+  const bFailed = new Set<Id>();
+  let session: MediaSession | null = null;
+  let sessionCall: string | null = null;
+  const bGains = new Map<Id, GainNode>();
+  const bSpeak = new Map<Id, SpeakState>();
+  /** What setCallWebrtcPeers last said, to send only changes. */
+  let webrtcSent = '';
   let local: MediaStream | null = null;
   let micMuted = false;
   /** G-84: everyone's audio silenced. */
@@ -518,6 +558,11 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     if (!active || !me) return;
     const list: VoiceParticipant[] = [{ identity: me, state: micState }];
     for (const p of peers.values()) list.push({ identity: p.id, state: p.state });
+    for (const id of bPeers.keys()) {
+      if (peers.has(id)) continue;
+      list.push({ identity: id, state: bFailed.has(id) ? 'failed' : usableB(id) && session ? 'connected' : 'connecting' });
+    }
+    reportWebrtc();
     emit('participants', list);
   }
 
@@ -596,6 +641,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     applyMute();
     localMeter = makeMeter(next);
     micState = 'connected';
+    if (session && callId) session.start(callId, track); // G-81 B: the new mic
     emitParticipants();
   }
 
@@ -605,6 +651,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
 
   function applyMute() {
     for (const t of local?.getAudioTracks() ?? []) t.enabled = !micMuted;
+    session?.setMuted(micMuted); // G-81 B: nothing is encoded or sent while muted (TL A4)
   }
 
   // ---- audio analysis --------------------------------------------------------
@@ -658,6 +705,13 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     const mine = !!localMeter && loud(localMeter, now);
     next[me] = !micMuted && mine;
     for (const p of peers.values()) next[p.id] = p.verified && !!p.meter && loud(p.meter, now);
+    for (const id of bPeers.keys()) {
+      if (peers.has(id)) continue;
+      // MediaSession.level is RMS × 4, clipped: back to RMS for the same state machine.
+      const st = stepSpeaking(bSpeak.get(id) ?? quiet(), (session?.level(id) ?? 0) / 4, now, threshold);
+      bSpeak.set(id, st);
+      next[id] = st.on;
+    }
     const keys = new Set([...Object.keys(next), ...Object.keys(speaking)]);
     if ([...keys].some((k) => next[k] !== speaking[k])) {
       speaking = next;
@@ -842,6 +896,13 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     }
     peers.delete(peer.id);
     if (reason === 'fingerprint-mismatch' || reason === 'unverified-signal') refused.add(peer.id);
+    if (p2p && active && reason === 'peer-failed' && members.has(peer.id)) {
+      // G-81 B: WebRTC gave up on a LAN peer: the call goes on over B (TL A7).
+      fellBack.add(peer.id);
+      toB(peer.id);
+      syncB();
+      reason = undefined;
+    }
     if (reason) emit('error', { code: reason, peer: peer.id });
     if (speaking[peer.id] !== undefined) {
       const { [peer.id]: _gone, ...rest } = speaking;
@@ -1018,6 +1079,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       return;
     }
     if (refused.has(signal.from)) return;
+    // G-81 B: a peer's offer never forces a path (TL A7): WebRTC only with a peer my core reaches on my LAN.
+    if (p2p && !useWebrtc(signal.from)) return;
     const iOffer = me < signal.from;
     try {
       if (signal.kind === 'offer') {
@@ -1089,12 +1152,138 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   function reconcile(state: CallState) {
     const others = state.participants.map((p) => p.identity).filter((id) => id !== me);
     members = new Set(others.slice(0, MAX_PEERS));
+    if (p2p) {
+      paths = new Map(state.participants.map((x) => [x.identity, x.path]));
+      if (state.callId !== callId) {
+        // A new call id (a fresh join): B starts over.
+        callId = state.callId ?? null;
+        stopB();
+      }
+      for (const id of [...bPeers.keys()]) if (!members.has(id)) leaveB(id);
+    }
     for (const p of [...peers.values()]) if (!members.has(p.id)) dropPeer(p);
     for (const id of members) {
-      if (peers.has(id) || refused.has(id)) continue;
+      if (peers.has(id) || refused.has(id) || bPeers.has(id)) continue;
+      if (!useWebrtc(id)) {
+        toB(id);
+        continue;
+      }
+      if (p2p && !lanTimers.has(id)) lanTimers.set(id, setTimeout(() => lanFallback(id), lanFallbackMs));
       if (me! < id) void offerTo(id);
     }
+    if (p2p) syncB();
     emitParticipants();
+  }
+
+  // ---- G-81 B: the C2 switch and media over the P2P network -----------------
+  /** WebRTC only toward a peer the core reaches on my LAN, never under relay-only (TL A7, SL B4). */
+  function useWebrtc(id: Id): boolean {
+    if (!p2p) return true;
+    return !options.relayOnly && paths.get(id) === 'lan' && !fellBack.has(id);
+  }
+
+  /** A LAN attempt that hasn't connected in time: this peer goes to B (no error). */
+  function lanFallback(id: Id) {
+    lanTimers.delete(id);
+    const peer = peers.get(id);
+    if (!active || (peer && peer.verified && peer.state === 'connected')) return;
+    fellBack.add(id);
+    if (peer) dropPeer(peer);
+    toB(id);
+    syncB();
+    emitParticipants();
+  }
+
+  function toB(id: Id) {
+    if (bPeers.has(id)) return;
+    bPeers.set(id, Date.now());
+    const t = lanTimers.get(id);
+    if (t) clearTimeout(t);
+    lanTimers.delete(id);
+    // No usable path in the connect timeout: no voice connection with them (as for WebRTC).
+    setTimeout(() => {
+      if (active && bPeers.has(id) && !usableB(id) && !bFailed.has(id)) {
+        bFailed.add(id);
+        emit('error', { code: 'peer-failed', peer: id });
+        emitParticipants();
+      }
+    }, connectTimeoutMs);
+  }
+
+  function leaveB(id: Id) {
+    bPeers.delete(id);
+    bFailed.delete(id);
+    bSpeak.delete(id);
+    session?.dropPeer(id);
+    const g = bGains.get(id);
+    try {
+      g?.disconnect();
+    } catch {
+      // already gone
+    }
+    bGains.delete(id);
+  }
+
+  const usableB = (id: Id) => {
+    const path = paths.get(id);
+    return path === 'lan' || path === 'direct' || path === 'circuit' || path === 'member-circuit';
+  };
+
+  /** One media session per call id while anyone is on B; 16 kbps when any B peer is relayed. */
+  function syncB() {
+    if (!active || !callId || !bPeers.size) return;
+    if (!session || sessionCall !== callId) {
+      const transport = (options.media?.transport ?? defaultTransport)();
+      const context = playbackContext();
+      if (!transport || !context) return; // no bridge or no Web Audio: B peers time out as peer-failed
+      session?.stop();
+      session = new MediaSession({
+        env: options.media?.env ?? browserMediaEnv(),
+        transport,
+        context,
+        output: (id) => bOutput(id),
+        accepts: (id) => bPeers.has(id) && members.has(id),
+      });
+      sessionCall = callId;
+      session.setMuted(micMuted);
+      session.start(callId, micTrack());
+    }
+    const relayed = [...bPeers.keys()].some((id) => paths.get(id) === 'circuit' || paths.get(id) === 'member-circuit');
+    session.setBitrate(relayed ? BITRATE_RELAYED : BITRATE_DIRECT);
+  }
+
+  /** A B peer's playback: its own gain (volume, deafen) into the shared limiter. */
+  function bOutput(id: Id): AudioNode | null {
+    let g = bGains.get(id);
+    if (!g) {
+      const c = playbackContext();
+      if (!c || !limiter) return null;
+      g = c.createGain();
+      g.connect(limiter);
+      bGains.set(id, g);
+    }
+    g.gain.value = deafened ? 0 : volumes.get(id) ?? 1;
+    return g;
+  }
+
+  function stopB() {
+    session?.stop();
+    session = null;
+    sessionCall = null;
+    for (const id of [...bPeers.keys()]) leaveB(id);
+    for (const t of lanTimers.values()) clearTimeout(t);
+    lanTimers.clear();
+    fellBack.clear();
+  }
+
+  /** Tells the core which participants have a live LAN WebRTC connection; it sends B to the rest. */
+  function reportWebrtc() {
+    if (!p2p || !core.setCallWebrtcPeers) return;
+    const ids = [...peers.values()].filter((x) => x.verified && x.state === 'connected').map((x) => x.id).sort();
+    const key = (callId ?? '') + ids.join(',');
+    if (key === webrtcSent) return;
+    webrtcSent = key;
+    void core.setCallWebrtcPeers(ids).catch(() => {});
   }
 
   // ---- TURN (G-81) -------------------------------------------------------------
@@ -1166,7 +1355,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     // SL S1: relay-only means no voice. The core already refuses and ends
     // calls; the engine adds its own stop: no microphone, no connection, no
     // candidate gathering (offers and signals are ignored while inactive).
-    if (options.relayOnly) return;
+    if (options.relayOnly && !p2p) return;
     active = true;
     const gen = ++generation;
     me = myId;
@@ -1201,6 +1390,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     active = false;
     generation++;
     for (const p of [...peers.values()]) dropPeer(p);
+    stopB();
+    callId = null;
+    paths = new Map();
+    webrtcSent = '';
     for (const t of local?.getTracks() ?? []) t.stop();
     local = null;
     dropMeter(localMeter);
@@ -1282,10 +1475,12 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       volumes.set(id, v);
       const p = peers.get(id);
       if (p) applyPlayback(p);
+      if (bGains.has(id)) bOutput(id);
     },
     setDeafened(on) {
       deafened = on;
       for (const p of peers.values()) applyPlayback(p);
+      for (const id of bGains.keys()) bOutput(id);
     },
     inputLevel() {
       if (!active || micMuted || !localMeter) return 0;

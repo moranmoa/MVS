@@ -9,6 +9,7 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Dialog, Name } from '../../components/common';
 import { VoiceDiagnostics } from './VoiceDiagnostics';
+import { useVoiceP2p } from '../../voice/useVoiceP2p';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
@@ -46,7 +47,9 @@ export function useCallEngine(myId: Id): CallEngine {
   const stunUrl = useStunUrl();
   // SL S1 (G-81): relay-only means no voice; the engine never starts a call then.
   const relayOnly = useStore(store, (s) => s.relayOnly);
-  const view = useVoiceEngine(call, myId, { stunUrl, relayOnly });
+  // G-81 B (voiceP2p): LAN peers on WebRTC, everyone else over the P2P network.
+  const p2p = useVoiceP2p();
+  const view = useVoiceEngine(call, myId, { stunUrl, relayOnly, p2p });
   const sim = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('voiceSim') : null;
   const error = call && sim === 'noMic' ? 'no-device' : call && sim === 'rejoin' ? 'rejoin-to-talk' : view.error;
   const other = call?.participants.find((p) => p.identity !== myId)?.identity;
@@ -126,19 +129,21 @@ export const FAILURE_TEXT: Record<PeerFailure, [text: string, hint: string]> = {
 /**
  * docs/ux/specs/voice-ip-notice.md: shown once per computer, before the first
  * join. v2 (G-81, STUN: co-callers can see my public IP): everyone sees it
- * once more; v1 is no longer read.
+ * once more; v1 is no longer read. v3 (G-81 B, behind `voiceP2p`): calls
+ * also go over the P2P network, so relay-only no longer turns them off; the
+ * wording changes and everyone sees it once more.
  */
-const IP_NOTICE_KEY = 'mvs.notices.voiceIp.v2';
-export function ipNoticeSeen(): boolean {
+const ipNoticeKey = (p2p: boolean) => (p2p ? 'mvs.notices.voiceIp.v3' : 'mvs.notices.voiceIp.v2');
+export function ipNoticeSeen(p2p = false): boolean {
   try {
-    return localStorage.getItem(IP_NOTICE_KEY) === '1';
+    return localStorage.getItem(ipNoticeKey(p2p)) === '1';
   } catch {
     return false; // no storage: explain every time rather than join unexplained
   }
 }
-export function rememberIpNotice(): void {
+export function rememberIpNotice(p2p = false): void {
   try {
-    localStorage.setItem(IP_NOTICE_KEY, '1');
+    localStorage.setItem(ipNoticeKey(p2p), '1');
   } catch {
     // Shown again next time.
   }

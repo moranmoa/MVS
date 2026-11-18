@@ -123,6 +123,8 @@ export interface CoreStatus {
   detail?: CoreDownDetail;
   /** Our STUN server for voice (#222), from the shell's config; absent without one. */
   stunUrl?: string;
+  /** G-81 B: calls over the P2P network are on in this build (off by default). */
+  voiceP2p?: boolean;
 }
 
 /** Commands reject with this shape; `code` maps to a translated message. */
@@ -305,7 +307,15 @@ export interface CallParticipant {
   muted: boolean;
   /** G-84b: hears no one (only with muted; never from cores before 0.6.0). */
   deafened?: boolean;
+  /**
+   * G-81 B (docs/design/g81-p2p-calls.md §2.3, dev-sync 2a): how my core
+   * reaches this participant. Absent for me, and from cores before 2a: unknown.
+   */
+  path?: CallPath;
 }
+
+/** G-81 B: the core's connection to a call participant. */
+export type CallPath = 'lan' | 'direct' | 'circuit' | 'member-circuit' | 'none';
 
 /** My current call. After leaveCall, `participants` is empty. `full` = 5 in. */
 export interface CallState {
@@ -314,6 +324,8 @@ export interface CallState {
   full: boolean;
   /** Relay-only is on (#272): with no participants, my call was ended for it. */
   relayOnly?: boolean;
+  /** G-81 B: this call's id for media frames, 32 lower-case hex; fresh on every join. Absent from cores before 2a. */
+  callId?: string;
 }
 
 /** Someone in a voice room. `userId` is a member id; `joinedAt` (ms) orders the hand-off. */

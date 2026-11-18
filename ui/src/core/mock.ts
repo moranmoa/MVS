@@ -107,6 +107,8 @@ export interface MockOptions {
   closedServer?: boolean;
   /** As the desktop shell would: a STUN URL on core.status (#222), given to every listener. */
   stunUrl?: string;
+  /** G-81 B on, as the shell's core.status would say (`?voiceP2p`). */
+  voiceP2p?: boolean;
   /** Add members and messages written the way an attacker would (see SECURITY.md). */
   hostile?: boolean;
   /** `getRecoveryWords()` fails, to show the load error state. */
@@ -289,8 +291,10 @@ export class MockCore implements CoreApi {
     set.add(handler as (p: unknown) => void);
     // Like the shell's core.status, which every listener gets, also late ones.
     const stunUrl = this.options.stunUrl;
-    if (event === 'core.status' && stunUrl !== undefined) {
-      this.timers.push(setTimeout(() => set!.has(handler as (p: unknown) => void) && (handler as (p: unknown) => void)({ state: 'up', stunUrl }), 0));
+    const voiceP2p = this.options.voiceP2p;
+    if (event === 'core.status' && (stunUrl !== undefined || voiceP2p)) {
+      const status = { state: 'up', ...(stunUrl !== undefined ? { stunUrl } : {}), ...(voiceP2p ? { voiceP2p: true } : {}) };
+      this.timers.push(setTimeout(() => set!.has(handler as (p: unknown) => void) && (handler as (p: unknown) => void)(status), 0));
     }
     return () => set!.delete(handler as (p: unknown) => void);
   }

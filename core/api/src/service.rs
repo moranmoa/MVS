@@ -516,7 +516,9 @@ fn parse_user(id: &str) -> CoreResult<PublicKey> {
     model::parse_hex32(id).map(PublicKey::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
 
-/// G-47: where the name known when `user` was blocked is kept.
+/// G-47: where the name known when `user` was blocked is kept. Local only:
+/// never in the account backup (`backup_set` holds server secrets only) or
+/// `exportDiagnostics` (counts only); `tests/blocked.rs` checks the export.
 fn blocked_name_key(user: &PublicKey) -> String {
     format!("blocked-name/{}", model::hex_id(user.as_bytes()))
 }

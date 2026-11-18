@@ -90,6 +90,9 @@ fn the_list_keeps_names_after_we_share_no_server() {
     assert!(member.core.list_servers().unwrap().is_empty());
     let kept = BlockedUser { user_id: owner_id.clone(), name: Some("Owner".into()) };
     assert_eq!(member.core.list_blocked().unwrap(), [kept]);
+    // The kept name and the blocked ID stay local: not in the diagnostics.
+    let report = member.core.export_diagnostics().unwrap();
+    assert!(!report.contains(&owner_id) && !report.contains("blocked-name"), "{report}");
 
     // Unblocking removes the owner and the kept name.
     member.events.take();

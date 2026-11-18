@@ -18,8 +18,7 @@ const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
 beforeEach(() => localStorage.clear());
 
-async function home() {
-  const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+async function home(core = new MockCore({ demo: true, speed: 0, simulateActivity: false })) {
   render(<App core={core} initialSettings={en} />);
   await screen.findByRole('textbox', { name: /^Message / });
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
@@ -74,8 +73,10 @@ describe('Home after sign-up (G-92)', () => {
   });
 
   it('a link: Enter joins through the usual dialog, which carries on from Home', async () => {
-    const core = await home();
+    // Spied before the app wraps the core (guardCore keeps the method it was given).
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
     const join = vi.spyOn(core, 'joinServer');
+    await home(core);
     const field = screen.getByRole('textbox', { name: 'Paste an invite link' });
     fireEvent.change(field, { target: { value: '  mvp://join/abc123  ' } });
     await act(async () => {

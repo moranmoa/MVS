@@ -6,7 +6,7 @@
 // test-results/explore-shots/.
 
 import { expect, test, type Page } from '@playwright/test';
-import { composer, createServer, he, lastMessage, onboard, readWords, toRestoreWords, trackErrors } from './helpers';
+import { composer, createServer, he, homeHeading, lastMessage, onboard, readWords, toRestoreWords, trackErrors } from './helpers';
 
 const SHOTS = 'test-results/explore-shots';
 
@@ -92,7 +92,7 @@ test.describe('onboarding', () => {
     await page.getByLabel(he.displayName).fill('תמונה גדולה');
     await page.getByRole('button', { name: he.done }).click();
     // Expected: either the picture is resized/refused with a message, or onboarding finishes.
-    await expect(page.getByRole('heading', { name: he.homeTitle }).or(page.getByRole('alert'))).toBeVisible({
+    await expect(homeHeading(page).or(page.getByRole('alert'))).toBeVisible({
       timeout: 5_000,
     });
     expect(errors.join('\n')).not.toMatch(/quota/i);

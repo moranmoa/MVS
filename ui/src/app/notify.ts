@@ -23,6 +23,10 @@ export interface NotifyPrefs {
   preview: boolean;
   /** G-62: the unread count on the app icon (taskbar / dock). On by default. */
   badge: boolean;
+  /** G-63: a short sound for a message that would notify. On by default. */
+  sound: boolean;
+  /** G-63: that sound during a call too. Off by default. */
+  soundInCall: boolean;
   servers: Record<Id, NotifyScope>;
   /** A channel's level overrides its server's. */
   channels: Record<Id, NotifyScope>;
@@ -34,7 +38,7 @@ export const GROUP_MS = 10_000;
 export const STALE_MS = 10 * 60_000;
 
 export function defaultNotifyPrefs(): NotifyPrefs {
-  return { desktop: true, preview: false, badge: true, servers: {}, channels: {} };
+  return { desktop: true, preview: false, badge: true, sound: true, soundInCall: false, servers: {}, channels: {} };
 }
 
 const LEVELS: readonly NotifyLevel[] = ['all', 'mentions', 'none'];
@@ -59,6 +63,8 @@ export function cleanNotifyPrefs(v: unknown): NotifyPrefs {
     desktop: typeof p.desktop === 'boolean' ? p.desktop : d.desktop,
     preview: typeof p.preview === 'boolean' ? p.preview : d.preview,
     badge: typeof p.badge === 'boolean' ? p.badge : d.badge,
+    sound: typeof p.sound === 'boolean' ? p.sound : d.sound,
+    soundInCall: typeof p.soundInCall === 'boolean' ? p.soundInCall : d.soundInCall,
     servers: cleanScopes(p.servers),
     channels: cleanScopes(p.channels),
   };
@@ -97,6 +103,30 @@ export function shouldNotify(m: Message, c: NotifyContext): boolean {
   // PO (#335): a mention of me still comes through a mute, unless the level is "Nothing".
   if (c.muted) return mention && level !== 'none';
   return level === 'all' || (level === 'mentions' && mention);
+}
+
+/** G-63: at most one message sound this often. */
+export const SOUND_GAP_MS = 2000;
+
+/**
+ * G-63: whether `m` gets the new-message sound: the same messages that would
+ * notify (not mine, not muted, not the channel I'm watching, by level), with
+ * the sound's own switch instead of the desktop one; during a call only if
+ * "also during a call" is on.
+ */
+export function shouldSound(m: Message, c: NotifyContext & { inCall: boolean }): boolean {
+  if (!c.prefs.sound || (c.inCall && !c.prefs.soundInCall)) return false;
+  return shouldNotify(m, { ...c, prefs: { ...c.prefs, desktop: true } });
+}
+
+/** G-63: lets a sound through at most once per `gapMs`. */
+export function createSoundGate(gapMs = SOUND_GAP_MS): (now: number) => boolean {
+  let last = -Infinity;
+  return (now) => {
+    if (now - last < gapMs) return false;
+    last = now;
+    return true;
+  };
 }
 
 /**

@@ -1567,12 +1567,13 @@ export class MockCore implements CoreApi {
     s.members = s.members.filter((m) => m.id !== userId);
     for (const c of s.channels) c.memberIds = c.memberIds.filter((id) => id !== userId);
     if (gone) {
-      s.removed = (s.removed ?? []).filter((r) => r.id !== userId);
-      s.removed.push({ id: gone.id, shortCode: gone.shortCode, displayName: gone.displayName, removedAt: Date.now(), member: gone });
+      const id = asAccountId(gone.id);
+      s.removed = (s.removed ?? []).filter((r) => r.id !== id);
+      s.removed.push({ id, shortCode: gone.shortCode, displayName: gone.displayName, removedAt: Date.now(), member: gone });
     }
+    // Like the core: members.changed, no server.updated.
     this.emit('members.changed', { serverId, members: s.members });
     this.emit('notice', { kind: 'encryption-renewed', serverId });
-    this.emit('server.updated', s.summary);
   }
 
   async listRemovedMembers(serverId: Id): Promise<RemovedMember[]> {
@@ -1759,4 +1760,14 @@ export class MockCore implements CoreApi {
       this.emit('members.changed', { serverId: s.summary.id, members: s.members });
     }
   }
+}
+
+/**
+ * G-53: a demo member id ('u-…') as a 64-hex account id, the form the core
+ * uses (the sanitizer drops anything else from listRemovedMembers).
+ */
+function asAccountId(demoId: string): string {
+  if (/^[0-9a-f]{64}$/.test(demoId)) return demoId;
+  const hex = Array.from(new TextEncoder().encode(demoId), (b) => b.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 64).padEnd(64, '0');
 }

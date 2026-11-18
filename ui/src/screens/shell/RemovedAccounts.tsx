@@ -49,6 +49,14 @@ export function RemovedAccounts({ server }: { server: ServerSummary }) {
     },
     [server.id],
   );
+  // A kick comes as members.changed (the core sends no server.updated for it).
+  useCoreEvent(
+    'members.changed',
+    (e) => {
+      if (e.serverId === server.id) void load();
+    },
+    [server.id],
+  );
 
   const sorted = useMemo(() => [...(list ?? [])].sort((a, b) => b.removedAt - a.removedAt), [list]);
   const shown = all ? sorted : sorted.slice(0, REMOVED_PAGE);

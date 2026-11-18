@@ -29,13 +29,18 @@ async function setup() {
   return { core, row };
 }
 const picker = () => screen.getByRole('dialog', { name: 'Add reaction' });
+/** G-27: the full list renders only visible rows, so pick through search. */
+async function pickNamed(name: string) {
+  fireEvent.change(within(picker()).getByRole('searchbox', { name: 'Search emoji' }), { target: { value: name } });
+  await click(await within(picker()).findByRole('gridcell', { name }));
+}
 
 describe('reactions (G-26)', () => {
   it('adds from the toolbar, shows a pressed chip with the count, and a click takes it back', async () => {
     const { core, row } = await setup();
     const react = vi.spyOn(core, 'react');
     await click(within(row).getByRole('button', { name: 'Add reaction' }));
-    await click(within(picker()).getByRole('button', { name: 'thumbs up' }));
+    await pickNamed('thumbs up');
     expect(react).toHaveBeenLastCalledWith(expect.any(String), '👍', true);
     expect(screen.queryByRole('dialog', { name: 'Add reaction' })).toBeNull();
     const chip = await within(row).findByRole('button', { name: (n) => plain(n) === '👍, 1' });
@@ -49,11 +54,11 @@ describe('reactions (G-26)', () => {
     const { core, row } = await setup();
     fireEvent.contextMenu(row);
     await click(within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Add reaction' }));
-    await click(within(picker()).getByRole('button', { name: 'fire' }));
+    await pickNamed('fire');
     await within(row).findByRole('group', { name: 'Reactions on this message' });
     const react = vi.spyOn(core, 'react');
     await click(within(within(row).getByRole('group', { name: 'Reactions on this message' })).getByRole('button', { name: 'Add reaction' }));
-    await click(within(picker()).getByRole('button', { name: 'party popper' }));
+    await pickNamed('party popper');
     expect(react).toHaveBeenLastCalledWith(expect.any(String), '🎉', true);
   });
 
@@ -62,7 +67,7 @@ describe('reactions (G-26)', () => {
     await click(within(row).getByRole('button', { name: 'Add reaction' }));
     const search = within(picker()).getByRole('searchbox', { name: 'Search emoji' });
     fireEvent.change(search, { target: { value: 'laugh' } });
-    expect(within(picker()).getAllByRole('button').filter((b) => b.classList.contains('emoji-cell')).map((b) => b.textContent)).toContain('😂');
+    expect((await within(picker()).findAllByRole('gridcell')).map((b) => b.textContent)).toContain('😂');
     fireEvent.change(search, { target: { value: 'nothing-like-this' } });
     expect(within(picker()).getByText('No emoji found')).toBeTruthy();
     fireEvent.change(search, { target: { value: 'laugh' } });
@@ -71,14 +76,14 @@ describe('reactions (G-26)', () => {
     });
     await within(row).findByRole('button', { name: (n) => plain(n) === '😂, 1' });
     await click(within(row).getAllByRole('button', { name: 'Add reaction' })[0]);
-    expect(within(picker()).getByRole('heading', { name: 'Recent' })).toBeTruthy();
+    expect(await within(picker()).findByRole('heading', { name: 'Recent' })).toBeTruthy();
   });
 
   it('errors from the core say why', async () => {
     const { core, row } = await setup();
     vi.spyOn(core, 'react').mockRejectedValueOnce({ code: 'bad-request' });
     await click(within(row).getByRole('button', { name: 'Add reaction' }));
-    await click(within(picker()).getByRole('button', { name: 'thumbs up' }));
+    await pickNamed('thumbs up');
     expect(await screen.findByText('You can add up to 10 emoji to one message.')).toBeTruthy();
   });
 });

@@ -99,6 +99,7 @@ export function MessageList({
   const core = useCore();
   // G-26: the message the emoji picker is open for.
   const [pickerFor, setPickerFor] = useState<Message | null>(null);
+  const pickedMine = useMemo(() => new Set((pickerFor?.reactions ?? []).filter((r) => r.mine).map((r) => r.emoji)), [pickerFor]);
   const react = useCallback(
     (m: Message, emoji: string, on: boolean) => {
       core.react(m.id, emoji, on).catch((e) => {
@@ -421,7 +422,14 @@ export function MessageList({
         </button>
       )}
       {menu}
-      <EmojiPicker open={!!pickerFor} onClose={() => setPickerFor(null)} onPick={(emoji) => pickerFor && react(pickerFor, emoji, true)} />
+      <EmojiPicker
+        mode="reaction"
+        open={!!pickerFor}
+        onClose={() => setPickerFor(null)}
+        selected={pickedMine}
+        // G-27: choosing one I already used removes my reaction, like the chip.
+        onPick={(emoji) => pickerFor && react(pickerFor, emoji, !pickedMine.has(emoji))}
+      />
     </div>
   );
 }

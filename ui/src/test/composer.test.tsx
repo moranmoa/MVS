@@ -1,7 +1,7 @@
 // QA-10: the composer shows the length limit instead of cutting a paste
 // silently, never sends past it, and keeps the text when the core refuses it.
 
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
@@ -84,5 +84,25 @@ describe('composer length limit (QA-10)', () => {
     });
     expect(box.value).toBe('hello');
     expect(screen.getByRole('alert').textContent).toContain('waiting for a moderator to renew');
+  });
+});
+
+describe('composer emoji button (G-27)', () => {
+  it('inserts at the cursor, then gives focus back to the text box after the emoji', async () => {
+    const { box } = await setup();
+    fireEvent.change(box, { target: { value: 'hello world' } });
+    box.setSelectionRange(5, 5);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Insert emoji' }));
+    });
+    const dialog = screen.getByRole('dialog', { name: 'Insert emoji' });
+    fireEvent.change(within(dialog).getByRole('searchbox'), { target: { value: 'fire' } });
+    await act(async () => {
+      fireEvent.click(await within(dialog).findByRole('gridcell', { name: 'fire' }));
+      await new Promise((r) => requestAnimationFrame(r));
+    });
+    expect(box.value).toBe('hello🔥 world');
+    expect(document.activeElement).toBe(box);
+    expect(box.selectionStart).toBe(7);
   });
 });

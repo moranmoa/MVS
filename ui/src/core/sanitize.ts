@@ -248,12 +248,15 @@ export function cleanInvite(i: Invite): Invite {
   };
 }
 
-/** G-47: a blocked account from the core, or null without a usable id. */
+/**
+ * G-47: a blocked account from the core, or null when its id isn't 64
+ * lower-case hex (SL, as for removed accounts): setBlocked only ever gets a
+ * real account id.
+ */
 export function cleanBlockedUser(b: BlockedUser): BlockedUser | null {
-  const userId = cleanHexId(b?.userId);
-  if (!userId) return null;
-  const name = cleanName(b?.name);
-  return name ? { userId, name } : { userId };
+  if (typeof b?.userId !== 'string' || !/^[0-9a-f]{64}$/.test(b.userId)) return null;
+  const name = cleanName(b.name);
+  return name ? { userId: b.userId, name } : { userId: b.userId };
 }
 const cleanBlockedList = (l: unknown): BlockedUser[] =>
   Array.isArray(l) ? l.map(cleanBlockedUser).filter((b): b is BlockedUser => b !== null) : [];

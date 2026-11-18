@@ -1314,7 +1314,8 @@ export class MockCore implements CoreApi {
 
   // ---- safety --------------------------------------------------------------
 
-  async blockUser(userId: Id): Promise<void> {
+  async blockUser(rawId: Id): Promise<void> {
+    const userId = this.memberIdOf(rawId);
     const now = this.blockedIds().has(userId);
     for (const s of this.servers.values()) {
       if (!s.members.some((m) => m.id === userId)) continue;
@@ -1335,13 +1336,22 @@ export class MockCore implements CoreApi {
     return this.blockedList();
   }
 
+  /** Like the core, by 64-hex account id (the sanitizer drops anything else). */
   private blockedList(): BlockedUser[] {
     return [...this.blockedIds()]
+      .map(([id, name]) => [asAccountId(id), name] as const)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([userId, name]) => (name ? { userId, name } : { userId }));
   }
 
-  async setBlocked(userId: Id, blocked: boolean): Promise<null> {
+  /** A demo member id, given as itself or as its 64-hex account id. */
+  private memberIdOf(id: Id): Id {
+    for (const s of this.servers.values()) for (const m of s.members) if (m.id === id || asAccountId(m.id) === id) return m.id;
+    return id;
+  }
+
+  async setBlocked(rawId: Id, blocked: boolean): Promise<null> {
+    const userId = this.memberIdOf(rawId);
     if (userId === this.identity?.id) throw err({ code: 'bad-request' });
     if (this.blockedIds().has(userId) !== blocked) await this.blockUser(userId);
     return null;

@@ -10,6 +10,11 @@ import './blocked.css';
 export const UNDO_MS = 5000;
 /** G-47 (TL): a person's button stays busy until the list shows the change, at most this long. */
 export const GUARD_MS = 2000;
+/** G-47 (TL): listBlocked is tried again after a transient error, after these waits. */
+export const LIST_RETRY_MS = [1000, 2000, 4000, 8000, 16000];
+/** An older core answers these for a command it doesn't have: no retry. */
+const NO_SUCH_COMMAND = new Set(['bad-request', 'not-implemented']);
+
 /** No colour is known for someone who shares no server with me: a neutral one (white text passes AA). */
 const NEUTRAL = '#5f6672';
 
@@ -67,18 +72,30 @@ export function BlockedList({ focus }: { focus?: number }) {
   // The core's list; null until read, or for good on a core without listBlocked.
   const [fromCore, setFromCore] = useState<BlockedUser[] | null>(null);
   const [coreHasList, setCoreHasList] = useState<boolean | null>(null);
+  // Meanwhile (or for good on an older core) the member lists stand in.
   useEffect(() => {
     let live = true;
-    core.listBlocked().then(
-      (l) => {
-        if (!live) return;
-        setFromCore(l);
-        setCoreHasList(true);
-      },
-      () => live && setCoreHasList(false),
-    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = (attempt: number) =>
+      core.listBlocked().then(
+        (l) => {
+          if (!live) return;
+          setFromCore(l);
+          setCoreHasList(true);
+        },
+        (e: unknown) => {
+          if (!live) return;
+          setCoreHasList((had) => had ?? false);
+          const code = (e as { code?: unknown } | null)?.code;
+          const wait = LIST_RETRY_MS[attempt];
+          if (typeof code === 'string' && NO_SUCH_COMMAND.has(code)) return;
+          if (wait !== undefined) timer = setTimeout(() => void read(attempt + 1), wait);
+        },
+      );
+    void read(0);
     return () => {
       live = false;
+      clearTimeout(timer);
     };
   }, [core]);
   useCoreEvent('blocks.changed', ({ blocked }) => {

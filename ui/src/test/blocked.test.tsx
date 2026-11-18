@@ -86,6 +86,33 @@ describe('G-47: blocked accounts', () => {
     expect(within(region).getByRole('button', { name: 'Unblock ⁨Unknown account⁩' })).toBeTruthy();
   });
 
+  it("a transient listBlocked error: the member lists meanwhile, then the core's list after a retry (TL)", async () => {
+    let calls = 0;
+    const { core, others } = await setup((core) => {
+      const real = core.listBlocked.bind(core);
+      core.listBlocked = vi.fn(() => (++calls === 1 ? Promise.reject({ code: 'internal' }) : real()));
+    });
+    const region = await openPrivacy();
+    // Blocked before the retry: shown from the member lists meanwhile.
+    await act(async () => core.blockUser(others[0]!.id));
+    await within(region).findByRole('button', { name: /^Unblock / });
+    await waitFor(() => expect(calls).toBe(2), { timeout: 3000 });
+    // Now on the core's list: Unblock is setBlocked.
+    const set = vi.spyOn(core, 'setBlocked');
+    await click(within(region).getByRole('button', { name: /^Unblock / }));
+    expect(set).toHaveBeenCalledWith(expect.stringMatching(/^[0-9a-f]{64}$/), false);
+  });
+
+  it('older core (bad-request): no retry', async () => {
+    const list = vi.fn().mockRejectedValue({ code: 'bad-request' });
+    await setup((core) => {
+      core.listBlocked = list;
+    });
+    await openPrivacy();
+    await new Promise((r) => setTimeout(r, 1300));
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
   it('older core (listBlocked fails): the member lists and the toggle', async () => {
     const { core, others } = await setup((core) => {
       core.listBlocked = vi.fn().mockRejectedValue({ code: 'bad-request' });
@@ -136,7 +163,7 @@ describe('G-47: blocked accounts', () => {
       fireEvent.click(unblock);
     });
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith(target.id, false);
+    expect(spy).toHaveBeenCalledWith(expect.stringMatching(/^[0-9a-f]{64}$/), false); // the core's account id
     await waitFor(() => expect(within(region).queryByRole('listitem')).toBeNull());
     const server = (await core.listServers())[0]!;
     expect((await core.listMembers(server.id)).find((m) => m.id === target.id)?.blocked).toBeFalsy();
@@ -152,7 +179,7 @@ describe('G-47: blocked accounts', () => {
     expect(status.textContent).toBe(`You unblocked ⁨${nameOf(target)}⁩.Undo`);
     const set = vi.spyOn(core, 'setBlocked');
     await click(within(status).getByRole('button', { name: 'Undo' }));
-    expect(set).toHaveBeenCalledWith(target.id, true);
+    expect(set).toHaveBeenCalledWith(expect.stringMatching(/^[0-9a-f]{64}$/), true);
     await waitFor(() => expect(within(region).getAllByRole('listitem')).toHaveLength(1));
     expect(status.textContent).toBe('');
 
@@ -216,6 +243,10 @@ describe('G-47: the sanitizer', () => {
     expect(cleanBlockedUser({ userId: 'a'.repeat(64), name: '' })).toEqual({ userId: 'a'.repeat(64) });
     expect(cleanBlockedUser({ userId: 'a'.repeat(64), name: 'Tal\u202e' })?.name).not.toContain('\u202e');
     expect(cleanBlockedUser({ name: 'x' } as never)).toBeNull();
+    // SL: a strict 64 lower-case hex id, like removed accounts.
+    expect(cleanBlockedUser({ userId: 'u-tal', name: 'Tal' })).toBeNull();
+    expect(cleanBlockedUser({ userId: 'A'.repeat(64) })).toBeNull();
+    expect(cleanBlockedUser({ userId: 'a'.repeat(63) })).toBeNull();
     expect(cleanBlockedUser(null as never)).toBeNull();
   });
 });

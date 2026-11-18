@@ -331,6 +331,8 @@ function Composer({
     setText(text.slice(0, from) + emoji + text.slice(to));
     setFailed(null);
     caret.current = [at, at];
+    // G-29: an inserted emoji is typing too (not while editing a sent message).
+    if (!editing) onTyping(true);
     if (keep) return;
     requestAnimationFrame(() => {
       ref.current?.focus();
@@ -566,7 +568,7 @@ function Composer({
             }
           }}
         />
-        <EmojiPicker mode="composer" open={emojiOpen} anchor={emojiButton.current} onClose={() => setEmojiOpen(false)} onPick={insertEmoji} />
+        <EmojiPicker mode="composer" open={emojiOpen} anchor={emojiButton} onClose={() => setEmojiOpen(false)} onPick={insertEmoji} />
         <button type="submit" className="icon-button send" aria-label={intl.formatMessage({ id: 'chat.send' })} disabled={!text.trim() || tooLong}>
           <SendIcon />
         </button>

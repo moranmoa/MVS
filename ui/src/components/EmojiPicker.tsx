@@ -6,7 +6,7 @@
 // strip and the category tabs.
 
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject, type CSSProperties, type KeyboardEvent, type MouseEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { normalizeEmoji } from '../core/emoji';
 import { GROUPS, loadEmoji, search, type EmojiData, type EmojiEntry, type Group } from '../emoji';
@@ -85,7 +85,7 @@ export interface EmojiPickerProps {
   onPick: (emoji: string, keep: boolean) => void;
   mode: 'composer' | 'reaction';
   /** What opened it: placement, and focus goes back there on close. */
-  anchor?: HTMLElement | null;
+  anchor?: RefObject<HTMLElement | null>;
   /** Reaction mode: the emoji I already reacted with (normalized). */
   selected?: ReadonlySet<string>;
 }
@@ -113,7 +113,7 @@ export function EmojiPicker({ open, onClose, onPick, mode, anchor, selected }: E
     const d = ref.current;
     if (!d) return;
     if (open && !d.open) {
-      anchorRef.current = anchor ?? (document.activeElement as HTMLElement | null);
+      anchorRef.current = anchor?.current ?? (document.activeElement as HTMLElement | null);
       setQuery('');
       setActive(0);
       setHover(null);

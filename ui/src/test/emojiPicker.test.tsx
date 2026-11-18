@@ -37,6 +37,14 @@ describe('the emoji bundle', () => {
     }
     expect(search(data, 'zzzz-nothing')).toEqual([]);
   });
+
+  it('ranks whole words first: "לב" puts every heart before anything "לבן" (white)', async () => {
+    const data = await loadEmoji();
+    const found = search(data, 'לב');
+    const firstWhite = found.findIndex((e) => !e.words.includes('לב') && e.words.some((w) => w.startsWith('לבן')));
+    expect(firstWhite).toBeGreaterThan(found.indexOf(data.byKey.get('❤')!));
+    expect(found.slice(0, firstWhite).every((e) => e.words.includes('לב'))).toBe(true);
+  });
 });
 
 function Harness({ locale = 'en', mode = 'composer', selected, onPick = () => {} }: { locale?: 'en' | 'he'; mode?: 'composer' | 'reaction'; selected?: Set<string>; onPick?: (e: string, keep: boolean) => void }) {
@@ -48,7 +56,7 @@ function Harness({ locale = 'en', mode = 'composer', selected, onPick = () => {}
         <button ref={btn} type="button" onClick={() => setOpen(true)}>
           open
         </button>
-        <EmojiPicker mode={mode} open={open} anchor={btn.current} selected={selected} onClose={() => setOpen(false)} onPick={onPick} />
+        <EmojiPicker mode={mode} open={open} anchor={btn} selected={selected} onClose={() => setOpen(false)} onPick={onPick} />
       </div>
     </IntlProvider>
   );

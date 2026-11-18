@@ -17,6 +17,8 @@ export interface EmojiEntry {
   he: string;
   /** Folded words of both names and both keyword lists, for search. */
   words: string[];
+  /** Folded words of the two names only (search ranks these first). */
+  nameWords: string[];
 }
 
 export interface EmojiData {
@@ -43,7 +45,15 @@ export function buildData(raw: Raw): EmojiData {
     const key = normalizeEmoji(glyph);
     const group = raw.groups[g] as Group | undefined;
     if (!key || !group || !GROUPS.includes(group)) continue;
-    list.push({ glyph, key, group, en, he: he || en, words: [...new Set(words(`${en} ${enKw} ${he} ${heKw}`))] });
+    list.push({
+      glyph,
+      key,
+      group,
+      en,
+      he: he || en,
+      words: [...new Set(words(`${en} ${enKw} ${he} ${heKw}`))],
+      nameWords: [...new Set(words(`${en} ${he}`))],
+    });
   }
   return { list, byKey: new Map(list.map((e) => [e.key, e])) };
 }
@@ -55,9 +65,33 @@ export function loadEmoji(): Promise<EmojiData> {
   return loading;
 }
 
-/** Every word of the query starts some word of the name or keywords, in either language. */
+/** How well one query word fits: 0 a whole word, 1 the start of a name word, 2 the start of a keyword, -1 none. */
+function fit(e: EmojiEntry, w: string): number {
+  if (e.words.includes(w)) return 0;
+  if (e.nameWords.some((x) => x.startsWith(w))) return 1;
+  return e.words.some((x) => x.startsWith(w)) ? 2 : -1;
+}
+
+/**
+ * Every word of the query starts some word of the name or keywords, in either
+ * language. Ranked (UX on #489): whole words first, then name starts, then
+ * keyword starts; CLDR order within each. So "לב" puts the hearts before "לבן".
+ */
 export function search(data: EmojiData, query: string): EmojiEntry[] {
   const q = words(query);
   if (!q.length) return [];
-  return data.list.filter((e) => q.every((w) => e.words.some((x) => x.startsWith(w))));
+  const found: [EmojiEntry, number][] = [];
+  for (const e of data.list) {
+    let worst = 0;
+    for (const w of q) {
+      const f = fit(e, w);
+      if (f < 0) {
+        worst = -1;
+        break;
+      }
+      worst = Math.max(worst, f);
+    }
+    if (worst >= 0) found.push([e, worst]);
+  }
+  return found.sort((a, b) => a[1] - b[1]).map(([e]) => e);
 }

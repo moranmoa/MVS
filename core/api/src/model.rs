@@ -169,9 +169,13 @@ pub(crate) const SERVER_LIFECYCLE_CAP: &str = "server-lifecycle-v1";
 /// refuse an unknown kind and stall the channel behind it, so nobody
 /// reacts until every member posts this.
 pub(crate) const REACTIONS_CAP: &str = "reactions-v1";
+/// G-14: this version reads `ChannelTopic` records (kind 22). Older cores
+/// refuse an unknown kind and stall the control log behind it, so nobody
+/// sets a topic until every member posts this.
+pub(crate) const TOPIC_CAP: &str = "channel-topic-v1";
 /// Every cap this version posts, and the only names `getUpdateNeeded`
 /// takes.
-pub(crate) const CAPS: [&str; 2] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP];
+pub(crate) const CAPS: [&str; 3] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {

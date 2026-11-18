@@ -228,7 +228,7 @@
   "reports.showConfirm": "הצגה",
   "reports.withheld": "התוכן מוסתר כי הוא עלול להיות לא מתאים לגיל.",
   "reports.invalid": "לא ניתן לאמת את התוכן הזה.",
-  "reports.noKey": "אי אפשר לפתוח את ההודעה הזו במכשיר הזה.",
+  "reports.noKey": "אי אפשר לפתוח את ההודעה הזו במחשב הזה.",
   "reports.deleteMessage": "מחיקת ההודעה",
   "reports.deleted": "ההודעה נמחקה.",
   "reports.dismiss": "סימון כטופל",

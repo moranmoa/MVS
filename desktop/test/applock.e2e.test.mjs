@@ -40,7 +40,7 @@ const sent = () =>
 before(async () => {
   mkdirSync(CORE_DIR, { recursive: true });
   writeFileSync(join(CORE_DIR, 'fake-applock.json'), JSON.stringify({ enabled: true, idleMinutes: 5, lockOnSleep: true }));
-  app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_DEMO: '1', MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
+  app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
   page = await app.firstWindow();
   await page.waitForLoadState('domcontentloaded');
 });

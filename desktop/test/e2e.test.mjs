@@ -17,7 +17,7 @@ let app;
 let page;
 
 before(async () => {
-  app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_DEMO: '1', MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
+  app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
   page = await app.firstWindow();
   await page.waitForFunction(() => document.querySelector('#root')?.children.length > 0, null, { timeout: 30_000 });
 });

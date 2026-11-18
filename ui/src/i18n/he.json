@@ -619,7 +619,7 @@
   "notify.settings.badgeHint": "מספר האזכורים שלך והערוצים שיש בהם הודעות חדשות, על האייקון בשורת המשימות. שרתים וערוצים מושתקים לא נספרים.",
   "notify.settings.badge": "מונה על אייקון האפליקציה",
   "notify.settings.sound": "צליל להודעות חדשות",
-  "notify.settings.soundHint": "לאותן הודעות שמקבלות התראה. לכל היותר צליל אחד כל 2 שניות.",
+  "notify.settings.soundHint": "לפי הגדרות ההתראות של כל שרת וערוץ. לכל היותר צליל אחד כל 2 שניות.",
   "notify.settings.soundInCall": "גם בזמן שיחה",
   "notify.settings.desktopOnly": "התראות עובדות באפליקציית הדסקטופ.",
   "notify.hidden": "הודעה חדשה ב-\u2068#{channel}\u2069",

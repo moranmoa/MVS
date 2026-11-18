@@ -167,7 +167,7 @@ pub struct PayloadProfile {
 /// The seed as a `Zeroizing<String>` in JSON: a plain string on the wire,
 /// wiped from memory when the payload is dropped (Security Lead on #407).
 /// Deserialising moves the parsed `String` into the wrapper (no copy).
-mod secret_string {
+pub(crate) mod secret_string {
     use serde::{Deserialize, Deserializer, Serializer};
     use zeroize::Zeroizing;
 

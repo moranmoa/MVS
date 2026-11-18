@@ -160,6 +160,19 @@ pub(crate) fn open(
     Ok(entropy)
 }
 
+/// G-78, the screen lock's passcode verifier (`docs/design/app-lock.md` §3):
+/// `derive_key("mvs/app-lock-verifier/v1", Argon2id(NFC(passcode), salt))`.
+/// A UI gate only: never the vault passphrase (§7), and never a key. `None`
+/// for parameters below [`LockParams::MIN`] or above the read limits, or a
+/// salt shorter than 16 bytes.
+pub fn app_lock_verifier(passcode: &str, salt: &[u8], params: LockParams) -> Option<Zeroizing<[u8; 32]>> {
+    if salt.len() < 16 || !params.at_least_min() || !params.within_max() {
+        return None;
+    }
+    let key = kek(passcode, salt, params).ok()?;
+    Some(Zeroizing::new(blake3::derive_key("mvs/app-lock-verifier/v1", &*key)))
+}
+
 fn kek(
     passphrase: &str,
     salt: &[u8],
@@ -194,4 +207,26 @@ mod tests {
     }
 
     const GOLDEN_KEK: &str = "3e7f80dfa6fad77c2a2013f1babcf80aa795ef9a2a3b8d2048d1ec9eccdf659f";
+
+    /// G-78: the verifier is deterministic, refuses weak parameters and short
+    /// salts, and NFC makes equivalent input agree (U+FB2A is ש with its
+    /// shin dot, which NFC writes as two code points).
+    #[test]
+    fn app_lock_verifier_is_strict_and_normalised() {
+        let salt = b"0123456789abcdef";
+        let v = app_lock_verifier("2468", salt, LockParams::MIN).unwrap();
+        assert_eq!(app_lock_verifier("2468", salt, LockParams::MIN).unwrap(), v);
+        assert_ne!(app_lock_verifier("2469", salt, LockParams::MIN).unwrap(), v);
+        assert_ne!(app_lock_verifier("2468", b"0123456789abcdeg", LockParams::MIN).unwrap(), v);
+        assert!(app_lock_verifier("2468", b"short", LockParams::MIN).is_none());
+        assert!(app_lock_verifier("2468", salt, LockParams { m_kib: 1024, t: 2, p: 1 }).is_none());
+        let composed = "\u{FB2A}";
+        let decomposed = "\u{05E9}\u{05C1}";
+        assert_eq!(
+            app_lock_verifier(composed, salt, LockParams::MIN).unwrap(),
+            app_lock_verifier(decomposed, salt, LockParams::MIN).unwrap()
+        );
+        // Not the bare Argon2id output (that is the vault's kind of key).
+        assert_ne!(*v, *kek("2468", salt, LockParams::MIN).unwrap());
+    }
 }

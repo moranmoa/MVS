@@ -16,7 +16,7 @@ const PROFILE = mkdtempSync(join(tmpdir(), 'mvs-e2e-close-'));
 after(() => rmSync(PROFILE, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }));
 
 test('in a call with the renderer killed, closing the app returns at once', async () => {
-  const app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_DEMO: '1', MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
+  const app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
   const page = await app.firstWindow();
   await page.waitForFunction(() => document.querySelector('#root')?.children.length > 0, null, { timeout: 30_000 });
   const joined = await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]));

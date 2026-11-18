@@ -71,6 +71,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::CallState(_) => "call.state",
             Event::CallSignal { .. } => "call.signal",
             Event::VoiceRooms { .. } => "voice.rooms",
+            Event::Typing { .. } => "typing",
             Event::MemberRelayChanged(_) => "memberRelay.changed",
             Event::ServerRestoreChanged(_) => "serverRestore.changed",
             Event::DeviceLinkState(_) => "deviceLink.state",

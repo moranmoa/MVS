@@ -36,6 +36,7 @@ mod notice;
 mod device_link;
 mod member_relay;
 mod invite;
+mod typing;
 mod voice;
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -60,6 +61,7 @@ pub use member_relay::{
     MAX_RESERVATIONS as MEMBER_RELAY_MAX_RESERVATIONS,
 };
 pub use invite::{MAX_PER_SERVER as MAX_INVITES_PER_SERVER, MAX_PUBLICATION as MAX_INVITE_PUBLICATION};
+pub use typing::{TypingError, MAX_TYPING_BLOB};
 pub use voice::{VoiceError, MAX_VOICE_BLOB};
 pub use store::{Append, ChannelLog, ControlLog, Held, IngestError, Store};
 

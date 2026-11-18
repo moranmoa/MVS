@@ -44,6 +44,10 @@ const VOICE_QUEUE: usize = 256;
 /// A voice signal from sync: the sender's bound identity and the blob.
 pub type VoiceSignal = (PublicKey, Vec<u8>);
 
+/// G-29: received typing signals waiting for the core; more are dropped
+/// (sync caps them at 30 at once and 10 a second from everyone).
+const TYPING_QUEUE: usize = 64;
+
 /// A `--relay` address: a multiaddr that ends in `/p2p/<peer id>`, so Noise
 /// checks it reached that very relay. Without the peer ID it would accept
 /// whatever answers at the address (behind Cloudflare, anyone), so it is
@@ -121,6 +125,8 @@ pub struct SyncNetwork {
     hints: Mutex<Option<Receiver<()>>>,
     waker: SyncSender<()>,
     voice: Mutex<Option<Receiver<VoiceSignal>>>,
+    /// G-29: typing signals, as voice.
+    typing: Mutex<Option<Receiver<VoiceSignal>>>,
     /// T8-02: invite publications members pushed, until the core takes them.
     invite_pushes: InvitePushes,
     /// Device link (new device): what arrived on the link.
@@ -224,6 +230,7 @@ impl SyncNetwork {
         let (hint, hints) = std::sync::mpsc::sync_channel(1);
         let waker = hint.clone();
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
+        let (typing_tx, typing) = std::sync::mpsc::sync_channel(TYPING_QUEUE);
         let invite_pushes: InvitePushes = Arc::default();
         let pushes = invite_pushes.clone();
         let link_inbox: LinkInbox = Arc::default();
@@ -244,6 +251,11 @@ impl SyncNetwork {
                     // the core checks the envelope.
                     NodeEvent::VoiceSignal { from, bytes } => {
                         let _ = voice_tx.try_send((from, bytes));
+                        false
+                    }
+                    // G-29: as voice.
+                    NodeEvent::TypingSignal { from, bytes } => {
+                        let _ = typing_tx.try_send((from, bytes));
                         false
                     }
                     NodeEvent::Stored { .. } | NodeEvent::Lagged { .. } => true,
@@ -286,6 +298,7 @@ impl SyncNetwork {
             hints: Mutex::new(Some(hints)),
             waker,
             voice: Mutex::new(Some(voice)),
+            typing: Mutex::new(Some(typing)),
             invite_pushes,
             link_inbox,
             relay: relay_copy,
@@ -295,6 +308,11 @@ impl SyncNetwork {
     /// The voice signals for [`deliver_voice`] (once; `None` after).
     pub fn take_voice(&self) -> Option<Receiver<VoiceSignal>> {
         self.voice.lock().expect("not poisoned").take()
+    }
+
+    /// G-29: the typing signals for [`deliver_typing`] (once; `None` after).
+    pub fn take_typing(&self) -> Option<Receiver<VoiceSignal>> {
+        self.typing.lock().expect("not poisoned").take()
     }
 
     /// The hints for `Core::run_sync_loop` (once; `None` after).
@@ -348,6 +366,28 @@ impl SyncNetwork {
 pub fn deliver_voice(signals: Receiver<VoiceSignal>, core: &Core) {
     for (from, blob) in signals {
         core.voice_received(Some(from), &blob);
+    }
+}
+
+/// G-29: hands each received typing signal to the core, and runs its timers
+/// about every second, until the node stops. Its own thread.
+pub fn deliver_typing(signals: Receiver<VoiceSignal>, core: &Core) {
+    loop {
+        match signals.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok((from, blob)) => core.typing_received(Some(from), &blob),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        core.typing_tick();
+    }
+}
+
+impl crate::typing::TypingNet for SyncNetwork {
+    /// Best effort: no connected member peer bound to `to` drops it.
+    fn send(&self, to: PublicKey, blob: Vec<u8>) {
+        if let Err(e) = self.runtime.block_on(self.node.typing_send(to, blob)) {
+            tracing::debug!(%e, "typing signal not sent");
+        }
     }
 }
 

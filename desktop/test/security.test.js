@@ -316,3 +316,32 @@ test('only plain https links may be offered to the OS browser', () => {
     assert.equal(sec.isExternalWebUrl(url), false, url);
   }
 });
+
+test('links to IP literals and localhost are never offered to the OS browser (#484)', () => {
+  for (const url of [
+    'https://127.0.0.1/',
+    'https://127.0.0.1./',
+    'https://192.168.1.1:8443/admin',
+    'https://10.0.0.1/',
+    'https://0x7f000001/',
+    'https://0x7f.0.0.1/',
+    'https://2130706433/',
+    'https://017700000001/',
+    'https://127.1/',
+    'https://0/',
+    'https://[::1]/',
+    'https://[fe80::1]/',
+    'https://[::ffff:127.0.0.1]/',
+    'https://localhost/',
+    'https://LOCALHOST./',
+    'https://localhost:3000/x',
+    'https://app.localhost/',
+    'https://a.b.localhost./',
+  ]) {
+    assert.equal(sec.isExternalWebUrl(url), false, url);
+  }
+  // Ordinary names (digits in them too) still go.
+  for (const url of ['https://example.org/', 'https://example.org./', 'https://1password.com/', 'https://123.example.org/', 'https://localhost.example.org/', 'https://my-localhost.org/']) {
+    assert.equal(sec.isExternalWebUrl(url), true, url);
+  }
+});

@@ -222,6 +222,13 @@ pub const SYNC_EVERY: Duration = Duration::from_secs(2);
 /// How long a message held for its channel key (the re-key a moderator
 /// makes when they read the join) waits before it is marked `failed`.
 pub const KEY_PENDING_FOR: Duration = Duration::from_secs(120);
+/// How long messages wait for a join re-key (lost-message P1): while
+/// current members can't read the channel's key (they just joined), a new
+/// message is held until a re-key covers them, so it isn't sealed under a
+/// key they never get. Counted per channel from when those members were
+/// first seen missing; past it (no moderator online to re-key), messages go
+/// out under the current key again, and the joiners can't read those.
+pub const JOIN_KEY_WAIT: Duration = Duration::from_secs(20);
 /// Provisional IDs of messages held for their key.
 pub const KEY_PENDING_PREFIX: &str = "pending-";
 /// Messages held for their key per channel at once; more get `not-allowed`.
@@ -325,6 +332,10 @@ struct Inner {
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
     key_pending: Vec<KeyPending>,
+    /// Channels whose current key some members can't read, and since when
+    /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
+    /// once nobody is missing.
+    join_key_wait: HashMap<(ServerId, ChannelId), u64>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -553,6 +564,7 @@ impl Core {
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
             key_pending: Vec::new(),
+            join_key_wait: HashMap::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -608,6 +620,13 @@ impl Core {
         self.ports.cipher.lock();
         self.ports.network.lock();
         self.keys_locked.store(true, Ordering::SeqCst);
+        // Messages held for a key: their text is dropped (zeroized) at lock
+        // and sign-out, never kept past them (lost-message P1, SL C3).
+        {
+            let mut inner = self.lock();
+            inner.key_pending.clear();
+            inner.join_key_wait.clear();
+        }
         // G-91 (Security Lead on #457): the server secrets a restore took
         // from the backup go too; the backup is fetched again after unlock.
         let mut restore = self.restore.lock().expect("not poisoned");
@@ -693,6 +712,8 @@ impl Core {
         inner.me = None;
         inner.logs.clear();
         inner.calls = voice::Calls::default();
+        inner.key_pending.clear();
+        inner.join_key_wait.clear();
         self.signed_out.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1642,6 +1663,39 @@ impl Core {
         Ok(json)
     }
 
+    /// G-14 `setChannelTopic(channelId, topic)`: the owner or an admin sets
+    /// a channel's topic; an empty one (after trimming) clears it.
+    /// `bad-request` unless it is one line of at most 256 code points that
+    /// passes the strict name rule; `not-found` for an unknown or deleted
+    /// channel; `not-allowed` below admin; `update-needed` until every member
+    /// reads topics. The same topic again signs nothing. Never unread, a
+    /// mention or a notification: only `channel.updated`.
+    pub fn set_channel_topic(&self, channel_id: &str, topic: &str) -> CoreResult<Channel> {
+        let topic = authority::channel_topic(topic).ok_or(ErrorCode::BadRequest)?;
+        let topic = topic.as_str();
+        let (server, channel, _) = self.live_channel(channel_id)?;
+        let unchanged = {
+            let mut inner = self.lock();
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            let current = inner.view(server)?.state.topics.get(&channel).cloned();
+            if current.as_deref().unwrap_or("") != topic {
+                inner.cap_gate(server, model::TOPIC_CAP)?;
+            }
+            current.as_deref().unwrap_or("") == topic
+        };
+        if !unchanged {
+            let server_id = model::hex_id(server.as_bytes());
+            let action = Action::ChannelTopic { channel, topic: topic.to_owned() };
+            self.control_action(&server_id, action)?;
+        }
+        let json = self.channel_json(server, channel)?;
+        if !unchanged {
+            self.ports.events.emit(&Event::ChannelUpdated(json.clone()));
+        }
+        Ok(json)
+    }
+
     /// G-11 `moveChannel(serverId, channelId, before?, after?)`: owner and
     /// admin only (`not-allowed`). Puts the channel right before `before`,
     /// or right after `after`, or last with neither; both must agree (the
@@ -2236,6 +2290,11 @@ impl Core {
             // G-29: a send ends my typing there (`off` once, if `on` went out).
             let stop = inner.typing.stopped(channel);
             inner.send_typing(ports.clock.now_ms(), stop.into_iter().collect());
+            if inner.waits_for_join_key(ports, server, channel)? {
+                let message = inner.hold_for_key(ports, server, channel, body)?;
+                events.push(Event::MessageAdded(message.clone()));
+                return Ok(message);
+            }
             let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
@@ -2531,6 +2590,7 @@ impl Core {
                 inner.load(server)?;
                 inner.seed_announced(&*ports.cipher, server)?;
                 let name_before = inner.view(server)?.state.server_name.clone();
+                let topics_before = inner.view(server)?.state.topics.clone();
                 let mut changed = false;
                 for record in records {
                     if record.server() == server {
@@ -2545,6 +2605,9 @@ impl Core {
                 if inner.view(server)?.state.server_name != name_before {
                     events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
+                // G-14: a topic set or cleared elsewhere. Only
+                // `channel.updated`: never unread, a mention or a notice.
+                inner.topic_events(&*ports.cipher, server, &topics_before, Some(me), events)?;
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
                 let _ = inner.post_caps(ports, server);
@@ -3953,6 +4016,11 @@ impl Inner {
             let body = self.key_pending[i].body.clone();
             let waiting = self.db.has_server(server)? && {
                 self.load(server)?;
+                // Still within a join re-key's wait: neither sent nor failed.
+                if self.waits_for_join_key(ports, server, channel)? {
+                    i += 1;
+                    continue;
+                }
                 match self.seal(ports, server, channel, body.as_bytes()) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
@@ -3995,6 +4063,30 @@ impl Inner {
             });
         }
         Ok(())
+    }
+
+    /// Whether a new message in `channel` should wait for a join re-key:
+    /// some current members can't read its key yet, for less than
+    /// [`JOIN_KEY_WAIT`] so far. Sealed now, the message would never reach
+    /// them (lost-message P1). A moderator's sync round makes that re-key
+    /// (GAP-8 bucket); everyone else's arrives with it.
+    fn waits_for_join_key(&mut self, ports: &Ports, server: ServerId, channel: ChannelId) -> CoreResult<bool> {
+        let members = self.view(server)?.state.members.clone();
+        let cipher = &*ports.cipher;
+        cipher.membership_changed(server, &members);
+        chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        let missing = cipher.missing_readers(server, channel).len();
+        if missing == 0 {
+            self.join_key_wait.remove(&(server, channel));
+            return Ok(false);
+        }
+        let now = ports.clock.now_ms();
+        let since = *self.join_key_wait.entry((server, channel)).or_insert(now);
+        if now.saturating_sub(since) < JOIN_KEY_WAIT.as_millis() as u64 {
+            return Ok(true);
+        }
+        tracing::info!(target: "mvs::keys", missing, "join key wait over: sending under the current key");
+        Ok(false)
     }
 
     fn awaiting_key(&self, server: ServerId) -> CoreResult<bool> {
@@ -4620,6 +4712,34 @@ impl Inner {
         Ok(())
     }
 
+    /// G-14: `channel.updated` for each channel I can see whose topic is not
+    /// what it was in `before`.
+    fn topic_events(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+        before: &BTreeMap<ChannelId, String>,
+        me: Option<PublicKey>,
+        events: &mut Vec<Event>,
+    ) -> CoreResult<()> {
+        let view = self.view(server)?;
+        let after = &view.state.topics;
+        let changed: Vec<String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|id| before.get(*id) != after.get(*id))
+            .map(|id| model::hex_id(id.as_bytes()))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut channels = view.channels(me);
+        channels.retain(|c| changed.contains(&c.id));
+        self.fill_unread(cipher, server, &mut channels)?;
+        events.extend(channels.into_iter().map(Event::ChannelUpdated));
+        Ok(())
+    }
+
     /// `not-allowed` below `role` in loaded `server` (before the gate, so a
     /// member learns they can't, not that others must update).
     fn lifecycle_role(&self, server: ServerId, role: authority::Role) -> CoreResult<()> {
@@ -4682,6 +4802,9 @@ impl Inner {
     ) -> CoreResult<()> {
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
+        // Held text goes with the server (lost-message P1, SL C3).
+        self.key_pending.retain(|p| p.server != server);
+        self.join_key_wait.retain(|(s, _), _| *s != server);
         self.logs.remove(&server);
         self.announced.remove(&server);
         events.push(Event::ServerRemoved {
@@ -4991,6 +5114,12 @@ impl ServerView<'_> {
     /// The channels authority knows, with their names as created; a server
     /// from before #113 shows its derived #general.
     /// TODO(#116): hide 18+ channels from members without an 18+ claim.
+    ///
+    /// The one place 18+ channels, with their names and G-14 topics, are
+    /// withheld from members without an 18+ claim: `listChannels`, every
+    /// `channel.updated` (`channel_json`, `topic_events`) and anything later
+    /// that quotes a channel go through here. Display-only (GAP-22): the
+    /// control log is plaintext to every member.
     fn channels(&self, me: Option<PublicKey>) -> Vec<Channel> {
         let server_id = model::hex_id(self.id.as_bytes());
         let positions = self.channel_positions();
@@ -5005,6 +5134,7 @@ impl ServerView<'_> {
             first_unread_index: None,
             unread_count: None,
             position: positions.get(&id).cloned(),
+            topic: self.state.topics.get(&id).cloned(),
         };
         if self.state.channels.is_empty() && self.state.deleted_channels.is_empty() {
             return vec![channel(model::default_channel(self.id), model::GENERAL, false, true)];

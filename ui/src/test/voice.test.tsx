@@ -74,7 +74,7 @@ const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize:
 
 /** `ipNoticeSeen: false` starts as on a computer that never joined a call. */
 async function setup(options: MockOptions = {}, { ipNoticeSeen = true, prefs = {} as Partial<Settings> } = {}) {
-  if (ipNoticeSeen) localStorage.setItem('mvs.notices.voiceIp.v1', '1');
+  if (ipNoticeSeen) localStorage.setItem('mvs.notices.voiceIp.v2', '1');
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, ...options });
   render(<App core={core} initialSettings={{ ...settings, ...prefs }} />);
   await screen.findByRole('textbox', { name: /^Message / });
@@ -412,12 +412,12 @@ describe('voice rooms (0.4.3)', () => {
       const inRoom = async () => (await rooms(core))[0].members.length;
       await join();
       const dialog = screen.getByRole('dialog', { name: 'Before your first call' });
-      expect(document.getElementById(dialog.getAttribute('aria-describedby')!)?.textContent).toContain('can see your IP address');
+      expect(document.getElementById(dialog.getAttribute('aria-describedby')!)?.textContent).toContain('can see your internet address (IP)');
       expect(document.activeElement?.textContent).toBe('Got it');
       expect(await inRoom()).toBe(2); // joinCall not called yet
       await click(within(dialog).getByRole('button', { name: 'Got it' }));
       expect(await inRoom()).toBe(3);
-      expect(localStorage.getItem('mvs.notices.voiceIp.v1')).toBe('1');
+      expect(localStorage.getItem('mvs.notices.voiceIp.v2')).toBe('1');
       const bar = screen.getByRole('region', { name: 'Voice call' });
       await waitFor(() => expect(document.activeElement).toBe(within(bar).getByRole('button', { name: 'Mute' })));
       // Leave and open a room: no notice the second time.
@@ -440,10 +440,36 @@ describe('voice rooms (0.4.3)', () => {
       await click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
       expect(screen.queryByRole('dialog')).toBeNull();
       expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
-      expect(localStorage.getItem('mvs.notices.voiceIp.v1')).toBeNull();
+      expect(localStorage.getItem('mvs.notices.voiceIp.v2')).toBeNull();
       expect(document.activeElement).toBe(entry());
       await join();
       expect(screen.getByRole('dialog', { name: 'Before your first call' })).toBeTruthy();
+    });
+
+    it('v2: "Privacy settings" first in Tab order, then Cancel, then Got it; it says what relay-only does', async () => {
+      const { join } = await setup({}, { ipNoticeSeen: false });
+      await join();
+      const dialog = screen.getByRole('dialog', { name: 'Before your first call' });
+      expect(within(dialog).getAllByRole('button').map((b) => b.textContent).filter((t) => t !== '' && t !== 'Close')).toEqual(['Privacy settings', 'Cancel', 'Got it']);
+      expect(document.getElementById(dialog.getAttribute('aria-describedby')!)?.textContent).toContain('Relay-only mode turns calls off.');
+    });
+
+    it('v2: "Privacy settings" neither joins nor remembers; it opens Settings on the relay-only switch', async () => {
+      const { join } = await setup({}, { ipNoticeSeen: false });
+      await join();
+      await click(within(screen.getByRole('dialog', { name: 'Before your first call' })).getByRole('button', { name: 'Privacy settings' }));
+      expect(screen.queryByRole('region', { name: 'Voice call' })).toBeNull();
+      expect(localStorage.getItem('mvs.notices.voiceIp.v2')).toBeNull();
+      const relaySwitch = await screen.findByRole('switch', { name: /relay only/i });
+      await waitFor(() => expect(document.activeElement).toBe(relaySwitch));
+    });
+
+    it('v2: a computer that saw only the v1 notice sees it once more', async () => {
+      localStorage.setItem('mvs.notices.voiceIp.v1', '1');
+      const { join } = await setup({}, { ipNoticeSeen: false });
+      await join();
+      expect(screen.getByRole('dialog', { name: 'Before your first call' })).toBeTruthy();
+      localStorage.removeItem('mvs.notices.voiceIp.v1');
     });
 
     it('a full room shows no notice: the row is disabled', async () => {

@@ -19,6 +19,7 @@ import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
 import { CreateServerDialog, Home, JoinDialog } from './Home';
 import { MemberList } from './MemberList';
+import { MEMBER_SEARCH_ID } from './MemberSearch';
 import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
 import { LeaveServerDialog } from './ServerLifecycle';
@@ -130,6 +131,19 @@ export function Shell() {
     if (settingsRequest) setSettingsOpen(true);
   }, [settingsRequest]);
 
+  // B18: joins left to the background. A final answer comes as a toast, so a
+  // removed account (or a closed server) is told why instead of nothing happening.
+  const backgroundJoins = useRef(new Set<string>());
+  useCoreEvent('join.status', (s) => {
+    if (!backgroundJoins.current.has(s.link) || s.phase === 'searching' || s.phase === 'nobody-online') return;
+    backgroundJoins.current.delete(s.link);
+    if (s.phase === 'removed') store.showFlash('join.removed');
+    else if (s.phase === 'closed') store.showFlash('join.closed');
+    else if (s.phase === 'age-blocked') store.showFlash('join.ageBlocked', { age: s.required.slice(0, 2) });
+    else if (s.phase === 'invalid') store.showFlash('join.invalid');
+    // joined: the server appears in the rail (server.added).
+  });
+
   useEffect(() => {
     if (!flash) return;
     const t = setTimeout(() => store.clearFlash(), 3000);
@@ -201,6 +215,30 @@ export function Shell() {
   });
   const sheetOpen = phone && phoneMembers && phoneView === 'chat';
   const showMembers = !!server && (phone ? sheetOpen : membersOpen);
+
+  // G-41: Ctrl+Shift+M opens the member list if it is hidden and focuses its search
+  // (servers of 15+ members have one). By key position, so any keyboard layout works.
+  const searchAfterOpen = useRef(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey || e.code !== 'KeyM' || !server) return;
+      e.preventDefault();
+      const field = document.getElementById(MEMBER_SEARCH_ID);
+      if (showMembers && field) field.focus();
+      else if (!showMembers) {
+        searchAfterOpen.current = true;
+        if (phone) goPhone('chat');
+        toggleMembers();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+  useEffect(() => {
+    if (!showMembers || !searchAfterOpen.current) return;
+    searchAfterOpen.current = false;
+    document.getElementById(MEMBER_SEARCH_ID)?.focus();
+  }, [showMembers]);
 
   // Keyboard and screen-reader users keep their place when the phone pages switch:
   // the chat heading after opening a channel, the open channel after going back,
@@ -325,6 +363,7 @@ export function Shell() {
       <JoinDialog
         open={dialog === 'join'}
         initialLink={invite}
+        onBackground={(link) => backgroundJoins.current.add(link)}
         onClose={() => {
           setDialog(null);
           setInvite(undefined);

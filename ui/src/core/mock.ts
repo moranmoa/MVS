@@ -10,6 +10,7 @@ import { normalizeEmoji } from './emoji';
 import type {
   CallState,
   VoiceRoom,
+  CoreSettings,
   ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
@@ -21,6 +22,7 @@ import type {
   Channel,
   CreatedInvite,
   Invite,
+  RemovedMember,
   CoreError,
   Id,
   Identity,
@@ -92,6 +94,8 @@ export interface MockOptions {
   deviceLink?: 'confirm' | 'expired' | 'failed';
   /** Time between demo messages (default 47 s); hours make the last screen cross days (G-23). */
   messageGapMs?: number;
+  /** G-29: this many demo members are typing in the open channel (1-3). */
+  typing?: number;
   /** G-91: hold the restore progress at this state (screenshots); otherwise it plays out. */
   restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
@@ -137,6 +141,8 @@ interface ServerState {
   summary: ServerSummary;
   channels: ChannelState[];
   members: Member[];
+  /** G-53: removed by the owner, until undone. */
+  removed?: (RemovedMember & { member: Member })[];
 }
 
 /**
@@ -231,6 +237,17 @@ export class MockCore implements CoreApi {
     if (options.deviceLinked !== undefined) {
       const label = options.deviceLinked;
       this.timers.push(setTimeout(() => this.simulateDeviceAdded(label, Date.now() - 2 * 60_000), 50));
+    }
+    if (options.typing) {
+      const n = Math.min(3, options.typing);
+      // Keeps saying so, as a typing peer does, so screenshots never catch it expired.
+      const tick = () => {
+        const [server] = this.servers.values();
+        if (!server) return;
+        const ids = server.members.filter((m) => m.id !== this.identity?.id && m.presence === 'online').slice(0, n).map((m) => m.id);
+        this.simulateTyping(server.channels[0].channel.id, ids);
+      };
+      this.timers.push(setTimeout(tick, 50), setInterval(tick, 3000));
     }
     if (options.updateInstalled) {
       this.timers.push(
@@ -1034,6 +1051,12 @@ export class MockCore implements CoreApi {
       this.pendingJoins.delete(clean);
       if (/offline/i.test(clean)) {
         this.emit('join.status', { phase: 'nobody-online', link: clean });
+      } else if (/closed/i.test(clean)) {
+        // #261: a link with "closed" in it plays a server its owner closed.
+        this.emit('join.status', { phase: 'closed', link: clean });
+      } else if (/removed/i.test(clean)) {
+        // G-53: a link with "removed" in it plays an account the owner removed.
+        this.emit('join.status', { phase: 'removed', link: clean });
       } else if (/adult/i.test(clean) && this.ageOf(this.identity!.birthDate) < 18) {
         this.emit('join.status', { phase: 'age-blocked', link: clean, required: '18+' });
       } else {
@@ -1500,6 +1523,32 @@ export class MockCore implements CoreApi {
     return null;
   }
 
+  // ---- G-29 typing ---------------------------------------------------------------
+
+  private typingIndicator = true;
+  /** What this device last said about typing, by channel (for tests). */
+  typingSent: Record<Id, boolean> = {};
+
+  async setTyping(channelId: Id, on: boolean): Promise<null> {
+    if (!this.channelIndex.has(channelId)) throw err({ code: 'not-found' });
+    if (this.typingIndicator) this.typingSent[channelId] = on;
+    return null;
+  }
+
+  async getSettings(): Promise<CoreSettings> {
+    return { typingIndicator: this.typingIndicator };
+  }
+
+  async setTypingIndicator(on: boolean): Promise<null> {
+    this.typingIndicator = on;
+    return null;
+  }
+
+  /** Mock only: members typing in a channel (an empty list stops them). */
+  simulateTyping(channelId: Id, userIds: Id[]): void {
+    this.emit('typing', { channelId, userIds });
+  }
+
   async setDeafened(deafened: boolean): Promise<null> {
     const here = this.callRoom();
     if (!this.call || !here) throw err({ code: 'not-allowed' });
@@ -1520,10 +1569,34 @@ export class MockCore implements CoreApi {
     if (!s) throw err({ code: 'not-found' });
     if (s.summary.ownerId !== this.identity?.id || userId === this.identity.id) throw err({ code: 'not-allowed' });
     await this.wait(200);
+    const gone = s.members.find((m) => m.id === userId);
     s.members = s.members.filter((m) => m.id !== userId);
     for (const c of s.channels) c.memberIds = c.memberIds.filter((id) => id !== userId);
+    if (gone) {
+      const id = asAccountId(gone.id);
+      s.removed = (s.removed ?? []).filter((r) => r.id !== id);
+      s.removed.push({ id, shortCode: gone.shortCode, displayName: gone.displayName, removedAt: Date.now(), member: gone });
+    }
+    // Like the core: members.changed, no server.updated.
     this.emit('members.changed', { serverId, members: s.members });
     this.emit('notice', { kind: 'encryption-renewed', serverId });
+  }
+
+  async listRemovedMembers(serverId: Id): Promise<RemovedMember[]> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
+    return (s.removed ?? []).map(({ member: _, ...r }) => ({ ...r }));
+  }
+
+  async undoKick(serverId: Id, userId: Id): Promise<void> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || !s.removed?.some((r) => r.id === userId)) throw err({ code: 'not-allowed' });
+    await this.wait(200);
+    // Let back, not made a member: they may join again with an invite.
+    s.removed = s.removed.filter((r) => r.id !== userId);
+    this.emit('server.updated', s.summary);
   }
 
   // ---- app -----------------------------------------------------------------
@@ -1693,4 +1766,14 @@ export class MockCore implements CoreApi {
       this.emit('members.changed', { serverId: s.summary.id, members: s.members });
     }
   }
+}
+
+/**
+ * G-53: a demo member id ('u-…') as a 64-hex account id, the form the core
+ * uses (the sanitizer drops anything else from listRemovedMembers).
+ */
+function asAccountId(demoId: string): string {
+  if (/^[0-9a-f]{64}$/.test(demoId)) return demoId;
+  const hex = Array.from(new TextEncoder().encode(demoId), (b) => b.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 64).padEnd(64, '0');
 }

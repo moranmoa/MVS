@@ -193,11 +193,14 @@ export function JoinDialog({
   initialLink,
   onClose,
   onJoined,
+  onBackground,
 }: {
   open: boolean;
   initialLink?: string;
   onClose: () => void;
   onJoined: (id: Id) => void;
+  /** B18: closed while nobody was online: the core keeps looking for this link in the background. */
+  onBackground?: (link: string) => void;
 }) {
   const core = useCore();
   const intl = useIntl();
@@ -227,6 +230,7 @@ export function JoinDialog({
 
   const cancel = () => {
     if (status?.phase === 'searching') void core.cancelJoin(link);
+    if (status?.phase === 'nobody-online') onBackground?.(link.trim());
     onClose();
   };
 
@@ -286,6 +290,11 @@ export function JoinDialog({
               <FormattedMessage id="join.ageBlocked" values={{ age: status.required.slice(0, 2) }} />
             </p>
           )}
+          {(status?.phase === 'removed' || status?.phase === 'closed') && (
+            <p className="error" role="alert">
+              <FormattedMessage id={status.phase === 'removed' ? 'join.removed' : 'join.closed'} />
+            </p>
+          )}
           {status?.phase === 'joined' && (
             <p className="success">
               <FormattedMessage id="join.joined" />
@@ -294,17 +303,24 @@ export function JoinDialog({
         </div>
         <div className="actions">
           {status?.phase === 'nobody-online' ? (
-            <button type="button" className="primary" onClick={onClose}>
+            <button type="button" className="primary" onClick={cancel}>
               <FormattedMessage id="join.keepTrying" />
+            </button>
+          ) : status?.phase === 'removed' || status?.phase === 'closed' ? (
+            // G-53 (B11a–d §5א): final, so no "Join"; "Close" only.
+            <button type="button" className="primary" onClick={onClose}>
+              <FormattedMessage id="common.close" />
             </button>
           ) : (
             <button type="submit" className="primary" disabled={busy || !link.trim()}>
               <FormattedMessage id="join.submit" />
             </button>
           )}
-          <button type="button" className="secondary" onClick={cancel}>
-            <FormattedMessage id="common.cancel" />
-          </button>
+          {status?.phase !== 'removed' && status?.phase !== 'closed' && (
+            <button type="button" className="secondary" onClick={cancel}>
+              <FormattedMessage id="common.cancel" />
+            </button>
+          )}
         </div>
       </form>
     </Dialog>

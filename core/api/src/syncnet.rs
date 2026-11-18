@@ -181,21 +181,16 @@ impl SyncNetwork {
         data_dir: &Path,
         gate: Arc<MemberGate>,
     ) -> anyhow::Result<Self> {
-        // Multi-relay part A: the list reaches here, but until sync takes
-        // several (part B, dev-sync) only the first is used, so behaviour
-        // doesn't change. Counts only in the log, never addresses.
+        // Multi-relay part B: sync dials, reserves on and announces all of
+        // them; the member relay fallback starts only when all are down.
         let Some(relay) = relays.first().cloned() else { anyhow::bail!("no relay") };
-        if relays.len() > 1 {
-            tracing::debug!(
-                relays = relays.len(),
-                "multi-relay: using the first relay until sync takes several"
-            );
-        }
+        let more_relays: Vec<Multiaddr> = relays.iter().skip(1).cloned().collect();
         let runtime =
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
         let relay_copy = relay.clone();
         let config = NodeConfig {
             relay: relay.clone(),
+            more_relays,
             data_dir: data_dir.to_owned(),
             logs: Vec::new(),
             authorizer: gate,

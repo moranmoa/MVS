@@ -127,6 +127,8 @@
 
 **בהצטרפות של חשבון שהורחק:** `join.status` עם `phase: 'removed'` ← בדיאלוג ההצטרפות (או ב-toast, אם זו הצטרפות ברקע של B18): `join.removed`. בלי כפתור "הצטרפות". "סגירה" בלבד.
 
+**בהצטרפות לשרת שהבעלים סגרו (#261):** `join.status` עם `phase: 'closed'` ← `join.closed`, באותו אופן: בדיאלוג או ב-toast של B18, בלי "הצטרפות", "סגירה" בלבד. בשתי ההודעות `role="alert"`.
+
 **מקלדת וקורא מסך:** רשימה (`<ul>`) עם כותרת `h3`. השם הנגיש של כל כפתור: `server.removed.undoFor` ("ביטול ההרחקה של {name}"). אחרי ביטול, הפוקוס עובר לכפתור בשורה הבאה. אם זו הייתה השורה האחרונה – לכותרת "לינק הזמנה".
 
 ## 6. מצבים
@@ -230,6 +232,7 @@
 | `server.removed.undone` | `ההרחקה בוטלה. אפשר להצטרף שוב עם לינק הזמנה.` | `Removal undone. They can join again with an invite link.` |
 | `server.removed.showAll` | `הצגת כל ה-{count}` | `Show all {count}` |
 | `join.removed` | `החשבון הזה הורחק מהשרת, ולכן אי אפשר להצטרף. אפשר לפנות לבעלים.` | `This account was removed from the server, so it can't join. You can contact the owner.` |
+| `join.closed` | `הבעלים סגרו את השרת הזה, ולכן אי אפשר להצטרף אליו.` | `The owner closed this server, so it can't be joined.` |
 | `join.preview.confirm` | `הצטרפות` | `Join` |
 | `join.preview.found` | `השרת ⁨{server}⁩ נמצא.` | `Found ⁨{server}⁩.` |
 | `join.preview.details` | `לפרטים` | `Details` |

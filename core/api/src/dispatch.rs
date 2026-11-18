@@ -148,6 +148,14 @@ struct UpdateChannelArgs {
     input: ChannelInput,
 }
 
+/// G-14 `setChannelTopic(channelId, topic)`; an empty topic clears it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetChannelTopicArgs {
+    channel_id: String,
+    topic: String,
+}
+
 /// G-11 `moveChannel(serverId, channelId, before?, after?)`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -478,6 +486,10 @@ impl Core {
                 ok(self.update_channel(&a.channel_id, a.input.name.as_deref(), a.input.adult))
             }
             "deleteChannel" => ok(self.delete_channel(&args::<ChannelIdArg>(raw)?.channel_id)),
+            "setChannelTopic" => {
+                let a: SetChannelTopicArgs = args(raw)?;
+                ok(self.set_channel_topic(&a.channel_id, &a.topic))
+            }
             "moveChannel" => {
                 let a: MoveChannelArgs = args(raw)?;
                 ok(self.move_channel(&a.server_id, &a.channel_id, a.before.as_deref(), a.after.as_deref()))

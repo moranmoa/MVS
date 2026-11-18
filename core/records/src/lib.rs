@@ -208,7 +208,15 @@ pub enum Kind {
     /// sealed like a `Message`'s, over a fixed-size plaintext (`core/api`),
     /// so holders see neither the target nor the emoji.
     Reaction = 21,
+    /// Sets or clears a channel's topic (G-14). Body: the channel's ID,
+    /// `history u8` (reserved for D30, written as 0), then the topic, UTF-8,
+    /// at most [`MAX_CHANNEL_TOPIC_BYTES`]; empty clears it.
+    ChannelTopic = 22,
 }
+
+/// Longest channel topic body, in UTF-8 bytes (G-14). The authority also
+/// caps it in code points.
+pub const MAX_CHANNEL_TOPIC_BYTES: usize = 1024;
 
 /// Most (channel, head) pairs a cut names, over all its channels.
 pub const MAX_CUT_ENTRIES: usize = 64;
@@ -232,7 +240,7 @@ pub const MAX_ROTATION_PARTS: u8 = 32;
 pub const ROTATION_HEADER_LEN: usize = ID_LEN + 2;
 
 impl Kind {
-    const ALL: [Kind; 21] = [
+    const ALL: [Kind; 22] = [
         Kind::Genesis,
         Kind::Grant,
         Kind::Revoke,
@@ -254,6 +262,7 @@ impl Kind {
         Kind::KeyRotation,
         Kind::Unban,
         Kind::Reaction,
+        Kind::ChannelTopic,
     ];
 
     const LARGEST_BODY: usize = 16 * 1024;
@@ -288,6 +297,8 @@ impl Kind {
             Kind::Message | Kind::MessageEdit | Kind::KeyRotation => Kind::LARGEST_BODY,
             // A sealed 64-byte plaintext (121 bytes today), with room to spare.
             Kind::Reaction => 256,
+            // Channel ID, history byte and the topic.
+            Kind::ChannelTopic => ID_LEN + 1 + MAX_CHANNEL_TOPIC_BYTES,
         }
     }
 
@@ -1029,14 +1040,23 @@ mod tests {
         assert_eq!(Kind::from_code(21), Some(Kind::Reaction));
         assert_eq!(Kind::Reaction.max_body(), 256);
         assert!(!Kind::Reaction.prunable());
-        assert_eq!(Kind::from_code(22), None, "older cores still refuse what they don't know");
+    }
+
+    #[test]
+    fn a_channel_topic_is_a_control_record_and_later_codes_stay_unknown() {
+        assert_eq!(Kind::from_code(22), Some(Kind::ChannelTopic));
+        assert_eq!(Kind::ChannelTopic.max_body(), 1057);
+        assert!(!Kind::ChannelTopic.prunable());
+        assert!(Kind::ChannelTopic.allowed_in(Scope::Control));
+        assert!(!Kind::ChannelTopic.allowed_in(Scope::Channel(ChannelId::from_bytes([1; 32]))));
+        assert_eq!(Kind::from_code(23), None, "older cores still refuse what they don't know");
     }
 
     #[test]
     fn every_kind_has_one_scope_and_a_body_limit() {
         let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
         let codes: Vec<u16> = Kind::ALL.iter().map(|kind| kind.code()).collect();
-        assert_eq!(codes, (1..=21).collect::<Vec<u16>>(), "codes are dense and in order");
+        assert_eq!(codes, (1..=22).collect::<Vec<u16>>(), "codes are dense and in order");
         // The genesis has its own tests: its body must carry the nonce.
         for kind in Kind::ALL.into_iter().filter(|kind| *kind != Kind::Genesis) {
             assert_eq!(Kind::from_code(kind.code()), Some(kind));

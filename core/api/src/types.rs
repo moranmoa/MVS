@@ -127,6 +127,10 @@ pub struct Channel {
     /// key is informational only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<String>,
+    /// G-14: the channel's topic, one line; absent when there is none. It
+    /// is plaintext in the control log, readable by every member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     /// G-21: the index (as in `getMessages`) of the first message after my
     /// read marker that isn't mine; absent with nothing unread.
     #[serde(default, skip_serializing_if = "Option::is_none")]

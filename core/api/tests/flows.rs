@@ -761,6 +761,9 @@ struct Spy {
     channels: std::sync::Mutex<BTreeSet<records::ChannelId>>,
     /// When set, `rotate` fails (a re-key that can't happen).
     fail_rotate: std::sync::atomic::AtomicBool,
+    /// When set, what opens opens as untrusted (a rotation authority
+    /// doesn't accept, #21).
+    distrust: std::sync::atomic::AtomicBool,
 }
 
 impl Spy {
@@ -769,6 +772,7 @@ impl Spy {
             inner: api::crypto::GroupKeysCipher::locked(),
             channels: Default::default(),
             fail_rotate: Default::default(),
+            distrust: Default::default(),
         }
     }
 
@@ -798,7 +802,9 @@ impl GroupCipher for Spy {
         b: &[u8],
     ) -> Result<Opened, CipherError> {
         self.saw(c);
-        self.inner.decrypt(s, c, a, b)
+        let opened = self.inner.decrypt(s, c, a, b)?;
+        let distrust = self.distrust.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(Opened { accepted: opened.accepted && !distrust, ..opened })
     }
     fn apply_rotation(&self, r: &records::Record) -> Result<Vec<records::RecordId>, CipherError> {
         if let Scope::Channel(c) = r.scope() {
@@ -5815,4 +5821,89 @@ fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
 fn peer_key(peer: &Peer) -> PublicKey {
     let id = peer.core.get_identity().unwrap().unwrap().id;
     PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
+}
+
+/// TODO #21, the PO's placeholders: a message sent after my join that this
+/// device can't open keeps its place (author, time, no text). One from
+/// before my join stays hidden. Neither counts as unread, and react,
+/// edit and delete on a placeholder get `bad-request`.
+#[test]
+fn a_message_the_joiner_cant_open_is_a_placeholder_in_place() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Placeholder");
+    owner.core.send_message(&channel, "before B joined", None).unwrap();
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+
+    // B joins and A sees it, but the owner (the only re-keyer) stays away
+    // past any wait for the join re-key: A's message goes out under the
+    // key B never gets.
+    let b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "B can't open this", None).unwrap();
+    advance(&world, 60_000);
+    a.core.sync_now().unwrap();
+    // Then the owner re-keys for B and writes under the new key.
+    owner.core.sync_now().unwrap();
+    owner.core.send_message(&channel, "after the re-key", None).unwrap();
+    b.core.sync_now().unwrap();
+
+    let got = b.core.get_messages(&channel, 0, 9).unwrap().messages;
+    let a_id = peer_key(&a);
+    // The message from before B joined is hidden, not a placeholder.
+    assert_eq!(got.len(), 2, "{got:?}");
+    let held = &got[0];
+    assert_eq!(held.unreadable, Some(Unreadable::NoKey), "{got:?}");
+    assert_eq!(held.body, "");
+    assert_eq!(held.author_id, hex::encode(a_id.as_bytes()));
+    assert_eq!(held.reactions, None);
+    assert_eq!(got[1].body, "after the re-key");
+    assert_eq!(got[1].unreadable, None);
+    assert_eq!(b.core.get_message_count(&channel).unwrap(), 2);
+
+    // Not unread: only the owner's readable message is.
+    let listed = b.core.list_channels(&server.id).unwrap();
+    let ch = listed.iter().find(|c| c.id == channel).unwrap();
+    assert_eq!(ch.unread_count, Some(1), "{ch:?}");
+
+    // Nothing to do on a placeholder.
+    let code = |r: CoreResult<()>| r.unwrap_err().code;
+    assert_eq!(code(b.core.react(&held.id, "👍", true)), ErrorCode::BadRequest);
+    assert_eq!(code(b.core.edit_message(&held.id, "x")), ErrorCode::BadRequest);
+    assert_eq!(code(b.core.delete_message(&held.id)), ErrorCode::BadRequest);
+}
+
+/// TODO #21, the PO: a message that opens only under a rotation authority
+/// doesn't accept is a placeholder with no author, text or reactions, and
+/// isn't unread.
+#[test]
+fn an_untrusted_message_is_a_placeholder_without_its_author() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Untrusted");
+    let spy = Arc::new(Spy::new());
+    let reader = world.peer_with(Arc::new(MemoryStore::new()), None, spy.clone());
+    sign_up(&reader, "Reader");
+    reader.core.join_server(&server.invite_link).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    reader.core.sync_now().unwrap();
+    owner.core.send_message(&channel, "hello", None).unwrap();
+    reader.core.sync_now().unwrap();
+    let got = reader.core.get_messages(&channel, 0, 9).unwrap().messages;
+    assert_eq!(got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["hello"]);
+
+    spy.distrust.store(true, std::sync::atomic::Ordering::SeqCst);
+    let got = reader.core.get_messages(&channel, 0, 9).unwrap().messages;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].unreadable, Some(Unreadable::Untrusted));
+    assert_eq!(got[0].body, "");
+    assert_eq!(got[0].reactions, None);
+    let json = serde_json::to_value(&got[0]).unwrap();
+    assert!(json.get("authorId").is_none(), "{json}");
+    assert_eq!(json["unreadable"], "untrusted");
+    let listed = reader.core.list_channels(&server.id).unwrap();
+    let ch = listed.iter().find(|c| c.id == channel).unwrap();
+    assert_eq!(ch.unread_count, Some(0), "{ch:?}");
 }

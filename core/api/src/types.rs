@@ -149,6 +149,19 @@ pub enum SendState {
     Failed,
 }
 
+/// Why a message is a placeholder (`Message.unreadable`, the PO's rules,
+/// TODO #21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unreadable {
+    /// Sent after my join under a key this device doesn't hold; it may
+    /// open later (`message.updated` with the text).
+    NoKey,
+    /// Under a rotation authority doesn't accept: no author, no reactions,
+    /// never a reply target.
+    Untrusted,
+}
+
 /// `Message` in types.ts. TODO: replies, edits, deletes, mentions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,6 +170,8 @@ pub struct Message {
     pub channel_id: Id,
     /// Position in the channel as shown, oldest first.
     pub index: usize,
+    /// Absent (empty) only on an `untrusted` placeholder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author_id: Id,
     pub body: String,
     pub created_at: Timestamp,
@@ -183,6 +198,11 @@ pub struct Message {
     /// first appeared; absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactions: Option<Vec<ReactionCount>>,
+    /// A placeholder (TODO #21): the body is "" and doesn't open here.
+    /// No mentions or reactions; not unread; react, edit and delete on it
+    /// get `bad-request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<Unreadable>,
 }
 
 /// `getSettings`: what the core keeps on this device.

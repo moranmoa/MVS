@@ -456,6 +456,11 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - It stays listed, failed, until a restart or `discardMessage(messageId)`, which drops a held or failed `pending-…` message and wipes its text (`not-found` for any other ID). "Send again" is `discardMessage` plus a new `sendMessage`.
   - `Message.replaces?: string` is new, and appears only on that one `message.updated`.
   - A moderator or above never gets a pending message: they make the key on the way. A non-member, or someone kicked, still gets `not-allowed` at once.
+- `Message.unreadable?: 'no-key' | 'untrusted'` (additive, TODO #21, the PO's placeholders). The message keeps its place (`index`, `createdAt`, `id`), and its `body` is `""`. It has no `mentions`, `mentionsMe` or `reactions`. It counts in `getMessageCount` but never in `unreadCount`, `firstUnreadIndex` or `mentions`.
+  - `'no-key'`: sealed under a key this device doesn't hold, by someone who had already seen me join (their record's auth deps reach my latest `Join`). It keeps its `authorId`. It isn't final: if a later rotation opens it, `message.updated` (same `id`) brings the text with no `unreadable`. A message from before my join that doesn't open is never listed, as before.
+  - `'untrusted'`: it opens only under a rotation authority doesn't accept (#21). It has **no `authorId`** and no `sendState`, and it's never a reply target.
+  - `react`, `editMessage` and `deleteMessage` on a placeholder give `bad-request`.
+  - An edit that doesn't open leaves the original text shown (with no `editedAt`); the message is a placeholder only when the original doesn't open either.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):

@@ -219,7 +219,7 @@ pub(crate) fn reactions(
 
 /// Opens a message or edit body; `None` unless it opens under an accepted
 /// rotation (#21) as text within `message_text_ok`.
-fn open(
+pub(crate) fn open(
     cipher: &dyn GroupCipher,
     server: ServerId,
     channel: ChannelId,

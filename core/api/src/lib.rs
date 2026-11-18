@@ -33,6 +33,7 @@ pub mod sidecar;
 pub mod syncnet;
 pub mod types;
 pub mod update;
+pub mod report;
 pub mod typing;
 mod voice;
 
@@ -52,6 +53,7 @@ pub use service::{
     SYNC_EVERY,
 };
 pub use types::*;
+pub use report::ReportNet;
 pub use typing::TypingNet;
 pub use voice::{
     VoiceNet, CLOCK_WINDOW_MS, HELLO_EVERY_MS, HELLO_TIMEOUT_MS, MAX_PARTICIPANTS, MAX_PAYLOAD,

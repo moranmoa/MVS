@@ -13,8 +13,8 @@ use libp2p::{
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
 use sync::{
-    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, TypingError, VoiceError,
-    MAX_TYPING_BLOB, MAX_VOICE_BLOB,
+    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, ReportError, TypingError, VoiceError,
+    MAX_REPORT_BLOB, MAX_TYPING_BLOB, MAX_VOICE_BLOB,
 };
 use tokio::sync::mpsc;
 
@@ -807,6 +807,53 @@ async fn typing_signals_go_between_members_with_their_own_caps() {
     b.shutdown().await.unwrap();
 }
 
+
+/// G-48: report boxes go between members over `/mvs/report/1`, acked only
+/// once they arrive, with their own caps (a burst of 3, then one every
+/// 10 s), never as voice or typing; a non-member's is dropped unanswered
+/// (so never acked) and none go to one; 20 KiB at most.
+#[tokio::test(flavor = "multi_thread")]
+async fn report_boxes_go_between_members_acked_with_their_own_caps() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    let (a, _ea) = bound_node_events("report-a", &relay, 32, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("report-b", &relay, 33, false, Arc::new(gate.clone())).await;
+    voice_meet(&a, &b, voice_id(32), voice_id(33), false).await;
+
+    let mut acked = 0;
+    // The fourth is over the cap: dropped unanswered, so it times out unacked.
+    for n in 0..4u8 {
+        if a.report_send(voice_id(33), vec![n; MAX_REPORT_BLOB]).await.is_ok() {
+            acked += 1;
+        }
+    }
+    assert_eq!(acked, 3, "the burst is acked; over the cap, no ack");
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        match event {
+            NodeEvent::ReportBox { from, bytes } => got.push((from, bytes)),
+            NodeEvent::VoiceSignal { .. } | NodeEvent::TypingSignal { .. } => panic!("a report arrived as voice or typing"),
+            _ => {}
+        }
+    }
+    assert_eq!(got.len(), 3);
+    assert!(got.iter().all(|(from, bytes)| *from == voice_id(32) && bytes.len() == MAX_REPORT_BLOB));
+    assert_eq!(a.report_send(voice_id(33), vec![0; MAX_REPORT_BLOB + 1]).await, Err(ReportError::TooLarge));
+    assert_eq!(a.report_send(voice_id(99), b"x".to_vec()).await, Err(ReportError::NotMember));
+
+    // Not a member to B: dropped unanswered there, and B sends it none.
+    gate.set(voice_id(32), true);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(a.report_send(voice_id(33), b"from a non-member".to_vec()).await, Err(ReportError::NotAcked));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        assert!(!matches!(event, NodeEvent::ReportBox { .. }), "a non-member's report arrived");
+    }
+    assert_eq!(b.report_send(voice_id(32), b"to a non-member".to_vec()).await, Err(ReportError::NotMember));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
 /// T8-02 piece 3: a member's invite publication reaches the other members
 /// (`/mvs/invite-pub/1`), also one that binds later; anyone, a stranger
 /// with no server secret included, can ask for its envelope handle

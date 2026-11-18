@@ -416,8 +416,8 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    fn eligible(&self, now: u64) -> bool {
-        self.adult
+    fn eligible(&self, now: u64, adult_required: bool) -> bool {
+        (self.adult || !adult_required)
             && self.current
             && !self.blocked
             && !self.mine
@@ -456,8 +456,21 @@ impl Plan {
 ///    through another owner is skipped;
 /// 4. at most 5, at least 3, and no two holders under one owner.
 pub fn pick_holders(candidates: &[Candidate], now: u64) -> Plan {
+    let holders = pick_owner_groups(candidates, now, MAX_HOLDERS, true);
+    if holders.len() < THRESHOLD {
+        return Plan::Unavailable;
+    }
+    let weak = holders.len() == THRESHOLD;
+    Plan::Shares { holders, weak }
+}
+
+/// The pick shared by member recovery and backup buddies (G-91, Tech Lead):
+/// at most `max` members, at most one per owner group, in the order of
+/// [`pick_holders`]. `adult_required`: recovery holders must be 18+;
+/// buddies hold a sealed blob, so age doesn't matter there.
+pub fn pick_owner_groups(candidates: &[Candidate], now: u64, max: usize, adult_required: bool) -> Vec<Pick> {
     let mut owners: Vec<([u8; 32], u64)> = Vec::new();
-    for c in candidates.iter().filter(|c| c.eligible(now)) {
+    for c in candidates.iter().filter(|c| c.eligible(now, adult_required)) {
         match owners.iter_mut().find(|(o, _)| *o == c.owner) {
             Some((_, joined)) => *joined = (*joined).min(c.my_join),
             None => owners.push((c.owner, c.my_join)),
@@ -466,12 +479,12 @@ pub fn pick_holders(candidates: &[Candidate], now: u64) -> Plan {
     owners.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut holders: Vec<Pick> = Vec::new();
     for (owner, _) in owners {
-        if holders.len() == MAX_HOLDERS {
+        if holders.len() == max {
             break;
         }
         let best = candidates
             .iter()
-            .filter(|c| c.owner == owner && c.eligible(now) && !holders.iter().any(|p| p.member == c.member))
+            .filter(|c| c.owner == owner && c.eligible(now, adult_required) && !holders.iter().any(|p| p.member == c.member))
             .min_by(|a, b| {
                 a.shared_since.cmp(&b.shared_since).then(b.last_seen.cmp(&a.last_seen)).then(a.member.cmp(&b.member))
             });
@@ -479,11 +492,7 @@ pub fn pick_holders(candidates: &[Candidate], now: u64) -> Plan {
             holders.push(Pick { member: c.member, owner });
         }
     }
-    if holders.len() < THRESHOLD {
-        return Plan::Unavailable;
-    }
-    let weak = holders.len() == THRESHOLD;
-    Plan::Shares { holders, weak }
+    holders
 }
 
 // --------------------------------------------------------------- re-share
@@ -886,6 +895,18 @@ mod tests {
         // Seven owners: the five whose servers I joined first.
         let seven: Vec<Candidate> = (1..=7).map(|o| cand(10 + o, o)).collect();
         assert_eq!(holders(&pick_holders(&seven, NOW)), [11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn buddies_take_one_per_owner_and_ignore_age() {
+        // G-91 (Tech Lead): one owner's 5 sock puppets yield at most 1 buddy.
+        let puppets: Vec<Candidate> = (1..=5).map(|m| cand(m, 1)).collect();
+        assert_eq!(pick_owner_groups(&puppets, NOW, 3, false).len(), 1);
+        let mut list: Vec<Candidate> = (1..=4).map(|o| cand(o, o)).collect();
+        list.iter_mut().for_each(|c| c.adult = false);
+        assert!(pick_owner_groups(&list, NOW, 3, true).is_empty(), "recovery needs 18+");
+        let buddies: Vec<u8> = pick_owner_groups(&list, NOW, 3, false).iter().map(|p| p.member[0]).collect();
+        assert_eq!(buddies, [1, 2, 3], "buddies don't, and stop at 3");
     }
 
     #[test]

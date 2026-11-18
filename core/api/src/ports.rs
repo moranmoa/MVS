@@ -220,6 +220,15 @@ pub trait Network: Send + Sync {
         Vec::new()
     }
 
+    /// G-91, phase B: hands my sealed backup to these co-members (identity
+    /// keys), my backup buddies, as well as the mailboxes. The core's pick
+    /// is advice, not authority: the network sends only to a peer bound to
+    /// one of them as a current member of a server we share, checked at
+    /// send time (Tech Lead). Best effort, like `put_backup`.
+    fn put_backup_to(&self, tag: [u8; 32], blob: &[u8], members: &[PublicKey]) {
+        let _ = (tag, blob, members);
+    }
+
     // ---- holder notice slot (`notice-slot-spec.md`, dev-sync's network) ----
 
     /// Hands my notice (`"mvsn1" ‖ …`, exactly `sync::NOTICE_LEN` bytes) to
@@ -320,6 +329,9 @@ struct FakeLink {
 /// An envelope handle, its server and the publication served under it.
 type ServedInvite = ([u8; 32], ServerId, Vec<u8>);
 
+/// What one buddy holds: tag -> blob.
+type HeldBackups = HashMap<[u8; 32], Vec<u8>>;
+
 /// All cores sharing one instance see each other's records instantly, and
 /// every served invite publication (as if each core were a reachable peer).
 #[derive(Default)]
@@ -328,6 +340,8 @@ pub struct LoopbackNetwork {
     invites: Mutex<Vec<ServedInvite>>,
     /// A holder of backups: the highest valid version per tag.
     backups: Mutex<HashMap<[u8; 32], Vec<u8>>>,
+    /// G-91 phase B: what each buddy (by identity key) holds, per tag.
+    buddies: Mutex<HashMap<[u8; 32], HeldBackups>>,
     /// Device link: the one open link (the frozen port's fake guidance).
     link: Mutex<Option<FakeLink>>,
 }
@@ -335,6 +349,17 @@ pub struct LoopbackNetwork {
 impl LoopbackNetwork {
     pub fn new() -> LoopbackNetwork {
         LoopbackNetwork::default()
+    }
+
+    /// Tests: the mailbox loses everything (a wiped relay volume).
+    pub fn wipe_mailbox(&self) {
+        self.backups.lock().expect("not poisoned").clear();
+    }
+
+    /// Tests: the tags a buddy holds a backup for.
+    pub fn held_by(&self, member: &PublicKey) -> Vec<[u8; 32]> {
+        let buddies = self.buddies.lock().expect("not poisoned");
+        buddies.get(member.as_bytes()).map(|held| held.keys().copied().collect()).unwrap_or_default()
     }
 }
 
@@ -369,7 +394,29 @@ impl Network for LoopbackNetwork {
     }
 
     fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
-        self.backups.lock().expect("not poisoned").get(&tag).cloned().into_iter().collect()
+        // The mailbox, then every buddy holding it (as DHT providers would).
+        let mut out: Vec<Vec<u8>> = self.backups.lock().expect("not poisoned").get(&tag).cloned().into_iter().collect();
+        let buddies = self.buddies.lock().expect("not poisoned");
+        out.extend(buddies.values().filter_map(|held| held.get(&tag).cloned()));
+        out
+    }
+
+    fn put_backup_to(&self, tag: [u8; 32], blob: &[u8], members: &[PublicKey]) {
+        let Ok((blob_tag, version)) = crate::backup::check(blob) else { return };
+        if blob_tag != tag {
+            return;
+        }
+        let mut buddies = self.buddies.lock().expect("not poisoned");
+        for member in members {
+            let held = buddies.entry(*member.as_bytes()).or_default();
+            let newer = held
+                .get(&tag)
+                .and_then(|old| crate::backup::check(old).ok())
+                .is_none_or(|(_, old)| version > old);
+            if newer {
+                held.insert(tag, blob.to_vec());
+            }
+        }
     }
 
     fn device_link_open(&self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<DeviceLinkAddr> {

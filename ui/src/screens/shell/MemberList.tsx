@@ -287,7 +287,17 @@ export function ProfileCard({
         )}
         {!isMe && !member.blocked && !confirmKick && (
           <p className="muted small">
-            <FormattedMessage id="profile.blockHint" />
+            <FormattedMessage id="profile.blockHint" />{' '}
+            <button
+              type="button"
+              className="link"
+              onClick={() => {
+                onClose();
+                store.openSettings('blocked');
+              }}
+            >
+              <FormattedMessage id="profile.blockedListLink" />
+            </button>
           </p>
         )}
         {confirmKick && (

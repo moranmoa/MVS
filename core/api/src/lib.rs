@@ -10,6 +10,7 @@
 //! crates are merged.
 
 mod access;
+mod applock;
 pub mod avatar;
 pub mod backup;
 mod chat;
@@ -32,6 +33,7 @@ pub mod sidecar;
 pub mod syncnet;
 pub mod types;
 pub mod update;
+pub mod typing;
 mod voice;
 
 pub use access::{KeyBinder, MemberReadGate, MemberStubGate, BINDING_PREFIX};
@@ -44,12 +46,13 @@ pub use ports::{
 pub use rekey::{JOIN_REKEY_BURST, JOIN_REKEY_REFILL_MS};
 pub use service::{finish_sign_out, sign_out_pending, stored_relay_only};
 pub use service::{
-    Config, Core, AGE_RAISE_DELAY_MS, BACKUP_REPUBLISH_MS, BACKUP_RETRY_FIRST_MS, BACKUP_RETRY_MAX_MS, CHALLENGE_POSITIONS, CLOSED_RETENTION_MS, JOIN_RETRY_FIRST, JOIN_RETRY_FOR,
+    Config, Core, AGE_RAISE_DELAY_MS, BACKUP_BUDDIES, BACKUP_REPUBLISH_MS, BUDDY_CHECK_MS, BACKUP_RETRY_FIRST_MS, BACKUP_RETRY_MAX_MS, CHALLENGE_POSITIONS, CLOSED_RETENTION_MS, JOIN_RETRY_FIRST, JOIN_RETRY_FOR,
     JOIN_RETRY_MAX, KEY_PENDING_FOR, KEY_PENDING_PREFIX, MAX_CHECK_FAILURES, MAX_KEY_PENDING,
     MEMBER_RELAY_CAP_DEFAULT_MB, MEMBER_RELAY_CAP_MB, PROFILE_POST_BURST, PROFILE_POST_EVERY_MS, REKEY_WAKE_FLOOR,
     SYNC_EVERY,
 };
 pub use types::*;
+pub use typing::TypingNet;
 pub use voice::{
     VoiceNet, CLOCK_WINDOW_MS, HELLO_EVERY_MS, HELLO_TIMEOUT_MS, MAX_PARTICIPANTS, MAX_PAYLOAD,
     SIGNAL_PREFIX,

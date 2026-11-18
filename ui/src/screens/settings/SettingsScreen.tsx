@@ -14,6 +14,7 @@ import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/not
 import { MemberRelaySetting } from './MemberRelay';
 import { DevicesSection } from './Devices';
 import { VoiceSection } from './Voice';
+import { BlockedList } from './Blocked';
 
 type Section = 'account' | 'privacy' | 'devices' | 'voice' | 'notifications' | 'language' | 'appearance' | 'storage' | 'diagnostics' | 'about';
 const SECTIONS: Section[] = ['account', 'privacy', 'devices', 'voice', 'notifications', 'language', 'appearance', 'storage', 'diagnostics', 'about'];
@@ -45,7 +46,9 @@ export function SettingsScreen({
   const guard = (action: () => void) => (profileDirty && section === 'account' ? setLeaving(() => action) : action());
   const onDirtyChange = useCallback((d: boolean) => setProfileDirty(d), []);
   useEffect(() => {
-    if (request && SECTIONS.includes(request.section as Section)) guard(() => setSection(request.section as Section));
+    // G-47: "blocked" is Privacy, at its blocked-accounts list.
+    const want = request?.section === 'blocked' ? 'privacy' : request?.section;
+    if (want && SECTIONS.includes(want as Section)) guard(() => setSection(want as Section));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request]);
   const leave = () => {
@@ -90,7 +93,12 @@ export function SettingsScreen({
           {section === 'devices' && <DevicesSection />}
           {section === 'voice' && <VoiceSection />}
           {section === 'notifications' && <NotificationsSection />}
-          {section === 'privacy' && <PrivacySection focus={request?.section === 'privacy' ? request.at : undefined} />}
+          {section === 'privacy' && (
+            <PrivacySection
+              focus={request?.section === 'privacy' ? request.at : undefined}
+              focusBlocked={request?.section === 'blocked' ? request.at : undefined}
+            />
+          )}
         </section>
       </div>
       <Dialog open={!!leaving} onClose={() => setLeaving(null)} title={intl.formatMessage({ id: 'profile.edit.unsavedTitle' })}>
@@ -503,7 +511,7 @@ function DiagnosticsSection() {
 
 // Relay-only (GAP-6r, #272), per device: nobody connects to me directly, so
 // members never see my IP address; calls are off while it is on.
-function PrivacySection({ focus }: { focus?: number }) {
+function PrivacySection({ focus, focusBlocked }: { focus?: number; focusBlocked?: number }) {
   const store = useAppStore();
   const intl = useIntl();
   const relayOnly = useStore(store, (s) => s.relayOnly);
@@ -576,6 +584,7 @@ function PrivacySection({ focus }: { focus?: number }) {
         </p>
       )}
       <MemberRelaySetting />
+      <BlockedList focus={focusBlocked} />
     </div>
   );
 }

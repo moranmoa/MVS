@@ -101,6 +101,28 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `Channel.mentions` and `ServerSummary.mentions` count unread messages that mention me (after the read marker, not mine). `markRead` resets them. `ServerSummary.unread` is set when any channel has unread messages; both come from `listServers`.
   - No authority or sync change: mentions are read from the message body.
 
+- "Is typing…" (G-29; design `g29-typing-design.md` with Amendment 1). Ephemeral: never stored, never in a log, the backup or the logs, never unread.
+  - `setTyping(channelId, on: boolean)` returns `null`.
+    - `true` while typing: the first goes out at once, and repeats at most every 3 s while the UI keeps calling it.
+    - `false` on send or clear: `off` goes out once, if `on` went out. `off` also goes 4 s after the last `true`, and `sendMessage` sends it too.
+    - Errors: `not-found` (no channel I can see), `not-allowed` (I can't post there now).
+  - `getSettings()` returns `{ typingIndicator: boolean }`, settings this device keeps. `setTypingIndicator(on)` returns `null`.
+    - "Show others when I'm typing" is on by default and local only.
+    - Off: nothing is sent (turning it off sends `off` wherever I was typing), but others still show.
+  - Event `typing { channelId, userIds }`: who is typing there now, by key, at most 5; an empty list means nobody. It's sent when that set changes, at most one per channel per tick.
+    - A typer is dropped 6 s after their last `on`, at once on `off`, or when their message arrives.
+    - My own other computers (same identity) aren't shown.
+  - **Transport:** sync's `/mvs/typing/1`.
+    - One blob of at most 512 bytes; the answer is empty.
+    - Only to and from verified current members.
+    - Its own caps: per peer a burst of 3, then 1 every 2 s; all peers a burst of 30, then 10 a second.
+    - Older peers fail negotiation, harmlessly. No gate is needed, since nothing is stored.
+  - **Envelope:** `{ v: 1, from, server, channel, ts, nonce, on }`, signed by the identity under `mvs/typing/v1`, with `deny_unknown_fields` on the body and the wrapper. It's dropped quietly unless:
+    - it verifies, is version 1, is within 2 minutes of our clock, and isn't a replay;
+    - it's signed by the identity its peer is bound to;
+    - that identity can read and post in the channel now (a member, not kicked, the channel known, 18+ only with a claim), in one of my servers and a channel I can see.
+  - It's sent to the online members who can read that channel.
+
 - Emoji reactions (G-26; design `g26-reactions-design.md` with Amendment 1):
   - `react(messageId, emoji, on: boolean)` returns `null` and fires `message.updated` for the message. Nothing is signed when it's already so (an add of an emoji I have on, or a removal of one I don't).
   - `Message.reactions?: { emoji, count, mine }[]` (additive) lists at most 20 emoji: the 20 with the most members, ties going to the one that appeared first. They're listed in the order they first appeared, and the field is absent when there are none. A deleted message has none.
@@ -187,7 +209,24 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).
     - `found`: the live servers the backup lists (0 until found). `waiting`: of those, the ones not back yet.
     - The UI shows "searching" and "waiting" honestly on the restore screen, with the invite-link hint (PO G-91 criterion 2). A server I left, was removed from, or that closed never comes back and isn't counted as waiting.
+  - **Buddies, phase B (#461):** every 10 min the core checks its 3 backup buddies, at most one per owner group. A gone buddy, or two under one owner, is replaced at once; 2 or more stale buddies, or room for more, wait a day. A new set makes the next backup round write to the mailbox and to them (`Network::put_backup_to`, a no-op until dev-sync's network re-checks each recipient is a bound current co-member at send time; `BUDDIES` stays off until the Security Lead's re-review).
+    - **GAP-11 (local plaintext):** `member-seen`, when each co-member was last seen online, and `backup-buddies` are kept in `core.db` in the clear, like the rest of the store until GAP-11. They never go into the backup or `exportDiagnostics`.
   - **Holders:** the ports are no-ops until dev-sync's `/mvs/backup/1` and devops' mailbox exist. `LoopbackNetwork` holds them for tests.
+
+- App lock, G-78 (`src/applock.rs`, `docs/design/app-lock.md`). The core keeps the passcode verifier and one attempt counter; the shell's main process enforces the lock.
+  - **Commands.** Every answer is `ok`; "wrong" is an answer, not an error. `AppLockAnswer` is `{ result: 'ok' | 'wrong' | 'rate-limited', retryAfter?: seconds }`.
+    - `getAppLock()` returns `{ enabled, method: 'passcode' | 'os', idleMinutes, lockOnSleep, retryAfter? }`. It never holds the verifier or the salt. Off: `enabled: false`, `passcode`, 5, `true`.
+    - `verifyAppLock({ passcode })` returns `AppLockAnswer`. With no lock set it answers `ok`.
+    - `setAppLock({ current?, passcode, method, idleMinutes, lockOnSleep })` returns `AppLockAnswer`. `current` is required once a lock is set, and is checked as an attempt. A new passcode is 4–12 digits or a passphrase of 6–64 characters (NFC, no control characters, no leading or trailing spaces); `idleMinutes` is 1–60. Anything else is `bad-request`, before anything counts.
+    - `clearAppLock({ current })` returns `AppLockAnswer`; `ok` turns the lock off.
+    - `clearAppLockWithWords({ words })` returns `AppLockAnswer`. `words` is a string of at most 1024 characters (longer: `bad-request`); `ok` only for this identity's 12 words (the restore check), and it turns the lock off. No identity: `not-found`.
+  - **Main-only:** `getAppLock`, `verifyAppLock` and `clearAppLockWithWords` stay off the page's allow-list (`desktop/src/commands.js`); main calls them itself. The page reaches `setAppLock` and `clearAppLock` only while unlocked.
+  - **Fail closed:** any stored lock record counts as on, even one that doesn't parse or has another version. Then every passcode is `wrong` (counted), and only the 12 words clear it.
+  - **The verifier:** Argon2id at `LockParams::MIN` (19 MiB, t=2, p=1) over the NFC passcode and a 16-byte random salt, then `derive_key("mvs/app-lock-verifier/v1", …)` (`identity::app_lock_verifier`). Stored in the core DB as `{ v: 1, salt, mKib, t, p, hash }` with the settings, compared in constant time. It is **not** `Vault::set_app_lock`: this passcode is never the vault passphrase.
+  - **One attempt counter,** kept in the core DB (a restart keeps it), shared by `verifyAppLock`, the `current` of `setAppLock` and `clearAppLock`, and `clearAppLockWithWords`. The 5th wrong attempt in a row starts a delay of 30 s, doubling up to 15 min (`retryAfter` with that `wrong`). While a delay runs, every attempt is `rate-limited` with `retryAfter`, unchecked. A right answer resets the counter. Nothing is ever wiped.
+  - **Never logged:** neither the passcode nor the words, anywhere. Their argument strings are wiped from memory when dropped (the JSON request line itself isn't).
+  - **TB1:** the lock is a UI gate only. The keychain and the SQLite store are untouched and stay as readable to anything running as me as before (GAP-11 is the at-rest lock).
+  - **Path B residual:** during a call behind the lock, the page's earlier content stays in renderer memory, unmounted from the DOM but not wiped, until the call ends, and incoming call audio keeps playing.
 
 - `signOut({ words: string[] } | { withoutWords: true })` returns `null` (both read at the top level of `args`). It removes this identity from this computer.
   - `words` must be this identity's 12 words: `invalid-words` (with `positions`) for unknown words, `not-allowed` for another identity's. `withoutWords: true` is the explicit "I accept losing this account" path. Neither: `bad-request`. No identity: `not-found`.

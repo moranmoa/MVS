@@ -1,0 +1,47 @@
+/* G-47: Settings → Privacy → Blocked. Theme colours only (AA in both themes); no motion. */
+.blocked-list {
+  margin-block-start: 1rem;
+  border-block-start: 1px solid var(--border);
+  padding-block-start: 1rem;
+}
+.blocked-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.blocked-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-block: 0.5rem;
+}
+.blocked-row + .blocked-row {
+  border-block-start: 1px solid var(--border);
+}
+.blocked-who {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+  color: var(--text);
+}
+.blocked-who .name {
+  overflow-wrap: anywhere;
+}
+.blocked-code {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+.blocked-undo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-s);
+  background: var(--bg-input);
+  color: var(--text);
+}

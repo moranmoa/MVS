@@ -352,9 +352,9 @@
   "presence.offline": "Offline",
 
   "chat.messages": "Messages in \u2068#{channel}\u2069",
-  "a11y.newMessage": "\u2068{name}\u2069: {phrase}",
+  "a11y.newMessage": "\u2068{name}\u2069: \u2068{phrase}\u2069",
   "a11y.newMessageFrom": "New message from \u2068{name}\u2069",
-  "a11y.newMessages": "{count} new messages",
+  "a11y.newMessages": "{count, plural, one {# new message} other {# new messages}}",
   "chat.empty": "This is the start of \u2068#{channel}\u2069. Write the first message.",
   "chat.composer": "Message \u2068#{channel}\u2069",
   "chat.send": "Send",

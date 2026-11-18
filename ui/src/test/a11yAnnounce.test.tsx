@@ -43,7 +43,7 @@ describe('G-113: new messages for screen readers', () => {
     const { add, live, author } = await setup(true);
     expect(live()).toBe('');
     await add();
-    expect(live()).toBe(`⁨${author.displayName}⁩: Anyone up tonight?`);
+    expect(live()).toBe(`⁨${author.displayName}⁩: ⁨Anyone up tonight?⁩`);
   });
 
   it('with previews off (the default): only "New message from {name}"', async () => {
@@ -58,7 +58,7 @@ describe('G-113: new messages for screen readers', () => {
     await add({ authorId: me.id, body: 'mine' });
     expect(live()).toBe('');
     await add({ body: 'x'.repeat(150) });
-    expect(live()).toMatch(new RegExp(`: ${'x'.repeat(100)}…$`));
+    expect(live()).toMatch(new RegExp(`: ⁨${'x'.repeat(100)}…⁩$`));
   });
 
   it('several within 1.5 s become one "{count} new messages"', async () => {
@@ -66,10 +66,10 @@ describe('G-113: new messages for screen readers', () => {
     try {
       const { add, live } = await setup(true);
       await add({ body: 'one' });
-      expect(live()).toMatch(/: one$/);
+      expect(live()).toMatch(/: ⁨one⁩$/);
       await add({ body: 'two' });
       await add({ body: 'three' });
-      expect(live()).toMatch(/: one$/); // held
+      expect(live()).toMatch(/: ⁨one⁩$/); // held
       await act(async () => {
         vi.advanceTimersByTime(ANNOUNCE_GAP_MS);
       });

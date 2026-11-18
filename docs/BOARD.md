@@ -171,7 +171,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 
 **Condition on every UI PR from now on:** AA contrast (G-112, B20) and reduced motion (G-114, B21). A UI PR that breaks either is not accepted.
 
-**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-53 → G-14 → G-51 · voice-c G-48 → G-47 → G-41 · voice-d G-25 · dev-ui G-27 → G-05 → G-06 → G-78 UI → G-30. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
+**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-48 core (report record: design note → sec-lead → core) → G-14 → G-51 · voice-c G-47 → G-53 UI → G-48 UI → G-41 · voice-d G-25 · dev-ui G-27 → G-05 → G-06 → G-78 UI → G-30. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
 
 | ID | Title | Owner | Status | PR | Depends on | Size | MS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -206,16 +206,16 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | done, accepted | #470 | – | S | 0.5.0 |
 | G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
-| G-53 | Removed accounts list + undo-kick UI (core ready, #110) | dev-updater | todo (dev-updater 1st) | – | – | S | 0.5.x |
+| G-53 | Removed accounts list + undo-kick UI (core ready, #110) | voice-c | todo (voice-c 2nd; core ready, #110) | – | – | S | 0.5.x |
 | G-52 | Age restriction setting (B7 §6; read-only today) | dev-ui | todo | – | – | S | 0.5.x |
 | G-51 | Server icon and description (signed record) | dev-updater | todo (dev-updater 3rd) | – | – | M | 0.5.x |
 | G-12 | Channel categories (signed record) | dev-records → dev-ui | todo | – | G-11 | L | 0.5.x |
 | G-13 | Collapse categories (local) | dev-ui | todo | – | G-12 | S | 0.5.x |
 | G-14 | Channel topic (signed record) | dev-updater | todo (dev-updater 2nd) | – | – | S | 0.5.x |
 | G-18 | Write-only-for-owners channel (signed record, channel permissions) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
-| G-47 | Blocked list with unblock (local) | voice-c | todo (voice-c 2nd) | – | – | S | 0.5.x |
-| G-48 | Report to the owners (signed record) | voice-c | todo (voice-c 1st) | – | – | M | 0.5.x |
-| G-41 | Search members (30+ member servers) | voice-c | todo (voice-c 3rd) | – | – | S | 0.5.x |
+| G-47 | Blocked list with unblock (local) | voice-c | in progress (voice-c 1st) | – | – | S | 0.5.x |
+| G-48 | Report to the owners (signed record) | dev-updater (core) → voice-c (UI) | todo (dev-updater 1st: design note → sec-lead → core; then voice-c UI, 3rd) | – | – | M | 0.5.x |
+| G-41 | Search members (30+ member servers) | voice-c | todo (voice-c 4th) | – | – | S | 0.5.x |
 | G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | todo | – | – | S | 0.5.x |
 | **0.6.0** | **"Voice like Discord" (P1)** | | | | | | |
 | G-16 | Additional voice channels (record + core) | dev-records + dev-identity → dev-ui | built as voice rooms (join to create; dev-ui verifies against GAPS scope) | #355 #369 #371 #375 | – | L | 0.4.3 |

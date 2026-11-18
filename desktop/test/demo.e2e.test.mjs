@@ -57,17 +57,31 @@ test('no core is started, even with MVS_CORE_PATH set', async () => {
   assert.equal(await page.evaluate(() => window.mvs.retryCore()), false);
 });
 
-test('without a test profile, the demo gets its own profile beside the real one', async () => {
-  const config = mkdtempSync(join(tmpdir(), 'mvs-e2e-demo-xdg-'));
-  const env = { ...process.env, MVS_DEMO: '1', XDG_CONFIG_HOME: config };
-  delete env.MVS_TEST_USER_DATA;
-  const other = await electron.launch({ args: ['.'], env });
-  try {
-    const userData = await other.evaluate(({ app }) => app.getPath('userData'));
-    assert.ok(userData.endsWith('-demo'), userData);
-    assert.ok(userData.startsWith(config), userData);
-  } finally {
-    await other.close().catch(() => {});
-    rmSync(config, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  }
-});
+// Linux: XDG_CONFIG_HOME moves the app-data folder into a temp dir. Windows
+// and macOS ignore it (the OS gives the folder), so there the profile lands
+// beside the real one in the real app-data folder: only on CI runners, and
+// removed afterwards if this test created it. Never on a developer's machine.
+const OWN_APPDATA = process.platform === 'linux';
+test(
+  'without a test profile, the demo gets its own profile beside the real one',
+  { skip: !OWN_APPDATA && !process.env.CI ? 'would touch the real app-data folder outside CI' : false },
+  async () => {
+    const config = mkdtempSync(join(tmpdir(), 'mvs-e2e-demo-xdg-'));
+    const env = { ...process.env, MVS_DEMO: '1', XDG_CONFIG_HOME: config };
+    delete env.MVS_TEST_USER_DATA;
+    const other = await electron.launch({ args: ['.'], env });
+    let userData = null;
+    try {
+      const paths = await other.evaluate(({ app }) => ({ userData: app.getPath('userData'), appData: app.getPath('appData'), name: app.getName() }));
+      userData = paths.userData;
+      // A sibling of the real profile (<appData>/<name>), never inside it.
+      assert.equal(userData, join(paths.appData, `${paths.name}-demo`));
+      if (OWN_APPDATA) assert.ok(userData.startsWith(config), userData);
+    } finally {
+      await other.close().catch(() => {});
+      rmSync(config, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      // CI on Windows/macOS (a throwaway runner): the demo profile goes too.
+      if (!OWN_APPDATA && userData && userData.endsWith('-demo')) rmSync(userData, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  },
+);

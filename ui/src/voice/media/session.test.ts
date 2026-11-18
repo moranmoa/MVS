@@ -283,3 +283,45 @@ describe('media session: what the real-Electron smoke test caught', () => {
     expect(s.stats()).toMatchObject({ sent: 0, sendError: 'channels mismatch' });
   });
 });
+
+describe('media session: DTX and broken decoders (TL)', () => {
+  it('an empty (DTX) frame is 40 ms of silence and never reaches the decoder', async () => {
+    const net = loopback([A, B], {}, (fn) => fn());
+    const eb = env();
+    const decoded: number[] = [];
+    const make = eb.env.createDecoder;
+    eb.env.createDecoder = (init) => {
+      const d = make(init);
+      return { ...d, decode: (c) => (decoded.push(c.data.length), d.decode(c)) };
+    };
+    const cb = context();
+    const sb = new MediaSession({ env: eb.env, transport: net[B]!, context: cb.ctx, output: (peer) => ({ peer }) as unknown as AudioNode, accepts: () => true, jitter: { startMs: 40 } });
+    sb.start(CALL, null);
+    for (const [seq, len] of [[0, 1], [1, 0], [2, 1]] as const) {
+      net[A]!.send({ callId: CALL, seq, ts: seq * 1920, data: new Uint8Array(len).fill(5) });
+      runClock(cb, eb, F);
+    }
+    runClock(cb, eb, 0.2);
+    expect(decoded).toEqual([1, 1]);
+    expect(cb.played).toHaveLength(2);
+    expect(cb.played[1]!.at - cb.played[0]!.at).toBeGreaterThanOrEqual(2 * F - 1e-9); // its slot stays silent
+  });
+
+  it('a failing decoder is replaced, at most 5 times per peer; past that the peer is silent', async () => {
+    const net = loopback([A, B], {}, (fn) => fn());
+    const eb = env();
+    let made = 0;
+    eb.env.createDecoder = ({ error }) => {
+      made++;
+      return { configure() {}, decode: () => error(new Error('bad frame')), close() {} };
+    };
+    const cb = context();
+    const sb = new MediaSession({ env: eb.env, transport: net[B]!, context: cb.ctx, output: () => null, accepts: () => true, jitter: { startMs: 40 } });
+    sb.start(CALL, null);
+    for (let seq = 0; seq < 20; seq++) {
+      net[A]!.send({ callId: CALL, seq, ts: seq * 1920, data: new Uint8Array([1]) });
+      runClock(cb, eb, F);
+    }
+    expect(made).toBe(1 + 5);
+  });
+});

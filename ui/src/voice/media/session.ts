@@ -111,6 +111,8 @@ const LOOKAHEAD_S = 0.05;
 const TICK_MS = 20;
 /** Peers held at once (the room cap, TL A6). */
 export const MAX_MEDIA_PEERS = 8;
+/** Fresh decoders per peer per call after a decode error (TL). */
+export const MAX_DECODER_RESTARTS = 5;
 
 export interface MediaSessionOptions {
   env: MediaEnv;
@@ -145,6 +147,7 @@ interface PeerPlayer {
   cursor: number;
   level: number;
   pullTs: number;
+  decoderRestarts: number;
 }
 
 export class MediaSession {
@@ -282,17 +285,27 @@ export class MediaSession {
   }
 
   private newPeer(id: string): PeerPlayer {
-    const p: PeerPlayer = { jitter: new JitterBuffer(this.o.jitter), decoder: null as unknown as DecoderLike, slots: [], planned: 0, cursor: 0, level: 0, pullTs: 0 };
-    p.decoder = this.o.env.createDecoder({
-      output: (audio) => this.play(id, p, audio),
-      error: () => {
-        // A bad frame broke the decoder: start a fresh one; the buffer goes on.
-        p.decoder = this.o.env.createDecoder({ output: (a) => this.play(id, p, a), error: () => {} });
-        p.decoder.configure(DECODER_CONFIG);
-        p.slots = [];
-      },
-    });
-    p.decoder.configure(DECODER_CONFIG);
+    const p: PeerPlayer = { jitter: new JitterBuffer(this.o.jitter), decoder: null as unknown as DecoderLike, slots: [], planned: 0, cursor: 0, level: 0, pullTs: 0, decoderRestarts: 0 };
+    const make = (): DecoderLike => {
+      const d = this.o.env.createDecoder({
+        output: (audio) => this.play(id, p, audio),
+        error: () => {
+          // A bad frame broke the decoder: a fresh one, the buffer goes on.
+          // Capped, so a peer sending garbage can't make us rebuild forever;
+          // past the cap this peer stays silent for the rest of the call.
+          if (p.decoder !== d) return;
+          p.slots = [];
+          if (++p.decoderRestarts > MAX_DECODER_RESTARTS) {
+            p.decoder = { configure() {}, decode() {}, close() {} };
+            return;
+          }
+          p.decoder = make();
+        },
+      });
+      d.configure(DECODER_CONFIG);
+      return d;
+    };
+    p.decoder = make();
     return p;
   }
 
@@ -313,7 +326,8 @@ export class MediaSession {
         const r = p.jitter.pull();
         if (r.kind === 'wait') break;
         p.planned += FRAME_MS / 1000;
-        if (r.kind === 'missing') {
+        // A lost slot, or a DTX frame (empty: WebCodecs rejects 0-byte chunks): 40 ms of silence.
+        if (r.kind === 'missing' || !r.data.length) {
           if (p.slots.length) p.slots.push('gap');
           else p.cursor += FRAME_MS / 1000; // silence: nothing to play for this slot
           continue;

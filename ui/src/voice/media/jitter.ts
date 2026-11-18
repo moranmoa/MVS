@@ -67,7 +67,18 @@ export class JitterBuffer {
     this.frames.set(seq, data);
     this.s.received++;
     if (this.next === null) this.next = seq;
-    else if (!this.started && u32Diff(seq, this.next) < 0) this.next = seq; // floor (above) keeps it from rewinding past played slots
+    else if (!this.started && u32Diff(seq, this.next) < 0) {
+      // Before playout: an earlier frame becomes the first, but never more
+      // than the window back (TL: a frame claiming seq − 2^30 can't drag the
+      // start back). The floor (above) keeps it from rewinding past played slots.
+      if (u32Diff(this.next, seq) >= this.maxFrames) {
+        this.frames.delete(seq);
+        this.s.received--;
+        this.s.late++;
+        return 'late';
+      }
+      this.next = seq;
+    }
     this.trim();
     return 'ok';
   }
@@ -82,11 +93,21 @@ export class JitterBuffer {
 
   /** Over the ms cap: skip ahead to the newest frames (old audio is worth less than low delay). */
   private trim(): void {
-    while (this.next !== null && this.span() > this.maxFrames) {
-      if (this.frames.delete(this.next)) this.s.dropped++;
-      this.next = (this.next + 1) >>> 0;
-      if (this.floor !== null) this.floor = this.next;
+    if (this.next === null || this.span() <= this.maxFrames) return;
+    // One pass, whatever the jump (SL: a peer's single frame with a huge seq
+    // must not cost a step per skipped slot): the window becomes the newest
+    // maxFrames slots, and everything held before it goes.
+    let newest = this.next;
+    for (const k of this.frames.keys()) if (u32Diff(k, newest) > 0) newest = k;
+    const start = (newest - this.maxFrames + 1) >>> 0;
+    for (const k of [...this.frames.keys()]) {
+      if (u32Diff(k, start) < 0) {
+        this.frames.delete(k);
+        this.s.dropped++;
+      }
     }
+    this.next = start;
+    if (this.floor !== null) this.floor = start;
   }
 
   /**

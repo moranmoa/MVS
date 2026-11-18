@@ -146,3 +146,38 @@ describe('jitter buffer: the end of a sentence', () => {
     expect(got.filter((k) => k === 'frame')).toHaveLength(1);
   });
 });
+
+describe('jitter buffer: a huge seq jump costs one pass (SL)', () => {
+  it.each([2 ** 31 - 1, 0xffff_ffff, 1e8])('push(0) then push(%d) finishes in a few ms, and the buffer stays bounded', (jump) => {
+    const j = new JitterBuffer();
+    j.push(0, bytes(1));
+    const t0 = performance.now();
+    j.push(jump >>> 0, bytes(1));
+    expect(performance.now() - t0).toBeLessThan(20);
+    expect(j.stats().depthFrames).toBeLessThanOrEqual(5);
+  });
+
+  it('after playout started, a jump far ahead skips to it and the next pull plays it', () => {
+    const j = new JitterBuffer({ startMs: 40 });
+    j.push(0, bytes(1));
+    expect(j.pull()).toMatchObject({ kind: 'frame', seq: 0 });
+    const t0 = performance.now();
+    j.push(2 ** 31 - 1, bytes(1));
+    expect(performance.now() - t0).toBeLessThan(20);
+    const kinds = [j.pull(), j.pull(), j.pull(), j.pull(), j.pull()].map((p) => (p.kind === 'frame' ? p.seq : p.kind));
+    expect(kinds).toContain(2 ** 31 - 1);
+    expect(j.push(5, bytes(1))).toBe('late'); // everything before the new window is passed
+  });
+});
+
+describe('jitter buffer: no big rewind before playout (TL)', () => {
+  it('a frame claiming seq − 2^30 before start is refused at once; a near-earlier one becomes the first', () => {
+    const j = new JitterBuffer({ startMs: 80 });
+    j.push(2 ** 30 + 10, bytes(1));
+    const t0 = performance.now();
+    expect(j.push(10, bytes(1))).toBe('late');
+    expect(performance.now() - t0).toBeLessThan(20);
+    expect(j.push(2 ** 30 + 9, bytes(1))).toBe('ok');
+    expect(j.pull()).toMatchObject({ kind: 'frame', seq: 2 ** 30 + 9 });
+  });
+});

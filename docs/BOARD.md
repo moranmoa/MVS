@@ -38,6 +38,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | PR | What | Author | Required verdicts | Status | Next step |
 | --- | --- | --- | --- | --- | --- |
 | [#465](https://github.com/moranmoa/MVS/pull/465) | docs: CHANGELOG 0.4.7 (replaces the unpublished 0.4.6) | pm / product-lead | product-lead | in review | merge, then the 0.4.7 go/no-go |
+| [#466](https://github.com/moranmoa/MVS/pull/466) | docs: G-78 optional app lock design note | dev-voice-shell | tech-lead, sec-lead | in review | tech-lead APPROVE with one change; awaiting sec-lead |
 | [#463](https://github.com/moranmoa/MVS/pull/463) | ui: emoji reactions UI (G-26) | dev-ui | tech-lead, product-lead (+ ux visual) | in review | core is merged (#454) |
 | [#461](https://github.com/moranmoa/MVS/pull/461) | identity: G-91 phase B, buddies | dev-identity | tech-lead, sec-lead | in review | sync side "BUDDIES on" by dev-sync only after multi-relay part B |
 | [#460](https://github.com/moranmoa/MVS/pull/460) | sync: LAN beacon (relay-down part 2, RD2) | dev-sync | tech-lead, sec-lead | in review | changes requested |
@@ -196,9 +197,9 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-32 | ↑ to edit the last message (check `onEditLast`) | dev-ui | done | #441 | – | S | 0.5.0 |
 | G-33 | Jump to latest message button | dev-ui | done | #441 | – | S | 0.5.0 |
 | G-30 | Link to a message | dev-ui + dev-identity | todo | – | – | M | 0.5.0 |
-| G-63 | Notification sound | dev-ui | todo | – | – | S | 0.5.0 |
+| G-63 | Notification sound | voice-c | todo | – | – | S | 0.5.0 |
 | G-62 | Taskbar unread count | dev-voice-shell | done | #430 #442 | G-61 ✔ | S | 0.5.0 |
-| G-113 | Screen-reader announcement of new messages (B21, UX-38) | dev-ui | todo | – | – | S | 0.5.0 |
+| G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | todo | – | – | S | 0.5.0 |
 | G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
 | G-53 | Removed accounts list + undo-kick UI (core ready, #110) | dev-ui | todo | – | – | S | 0.5.x |
@@ -221,11 +222,12 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | done (shell #444, UI #450) | #444 #450 | – | M | 0.6.0 |
 | G-64 | Join/leave notification sound | dev-ui | done | #456 | – | S | 0.6.0 |
 | G-83 | Participant count on room rows (covered by the voice rooms shipped in 0.4.3) | dev-identity → dev-ui | done | #369 #371 #375 | – | S | 0.6.0 |
+| G-78 | Optional app lock (design note first) | dev-voice-shell | in review (design note #466, approved by the tech lead with one change; awaiting the security lead) | #466 | – | M | – |
 | **P2** | **P2 backlog, after the closed alpha: see [`docs/ux/GAPS.md`](ux/GAPS.md)** (G-28 files, G-31 search, G-34 link previews, G-15 pins, G-42 roles, G-43, G-44, G-45 DM, G-46, G-55, G-71, G-75, G-76, G-78, G-93, G-02, G-101–G-103, G-111, G-115) | product-lead | todo | – | – | – | – |
 | **Done** | | | | | | | |
 | G-35 | Owners delete any message (in B25) | – | done | #208 | – | – | – |
 | G-54 | Limited invite links (time or uses) | – | done | #216 | – | – | – |
-| G-82 | Who is speaking: speaking indicator on the roster and the `CallBar` ring | voice-c | todo | – | – | S | 0.6.0 |
+| G-82 | Who is speaking (ring in `CallBar`) | – | done | – | – | – | – |
 
 ### Device link, member relays, relays (0.4.6 and after)
 
@@ -370,16 +372,16 @@ What each agent picks up **after its current PR merges**, the lead who assigns i
 
 | Agent | Assigned by | Now | Next (in order) | Writes | Must not touch |
 | --- | --- | --- | --- | --- | --- |
-| **tech-lead** | manager | reviews #447, #458, #459, #460, #461, #463, #433, #465 | 1. Reviews: the open PRs above. 2. 0.4.7 go/no-go (replaces 0.4.6). 3. G-81 scope (TURN decision, owner). 4. G-78 app lock note with sec-lead. | – | – |
+| **tech-lead** | manager | reviews #447, #458, #459, #460, #461, #463, #433, #465 | 1. Reviews: the open PRs above. 2. 0.4.7 go/no-go (replaces 0.4.6). 3. G-81 scope (TURN decision, owner). 4. G-78 note #466: approved, one change requested; with sec-lead. | – | – |
 | **dev-sync** | tech-lead → dev-identity | #460 LAN beacon (changes requested) | 1. **#460** relay-down part 2 (RD2): address the requested changes. 2. **Multi-relay part B** (`node.rs`, MX). 3. **GAP-25** (after part B): per-peer ingest rate for channel records, refuse records more than 10 min ahead on receive (P1, before open alpha). 4. "BUDDIES on" for G-91 (after part B). 5. Slice 3c later. One writer on `node.rs`. | `core/sync/**`, `core/spike-peer/**` | `core/records`, `infra/` |
 | **dev-identity** (core sub-lead) | tech-lead | – | 1. **G-91** servers come back after restore: design note to tech-lead first. 2. **#461** phase B buddies and **#431** follow-ups; notice fetch loop (fetch once at start/unlock). 3. Member recovery design stays deferred. 4. B7-k, B23-z2, T17, T19 call. | `core/api/**`, `core/identity/**` | `ui/**` (contract changes go to dev-ui) |
-| **dev-ui** (client sub-lead) | tech-lead | 0.5.0 "Conversation" | 1. In review: **G-26** UI (#463), **G-29** UI on the mock (#447), **G-91** restore screen (#458). 2. G-23, G-32, G-33, G-64, G-74 UI are done. 4. Rest of 0.5.0 (G-25, G-27, G-30, G-63, G-113, G-92). 5. B12, B20, B21, B24, pill polish. | `ui/**` (sole writer, incl. `ui/src/i18n/*.json`) | `ui/src/core/ipc.ts`, `desktop/**` |
+| **dev-ui** (client sub-lead) | tech-lead | 0.5.0 "Conversation" | 1. In review: **G-26** UI (#463), **G-29** UI on the mock (#447), **G-91** restore screen (#458). 2. G-23, G-32, G-33, G-64, G-74 UI are done. 4. Rest of 0.5.0 (G-25, G-27, G-30, G-92). 5. B12, B20, B21, B24, pill polish. | `ui/**` (sole writer, incl. `ui/src/i18n/*.json`) | `ui/src/core/ipc.ts`, `desktop/**` |
 | **voice-d** | tech-lead | #433 TURN path behind a flag (in review) | 1. **G-81 calls across networks** (#433; owner decision on running TURN pending). 2. **ICE restart on network change** (todo, after #433). | `ui/src/voice/**` | `core/sync`, `infra/` |
-| **dev-voice-shell / voice-c** | tech-lead → dev-ui | G-62, G-74 shell merged | 1. **G-78 optional app lock**: design note first, security lead reviews. 2. #269 with the relay move. 3. T8-04 `MVS_DEMO` (P2). 4. V-C3 WebRTC IP policy check. | `desktop/**`, `ui/src/core/ipc.ts` | other `ui/src/**`, `release.yml` |
+| **dev-voice-shell / voice-c** | tech-lead → dev-ui | G-62, G-74 shell merged | 1. **G-78 optional app lock**: design note in review (#466), awaiting the security lead. 2. #269 with the relay move. 3. T8-04 `MVS_DEMO` (P2). 4. V-C3 WebRTC IP policy check. | `desktop/**`, `ui/src/core/ipc.ts` | other `ui/src/**`, `release.yml` |
 | **devops** | tech-lead | #459 `PEER_RELAYS` (in review), #443 merged | 1. **#459** relay `PEER_RELAYS`, then multi-relay part C. 2. **Relay hickory bump**. 3. **Relay drops `/dns*` from identify**. 4. Multi-relay part C and the relay move (#220, owner; live relay only from `main` with the manager OK). 5. T21 firewall rule, T12 (#69), macOS runner (R8). | `infra/**`, `.github/workflows/release.yml`, `.github/scripts/manifest-body.mjs`, `docs/release/**`, `packaging/**` | `ci.yml` (dev-updater) |
 | **dev-updater** | tech-lead → dev-identity | G-26 core merged (#454) | 1. **G-29 core** (typing, spec `g29-typing-design.md`; dev-ui has the UI on the mock, #447). 2. B10 advisories blocking after the 0.57 bump. Never rename CI jobs. | `core/updater/**`, `.github/workflows/ci.yml`, `.github/scripts/npm-licenses.mjs`, `.github/scripts/install-cargo-deny.sh`, `.github/dependabot.yml`, `core/deny.toml` | `release.yml`, `.github/scripts/manifest-body.mjs` |
-| **dev-voice-shell** / **voice-c** | manager | – | dev-voice-shell: G-78 app lock (design note first). voice-c: **G-82** speaking indicator (todo). G-62, G-74, G-72, G-84, G-73 are done. | `desktop/**` (dev-voice-shell) | `ui/**` (ask dev-ui) |
-| **sec-lead** | manager | reviews #459, #460, #461, #433 | 1. G-78 app lock note review. 2. LAN beacon (#460) and GAP-25. 3. Member-recovery design review (when built). 3. 2c decision with the owner. 4. Key custody for D-sign / D23. | `docs/security/**` | crate code (findings go to owners) |
+| **dev-voice-shell** / **voice-c** | manager | – | dev-voice-shell: G-78 app lock (design note in review, #466). voice-c: **G-63** notification sound, **G-113** screen-reader announcement (both todo, moved from dev-ui). G-62, G-74, G-72, G-84, G-73 are done. | `desktop/**` (dev-voice-shell) | `ui/**` (ask dev-ui) |
+| **sec-lead** | manager | reviews #459, #460, #461, #433 | 1. G-78 app lock note review (#466). 2. LAN beacon (#460) and GAP-25. 3. Member-recovery design review (when built). 3. 2c decision with the owner. 4. Key custody for D-sign / D23. | `docs/security/**` | crate code (findings go to owners) |
 | **qa** | manager | – | 1. **Linux metered check** for member relays (#403, #418). 2. **0.5.0 test pass** after the merges. 3. Linux keyring prerequisite in the testing docs (QA-20). 4. T7, T12 manual pass; B5 with dev-sync. | `qa/**` | `ui/**`, `ci.yml` (ask dev-updater) |
 | **product-lead** | manager | – | 1. Accept 0.5.0 items (G-23, G-29). 2. Review product/UX/business/QA/board PRs. 3. 0.4.7 notes (#465). | `docs/spec.md`, `docs/reviews/po-*` | `ui/src/i18n/*` |
 | **ux** | product-lead | – | 1. Typing indicator and date divider specs/visual checks. 2. Visual check of dev-ui PRs. | `docs/ux/**`, `docs/reviews/ux-*` | `ui/**` |

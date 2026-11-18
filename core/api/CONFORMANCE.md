@@ -101,6 +101,28 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `Channel.mentions` and `ServerSummary.mentions` count unread messages that mention me (after the read marker, not mine). `markRead` resets them. `ServerSummary.unread` is set when any channel has unread messages; both come from `listServers`.
   - No authority or sync change: mentions are read from the message body.
 
+- "Is typing…" (G-29; design `g29-typing-design.md` with Amendment 1). Ephemeral: never stored, never in a log, the backup or the logs, never unread.
+  - `setTyping(channelId, on: boolean)` returns `null`.
+    - `true` while typing: the first goes out at once, and repeats at most every 3 s while the UI keeps calling it.
+    - `false` on send or clear: `off` goes out once, if `on` went out. `off` also goes 4 s after the last `true`, and `sendMessage` sends it too.
+    - Errors: `not-found` (no channel I can see), `not-allowed` (I can't post there now).
+  - `getSettings()` returns `{ typingIndicator: boolean }`, settings this device keeps. `setTypingIndicator(on)` returns `null`.
+    - "Show others when I'm typing" is on by default and local only.
+    - Off: nothing is sent (turning it off sends `off` wherever I was typing), but others still show.
+  - Event `typing { channelId, userIds }`: who is typing there now, by key, at most 5; an empty list means nobody. It's sent when that set changes, at most one per channel per tick.
+    - A typer is dropped 6 s after their last `on`, at once on `off`, or when their message arrives.
+    - My own other computers (same identity) aren't shown.
+  - **Transport:** sync's `/mvs/typing/1`.
+    - One blob of at most 512 bytes; the answer is empty.
+    - Only to and from verified current members.
+    - Its own caps: per peer a burst of 3, then 1 every 2 s; all peers a burst of 30, then 10 a second.
+    - Older peers fail negotiation, harmlessly. No gate is needed, since nothing is stored.
+  - **Envelope:** `{ v: 1, from, server, channel, ts, nonce, on }`, signed by the identity under `mvs/typing/v1`, with `deny_unknown_fields` on the body and the wrapper. It's dropped quietly unless:
+    - it verifies, is version 1, is within 2 minutes of our clock, and isn't a replay;
+    - it's signed by the identity its peer is bound to;
+    - that identity can read and post in the channel now (a member, not kicked, the channel known, 18+ only with a claim), in one of my servers and a channel I can see.
+  - It's sent to the online members who can read that channel.
+
 - Emoji reactions (G-26; design `g26-reactions-design.md` with Amendment 1):
   - `react(messageId, emoji, on: boolean)` returns `null` and fires `message.updated` for the message. Nothing is signed when it's already so (an add of an emoji I have on, or a removal of one I don't).
   - `Message.reactions?: { emoji, count, mine }[]` (additive) lists at most 20 emoji: the 20 with the most members, ties going to the one that appeared first. They're listed in the order they first appeared, and the field is absent when there are none. A deleted message has none.
@@ -187,6 +209,8 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).
     - `found`: the live servers the backup lists (0 until found). `waiting`: of those, the ones not back yet.
     - The UI shows "searching" and "waiting" honestly on the restore screen, with the invite-link hint (PO G-91 criterion 2). A server I left, was removed from, or that closed never comes back and isn't counted as waiting.
+  - **Buddies, phase B (#461):** every 10 min the core checks its 3 backup buddies, at most one per owner group. A gone buddy, or two under one owner, is replaced at once; 2 or more stale buddies, or room for more, wait a day. A new set makes the next backup round write to the mailbox and to them (`Network::put_backup_to`, a no-op until dev-sync's network re-checks each recipient is a bound current co-member at send time; `BUDDIES` stays off until the Security Lead's re-review).
+    - **GAP-11 (local plaintext):** `member-seen`, when each co-member was last seen online, and `backup-buddies` are kept in `core.db` in the clear, like the rest of the store until GAP-11. They never go into the backup or `exportDiagnostics`.
   - **Holders:** the ports are no-ops until dev-sync's `/mvs/backup/1` and devops' mailbox exist. `LoopbackNetwork` holds them for tests.
 
 - `signOut({ words: string[] } | { withoutWords: true })` returns `null` (both read at the top level of `args`). It removes this identity from this computer.

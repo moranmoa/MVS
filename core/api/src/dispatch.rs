@@ -41,6 +41,20 @@ struct UpdateNeededArgs {
     cap: Option<String>,
 }
 
+/// G-29.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TypingArgs {
+    channel_id: String,
+    on: bool,
+}
+
+/// G-29: `setTypingIndicator`.
+#[derive(Deserialize)]
+struct OnArg {
+    on: bool,
+}
+
 /// G-26.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,6 +386,13 @@ impl Core {
                 let a: ReactArgs = args(raw)?;
                 ok(self.react(&a.message_id, &a.emoji, a.on))
             }
+            // G-29.
+            "setTyping" => {
+                let a: TypingArgs = args(raw)?;
+                ok(self.set_typing(&a.channel_id, a.on))
+            }
+            "getSettings" => ok(self.get_settings()),
+            "setTypingIndicator" => ok(self.set_typing_indicator(args::<OnArg>(raw)?.on)),
             "listMembers" => ok(self.list_members(&args::<ServerArg>(raw)?.server_id)),
             "createServer" => {
                 let a: CreateServerArgs = args(raw)?;

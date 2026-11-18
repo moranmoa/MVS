@@ -23,9 +23,11 @@ use crate::reaction;
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
 use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
+use crate::recovery;
 use crate::rekey::JoinBucket;
 use crate::types::*;
 use crate::update::Updates;
+use crate::typing::{self, TypingNet};
 use crate::voice::{self, VoiceNet};
 use updater::client::UpdateEvent;
 
@@ -49,6 +51,8 @@ const KV_MEMBER_RELAY_CAP: &str = "member-relay-cap-mb";
 /// Slice 3b: the last verified `memberRelayOff` from the signed `flags.json`.
 /// Written only by the update loop; there is no command for it.
 const KV_MEMBER_RELAY_GLOBAL_OFF: &str = "member-relay-global-off";
+/// G-29: "0" when "Show others when I'm typing" is off; absent is on.
+const KV_TYPING_INDICATOR: &str = "typing-indicator";
 /// The member relay's daily cap: default and accepted range, in MB.
 pub const MEMBER_RELAY_CAP_DEFAULT_MB: u32 = 2_048;
 pub const MEMBER_RELAY_CAP_MB: std::ops::RangeInclusive<u32> = 256..=51_200;
@@ -99,6 +103,16 @@ const KV_BACKUP_PENDING: &str = "backup-pending";
 /// when it was last put (u64le ms).
 const KV_BACKUP_WRITTEN: &str = "backup-written";
 const KV_BACKUP_PUT_AT: &str = "backup-put-at";
+/// G-91 phase B: my backup buddies (JSON [`Buddies`]) and when each
+/// co-member was last seen online (JSON hex key -> ms).
+const KV_BACKUP_BUDDIES: &str = "backup-buddies";
+const KV_MEMBER_SEEN: &str = "member-seen";
+/// G-91 phase B: how many co-members hold my backup (design §2), one per
+/// owner group (Tech Lead).
+pub const BACKUP_BUDDIES: usize = 3;
+/// G-91 phase B: how often the buddies are checked (a gone one is
+/// replaced at the check after it went).
+pub const BUDDY_CHECK_MS: u64 = 10 * 60_000;
 /// Restore servers: an unchanged backup is put again this often (design
 /// §4), so holders keep it and copies heal.
 pub const BACKUP_REPUBLISH_MS: u64 = 24 * 3_600_000;
@@ -292,6 +306,9 @@ struct Inner {
     net: Arc<dyn Network>,
     /// The online members last reported per server (M2).
     presence_seen: HashMap<ServerId, Reach>,
+    /// G-91: when each co-member was last seen online (core clock), for
+    /// picking backup buddies; persisted with each buddy check.
+    member_seen: HashMap<PublicKey, u64>,
     /// Who each channel was last keyed for by our own rotation, so a
     /// moderator re-keys when members join (in memory: once after a restart).
     keyed_for: HashMap<(ServerId, ChannelId), BTreeSet<PublicKey>>,
@@ -301,6 +318,8 @@ struct Inner {
     join_waiting: BTreeSet<ServerId>,
     /// Voice calls: mine, and who is in which call.
     calls: voice::Calls,
+    /// G-29: who is typing, what I sent, the replay cache. Never stored.
+    typing: typing::Typing,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -360,6 +379,8 @@ pub struct Core {
     /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
     /// once the restore is done.
     backup_retry: Mutex<(u64, u64)>,
+    /// G-91 phase B: when the buddies were last checked (core clock).
+    buddies_checked: Mutex<Option<u64>>,
     /// G-91: the restore under way, once its backup is found.
     restore: Mutex<RestoreProgress>,
     /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
@@ -384,6 +405,23 @@ impl RestoreProgress {
     fn new(state: ServerRestoreState) -> RestoreProgress {
         RestoreProgress { found: None, waiting: BTreeMap::new(), status: ServerRestore { state, found: 0, waiting: 0 } }
     }
+}
+
+/// G-91 phase B: my backup buddies, as stored.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Buddies {
+    /// When this set was picked (core clock, ms).
+    picked_at: u64,
+    list: Vec<Buddy>,
+}
+
+/// One buddy: its identity key and the owner group it was picked
+/// through (both hex).
+#[derive(Serialize, Deserialize)]
+struct Buddy {
+    member: String,
+    owner: String,
 }
 
 struct PendingJoin {
@@ -504,10 +542,12 @@ impl Core {
             announced: HashMap::new(),
             net: ports.network.clone(),
             presence_seen: HashMap::new(),
+            member_seen: HashMap::new(),
             keyed_for: HashMap::new(),
             join_buckets: HashMap::new(),
             join_waiting: BTreeSet::new(),
             calls: voice::Calls::default(),
+            typing: typing::Typing::default(),
             key_pending: Vec::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
@@ -549,6 +589,7 @@ impl Core {
             backup_started: AtomicBool::new(false),
             notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
+            buddies_checked: Mutex::new(None),
             restore: Mutex::new(RestoreProgress::new(restore_state)),
             keys_locked: AtomicBool::new(false),
         })
@@ -1003,6 +1044,20 @@ impl Core {
     fn backup_round(&self) {
         let now = self.ports.clock.now_ms();
         let login = !self.backup_started.load(Ordering::SeqCst);
+        // G-91 phase B: the buddies, checked every BUDDY_CHECK_MS; a new set
+        // makes this round write.
+        {
+            let mut checked = self.buddies_checked.lock().expect("not poisoned");
+            if checked.is_none_or(|at| now.saturating_sub(at) >= BUDDY_CHECK_MS) {
+                let mut inner = self.lock();
+                if inner.me.is_some() {
+                    if let Err(e) = inner.buddy_check(now) {
+                        eprintln!("mvs-core: the backup buddies weren't checked: {:?}", e.code);
+                    }
+                    *checked = Some(now);
+                }
+            }
+        }
         let tag = {
             let inner = self.lock();
             match inner.backup_due(now, login) {
@@ -1023,7 +1078,18 @@ impl Core {
         let answers = self.ports.network.fetch_backup(tag);
         let blob = self.lock().backup_merge(now, &answers);
         match blob {
-            Ok(Some(blob)) => self.ports.network.put_backup(tag, &blob),
+            Ok(Some(blob)) => {
+                self.ports.network.put_backup(tag, &blob);
+                // G-91 phase B: and to my buddies (the network re-checks each
+                // is a bound current co-member at send time).
+                let buddies: Vec<PublicKey> = match self.lock().buddies() {
+                    Ok(b) => b.list.iter().filter_map(|b| model::parse_hex32(&b.member)).map(PublicKey::from_bytes).collect(),
+                    Err(_) => Vec::new(),
+                };
+                if !buddies.is_empty() {
+                    self.ports.network.put_backup_to(tag, &blob, &buddies);
+                }
+            }
             Ok(None) => {}
             Err(e) => eprintln!("mvs-core: the server backup wasn't written: {:?}", e.code),
         }
@@ -1919,6 +1985,90 @@ impl Core {
         self.voice(|calls, ctx, _| calls.send_signal(ctx, to, kind, payload))
     }
 
+    // ---- typing (G-29) ----------------------------------------------------
+
+    /// G-29: sync's typing transport. Without one, nothing is sent.
+    pub fn set_typing_net(&self, net: Arc<dyn TypingNet>) {
+        self.lock().typing.set_net(net);
+    }
+
+    /// `setTyping(channelId, on)`: `true` while typing (sent at once, then
+    /// at most every 3 s), `false` on send or clear (`off` once; `off` also
+    /// goes 4 s after the last `true`). Nothing is sent with the setting
+    /// off. `not-found`: no channel I can see; `not-allowed`: I can't post
+    /// there now.
+    pub fn set_typing(&self, channel_id: &str, on: bool) -> CoreResult<()> {
+        self.run(|inner, ports, _| {
+            let (server, channel) = inner.find_channel(channel_id)?;
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+            if !inner.may_type(me, server, channel) {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            if !inner.typing_indicator() {
+                return Ok(());
+            }
+            let now = ports.clock.now_ms();
+            let send =
+                if on { inner.typing.typing(server, channel, now) } else { inner.typing.stopped(channel) };
+            inner.send_typing(now, send.into_iter().collect());
+            Ok(())
+        })
+    }
+
+    /// A blob from sync's typing transport; `from` is the identity sync
+    /// bound the sending peer to. Anything that doesn't check out (see
+    /// `typing`) is dropped quietly.
+    pub fn typing_received(&self, from: Option<PublicKey>, blob: &[u8]) {
+        let _ = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let Some(opened) = typing::open(blob, now) else { return Ok(()) };
+            let me = inner.me.as_ref().map(Me::key);
+            // My own other computers aren't shown as typing.
+            if from != Some(opened.from) || me == Some(opened.from) {
+                return Ok(());
+            }
+            if !inner.may_type(opened.from, opened.server, opened.channel)
+                || !inner.visible(opened.server)?.contains(&opened.channel)
+                || !inner.typing.fresh(opened.nonce, now)
+            {
+                return Ok(());
+            }
+            inner.typing.heard(opened.from, opened.channel, opened.on, now);
+            inner.typing_events(events);
+            Ok(())
+        });
+    }
+
+    /// G-29 timers: `off` for my idle channels, and typers past 6 s
+    /// dropped. Called about every second.
+    pub fn typing_tick(&self) {
+        let _ = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let sends = inner.typing.tick(now);
+            inner.send_typing(now, sends);
+            inner.typing_events(events);
+            Ok(())
+        });
+    }
+
+    /// `getSettings`: what the core keeps on this device.
+    pub fn get_settings(&self) -> CoreResult<CoreSettings> {
+        Ok(CoreSettings { typing_indicator: self.lock().typing_indicator() })
+    }
+
+    /// `setTypingIndicator(on)`: "Show others when I'm typing" (local).
+    /// Turning it off sends `off` wherever I was typing.
+    pub fn set_typing_indicator(&self, on: bool) -> CoreResult<()> {
+        self.run(|inner, ports, _| {
+            inner.db.set(KV_TYPING_INDICATOR, if on { b"1" } else { b"0" })?;
+            if !on {
+                let sends = inner.typing.stop_all();
+                inner.send_typing(ports.clock.now_ms(), sends);
+            }
+            Ok(())
+        })
+    }
+
     /// A blob from sync's voice transport; `from` is the identity sync bound
     /// the sending peer to. Anything that doesn't check out is dropped.
     pub fn voice_received(&self, from: Option<PublicKey>, blob: &[u8]) {
@@ -2068,6 +2218,9 @@ impl Core {
         }
         let message = self.run(|inner, ports, events| {
             let (server, channel) = inner.find_channel(channel_id)?;
+            // G-29: a send ends my typing there (`off` once, if `on` went out).
+            let stop = inner.typing.stopped(channel);
+            inner.send_typing(ports.clock.now_ms(), stop.into_iter().collect());
             let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
@@ -2413,7 +2566,7 @@ impl Core {
                     inner.join_waiting.remove(&server);
                 }
                 // M2: someone came online or went offline (members only).
-                if inner.db.has_server(server)? && inner.presence_changed(server)? && !changed {
+                if inner.db.has_server(server)? && inner.presence_changed(server, ports.clock.now_ms())? && !changed {
                     let view = inner.view(server)?;
                     events.push(Event::MembersChanged {
                         server_id: model::hex_id(server.as_bytes()),
@@ -2986,12 +3139,15 @@ impl voice::Members for Inner {
 impl Inner {
     /// Whether the online members of `server` changed since last reported
     /// (and remembers the new set). Members only: authority's, not kicked.
-    fn presence_changed(&mut self, server: ServerId) -> CoreResult<bool> {
+    fn presence_changed(&mut self, server: ServerId, now: u64) -> CoreResult<bool> {
         let view = self.view(server)?;
         let mut reach = self.net.presence(server).unwrap_or_default();
         let member = |key: &PublicKey| view.state.members.contains(key) && !view.is_kicked(key);
         reach.online.retain(member);
         reach.direct.retain(|key| reach.online.contains(key));
+        for key in &reach.online {
+            self.member_seen.insert(*key, now);
+        }
         Ok(self.presence_seen.insert(server, reach.clone()) != Some(reach))
     }
 
@@ -3195,6 +3351,102 @@ impl Inner {
         self.db.set(KV_BACKUP_WRITTEN, &Self::backup_fingerprint(&current))?;
         self.db.set(KV_BACKUP_PUT_AT, &now.to_le_bytes())?;
         Ok(Some(blob))
+    }
+
+    /// G-91 phase B: my current backup buddies (identity keys).
+    fn buddies(&self) -> CoreResult<Buddies> {
+        Ok(self.db.get(KV_BACKUP_BUDDIES)?.and_then(|json| serde_json::from_slice(&json).ok()).unwrap_or_default())
+    }
+
+    /// G-91 phase B: every co-member as a buddy candidate, through each
+    /// server I'm in (closed ones left out), with the last-seen times
+    /// merged into the stored ones (and stored).
+    fn buddy_candidates(&mut self, now: u64) -> CoreResult<Vec<recovery::Candidate>> {
+        let me = self.me.as_ref().map(Me::key).ok_or(ErrorCode::NotFound)?;
+        let mut seen: BTreeMap<String, u64> =
+            self.db.get(KV_MEMBER_SEEN)?.and_then(|json| serde_json::from_slice(&json).ok()).unwrap_or_default();
+        for (key, at) in self.member_seen.drain() {
+            let entry = seen.entry(hex::encode(key.as_bytes())).or_insert(at);
+            *entry = (*entry).max(at);
+        }
+        let mut out = Vec::new();
+        let mut members = BTreeSet::new();
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            let view = self.view(server)?;
+            if !view.state.is_member(me) {
+                continue;
+            }
+            let since = view.member_since();
+            let my_join = since.get(&me).copied().unwrap_or(0);
+            let others = view.state.members.len().saturating_sub(1) as u32;
+            for key in view.state.members.iter().filter(|k| **k != me && !view.is_kicked(k)) {
+                members.insert(hex::encode(key.as_bytes()));
+                out.push(recovery::Candidate {
+                    member: *key.as_bytes(),
+                    owner: *view.owner.as_bytes(),
+                    adult: view.state.adults.contains(key),
+                    current: true,
+                    blocked: self.db.is_blocked(key)?,
+                    mine: false,
+                    last_seen: seen.get(&hex::encode(key.as_bytes())).copied().unwrap_or(0),
+                    others_in_server: others,
+                    shared_since: since.get(key).copied().unwrap_or(now).max(my_join),
+                    my_join,
+                });
+            }
+        }
+        // Only co-members are kept; someone in no shared server is forgotten.
+        seen.retain(|key, _| members.contains(key));
+        self.db.set(KV_MEMBER_SEEN, &serde_json::to_vec(&seen).expect("plain map"))?;
+        Ok(out)
+    }
+
+    /// G-91 phase B: checks my buddies and picks again when one is gone,
+    /// two share an owner (at once), or (routine, at most daily) 2 or more
+    /// are stale or there's room for more. A new set makes the next backup
+    /// round write, so the new buddies get the current version. Returns
+    /// whether the set changed.
+    fn buddy_check(&mut self, now: u64) -> CoreResult<bool> {
+        let candidates = self.buddy_candidates(now)?;
+        let stored = self.buddies()?;
+        let status: Vec<recovery::HolderStatus> = stored
+            .list
+            .iter()
+            .filter_map(|b| {
+                let member = model::parse_hex32(&b.member)?;
+                let picked_through = model::parse_hex32(&b.owner)?;
+                let rows: Vec<&recovery::Candidate> = candidates.iter().filter(|c| c.member == member).collect();
+                let owner = if rows.iter().any(|c| c.owner == picked_through) {
+                    picked_through
+                } else {
+                    rows.first().map_or(picked_through, |c| c.owner)
+                };
+                let last_seen = rows.first().map_or(0, |c| c.last_seen);
+                Some(recovery::HolderStatus { member, owner, gone: rows.is_empty(), last_seen })
+            })
+            .collect();
+        let fresh = recovery::pick_owner_groups(&candidates, now, BACKUP_BUDDIES, false);
+        let routine = now.saturating_sub(stored.picked_at) >= recovery::RESHARE_GAP_MS;
+        let repick = match recovery::reshare_reason(&status, fresh.len(), stored.picked_at, now) {
+            Some(_) => true,
+            // The first pick, or room for more buddies than I have.
+            None => (status.is_empty() || routine) && fresh.len() > status.len(),
+        };
+        if !repick || fresh.iter().map(|p| p.member).eq(status.iter().map(|s| s.member)) {
+            return Ok(false);
+        }
+        let list = fresh
+            .iter()
+            .map(|p| Buddy { member: hex::encode(p.member), owner: hex::encode(p.owner) })
+            .collect();
+        self.db.set(KV_BACKUP_BUDDIES, &serde_json::to_vec(&Buddies { picked_at: now, list }).expect("plain struct"))?;
+        // The next backup round writes, to the new buddies too.
+        self.db.delete(KV_BACKUP_WRITTEN)?;
+        Ok(true)
     }
 
     /// Each sync round: a raise whose 30 days are up takes effect, and its
@@ -3480,6 +3732,54 @@ impl Inner {
         Ok(chat::known_channels(server, log.resolver.state()))
     }
 
+    /// G-29: `who` may read and post in `channel` of `server` now: one of
+    /// my servers, not closed; a member, not kicked; a channel authority
+    /// knows; 18+ only with an accepted 18+ claim.
+    fn may_type(&mut self, who: PublicKey, server: ServerId, channel: ChannelId) -> bool {
+        if !self.db.has_server(server).unwrap_or(false) || self.load(server).is_err() {
+            return false;
+        }
+        let Ok(known) = self.known(server) else { return false };
+        let state = self.logs[&server].resolver.state();
+        state.closed.is_none()
+            && state.members.contains(&who)
+            && !state.kicked.contains(&who)
+            && known.contains(&channel)
+            && (!state.channels.get(&channel).is_some_and(|c| c.adult) || state.adults.contains(&who))
+    }
+
+    /// G-29: sends each of `sends` to the online members who may read its
+    /// channel (me excluded). Best effort; nothing without a transport or
+    /// an identity.
+    fn send_typing(&mut self, now: u64, sends: Vec<typing::Outgoing>) {
+        use voice::Members as _;
+        let Some(net) = self.typing.net() else { return };
+        let Some(key) = self.me.as_ref().map(|me| me.identity.signing_key().clone()) else { return };
+        for send in sends {
+            let blob = typing::seal(&key, send.server, send.channel, send.on, now);
+            for to in self.audience(send.server) {
+                if self.may_type(to, send.server, send.channel) {
+                    net.send(to, blob.clone());
+                }
+            }
+        }
+    }
+
+    /// G-29: a `typing` event for each channel whose typers changed.
+    fn typing_events(&mut self, events: &mut Events) {
+        for (channel, who) in self.typing.changed() {
+            events.push(Event::Typing {
+                channel_id: model::hex_id(channel.as_bytes()),
+                user_ids: who.iter().map(|k| model::hex_id(k.as_bytes())).collect(),
+            });
+        }
+    }
+
+    /// G-29: "Show others when I'm typing" (local, default on).
+    fn typing_indicator(&self) -> bool {
+        self.db.get(KV_TYPING_INDICATOR).ok().flatten().as_deref() != Some(b"0".as_slice())
+    }
+
     /// The first time a server is synced: what is already there counts as
     /// announced (the UI reads history with `getMessages`).
     fn seed_announced(&mut self, cipher: &dyn GroupCipher, server: ServerId) -> CoreResult<()> {
@@ -3519,6 +3819,11 @@ impl Inner {
             let seen = self.announced.entry(server).or_default();
             for (index, s) in shown.iter().enumerate() {
                 let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
+                let new = !seen.contains_key(&s.record.id());
+                if new && Some(s.record.author()) != me {
+                    // G-29: their message arrived; they're done typing.
+                    self.typing.gone(s.record.author(), channel);
+                }
                 let event = match seen.insert(s.record.id(), state.clone()) {
                     None if Some(s.record.author()) != me && !fresh.contains(&channel) => {
                         fresh.push(channel);
@@ -3561,6 +3866,7 @@ impl Inner {
             events.extend(channels.into_iter().map(Event::ChannelUpdated));
             events.push(Event::ServerUpdated(self.counted_summary(cipher, server)?));
         }
+        self.typing_events(events);
         Ok(())
     }
 

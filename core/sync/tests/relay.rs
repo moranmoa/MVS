@@ -13,8 +13,8 @@ use libp2p::{
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
 use sync::{
-    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, VoiceError,
-    MAX_VOICE_BLOB,
+    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, TypingError, VoiceError,
+    MAX_TYPING_BLOB, MAX_VOICE_BLOB,
 };
 use tokio::sync::mpsc;
 
@@ -758,6 +758,49 @@ async fn the_voice_rate_cap_holds() {
     assert!(got.len() >= 20, "only {} arrived", got.len());
     assert!(got.len() <= allowed, "{} arrived, at most {allowed} allowed", got.len());
     assert!(got.iter().all(|(from, _)| *from == voice_id(25)));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// G-29: `/mvs/typing/1` between members through the relay, with its own
+/// caps (a burst of 3, then one every 2 s), never arriving as voice; a
+/// non-member's is dropped and none go to one; 512 bytes at most.
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_signals_go_between_members_with_their_own_caps() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    let (a, _ea) = bound_node_events("typing-a", &relay, 27, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("typing-b", &relay, 28, false, Arc::new(gate.clone())).await;
+    voice_meet(&a, &b, voice_id(27), voice_id(28), false).await;
+
+    let start = Instant::now();
+    for n in 0..10u8 {
+        a.typing_send(voice_id(28), vec![n; MAX_TYPING_BLOB]).await.unwrap();
+    }
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        match event {
+            NodeEvent::TypingSignal { from, bytes } => got.push((from, bytes)),
+            NodeEvent::VoiceSignal { .. } => panic!("typing arrived as voice"),
+            _ => {}
+        }
+    }
+    let allowed = 3 + (start.elapsed().as_secs_f64() / 2.0).ceil() as usize;
+    assert!(got.len() >= 3 && got.len() <= allowed, "{} arrived, {allowed} allowed", got.len());
+    assert!(got.iter().all(|(from, bytes)| *from == voice_id(27) && bytes.len() == MAX_TYPING_BLOB));
+    assert_eq!(a.typing_send(voice_id(28), vec![0; MAX_TYPING_BLOB + 1]).await, Err(TypingError::TooLarge));
+    assert_eq!(a.typing_send(voice_id(99), b"x".to_vec()).await, Err(TypingError::NotMember));
+
+    // Not a member to B: dropped there, and B sends it none.
+    gate.set(voice_id(27), true);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    a.typing_send(voice_id(28), b"from a non-member".to_vec()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        assert!(!matches!(event, NodeEvent::TypingSignal { .. }), "a non-member's typing arrived");
+    }
+    assert_eq!(b.typing_send(voice_id(27), b"to a non-member".to_vec()).await, Err(TypingError::NotMember));
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }

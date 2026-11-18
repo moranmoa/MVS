@@ -34,10 +34,30 @@ function cleanWords(v) {
 }
 
 /**
- * The core's answers to getAppLock that mean "this core has no app lock"
+ * The core's answers to getAppLock that can mean "this core has no app lock"
  * (unknown or not-yet command), as opposed to "no answer" (down, timeout).
+ * They count as "off" only from a core older than LOCK_SINCE; from any other
+ * core they are a fault, and the lock stays on (fail closed).
  */
 const NO_LOCK_SUPPORT = new Set(['bad-request', 'not-implemented']);
+/** The first core with getAppLock (#476): the release after 0.4.7. */
+const LOCK_SINCE = [0, 4, 8];
+
+/**
+ * Is this getAppInfo version older than LOCK_SINCE? Only a plain
+ * "x.y.z[-pre][+build]" counts; anything else is false (not provably old).
+ * A pre-release of 0.4.8 counts as 0.4.8: it's cut after the lock landed.
+ */
+function predatesLock(version) {
+  if (typeof version !== 'string' || version.length > 64) return false;
+  const m = /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})(?:[-+][0-9A-Za-z.+-]*)?$/.exec(version);
+  if (!m) return false;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== LOCK_SINCE[i]) return v[i] < LOCK_SINCE[i];
+  }
+  return false;
+}
 
 /** Core events the page still gets: A (and pending) vs B (in a call). */
 const EVENTS_A = new Set(['core.status', 'lock.state']);
@@ -81,11 +101,20 @@ function createAppLock({ request, inCall, onChange, now = Date.now, setTimer = s
         pending = false; // no answer: the lock screen (fail closed)
         changed();
       }, START_TIMEOUT_MS);
-      let res;
-      try {
-        res = await request('getAppLock', {});
-      } catch {
-        res = null;
+      const ask = async (cmd) => {
+        try {
+          return await request(cmd, {});
+        } catch {
+          return null;
+        }
+      };
+      const res = await ask('getAppLock');
+      // "No such command" is "off" only from a core that predates the lock;
+      // the core says its version (getAppInfo). Unknown version: stays on.
+      let old = false;
+      if (res && res.error && NO_LOCK_SUPPORT.has(res.error.code)) {
+        const info = await ask('getAppInfo');
+        old = !!(info && info.ok && predatesLock(info.ok.version));
       }
       // A late answer (after the timeout) still counts: if the lock is
       // off, nobody is kept out; if it's on, the lock screen stays.
@@ -95,12 +124,13 @@ function createAppLock({ request, inCall, onChange, now = Date.now, setTimer = s
         answered = true;
         applyConfig(res.ok);
         if (!enabled) locked = false;
-      } else if (res && res.error && NO_LOCK_SUPPORT.has(res.error.code)) {
+      } else if (old) {
         // A core from before G-78 can't have a lock set: a definite "off".
         answered = true;
         enabled = false;
         locked = false;
       }
+      // Anything else (down, timeout, a lock-era core refusing): locked.
       changed();
     },
     /** The core came up: ask again if it never gave a definite answer (fail closed until then). */
@@ -192,4 +222,4 @@ function createAppLock({ request, inCall, onChange, now = Date.now, setTimer = s
   };
 }
 
-module.exports = { createAppLock, cleanPasscode, cleanWords, START_TIMEOUT_MS };
+module.exports = { createAppLock, cleanPasscode, cleanWords, predatesLock, START_TIMEOUT_MS };

@@ -34,6 +34,8 @@
 .md-code-block pre {
   margin: 0;
   padding: 8px 12px;
+  /* Room for the copy button: the first line never runs under it (UX). */
+  padding-inline-end: 36px;
   overflow-x: auto;
   white-space: pre;
   font-family: var(--font-mono);
@@ -108,7 +110,6 @@
   cursor: auto;
 }
 
-
 /* No hover on touch screens: the copy button is always there. */
 @media (hover: none) {
   .md-copy {
@@ -123,4 +124,18 @@
 .md-spoiler.revealed:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* G-25 §3: the one-time formatting hint under the composer. */
+.composer-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 0;
+  padding-inline: 4px;
+}
+
+.composer-hint .icon-button {
+  width: 24px;
+  height: 24px;
 }

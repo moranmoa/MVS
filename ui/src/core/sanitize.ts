@@ -15,6 +15,7 @@ import type {
   Channel,
   Identity,
   Invite,
+  RemovedMember,
   JoinStatus,
   Member,
   Message,
@@ -22,6 +23,8 @@ import type {
   ServerSummary,
   CallState,
   VoiceRoom,
+  CoreSettings,
+  TypingState,
   ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
@@ -241,6 +244,20 @@ export function cleanInvite(i: Invite): Invite {
     maxUses: count(i.maxUses),
     uses: count(i.uses),
     revoked: i.revoked === true,
+  };
+}
+
+/**
+ * G-53: a removed account from the core, or null when its id isn't 64
+ * lower-case hex (SL): undoKick is only ever sent a real account id.
+ */
+export function cleanRemovedMember(r: RemovedMember): RemovedMember | null {
+  if (typeof r?.id !== 'string' || !/^[0-9a-f]{64}$/.test(r.id)) return null;
+  return {
+    id: r.id,
+    shortCode: cleanCode(r.shortCode),
+    displayName: cleanName(r.displayName),
+    removedAt: when(r.removedAt) ?? 0,
   };
 }
 
@@ -525,6 +542,21 @@ export function cleanDeviceAdded(r: unknown): DeviceAdded | null {
   return { at, ...(clean ? { label: clean } : {}) };
 }
 
+/** G-29: a channel id and at most 5 distinct member ids; anything else drops the event. */
+export function cleanTyping(t: unknown): TypingState | null {
+  if (!t || typeof t !== 'object' || !onlyKeys(t, ['channelId', 'userIds'])) return null;
+  const { channelId, userIds } = t as Record<string, unknown>;
+  if (!isRoomId(channelId) || !Array.isArray(userIds) || userIds.length > 5) return null;
+  if (!userIds.every(isRoomId) || new Set(userIds).size !== userIds.length) return null;
+  return { channelId, userIds: [...userIds] as Id[] };
+}
+
+/** Core settings: a boolean, or the default (on). */
+export function cleanCoreSettings(s: unknown): CoreSettings {
+  const v = s && typeof s === 'object' ? (s as Record<string, unknown>).typingIndicator : undefined;
+  return { typingIndicator: typeof v === 'boolean' ? v : true };
+}
+
 /** G-91: a known state, whole counts, and no more waiting than found; anything else is dropped. */
 export function cleanServerRestore(r: unknown): ServerRestore | null {
   if (!r || typeof r !== 'object' || !onlyKeys(r, ['state', 'found', 'waiting'])) return null;
@@ -562,6 +594,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'memberRelay.changed': (r) => cleanMemberRelay(r),
   'deviceLink.state': (r) => cleanDeviceLinkState(r),
   'account.deviceAdded': (r) => cleanDeviceAdded(r),
+  typing: (t) => cleanTyping(t),
   'serverRestore.changed': (r) => cleanServerRestore(r),
   'voice.rooms': (p) => {
     const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
@@ -618,6 +651,9 @@ export function guardCore(core: CoreApi): CoreApi {
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
+      Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
+    ),
     joinServer: wrap(core.joinServer, cleanJoin),
     joinCall: wrap(core.joinCall, cleanCall),
     listVoiceRooms: (serverId: Id) =>
@@ -627,6 +663,7 @@ export function guardCore(core: CoreApi): CoreApi {
         return rooms;
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
+    getSettings: () => core.getSettings().then(cleanCoreSettings),
     getServerRestore: () =>
       core.getServerRestore().then((r) => {
         const clean = cleanServerRestore(r);

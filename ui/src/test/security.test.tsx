@@ -318,7 +318,13 @@ describe('source rules', () => {
   });
 
   it('only renders links it built itself', () => {
-    for (const f of files) expect(readFileSync(f, 'utf8'), f).not.toMatch(/href=\{(?!['"`]#)/);
+    // G-25: Markdown links are the one exception, in one file, through safeHref
+    // (https only, re-parsed; tested in markdown.render.test.tsx).
+    const MARKDOWN = join('markdown', 'render.tsx');
+    for (const f of files.filter((p) => !p.endsWith(MARKDOWN))) expect(readFileSync(f, 'utf8'), f).not.toMatch(/href=\{(?!['"`]#)/);
+    const md = readFileSync(join(SRC, MARKDOWN), 'utf8');
+    expect(md.match(/href=\{[^}]*\}/g)).toEqual(['href={href}']);
+    expect(md).toMatch(/const href = live \? safeHref\(n\.v\) : null;/);
   });
 });
 

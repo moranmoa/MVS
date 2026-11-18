@@ -27,6 +27,10 @@ pub mod reaction;
 // Member recovery: the pure parts first; the service wiring follows.
 #[allow(dead_code)]
 mod recovery;
+#[allow(dead_code)]
+mod recovery_holder;
+#[allow(dead_code)]
+mod recovery_device;
 mod rekey;
 mod service;
 pub mod sidecar;

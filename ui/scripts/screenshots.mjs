@@ -592,6 +592,16 @@ for (const [name, opts] of [
   await shot(p, '322-server-order-phone-he');
   await p.close();
 }
+// G-05 / G-06 in the rail: the mention count apart from the pip, and the tooltip
+// with the full server name (hover).
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.locator('.rail button[data-server-id]').first().hover();
+  await p.locator('.rail-tip').waitFor();
+  await p.waitForTimeout(150);
+  await shot(p, '323-rail-tooltip-he');
+  await p.close();
+}
 
 // ---- G-11: the owner reorders the channels (330-339) -------------------------
 {

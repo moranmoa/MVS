@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties, type HTMLAttributes, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
@@ -48,6 +49,7 @@ export function ServerRail({
   const mutes = useStore(store, (s) => s.mutes);
   const isServerMuted = (s: ServerSummary) => isMutedKey(mutes, serverMuteKey(s.id));
   const mutedLabel = useMutedLabel();
+  const { tipProps, node: tipNode } = useRailTip();
   /** "Notifications", with "· Muted until …" for a muted server. */
   const notifyLabel = (until: number | null) => [intl.formatMessage({ id: 'notify.menu' }), until !== null ? mutedLabel(until) : null].filter(Boolean).join(' · ');
   // G-04: every unread channel of the server, through the core's markRead.
@@ -219,6 +221,7 @@ export function ServerRail({
             onClick={() => onSelect('home')}
             className="rail-home"
             tabIndex={selected === 'home' ? 0 : -1}
+            tip={tipProps(intl.formatMessage({ id: 'rail.home' }))}
           >
             <HomeIcon />
           </RailButton>
@@ -241,6 +244,7 @@ export function ServerRail({
               active={selected === s.id}
               label={label(s)}
               title={s.name}
+              tip={arranging ? undefined : tipProps(s.name)}
               onClick={() => !suppressClick.current && !arranging && onSelect(s.id)}
               style={{ ['--server-color' as string]: s.color }}
               tabIndex={selected === s.id ? 0 : -1}
@@ -278,7 +282,7 @@ export function ServerRail({
         ))}
         {!arranging && (
           <li>
-            <RailButton label={intl.formatMessage({ id: 'rail.add' })} onClick={onAdd} className="rail-add" tabIndex={-1}>
+            <RailButton label={intl.formatMessage({ id: 'rail.add' })} onClick={onAdd} className="rail-add" tabIndex={-1} tip={tipProps(intl.formatMessage({ id: 'rail.add' }))}>
               <PlusIcon />
             </RailButton>
           </li>
@@ -309,12 +313,13 @@ export function ServerRail({
           className="rail-button rail-settings"
           onClick={onOpenSettings}
           aria-label={intl.formatMessage({ id: 'me.settings' })}
-          title={intl.formatMessage({ id: 'me.settings' })}
+          {...tipProps(intl.formatMessage({ id: 'me.settings' }))}
         >
           <GearIcon />
         </button>
       </div>
       {menu}
+      {tipNode}
       {notifyFor && <NotifyDialog target={notifyFor} onClose={() => setNotifyFor(null)} />}
     </nav>
     </>
@@ -335,6 +340,7 @@ function RailButton({
   mentions = 0,
   menuProps,
   serverId,
+  tip,
 }: {
   active?: boolean;
   label: string;
@@ -351,6 +357,8 @@ function RailButton({
   menuProps?: HTMLAttributes<HTMLButtonElement>;
   /** Servers only: lets the keyboard reorder find the focused one. */
   serverId?: Id;
+  /** G-06: the tooltip's handlers; without them, the native title. */
+  tip?: TipHandlers;
 }) {
   return (
     <div className={`rail-item ${active ? 'active' : ''} ${unread ? 'unread' : ''} ${muted ? 'muted' : ''}`}>
@@ -360,12 +368,12 @@ function RailButton({
         className={['rail-button', className].filter(Boolean).join(' ')}
         aria-label={label}
         aria-current={active ? 'page' : undefined}
-        title={title ?? label}
+        title={tip ? undefined : (title ?? label)}
         onClick={onClick}
         style={style}
         tabIndex={tabIndex}
         data-server-id={serverId}
-        {...menuProps}
+        {...(tip ? mergeHandlers(tip, menuProps) : menuProps)}
       >
         {children}
       </button>
@@ -376,4 +384,86 @@ function RailButton({
       )}
     </div>
   );
+}
+
+/** G-06: how long the mouse rests on a rail button before its tooltip shows. */
+const TIP_DELAY_MS = 400;
+
+type TipHandlers = Pick<HTMLAttributes<HTMLButtonElement>, 'onPointerEnter' | 'onPointerLeave' | 'onPointerDown' | 'onFocus' | 'onBlur'>;
+
+/**
+ * G-06: the rail's tooltip. The full name (servers can have 48-character names)
+ * beside the button, on hover after a moment and at once on keyboard focus. It's
+ * visual only: each button's aria-label already says it. Esc, a press, a scroll
+ * or leaving hides it.
+ */
+function useRailTip() {
+  const [tip, setTip] = useState<{ text: string; top: number; start: number } | null>(null);
+  const timer = useRef<number | undefined>(undefined);
+  const hide = () => {
+    window.clearTimeout(timer.current);
+    setTip(null);
+  };
+  const show = (el: HTMLElement, text: string) => {
+    if (!el.isConnected) return;
+    const r = el.getBoundingClientRect();
+    const rtl = (el.closest('[dir]')?.getAttribute('dir') ?? document.documentElement.dir) === 'rtl';
+    setTip({ text, top: r.top + r.height / 2, start: (rtl ? window.innerWidth - r.left : r.right) + 8 });
+  };
+  useEffect(() => {
+    if (!tip) return;
+    const onKey = (e: globalThis.KeyboardEvent) => e.key === 'Escape' && setTip(null);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', hide, true);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', hide, true);
+    };
+  }, [tip]);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  const tipProps = (text: string): TipHandlers => ({
+    onPointerEnter: (e) => {
+      if (e.pointerType && e.pointerType !== 'mouse') return;
+      const el = e.currentTarget;
+      window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => show(el, text), TIP_DELAY_MS);
+    },
+    onPointerLeave: hide,
+    onPointerDown: hide,
+    onFocus: (e) => {
+      let keyboard = true;
+      try {
+        keyboard = e.currentTarget.matches(':focus-visible');
+      } catch {
+        // No :focus-visible support: show it.
+      }
+      if (keyboard) show(e.currentTarget, text);
+    },
+    onBlur: hide,
+  });
+  const node =
+    tip &&
+    createPortal(
+      <div className="rail-tip" aria-hidden="true" style={{ top: tip.top, insetInlineStart: tip.start }}>
+        <bdi>{tip.text}</bdi>
+      </div>,
+      document.body,
+    );
+  return { tipProps, node };
+}
+
+/** Both handlers run: the tooltip's and the context menu's (long press, keys). */
+function mergeHandlers(a: HTMLAttributes<HTMLButtonElement>, b: HTMLAttributes<HTMLButtonElement> = {}): HTMLAttributes<HTMLButtonElement> {
+  const out: Record<string, unknown> = { ...a, ...b };
+  for (const k of Object.keys(a) as (keyof typeof a)[]) {
+    const fa = a[k];
+    const fb = b[k];
+    if (typeof fa === 'function' && typeof fb === 'function') {
+      out[k] = (e: unknown) => {
+        (fa as (e: unknown) => void)(e);
+        (fb as (e: unknown) => void)(e);
+      };
+    }
+  }
+  return out as HTMLAttributes<HTMLButtonElement>;
 }

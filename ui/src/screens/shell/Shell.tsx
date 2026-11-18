@@ -206,6 +206,42 @@ export function Shell() {
     setPhoneMembers(false);
     setPhoneView('nav');
   };
+  // G-30: an mvs://m/… link (main parsed it strictly). It only navigates: the
+  // right server and channel, then the message list scrolls and highlights.
+  const [linkNotMember, setLinkNotMember] = useState(false);
+  const linkSeq = useRef(0);
+  useCoreEvent('link.message', ({ serverId: sid, channelId: cid, messageId }) => {
+    // Never over the join dialog (the same rule as invites, #80).
+    if (dialogNow.current === 'join') return;
+    const seq = ++linkSeq.current;
+    // Not in my server list: the one case the UI tells apart, from its own data.
+    if (!store.getState().servers.some((s) => s.id === sid)) return setLinkNotMember(true);
+    /** The index is a snapshot (a sync can shift it): check the id there, and locate once more if it moved. */
+    const locate = async (): Promise<number | null> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { index } = await core.locateMessage(sid, cid, messageId);
+        const range = await core.getMessages(cid, index, index + 1);
+        if (range.messages[0]?.id === messageId) return index;
+      }
+      return null;
+    };
+    const open = (index: number | null) => {
+      if (seq !== linkSeq.current) return; // a newer link won
+      setSettingsOpen(false);
+      setServerId(sid);
+      // Not found looks the same whether the channel is hidden from me or doesn't
+      // exist (SL R1): only a channel in my list opens.
+      const known = (store.getState().channels[sid] ?? []).some((c) => c.id === cid);
+      if (index !== null || known) {
+        setChannelByServer((m) => ({ ...m, [sid]: cid }));
+        goPhone('chat');
+      }
+      if (index !== null) store.goToMessage(cid, index);
+      else store.showFlash('msglink.notFound');
+    };
+    // Every error is "not found": the core answers the same for all I can't see.
+    locate().then(open, () => open(null));
+  });
   // G-61: a click on a desktop notification opens its channel.
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
     setSettingsOpen(false);
@@ -351,6 +387,16 @@ export function Shell() {
       </main>
       {showMembers && <MemberList server={server} onClose={phone ? toggleMembers : undefined} />}
 
+      <Dialog open={linkNotMember} onClose={() => setLinkNotMember(false)} title={<FormattedMessage id="msglink.notMember.title" />} className="msglink-dialog">
+        <p>
+          <FormattedMessage id="msglink.notMember.body" />
+        </p>
+        <div className="actions">
+          <button type="button" className="primary" onClick={() => setLinkNotMember(false)} autoFocus>
+            <FormattedMessage id="msglink.ok" />
+          </button>
+        </div>
+      </Dialog>
       <CreateServerDialog
         open={dialog === 'create'}
         onClose={() => setDialog(null)}

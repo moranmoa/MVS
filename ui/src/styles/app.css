@@ -3898,3 +3898,35 @@ input.switch:disabled {
 .ip-notice .ip-notice-settings {
   margin-inline-end: auto;
 }
+
+/* G-30: the message a link pointed at: an accent wash and a start-side bar
+   (not colour alone) for 2.5 s, fading out; no fade with reduced motion. */
+.row.target .msg {
+  background: var(--accent-soft);
+  animation: target-fade 2.5s ease-in forwards;
+}
+
+.row.target .msg::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
+@keyframes target-fade {
+  0%,
+  60% {
+    background: var(--accent-soft);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row.target .msg {
+    animation: none;
+  }
+}

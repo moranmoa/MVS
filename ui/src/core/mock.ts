@@ -860,6 +860,26 @@ export class MockCore implements CoreApi {
     return null;
   }
 
+  // ---- G-30: links to a message -------------------------------------------------
+
+  async locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }> {
+    // One answer for all I can't see (SL R1): not a member, a hidden or missing channel, a mismatch.
+    if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
+    const ch = this.channelIndex.get(channelId);
+    if (!ch || ch.channel.serverId !== serverId) throw err({ code: 'not-found' });
+    const at = messageId.lastIndexOf('#');
+    const index = Number(messageId.slice(at + 1));
+    if (at < 0 || messageId.slice(0, at) !== channelId || !Number.isInteger(index) || index < 0 || index >= this.count(ch)) {
+      throw err({ code: 'not-found' });
+    }
+    return { index };
+  }
+
+  /** Mock only: as if the OS opened an mvs://m/… link. */
+  simulateMessageLink(serverId: Id, channelId: Id, messageId: Id): void {
+    this.emit('link.message', { serverId, channelId, messageId });
+  }
+
   // ---- G-91: servers coming back after a restore ---------------------------------
 
   private serverRestore: ServerRestore = { state: 'none', found: 0, waiting: 0 };

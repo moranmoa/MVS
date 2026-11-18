@@ -388,6 +388,8 @@ function RailButton({
 
 /** G-06: how long the mouse rests on a rail button before its tooltip shows. */
 const TIP_DELAY_MS = 400;
+/** G-06: how long it stays after the pointer leaves. */
+const TIP_LEAVE_MS = 150;
 
 type TipHandlers = Pick<HTMLAttributes<HTMLButtonElement>, 'onPointerEnter' | 'onPointerLeave' | 'onPointerDown' | 'onFocus' | 'onBlur'>;
 
@@ -432,7 +434,10 @@ function useRailTip() {
     },
     onPointerLeave: () => {
       pressed.current = false;
-      hide();
+      // WCAG 1.4.13 (UX): a short grace before it goes, so a pointer that slips
+      // off the edge for a moment doesn't make it flicker.
+      window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setTip(null), TIP_LEAVE_MS);
     },
     onPointerDown: () => {
       // A click focuses the button too: that focus shows no tooltip.

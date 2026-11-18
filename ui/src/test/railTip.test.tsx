@@ -85,7 +85,9 @@ describe('server rail (G-05, G-06)', () => {
     expect(tip()).toBeNull();
     await waitFor(() => expect(tip()?.textContent).toBe(name));
     fireEvent.pointerLeave(button);
-    expect(tip()).toBeNull();
+    // A short grace (WCAG 1.4.13), then gone.
+    expect(tip()).not.toBeNull();
+    await waitFor(() => expect(tip()).toBeNull());
     act(() => {
       fireEvent.focus(within(rail).getByRole('button', { name: 'Home' }));
     });

@@ -187,6 +187,36 @@ fn a_kick_voids_backdated_messages_by_its_cut() {
     assert_eq!(check_channel(&r, &other, &store), Verdict::Accept);
 }
 
+/// G-26: a reaction is judged like a message. Any member; voided by a
+/// kick's cut the same way; refused once its author's heads saw the kick;
+/// and never something an edit or delete can name.
+#[test]
+fn reactions_are_judged_like_messages() {
+    let (mut control, heads) = founded(&[1, 2]);
+    let mut store = Store::default();
+    let react = |author, seq, deps, auth: &[RecordId]| {
+        channel_record(author, seq, GENERAL, deps, auth.to_vec(), Kind::Reaction, vec![0; 121])
+    };
+    let seen = react(1, 0, vec![], &heads);
+    let head = store.add(&seen);
+    let stranger = react(9, 0, vec![], &heads);
+    assert_eq!(check_channel(&resolver(&control), &stranger, &store), Verdict::Refused(Refusal::NotAMember));
+    let kick =
+        rec(0, 2, heads.clone(), Action::Kick { target: actor(1), cut: cut(&[(GENERAL, head)]) });
+    control.push(kick.clone());
+    let r = resolver(&control);
+    assert_eq!(check_channel(&r, &seen, &store), Verdict::Accept, "seen by the kicker");
+    let backdated = react(1, 1, vec![seen.id()], &heads);
+    assert_eq!(check_channel(&r, &backdated, &store), Verdict::Voided { by: kick.id() });
+    let after = react(1, 2, vec![], &[kick.id()]);
+    assert_eq!(check_channel(&r, &after, &store), Verdict::Refused(Refusal::NotAMember));
+    assert_eq!(check_channel(&r, &react(2, 0, vec![head], &heads), &store), Verdict::Accept);
+    // An edit or delete naming a reaction: it isn't a message.
+    let named = delete(2, 1, &seen, &heads);
+    store.add(&named);
+    assert_eq!(check_channel(&r, &named, &store), Verdict::Refused(Refusal::BadTarget));
+}
+
 /// A channel with two concurrent heads: the kicker saw both, so the
 /// target's message on either branch survives.
 #[test]

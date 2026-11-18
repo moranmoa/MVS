@@ -136,6 +136,8 @@ export interface StoreState {
   typing: Record<Id, { userIds: Id[]; at: number }>;
   /** G-29: "Show others when I'm typing". */
   typingIndicator: boolean;
+  /** G-74: the shell's answer to the push-to-talk settings ('unsupported' outside the desktop app). */
+  pttStatus: 'ok' | 'invalid' | 'shortcut-taken' | 'unsupported' | 'pending';
   /** Member relays (slice 1, #368); null until read. */
   memberRelay: MemberRelay | null;
   /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
@@ -162,6 +164,7 @@ export class Store {
     relayOnly: false,
     typing: {},
     typingIndicator: true,
+    pttStatus: 'pending',
     memberRelay: null,
     flash: null,
     settingsRequest: null,
@@ -449,6 +452,10 @@ export class Store {
   async setTypingIndicator(on: boolean): Promise<void> {
     await this.core.setTypingIndicator(on);
     this.set({ typingIndicator: on });
+  }
+
+  setPttStatus(pttStatus: StoreState['pttStatus']): void {
+    if (pttStatus !== this.state.pttStatus) this.set({ pttStatus });
   }
 
   async setRelayOnly(on: boolean): Promise<void> {

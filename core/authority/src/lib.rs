@@ -330,7 +330,11 @@ impl Action {
             Kind::Leave => Some(Action::Leave { cut: Cut::parse(body)? }),
             Kind::ServerClose => body.is_empty().then_some(Action::ServerClose),
             // Channel kinds are judged by the channel checks (B4-4).
-            Kind::Message | Kind::MessageEdit | Kind::MessageDelete | Kind::KeyRotation => None,
+            Kind::Message
+            | Kind::MessageEdit
+            | Kind::MessageDelete
+            | Kind::KeyRotation
+            | Kind::Reaction => None,
         }
     }
 

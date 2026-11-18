@@ -1147,12 +1147,33 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
-// ---- G-29 typing (440-441, chat-and-voice-extras.md) ----------------------------
-for (const [n, name] of [[1, '440-typing-one-he'], [3, '441-typing-many-he']]) {
-  const p = await chat(`?demo=1&still=1&lang=he&theme=light&update=999999&typing=${n}`, 'x');
+// ---- G-29 typing (440, chat-and-voice-extras.md) --------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&typing=1', 'x');
   await p.locator('.typing-text').waitFor();
   await p.waitForTimeout(200);
-  await shot(p, name);
+  await shot(p, '440-typing-he');
+  await p.close();
+}
+
+// ---- G-74 push to talk (446, chat-and-voice-extras.md §6) ----------------------
+{
+  const ctx = await browser.newContext({ viewport: { width: 1366, height: 800 }, colorScheme: 'light', locale: 'he-IL' });
+  await ctx.addInitScript(() => {
+    window.mvs = { setPushToTalk: async () => 'ok', onPushToTalk: () => () => {} };
+  });
+  const p = await ctx.newPage();
+  p.on('pageerror', (e) => problems.push(`page error: ${e.message}`));
+  await p.goto(BASE + '?demo=1&still=1&lang=he&theme=light&update=999999');
+  await p.getByRole('textbox', { name: /^כתיבה ב/ }).waitFor();
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'קול' }).click();
+  await p.getByRole('radio', { name: 'לחיצה לדיבור' }).check();
+  const key = p.getByRole('button', { name: 'מקש לדיבור' });
+  await key.click();
+  await key.press('v');
+  await p.locator('.voice-settings').scrollIntoViewIfNeeded();
+  await shot(p, '446-push-to-talk-he');
   await p.close();
 }
 
@@ -1234,6 +1255,19 @@ for (const [n, name] of [[1, '440-typing-one-he'], [3, '441-typing-many-he']]) {
   await bar.getByRole('button', { name: 'הגדרות קול' }).click();
   await p.getByRole('dialog', { name: 'הגדרות קול' }).waitFor();
   await shot(p, '447-voice-dialog-he');
+  await p.close();
+}
+
+// G-84b: a deafened member in the room roster (crossed headphones instead of the mic): 449.
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await joinRoom(p);
+  const bar = p.getByRole('region', { name: 'שיחה קולית' });
+  await bar.waitFor();
+  await bar.getByRole('button', { name: 'השתקת השמע' }).click();
+  await p.getByRole('img', { name: 'השמע כבוי' }).first().waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '449-roster-deafened-he');
   await p.close();
 }
 

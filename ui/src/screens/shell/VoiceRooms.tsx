@@ -9,10 +9,10 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Avatar, Dialog, Name } from '../../components/common';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
-import { CrownIcon, MicOffIcon, SpeakerIcon } from '../../components/icons';
+import { CrownIcon, HeadphonesOffIcon, MicOffIcon, SpeakerIcon } from '../../components/icons';
 import { isCoreError, useCore, type Id, type Member, type ServerSummary, type VoiceRoom } from '../../core';
 import { VOICE_ROOM_LIMIT_MAX, VOICE_ROOM_NAME_MAX, VOICE_ROOMS_MAX } from '../../core/sanitize';
-import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, type CallEngine } from './CallBar';
+import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, VOLUME_TICKS, VolumeTicks, type CallEngine } from './CallBar';
 
 const NO_MEMBERS: Member[] = [];
 const NO_ROOMS: VoiceRoom[] = [];
@@ -37,6 +37,30 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
   const [pending, setPending] = useState<Pending | null>(null);
   const [renaming, setRenaming] = useState<Id | null>(null);
   const [limitFor, setLimitFor] = useState<Id | null>(null);
+  /** G-73: the person whose volume dialog is open (from the roster menu). */
+  const [volumeFor, setVolumeFor] = useState<{ id: Id; name: string } | null>(null);
+  /** G-73: each person's volume before "Mute for me", to restore it. */
+  const beforeMute = useRef<Record<Id, number>>({});
+  const volumeOf = (id: Id) => engine.volumes[id] ?? 100;
+  const toggleMuteForMe = (id: Id) => {
+    const now = volumeOf(id);
+    if (now > 0) {
+      beforeMute.current[id] = now;
+      engine.setVolume(id, 0);
+    } else {
+      engine.setVolume(id, beforeMute.current[id] ?? 100);
+    }
+  };
+  // Right-click a person in my call: their volume, or mute them for me (local only).
+  const personItems = (id: Id, name: string): MenuItem[] => [
+    { key: 'volume', label: intl.formatMessage({ id: 'voice.volumeMenu' }), icon: <SpeakerIcon />, onSelect: () => setVolumeFor({ id, name }) },
+    {
+      key: 'mute-for-me',
+      label: intl.formatMessage({ id: volumeOf(id) > 0 ? 'voice.muteForMe' : 'voice.unmuteForMe' }),
+      icon: <MicOffIcon />,
+      onSelect: () => toggleMuteForMe(id),
+    },
+  ];
   const [expanded, setExpanded] = useState(false);
   const [announce, setAnnounce] = useState('');
   const rootRef = useRef<HTMLButtonElement>(null);
@@ -218,7 +242,13 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
                     const failure = callHere && p.userId !== myId ? engine.peerFailed[p.userId] : undefined;
                     const [failText, failHint] = failure ? (FAILURE_TEXT[failure] ?? FAILURE_TEXT.failed) : ['', ''];
                     return (
-                      <li key={p.userId} className={callHere && engine.speaking[p.userId] ? 'speaking' : undefined}>
+                      <li
+                        key={p.userId}
+                        className={callHere && engine.speaking[p.userId] ? 'speaking' : undefined}
+                        {...(callHere && p.userId !== myId
+                          ? { tabIndex: 0, ...bind(intl.formatMessage({ id: 'voice.personMenu' }, { name: who }), () => personItems(p.userId, who)) }
+                          : {})}
+                      >
                         <Avatar name={who} color={m?.color ?? m?.avatarColor ?? '#888'} src={m?.avatarDataUrl} size={20} />
                         <span className="call-person">
                           <Name>{who}</Name>
@@ -233,10 +263,16 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
                             <CrownIcon />
                           </span>
                         )}
-                        {p.muted && (
-                          <span className="call-muted" role="img" aria-label={intl.formatMessage({ id: 'call.micOff' })}>
-                            <MicOffIcon />
+                        {p.muted && p.deafened ? (
+                          <span className="call-muted" role="img" aria-label={intl.formatMessage({ id: 'call.deafened' })} title={intl.formatMessage({ id: 'call.deafened' })}>
+                            <HeadphonesOffIcon />
                           </span>
+                        ) : (
+                          p.muted && (
+                            <span className="call-muted" role="img" aria-label={intl.formatMessage({ id: 'call.micOff' })}>
+                              <MicOffIcon />
+                            </span>
+                          )
                         )}
                       </li>
                     );
@@ -256,6 +292,35 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
         {announce}
       </span>
       {menu}
+      <Dialog
+        open={!!volumeFor}
+        onClose={() => setVolumeFor(null)}
+        title={volumeFor ? <FormattedMessage id="voice.volumeOf" values={{ name: volumeFor.name }} /> : ''}
+        className="person-volume"
+      >
+        {volumeFor && (
+          <label className="field range">
+            <span>
+              <FormattedMessage id="voice.volume" />
+              <output>{intl.formatNumber(volumeOf(volumeFor.id) / 100, { style: 'percent' })}</output>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={200}
+              step={10}
+              list={VOLUME_TICKS}
+              value={volumeOf(volumeFor.id)}
+              aria-valuetext={intl.formatNumber(volumeOf(volumeFor.id) / 100, { style: 'percent' })}
+              onChange={(e) => engine.setVolume(volumeFor.id, Number(e.target.value))}
+            />
+          </label>
+        )}
+        <p className="hint">
+          <FormattedMessage id="call.volumesHint" />
+        </p>
+        <VolumeTicks />
+      </Dialog>
 
       <Dialog
         open={!!pending}

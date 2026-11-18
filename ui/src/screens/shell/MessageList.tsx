@@ -435,10 +435,9 @@ const MessageRow = memo(function MessageRow({
   const name = author ? displayName(author) : '…';
   const tab = actionsTabbable ? 0 : -1;
   const time = new Date(m.createdAt);
-  const sameDay = new Date().toDateString() === time.toDateString();
-  const timeLabel = sameDay
-    ? intl.formatTime(time, { hour: '2-digit', minute: '2-digit' })
-    : intl.formatDate(time, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  // The day is on the date divider above (G-23), so the head shows the time only;
+  // the full date and time stay in the tooltip.
+  const timeLabel = intl.formatTime(time, { hour: '2-digit', minute: '2-digit' });
   const fullTime = intl.formatDate(time, { dateStyle: 'full', timeStyle: 'short' });
 
   if (m.deleted) {

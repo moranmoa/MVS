@@ -24,6 +24,13 @@ const ROLE = process.env.ROLE;
 const MODE = process.env.MODE || 'new';
 const JOIN_VIA = process.env.JOIN_VIA || 'bridge';
 const JOIN_ONLY = !!process.env.JOIN_ONLY;
+// G-81 (calls across networks): EXPECT_PATH=direct|relay makes the path check
+// strict (unset: report only); SETUP_MAX_MS is the PO's setup target (#426).
+const EXPECT_PATH = process.env.EXPECT_PATH || '';
+const SETUP_MAX_MS = Number(process.env.SETUP_MAX_MS || 10_000);
+if (EXPECT_PATH && !['direct', 'relay'].includes(EXPECT_PATH)) throw new Error('EXPECT_PATH must be direct or relay');
+/** When I pressed OK on the IP notice (the join), for the setup time. */
+let joinedAt = 0;
 const OTHER = ROLE === 'a' ? 'b' : 'a';
 const NAME = { a: 'QA-A owner', b: 'QA-B member' };
 const SERVER = 'voice e2e';
@@ -159,6 +166,9 @@ function connectionReport() {
         sdpFingerprint: sdpFp ? `${sdpFp[1].toLowerCase()} ${sdpFp[2].toUpperCase()}` : null,
         certFingerprint: remoteCert ? `${remoteCert.fingerprintAlgorithm.toLowerCase()} ${remoteCert.fingerprint.toUpperCase()}` : null,
         candidates: local && remote ? `${local.candidateType}/${local.protocol} -> ${remote.candidateType}/${remote.protocol}` : null,
+        // G-81: the selected pair's candidate types only (never addresses).
+        localType: local?.candidateType ?? null,
+        remoteType: remote?.candidateType ?? null,
         bytesIn: inbound.reduce((n, s) => n + (s.bytesReceived ?? 0), 0),
         packetsIn: inbound.reduce((n, s) => n + (s.packetsReceived ?? 0), 0),
         energyIn: inbound.reduce((n, s) => n + (s.totalAudioEnergy ?? 0), 0),
@@ -334,6 +344,7 @@ async function joinViaUi() {
     if (pcs) throw new Error(`${pcs} peer connection(s) before OK`);
   });
   await notice.locator('button.primary').click();
+  joinedAt = Date.now();
   await check('V6.3', 'after OK: joined, the notice is remembered, focus on Mute', async () => {
     await page.locator('.call-bar').waitFor({ timeout: 15_000 });
     const key = await page.evaluate(() => localStorage.getItem('mvs.notices.voiceIp.v1'));
@@ -417,6 +428,20 @@ try {
   }
   if (JOIN_ONLY) break scenario;
 
+  // 0.4.6: an owner sees the member-relay disclosure (modal) once a member
+  // is there; it has to be answered before anything else can be clicked.
+  if (ROLE === 'a') {
+    await check('MR.1', 'the owner sees the "Relay for your members" disclosure; OK closes it and relaying stays on', async () => {
+      const dlg = page.locator('dialog.member-relay-disclosure');
+      await dlg.waitFor({ state: 'visible', timeout: 30_000 });
+      await dlg.getByRole('button', { name: /^(OK|אישור)$/ }).click();
+      await dlg.waitFor({ state: 'hidden', timeout: 10_000 });
+      const mr = await invoke('getMemberRelay').catch(() => null);
+      if (mr && (!mr.disclosureSeen || !mr.effective)) throw new Error(JSON.stringify(mr));
+      return mr ? `disclosureSeen ${mr.disclosureSeen}, effective ${mr.effective}` : 'closed';
+    });
+  }
+
   await openServer();
   log('server open in the UI');
 
@@ -475,8 +500,10 @@ try {
     });
   }
 
+  let connectedAfterMs = 0;
   const connected = await check('V2.2', 'the WebRTC connection to the other side reaches "connected"', async () => {
-    const c = await until('connected', async () => (await live()).find((x) => x.state === 'connected'), 45_000, 500);
+    const c = await until('connected', async () => (await live()).find((x) => x.state === 'connected'), 45_000, 250);
+    if (joinedAt) connectedAfterMs = Date.now() - joinedAt;
     return `${c.candidates}, dtls ${c.dtls}`;
   });
   if (!connected) {
@@ -489,8 +516,9 @@ try {
         signaling: pc.signalingState,
         local: pc.localDescription?.type ?? null,
         remote: pc.remoteDescription?.type ?? null,
-        localCandidates: (pc.localDescription?.sdp.match(/a=candidate:[^\r\n]*/g) ?? []).map((c) => c.split(' ').slice(4, 8).join(' ')),
-        remoteCandidates: (pc.remoteDescription?.sdp.match(/a=candidate:[^\r\n]*/g) ?? []).map((c) => c.split(' ').slice(4, 8).join(' ')),
+        // Protocol and type only (fields 3 and 8): never the candidate's address or port.
+        localCandidates: (pc.localDescription?.sdp.match(/a=candidate:[^\r\n]*/g) ?? []).map((c) => { const f = c.split(' '); return `${f[2]} ${f[7]}`; }),
+        remoteCandidates: (pc.remoteDescription?.sdp.match(/a=candidate:[^\r\n]*/g) ?? []).map((c) => { const f = c.split(' '); return `${f[2]} ${f[7]}`; }),
       })),
     );
     log('peer connections:', JSON.stringify(diag));
@@ -506,6 +534,27 @@ try {
       if (await page.locator('.call-peer-failed').count()) throw new Error(await page.locator('.call-peer-failed').innerText());
       return c.certFingerprint.split(' ')[0];
     });
+    // G-81: the path the call took, direct (host/srflx/prflx on both ends) or
+    // through a TURN relay; types only, never an address.
+    await check('G81.1', `the call's path is ${EXPECT_PATH || 'reported'} (direct = host/srflx/prflx, relay = TURN)`, async () => {
+      const c = (await live()).find((x) => x.state === 'connected');
+      if (!c?.localType || !c?.remoteType) throw new Error('no selected candidate pair');
+      const known = ['host', 'srflx', 'prflx', 'relay'];
+      if (!known.includes(c.localType) || !known.includes(c.remoteType)) throw new Error(`unknown candidate type ${c.localType}/${c.remoteType}`);
+      const path = c.localType === 'relay' || c.remoteType === 'relay' ? 'relay' : 'direct';
+      const detail = `${path} (${c.localType} -> ${c.remoteType})`;
+      if (/\d+\.\d+\.\d+\.\d+|[0-9a-f]{1,4}:[0-9a-f]{1,4}:/i.test(detail)) throw new Error('an address reached the report');
+      if (EXPECT_PATH && path !== EXPECT_PATH) throw new Error(`expected ${EXPECT_PATH}, got ${detail}`);
+      return detail;
+    });
+    // The joiner (b) measures setup: from its OK to "connected" (PO, #426: under 10 s at p95).
+    if (ROLE === 'b') {
+      await check('G81.2', `call setup under ${SETUP_MAX_MS / 1000} s (OK to connected, the joiner)`, () => {
+        if (!connectedAfterMs) throw new Error('no setup time measured');
+        if (connectedAfterMs > SETUP_MAX_MS) throw new Error(`${(connectedAfterMs / 1000).toFixed(1)} s`);
+        return `${(connectedAfterMs / 1000).toFixed(1)} s`;
+      });
+    }
     await check('V2.2', 'audio arrives from the other side (inbound RTP bytes and audio energy growing)', async () => {
       const a1 = (await live()).find((x) => x.state === 'connected');
       await sleep(3000);

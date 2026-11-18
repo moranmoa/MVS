@@ -11,7 +11,11 @@ import { Dialog, Name } from '../../components/common';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
-import { playTestSound } from '../../voice/devices';
+// From its own module: tests that stub ../../voice keep push to talk working.
+import { usePushToTalk } from '../../voice/usePushToTalk';
+import { playCallCue, playTestSound } from '../../voice/devices';
+import { useSettings } from '../../app/settings';
+import { defaultVoicePrefs } from '../../app/voicePrefs';
 
 /**
  * The voice engine (piece D, ui/src/voice) as the call UI uses it. `peerFailed`
@@ -21,6 +25,10 @@ import { playTestSound } from '../../voice/devices';
 export interface CallEngine extends VoiceEngineView {
   /** No microphone, denied, or one picked after joining without one: listen-only. */
   noMic: boolean;
+  /** G-74: the push-to-talk key is held (the mic shows active). */
+  talking: boolean;
+  /** G-74: push to talk is on, with a key. */
+  ptt: boolean;
 }
 
 /**
@@ -57,7 +65,24 @@ export function useCallEngine(myId: Id): CallEngine {
   }, [fallback, store]);
   const simFailure: PeerFailure | null = sim === 'peerFailed' ? 'failed' : sim === 'peerRefused' ? 'refused' : null;
   const peerFailed = simFailure && other ? { ...view.peerFailed, [other]: simFailure } : view.peerFailed;
-  return { ...view, error, noMic, peerFailed };
+  // G-74: push to talk. The mute button stays a hard mute; the global key flips it.
+  const voice = useSettings().settings.voice ?? defaultVoicePrefs();
+  const { talking, status } = usePushToTalk({
+    mode: voice.mode,
+    pttKey: voice.pttKey,
+    globalMute: voice.globalMute,
+    inCall: !!call,
+    hardMuted: meMuted,
+    setMicMuted: view.setMicMuted,
+    onToggleMute: () => {
+      if (!call || noMic) return;
+      view.setMicMuted(!meMuted);
+      void core.setMuted(!meMuted).catch(() => {});
+    },
+  });
+  useEffect(() => store.setPttStatus(status), [store, status]);
+  const ptt = voice.mode === 'ptt' && !!voice.pttKey;
+  return { ...view, error, noMic, peerFailed, talking, ptt };
 }
 
 /**
@@ -146,6 +171,32 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
   const serverId = useStore(store, (s) => Object.entries(s.voiceRooms).find(([, rooms]) => rooms.some((r) => r.roomId === s.call?.channelId))?.[0]);
   const serverName = useStore(store, (s) => s.servers.find((x) => x.id === serverId)?.name ?? '');
   const members = useStore(store, (s) => (serverId ? s.members[serverId] : undefined)) ?? NO_MEMBERS;
+  const { settings } = useSettings();
+  // G-64: who joined or left my call since the last update, as a short sound
+  // (unless turned off, or I'm deafened) and a line for screen readers.
+  // Nothing for my own join: the first list of a call is just remembered.
+  const seen = useRef<{ channel: string; ids: Set<Id> } | null>(null);
+  const [cue, setCue] = useState('');
+  useEffect(() => {
+    if (!call || call.participants.length === 0) {
+      seen.current = null;
+      return;
+    }
+    const ids = new Set(call.participants.map((p) => p.identity).filter((id) => id !== myId));
+    const before = seen.current;
+    seen.current = { channel: call.channelId, ids };
+    if (!before || before.channel !== call.channelId) return;
+    const joined = [...ids].filter((id) => !before.ids.has(id));
+    const left = [...before.ids].filter((id) => !ids.has(id));
+    if (joined.length === 0 && left.length === 0) return;
+    const nameOf = (id: Id) => members.find((m) => m.id === id)?.displayName || codeOf(id);
+    setCue(
+      joined.length > 0
+        ? intl.formatMessage({ id: 'call.personJoined' }, { name: nameOf(joined[0]) })
+        : intl.formatMessage({ id: 'call.personLeft' }, { name: nameOf(left[0]) }),
+    );
+    if (settings.callSounds !== false && !engine.deafened) void playCallCue(joined.length > 0 ? 'join' : 'leave', engine.outputId);
+  }, [call, myId, members, intl, settings.callSounds, engine.deafened, engine.outputId]);
   if (!call) return null;
 
   const me = call.participants.find((p) => p.identity === myId);
@@ -161,6 +212,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
     // As in Discord: unmuting while deafened undeafens too.
     if (!muted && engine.deafened) {
       engine.setDeafened(false);
+      void core.setDeafened(false).catch(() => {});
       mutedByDeafen.current = false;
     }
     setMute(muted);
@@ -174,8 +226,11 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
         mutedByDeafen.current = true;
         setMute(true);
       }
+      // G-84b: the others see it (cores from 0.6.0 on), next to my mute.
+      void core.setDeafened(true).catch(() => {});
     } else {
       engine.setDeafened(false);
+      void core.setDeafened(false).catch(() => {});
       if (mutedByDeafen.current) setMute(false);
       mutedByDeafen.current = false;
     }
@@ -183,6 +238,9 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
 
   return (
     <section className="call-bar" aria-label={intl.formatMessage({ id: 'call.label' })}>
+      <span className="visually-hidden" aria-live="polite">
+        {cue}
+      </span>
       <p className="call-where">
         <PhoneIcon />
         <FormattedMessage id="call.inCall" values={{ server: serverName }} />
@@ -202,7 +260,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
       <div className="call-actions">
         <button
           type="button"
-          className={`icon-button call-mute ${me?.muted ? 'muted' : ''}`}
+          className={`icon-button call-mute ${me?.muted ? 'muted' : ''} ${engine.ptt && engine.talking && !me?.muted ? 'talking' : ''}`}
           aria-pressed={!!me?.muted}
           aria-disabled={noMic || undefined}
           aria-describedby={noMic ? 'call-no-mic' : undefined}
@@ -364,8 +422,9 @@ function VoiceSettings({
                 <input
                   type="range"
                   min={0}
-                  max={100}
-                  step={5}
+                  max={200}
+                  step={10}
+                  list={VOLUME_TICKS}
                   value={pct}
                   aria-valuetext={text}
                   onChange={(e) => engine.setVolume(o.id, Number(e.target.value))}
@@ -376,9 +435,20 @@ function VoiceSettings({
           <p className="hint">
             <FormattedMessage id="call.volumesHint" />
           </p>
+          <VolumeTicks />
         </fieldset>
       )}
     </Dialog>
+  );
+}
+
+/** G-73: the 100% mark on the 0–200% volume sliders (a tick Chromium draws on the track). */
+export const VOLUME_TICKS = 'volume-ticks-100';
+export function VolumeTicks() {
+  return (
+    <datalist id={VOLUME_TICKS}>
+      <option value={100} />
+    </datalist>
   );
 }
 

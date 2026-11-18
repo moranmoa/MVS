@@ -55,8 +55,11 @@ call_id [16] ‖ seq u32 ‖ ts u32 ‖ len u16 ‖ opus [len]      len ≤ 400
 ```
 
 - Anything else (a bad length, an over-size frame, a malformed header) **closes the stream**.
+- **The header is 26 bytes, big-endian.** `ts` is a 48 kHz sample count. `len = 0` is allowed (DTX).
 - `seq` strictly increases per (call, sender): a duplicate or stale seq is dropped.
 - A frame whose `call_id` isn't my current call is dropped.
+- **The call and its participants come from voice.rs's call state,** never from frames.
+- **During make-before-break,** a sender may send on both the old and new paths for up to 1 s, and the receiver dedupes by `seq` (dev-sync).
 
 **The stream gate (SL B1):** accepted and opened only with a peer:
 - whose libp2p key is **bound** to a member identity (GAP-4; mandatory, not merely connected);
@@ -68,7 +71,7 @@ Noise over the bound peer key is B's authentication, standing in for WebRTC's DT
 **Caps (SL B2):**
 - payload ≤ 400 B (stricter than the SL's 512);
 - per peer, 60 frames/s with a short burst;
-- a global cap;
+- a global cap of 480 frames/s;
 - the jitter buffer bounded in frames and in ms (≤ 200 ms).
 
 Over a cap, the frame is dropped; after a sustained flood, the stream is closed. Nothing from a frame is logged above trace, and audio payloads never.
@@ -76,7 +79,7 @@ Over a cap, the frame is dropped; after a sustained flood, the stream is closed.
 **Core API (TL A2, SL B3):**
 - **Send:** `voiceFrame(callId, seq, ts, data)` is **fire-and-forget**, with no reply per frame. The core sends to **every peer in my current call** that is on B. The renderer can't name arbitrary targets, and it encodes **once per frame**, not once per peer.
 - **Receive:** event `voice.frame { callId, from, seq, ts, data }`.
-- **Both:** in `commands.js` and `guardCore`, accepted only when `fromUs` and only during an active call. They carry the same size and rate caps as the stream, so a compromised renderer can't pump traffic. While the app is locked, they're allowed only under G-78 path B (a call in progress), for that call.
+- **Both:** in `commands.js` and `guardCore`, accepted only when `fromUs` and only during an active call. `data` is base64 on the JSON channel, and its cap applies after decoding. They carry the same size and rate caps as the stream, so a compromised renderer can't pump traffic. While the app is locked, they're allowed only under G-78 path B (a call in progress), for that call.
 - **Channel:** the existing stdio JSON channel, **unless the spike misses its target** (§5). A binary side channel is new IPC surface, which needs SL review and has to earn its place.
 - **Path report:** `path_to(peer) -> Lan | Direct | Circuit | MemberCircuit | None`, for the switch and for the diagnostics panel (types only).
 
@@ -94,15 +97,21 @@ Over a cap, the frame is dropped; after a sustained flood, the stream is closed.
 - **Cost per relayed 1:1 pair** (about 44 B of framing per frame, both directions summed): about 18 MB/h at 16 kbps (DTX lowers it further), about 30 MB/h at 24 kbps.
 - **Against the project relay:** both fit its 32 MiB circuit, which is refreshed before the cut anyway.
 
-### 2.4 Circuit order (decided by the manager)
+### 2.4 Circuit order (manager, with the SL)
 
-**Order:** direct (LAN or punched) → a member relay of the same server → the project relay as last resort.
+**Default order, the same as messages (#477):**
+1. direct (LAN or punched);
+2. our relays;
+3. a member relay of the same server, **only when none of our relays is reachable**.
 
-- **Member relays carry media through a voice circuit class** in `member_relay.rs`, charged by the bytes actually relayed. dev-sync builds it, with SL review.
-- **Until that class lands,** member relays carry media only when no project relay is reachable, because today each 120 s circuit is charged its full 8 MiB.
-- **Relay-only users** always use our relays only (SL B5), so members never see their IP.
-
-The two rules are consistent: member relays come first for normal users, and relay-only users never use them.
+- **Why our relays first:** a member relay is a co-member who learns both callers' IPs and, with DTX, when each one speaks. That's acceptable as a fallback, which keeps calls alive when our relays are gone, but not as the default (SL).
+- **The order is one setting**, not hard-coded (`member-first` or `ours-first`, default `ours-first`), so flipping it later is cheap.
+  - Member-first is a privacy trade-off, and it's pending the owner's decision.
+  - If the owner picks it, member circuits use dev-sync's option (a): a 1 MiB charge unit per circuit at open, with SL review.
+  - The per-byte voice class is dropped: libp2p-relay 0.21's `CircuitClosed` reports no byte count.
+- **Relay-only overrides the setting (SL).**
+  - Under relay-only there's no member relay and no direct path, whatever the order setting says: our relays only.
+  - This is enforced in the path selection in core/sync, not in the UI, and pinned by a test: with `member-first` set and relay-only on, media never goes over a member relay.
 
 **Background**, for the record. The requirements differed:
 - **Manager:** prefer a member relay of the same server over the project relay, so calls keep working when our relays are down or gone. The project relay is the last resort, as for messages.
@@ -111,7 +120,7 @@ The two rules are consistent: member relays come first for normal users, and rel
   - Every 120 s brings a forced switch, which A3's make-before-break handles but which is constant churn.
 - **SL (non-blocking):** while relay-only is off, prefer the project relay for media, rather than reconnecting every two minutes.
 
-The decision above follows voice-d's proposal, which the manager confirmed on 2026-11-18. The SL and TL had approved C2 before §2.4 was settled.
+**History:** an earlier version of this section (f7458c5) put member relays first, gated on a per-byte voice class. The manager corrected it after the SL's review: the per-byte class isn't feasible, and member-first goes to the owner.
 
 ## 3. Relay-only and the notice
 
@@ -173,7 +182,7 @@ QA's hooks (#500: G81.3, G81.4, G81.5) carry over. One more is needed: the media
 | **A: no open reflector** | A is rejected, and A0 isn't in v1. No reflector exists. |
 | **B: Noise end to end over the circuit** | Yes. A circuit is a transport with Noise between the cores, and a sync test taps the relay's bytes. |
 | **B: frame key if anyone forwards** | Nobody forwards (a full mesh, one stream per pair). A forwarder would need an SFrame-like key from the channel key with a new label, plus review. Refused for now. |
-| **B: relay budget (R11)** | Both directions summed: about 18 MB/h at 16 kbps (relayed default, less with DTX), about 30 MB/h at 24 kbps, under 32 MiB. Make-before-break before the cut, no `MAX_CIRCUIT_*` change, the mesh ≤ 8. Member relays carry media via a voice circuit class charged by actual bytes (§2.4). |
+| **B: relay budget (R11)** | Both directions summed: about 18 MB/h at 16 kbps (relayed default, less with DTX), about 30 MB/h at 24 kbps, under 32 MiB. Make-before-break before the cut, no `MAX_CIRCUIT_*` change, the mesh ≤ 8. Our relays first; member relays only as a fallback, under the order setting (§2.4). |
 | **B: frames bound to call, sender and sequence** | The frozen frame (§2.3). The sender comes from the bound stream. A wrong call, a duplicate or stale seq, or a bad length is dropped or closes the stream. Rate and size caps, jitter buffer ≤ 200 ms. |
 | **B: metadata** | Relays see two peer IDs, timing and volume, and with DTX when someone talks (§4). It goes in the threat model and notice v3. |
 | **C: a peer can't force a direct path under relay-only** | My engine decides (§2.2). Under relay-only, no RTCPeerConnection, candidates, DCUtR or member relays exist, so an offer is ignored. |

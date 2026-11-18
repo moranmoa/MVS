@@ -73,6 +73,16 @@ jobs:
         run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check licenses sources bans
       - name: relay
         run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check licenses sources bans
+      # The relay never resolves names (#443): no DNS resolver may come back
+      # in its build (Security Lead). Fails if hickory-proto is compiled in.
+      - name: relay has no DNS resolver
+        run: |
+          out=$(cargo tree --locked --manifest-path infra/relay/Cargo.toml -e normal -i hickory-proto 2>&1 || true)
+          if echo "$out" | grep -q "^hickory-proto "; then
+            echo "$out"
+            echo "::error::hickory-proto is in the relay build again"; exit 1
+          fi
+          echo "ok: no hickory-proto in the relay build"
       # core/vendor/libp2p-dns must stay the crates.io 0.45.0 package (sha256
       # pinned) with only the edits its README lists.
       - name: vendored libp2p-dns matches crates.io

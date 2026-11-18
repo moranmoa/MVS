@@ -237,6 +237,11 @@ fn main() -> ExitCode {
         if let Some(signals) = net.take_voice() {
             std::thread::spawn(move || api::syncnet::deliver_voice(signals, core));
         }
+        // G-29: typing over its own member-only protocol, with its timers.
+        core.set_typing_net(net.clone());
+        if let Some(signals) = net.take_typing() {
+            std::thread::spawn(move || api::syncnet::deliver_typing(signals, core));
+        }
     }
     eprintln!("mvs-core: ready");
     // With a network, a background sync beside the request loop; it stops

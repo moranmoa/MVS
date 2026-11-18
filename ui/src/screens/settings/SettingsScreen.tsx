@@ -358,6 +358,35 @@ function NotificationsSection() {
       <p className="muted small" id="notify-badge-hint">
         <FormattedMessage id="notify.settings.badgeHint" />
       </p>
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.sound" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.sound}
+          aria-describedby="notify-sound-hint"
+          onChange={(e) => set({ sound: e.target.checked })}
+        />
+      </label>
+      <p className="muted small" id="notify-sound-hint">
+        <FormattedMessage id="notify.settings.soundHint" />
+      </p>
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="notify.settings.soundInCall" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={prefs.sound && prefs.soundInCall}
+          disabled={!prefs.sound}
+          onChange={(e) => set({ soundInCall: e.target.checked })}
+        />
+      </label>
     </div>
   );
 }

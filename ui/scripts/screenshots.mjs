@@ -1147,12 +1147,33 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
+<<<<<<< HEAD
 // ---- G-29 typing (440, chat-and-voice-extras.md) --------------------------------
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&typing=1', 'x');
   await p.locator('.typing-text').waitFor();
   await p.waitForTimeout(200);
   await shot(p, '440-typing-he');
+=======
+// ---- G-26 reactions (441-442, chat-and-voice-extras.md §2-3) -----------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const row = p.locator('[role=article]:has(.msg:not(.skeleton))').last();
+  for (const name of ['אגודל למעלה', 'אש', 'פרצוף צוחק עם דמעות צחוק']) {
+    await row.hover();
+    await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
+    await p.getByRole('dialog').getByRole('button', { name, exact: true }).click();
+    await p.getByRole('dialog').waitFor({ state: 'detached' });
+  }
+  await row.locator('.reactions').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '441-reactions-he');
+  await row.hover();
+  await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
+  await p.getByRole('dialog').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '442-emoji-picker-he');
+>>>>>>> origin/main
   await p.close();
 }
 

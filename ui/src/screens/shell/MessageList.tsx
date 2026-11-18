@@ -5,7 +5,8 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { createContext, Fragment, memo, useCallback, useContext, useMemo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import type { MessageWindow } from '../../app/store';
-import type { Member, Message } from '../../core';
+import { isCoreError, useCore, type Member, type Message } from '../../core';
+import { EmojiPicker } from '../../components/EmojiPicker';
 import { isHeld } from '../../core/sanitize';
 import { MENTION, splitMentions } from '../../app/mentions';
 import { Avatar, Code, Name } from '../../components/common';
@@ -18,12 +19,14 @@ import {
   EditIcon,
   ReplyIcon,
   TrashIcon,
+  SmilePlusIcon,
 } from '../../components/icons';
 import { paragraphs, textDir, useUiDir } from '../../app/textDir';
 import { displayName, lookalikeIds, LookalikeTag } from './MemberList';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
 import { useAppStore } from '../../app/App';
+import { useSettings } from '../../app/settings';
 
 const GROUP_GAP_MS = 5 * 60_000;
 const BOTTOM_SLACK_PX = 48;
@@ -93,7 +96,22 @@ export function MessageList({
   const count = win.count;
   const flagged = useMemo(() => lookalikeIds([...memberMap.values()]), [memberMap]);
   const store = useAppStore();
+  const core = useCore();
+  // G-26: the message the emoji picker is open for.
+  const [pickerFor, setPickerFor] = useState<Message | null>(null);
+  const react = useCallback(
+    (m: Message, emoji: string, on: boolean) => {
+      core.react(m.id, emoji, on).catch((e) => {
+        const code = isCoreError(e) ? e.code : null;
+        store.showFlash(
+          code === 'bad-request' ? 'reactions.tooMany' : code === 'update-needed' ? 'reactions.updateNeeded' : code === 'rate-limited' ? 'reactions.slowDown' : 'error.generic',
+        );
+      });
+    },
+    [core, store],
+  );
   const { bind, menu } = useContextMenu();
+  const announcement = useNewMessageAnnouncement(win, count, atBottom, myId, memberMap);
   // B25 §2: the message menu, the same actions as the row's toolbar. Deleted
   // messages and hidden (blocked) ones have no items, so no menu opens.
   const authorName = (m: Message) => {
@@ -114,6 +132,7 @@ export function MessageList({
           ]
         : [
           { key: 'reply', label: intl.formatMessage({ id: 'chat.reply' }), onSelect: () => handlers.onReply(m) },
+          ...((m.reactions?.length ?? 0) < REACTIONS_SHOWN ? [{ key: 'react', label: intl.formatMessage({ id: 'reactions.add' }), onSelect: () => setPickerFor(m) }] : []),
           {
             key: 'copy',
             label: intl.formatMessage({ id: 'menu.copyText' }),
@@ -290,6 +309,10 @@ export function MessageList({
 
   return (
     <div className="message-area">
+      {/* G-113: a new message while I'm at the bottom, for screen readers. */}
+      <span className="visually-hidden" aria-live="polite">
+        {announcement}
+      </span>
       <div
         ref={scrollRef}
         className="message-scroll"
@@ -358,6 +381,8 @@ export function MessageList({
                     onReveal={reveal}
                     onJumpToReply={jumpToReply}
                     {...handlers}
+                    onAddReaction={setPickerFor}
+                    onReact={react}
                   />
                 ) : (
                   <div className="msg skeleton" aria-hidden="true">
@@ -396,6 +421,47 @@ export function MessageList({
         </button>
       )}
       {menu}
+      <EmojiPicker open={!!pickerFor} onClose={() => setPickerFor(null)} onPick={(emoji) => pickerFor && react(pickerFor, emoji, true)} />
+    </div>
+  );
+}
+
+/** G-26: at most this many different emoji show under a message (the core's display cap). */
+const REACTIONS_SHOWN = 20;
+
+/** G-26: the chips under a message: the emoji and the count; mine is pressed. Click toggles mine. */
+function Reactions({ message: m, tab, onAdd, onReact }: { message: Message; tab: number; onAdd: (m: Message) => void; onReact: (m: Message, emoji: string, on: boolean) => void }) {
+  const intl = useIntl();
+  const list = m.reactions ?? [];
+  return (
+    <div className="reactions" role="group" aria-label={intl.formatMessage({ id: 'reactions.label' })}>
+      {list.map((r) => {
+        const label = intl.formatMessage({ id: 'reactions.pill' }, { emoji: r.emoji, count: r.count });
+        return (
+          <button
+            key={r.emoji}
+            type="button"
+            tabIndex={tab}
+            className={`reaction ${r.mine ? 'mine' : ''}`}
+            aria-pressed={r.mine}
+            aria-label={label}
+            title={label}
+            onClick={() => onReact(m, r.emoji, !r.mine)}
+          >
+            <span className="reaction-emoji" aria-hidden="true">
+              {r.emoji}
+            </span>
+            <bdi dir="ltr" className="reaction-count" aria-hidden="true">
+              {r.count}
+            </bdi>
+          </button>
+        );
+      })}
+      {list.length < REACTIONS_SHOWN && (
+        <button type="button" tabIndex={tab} className="reaction add" aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })} onClick={() => onAdd(m)}>
+          +
+        </button>
+      )}
     </div>
   );
 }
@@ -416,6 +482,8 @@ const MessageRow = memo(function MessageRow({
   onEdit,
   onDelete,
   onRetry,
+  onAddReaction,
+  onReact,
 }: {
   message: Message;
   author?: Member;
@@ -428,6 +496,9 @@ const MessageRow = memo(function MessageRow({
   revealed: boolean;
   onReveal: (authorId: string) => void;
   onJumpToReply: (index: number) => void;
+  /** G-26: open the picker for this message. */
+  onAddReaction: (m: Message) => void;
+  onReact: (m: Message, emoji: string, on: boolean) => void;
 } & Handlers) {
   const intl = useIntl();
   const uiDir = useUiDir();
@@ -524,6 +595,7 @@ const MessageRow = memo(function MessageRow({
               <FormattedMessage id="chat.clipped" />
             </p>
           )}
+          {!m.deleted && !isHeld(m) && !!m.reactions?.length && <Reactions message={m} tab={tab} onAdd={onAddReaction} onReact={onReact} />}
           {mine && m.sendState && <SendStateView message={m} onRetry={onRetry} tab={tab} />}
         </div>
       </div>
@@ -532,6 +604,11 @@ const MessageRow = memo(function MessageRow({
         <button type="button" tabIndex={tab} onClick={() => onReply(m)} aria-label={intl.formatMessage({ id: 'chat.reply' })} title={intl.formatMessage({ id: 'chat.reply' })}>
           <ReplyIcon />
         </button>
+        {!m.deleted && (m.reactions?.length ?? 0) < REACTIONS_SHOWN && (
+          <button type="button" tabIndex={tab} onClick={() => onAddReaction(m)} aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })}>
+            <SmilePlusIcon />
+          </button>
+        )}
         {mine && (
           <button type="button" tabIndex={tab} onClick={() => onEdit(m)} aria-label={intl.formatMessage({ id: 'chat.edit' })} title={intl.formatMessage({ id: 'chat.edit' })}>
             <EditIcon />
@@ -655,4 +732,73 @@ function MentionText({ text, message, plain = false }: { text: string; message: 
       })}
     </>
   );
+}
+
+/** G-113: at most one announcement this often; messages in between are counted into it. */
+export const ANNOUNCE_GAP_MS = 1500;
+/** G-113: how much of a message is read out. */
+export const ANNOUNCE_CHARS = 100;
+
+/**
+ * G-113: a polite screen-reader line for messages that arrive while I'm at
+ * the bottom of the channel on screen: "{name}: {first 100 characters}", or
+ * "New message from {name}" when notification previews are off (the same
+ * privacy choice). Not my own, deleted or blocked authors' messages; nothing
+ * for what was already there when the channel opened. Throttled: several
+ * within 1.5 s become one "{count} new messages".
+ */
+function useNewMessageAnnouncement(
+  win: MessageWindow,
+  count: number,
+  atBottom: { current: boolean },
+  myId: string,
+  memberMap: Map<string, Member>,
+): string {
+  const intl = useIntl();
+  const preview = useSettings().settings.notify?.preview === true;
+  const [text, setText] = useState('');
+  const seen = useRef<number | null>(null);
+  const pending = useRef<{ last: Message; n: number } | null>(null);
+  const lastAt = useRef(-Infinity);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const now = useRef({ intl, preview, memberMap });
+  now.current = { intl, preview, memberMap };
+  useEffect(() => () => clearTimeout(timer.current), []);
+  useEffect(() => {
+    if (!win.ready) return;
+    const before = seen.current;
+    seen.current = count;
+    // The channel just opened: what's there was there before.
+    if (before === null || count <= before || !atBottom.current) return;
+    const fresh: Message[] = [];
+    for (let i = before; i < count; i++) {
+      const m = win.get(i);
+      if (m && !m.deleted && m.authorId !== myId && !now.current.memberMap.get(m.authorId)?.blocked) fresh.push(m);
+    }
+    if (fresh.length === 0) return;
+    pending.current = { last: fresh[fresh.length - 1]!, n: (pending.current?.n ?? 0) + fresh.length };
+    const say = () => {
+      const p = pending.current;
+      pending.current = null;
+      if (!p) return;
+      lastAt.current = Date.now();
+      const { intl, preview, memberMap } = now.current;
+      const author = memberMap.get(p.last.authorId);
+      const name = author ? displayName(author) : '…';
+      if (p.n > 1) return setText(intl.formatMessage({ id: 'a11y.newMessages' }, { count: p.n }));
+      const body = (p.last.body ?? '').replace(/\s+/g, ' ').trim();
+      setText(
+        preview && body
+          ? intl.formatMessage({ id: 'a11y.newMessage' }, { name, phrase: body.length > ANNOUNCE_CHARS ? body.slice(0, ANNOUNCE_CHARS) + '…' : body })
+          : intl.formatMessage({ id: 'a11y.newMessageFrom' }, { name }),
+      );
+    };
+    const wait = ANNOUNCE_GAP_MS - (Date.now() - lastAt.current);
+    if (wait <= 0) say();
+    else timer.current ??= setTimeout(() => {
+      timer.current = undefined;
+      say();
+    }, wait);
+  }, [win, win.ready, count, myId, atBottom]);
+  return text;
 }

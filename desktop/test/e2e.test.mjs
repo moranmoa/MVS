@@ -192,7 +192,7 @@ test('legacy desktop capture never gives a stream', async () => {
 test('the page sees only copyText, invoke, notify, onEvent, the core-down actions and the title bar', async () => {
   const keys = await page.evaluate(() => Object.keys(window.mvs).sort());
   const frame = process.platform === 'darwin' ? [] : ['windowControl', 'windowFrame'];
-  assert.deepEqual(keys, ['copyText', 'invoke', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setPushToTalk', 'setUnreadCount', ...frame].sort());
+  assert.deepEqual(keys, ['copyText', 'invoke', 'lock', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setPushToTalk', 'setUnreadCount', ...frame].sort());
   assert.equal(await page.evaluate(() => typeof window.ipcRenderer), 'undefined');
 });
 

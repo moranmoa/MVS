@@ -33,9 +33,11 @@ mod presence;
 mod punch;
 mod backup;
 mod notice;
+mod lan_beacon;
 mod device_link;
 mod member_relay;
 mod invite;
+mod typing;
 mod voice;
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -44,6 +46,7 @@ pub use access::{binding_message, Binder, Handle, ReadGate, ServerSecret};
 pub use node::{Access, Node, NodeConfig, NodeEvent, PresenceState, Reachability, Via};
 pub use records::{ChannelId, Record, RecordId, Scope, ServerId, Stub};
 pub use backup::MAX_BACKUP;
+pub use lan_beacon::BEACON_PORT as LAN_BEACON_PORT;
 pub use notice::{
     fetch_message as notice_fetch_message, tag_of as notice_tag, NoticeSigner, FETCH_CONTEXT as NOTICE_FETCH_CONTEXT,
     NOTICE_BODY, NOTICE_LEN, NOTICE_TAG_CONTEXT,
@@ -60,6 +63,7 @@ pub use member_relay::{
     MAX_RESERVATIONS as MEMBER_RELAY_MAX_RESERVATIONS,
 };
 pub use invite::{MAX_PER_SERVER as MAX_INVITES_PER_SERVER, MAX_PUBLICATION as MAX_INVITE_PUBLICATION};
+pub use typing::{TypingError, MAX_TYPING_BLOB};
 pub use voice::{VoiceError, MAX_VOICE_BLOB};
 pub use store::{Append, ChannelLog, ControlLog, Held, IngestError, Store};
 

@@ -26,6 +26,7 @@ use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbou
 use crate::rekey::JoinBucket;
 use crate::types::*;
 use crate::update::Updates;
+use crate::typing::{self, TypingNet};
 use crate::voice::{self, VoiceNet};
 use updater::client::UpdateEvent;
 
@@ -49,6 +50,8 @@ const KV_MEMBER_RELAY_CAP: &str = "member-relay-cap-mb";
 /// Slice 3b: the last verified `memberRelayOff` from the signed `flags.json`.
 /// Written only by the update loop; there is no command for it.
 const KV_MEMBER_RELAY_GLOBAL_OFF: &str = "member-relay-global-off";
+/// G-29: "0" when "Show others when I'm typing" is off; absent is on.
+const KV_TYPING_INDICATOR: &str = "typing-indicator";
 /// The member relay's daily cap: default and accepted range, in MB.
 pub const MEMBER_RELAY_CAP_DEFAULT_MB: u32 = 2_048;
 pub const MEMBER_RELAY_CAP_MB: std::ops::RangeInclusive<u32> = 256..=51_200;
@@ -301,6 +304,8 @@ struct Inner {
     join_waiting: BTreeSet<ServerId>,
     /// Voice calls: mine, and who is in which call.
     calls: voice::Calls,
+    /// G-29: who is typing, what I sent, the replay cache. Never stored.
+    typing: typing::Typing,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -508,6 +513,7 @@ impl Core {
             join_buckets: HashMap::new(),
             join_waiting: BTreeSet::new(),
             calls: voice::Calls::default(),
+            typing: typing::Typing::default(),
             key_pending: Vec::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
@@ -937,9 +943,10 @@ impl Core {
                 continue;
             }
             let fetched = self.open_and_fetch(server, &secret);
-            // Without the genesis the answer can't be judged (a partial
-            // fetch): "invalid" would only mean "not yet".
-            let judged = fetched.iter().any(|r| r.kind() == Kind::Genesis && r.scope() == Scope::Control);
+            // "Invalid" is final only with evidence in the log (Security Lead
+            // on #457): a partial log could otherwise drop a server I'm in.
+            let me = self.lock().me.as_ref().map(Me::key);
+            let judged = me.is_some_and(|me| removal_shown(server, me, &fetched));
             let status = self.run(|inner, ports, events| {
                 // No invite: a member I still am needs none; anyone else is
                 // refused by authority and nothing is stored or sent.
@@ -1918,6 +1925,90 @@ impl Core {
         self.voice(|calls, ctx, _| calls.send_signal(ctx, to, kind, payload))
     }
 
+    // ---- typing (G-29) ----------------------------------------------------
+
+    /// G-29: sync's typing transport. Without one, nothing is sent.
+    pub fn set_typing_net(&self, net: Arc<dyn TypingNet>) {
+        self.lock().typing.set_net(net);
+    }
+
+    /// `setTyping(channelId, on)`: `true` while typing (sent at once, then
+    /// at most every 3 s), `false` on send or clear (`off` once; `off` also
+    /// goes 4 s after the last `true`). Nothing is sent with the setting
+    /// off. `not-found`: no channel I can see; `not-allowed`: I can't post
+    /// there now.
+    pub fn set_typing(&self, channel_id: &str, on: bool) -> CoreResult<()> {
+        self.run(|inner, ports, _| {
+            let (server, channel) = inner.find_channel(channel_id)?;
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+            if !inner.may_type(me, server, channel) {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            if !inner.typing_indicator() {
+                return Ok(());
+            }
+            let now = ports.clock.now_ms();
+            let send =
+                if on { inner.typing.typing(server, channel, now) } else { inner.typing.stopped(channel) };
+            inner.send_typing(now, send.into_iter().collect());
+            Ok(())
+        })
+    }
+
+    /// A blob from sync's typing transport; `from` is the identity sync
+    /// bound the sending peer to. Anything that doesn't check out (see
+    /// `typing`) is dropped quietly.
+    pub fn typing_received(&self, from: Option<PublicKey>, blob: &[u8]) {
+        let _ = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let Some(opened) = typing::open(blob, now) else { return Ok(()) };
+            let me = inner.me.as_ref().map(Me::key);
+            // My own other computers aren't shown as typing.
+            if from != Some(opened.from) || me == Some(opened.from) {
+                return Ok(());
+            }
+            if !inner.may_type(opened.from, opened.server, opened.channel)
+                || !inner.visible(opened.server)?.contains(&opened.channel)
+                || !inner.typing.fresh(opened.nonce, now)
+            {
+                return Ok(());
+            }
+            inner.typing.heard(opened.from, opened.channel, opened.on, now);
+            inner.typing_events(events);
+            Ok(())
+        });
+    }
+
+    /// G-29 timers: `off` for my idle channels, and typers past 6 s
+    /// dropped. Called about every second.
+    pub fn typing_tick(&self) {
+        let _ = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let sends = inner.typing.tick(now);
+            inner.send_typing(now, sends);
+            inner.typing_events(events);
+            Ok(())
+        });
+    }
+
+    /// `getSettings`: what the core keeps on this device.
+    pub fn get_settings(&self) -> CoreResult<CoreSettings> {
+        Ok(CoreSettings { typing_indicator: self.lock().typing_indicator() })
+    }
+
+    /// `setTypingIndicator(on)`: "Show others when I'm typing" (local).
+    /// Turning it off sends `off` wherever I was typing.
+    pub fn set_typing_indicator(&self, on: bool) -> CoreResult<()> {
+        self.run(|inner, ports, _| {
+            inner.db.set(KV_TYPING_INDICATOR, if on { b"1" } else { b"0" })?;
+            if !on {
+                let sends = inner.typing.stop_all();
+                inner.send_typing(ports.clock.now_ms(), sends);
+            }
+            Ok(())
+        })
+    }
+
     /// A blob from sync's voice transport; `from` is the identity sync bound
     /// the sending peer to. Anything that doesn't check out is dropped.
     pub fn voice_received(&self, from: Option<PublicKey>, blob: &[u8]) {
@@ -2067,6 +2158,9 @@ impl Core {
         }
         let message = self.run(|inner, ports, events| {
             let (server, channel) = inner.find_channel(channel_id)?;
+            // G-29: a send ends my typing there (`off` once, if `on` went out).
+            let stop = inner.typing.stopped(channel);
+            inner.send_typing(ports.clock.now_ms(), stop.into_iter().collect());
             let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
@@ -3479,6 +3573,54 @@ impl Inner {
         Ok(chat::known_channels(server, log.resolver.state()))
     }
 
+    /// G-29: `who` may read and post in `channel` of `server` now: one of
+    /// my servers, not closed; a member, not kicked; a channel authority
+    /// knows; 18+ only with an accepted 18+ claim.
+    fn may_type(&mut self, who: PublicKey, server: ServerId, channel: ChannelId) -> bool {
+        if !self.db.has_server(server).unwrap_or(false) || self.load(server).is_err() {
+            return false;
+        }
+        let Ok(known) = self.known(server) else { return false };
+        let state = self.logs[&server].resolver.state();
+        state.closed.is_none()
+            && state.members.contains(&who)
+            && !state.kicked.contains(&who)
+            && known.contains(&channel)
+            && (!state.channels.get(&channel).is_some_and(|c| c.adult) || state.adults.contains(&who))
+    }
+
+    /// G-29: sends each of `sends` to the online members who may read its
+    /// channel (me excluded). Best effort; nothing without a transport or
+    /// an identity.
+    fn send_typing(&mut self, now: u64, sends: Vec<typing::Outgoing>) {
+        use voice::Members as _;
+        let Some(net) = self.typing.net() else { return };
+        let Some(key) = self.me.as_ref().map(|me| me.identity.signing_key().clone()) else { return };
+        for send in sends {
+            let blob = typing::seal(&key, send.server, send.channel, send.on, now);
+            for to in self.audience(send.server) {
+                if self.may_type(to, send.server, send.channel) {
+                    net.send(to, blob.clone());
+                }
+            }
+        }
+    }
+
+    /// G-29: a `typing` event for each channel whose typers changed.
+    fn typing_events(&mut self, events: &mut Events) {
+        for (channel, who) in self.typing.changed() {
+            events.push(Event::Typing {
+                channel_id: model::hex_id(channel.as_bytes()),
+                user_ids: who.iter().map(|k| model::hex_id(k.as_bytes())).collect(),
+            });
+        }
+    }
+
+    /// G-29: "Show others when I'm typing" (local, default on).
+    fn typing_indicator(&self) -> bool {
+        self.db.get(KV_TYPING_INDICATOR).ok().flatten().as_deref() != Some(b"0".as_slice())
+    }
+
     /// The first time a server is synced: what is already there counts as
     /// announced (the UI reads history with `getMessages`).
     fn seed_announced(&mut self, cipher: &dyn GroupCipher, server: ServerId) -> CoreResult<()> {
@@ -3518,6 +3660,11 @@ impl Inner {
             let seen = self.announced.entry(server).or_default();
             for (index, s) in shown.iter().enumerate() {
                 let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
+                let new = !seen.contains_key(&s.record.id());
+                if new && Some(s.record.author()) != me {
+                    // G-29: their message arrived; they're done typing.
+                    self.typing.gone(s.record.author(), channel);
+                }
                 let event = match seen.insert(s.record.id(), state.clone()) {
                     None if Some(s.record.author()) != me && !fresh.contains(&channel) => {
                         fresh.push(channel);
@@ -3560,6 +3707,7 @@ impl Inner {
             events.extend(channels.into_iter().map(Event::ChannelUpdated));
             events.push(Event::ServerUpdated(self.counted_summary(cipher, server)?));
         }
+        self.typing_events(events);
         Ok(())
     }
 
@@ -4838,19 +4986,33 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
 /// that server for good. Only a definite answer does:
 /// - `Joined`: it's back;
 /// - `Closed`: its owner closed it;
-/// - `Invalid` with the genesis in hand: kicked, or no longer a member, so
-///   authority refuses the join;
-/// - `AgeBlocked`: my known age is below its minimum (an invite link still
-///   works once that changes).
+/// - `Invalid` with evidence ([`removal_shown`]): the log shows an accepted
+///   kick or leave of me, so authority refuses the join.
 ///
 /// Anything else waits for the next try: `NobodyOnline`, `Searching`,
-/// `Invalid` without the genesis (a partial fetch), and every error
+/// `AgeBlocked` (it depends on whether the log shows me as a member, which
+/// a partial log can miss: Security Lead on #457),
+/// `Invalid` without that evidence (a partial log), and every error
 /// (locked, network, internal). One bad round never loses a server.
+/// G-91 (Security Lead on #457): whether the fetched log shows I left this
+/// server: an accepted kick of me, or an accepted leave of mine. Only then
+/// is a restore's "invalid" final; a log missing my join (or the kick)
+/// proves nothing, and the server waits for a fuller answer.
+fn removal_shown(server: ServerId, me: PublicKey, fetched: &[Record]) -> bool {
+    let log = Log::new(server, fetched.iter().cloned());
+    let Some(view) = ServerView::build(server, &log) else { return false };
+    if view.state.is_member(me) {
+        return false;
+    }
+    view.is_kicked(&me)
+        || log.records.iter().any(|r| r.kind() == Kind::Leave && r.author() == me && log.accepted(&r.id()))
+}
+
 fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
     match status {
-        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. } | JoinStatus::AgeBlocked { .. }) => true,
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,
         Ok(JoinStatus::Invalid { .. }) => judged,
-        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. }) | Err(_) => false,
+        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. } | JoinStatus::AgeBlocked { .. }) | Err(_) => false,
     }
 }
 
@@ -4945,9 +5107,10 @@ mod device_notice_tests {
         let link = String::new;
         let joined = JoinStatus::Joined { link: link(), server_id: "s".into() };
         let blocked = JoinStatus::AgeBlocked { link: link(), required: AgeRestriction::Eighteen };
-        for status in [joined, JoinStatus::Closed { link: link() }, blocked] {
+        for status in [joined, JoinStatus::Closed { link: link() }] {
             assert!(restore_settles(&Ok(status.clone()), false), "{status:?}");
         }
+        assert!(!restore_settles(&Ok(blocked), true), "age-blocked waits: a partial log can miss my membership");
         let invalid = JoinStatus::Invalid { link: link() };
         assert!(restore_settles(&Ok(invalid.clone()), true), "kicked or not a member");
         assert!(!restore_settles(&Ok(invalid), false), "a partial fetch: not yet");

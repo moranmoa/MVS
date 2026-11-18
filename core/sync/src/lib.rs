@@ -39,6 +39,7 @@ mod member_relay;
 mod invite;
 mod typing;
 mod voice;
+mod voice_media;
 #[cfg(test)]
 pub(crate) mod testutil;
 

@@ -4647,8 +4647,6 @@ impl Inner {
         Ok(())
     }
 
-    /// `not-allowed` below `role` in loaded `server` (before the gate, so a
-    /// member learns they can't, not that others must update).
     /// G-14: `channel.updated` for each channel I can see whose topic is not
     /// what it was in `before`.
     fn topic_events(
@@ -4677,6 +4675,8 @@ impl Inner {
         Ok(())
     }
 
+    /// `not-allowed` below `role` in loaded `server` (before the gate, so a
+    /// member learns they can't, not that others must update).
     fn lifecycle_role(&self, server: ServerId, role: authority::Role) -> CoreResult<()> {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
         if self.view(server)?.state.role(me) < role {

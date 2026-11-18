@@ -141,6 +141,17 @@ pub trait VoiceNet: Send + Sync {
     /// Sends one blob (at most [`MAX_BLOB`]) to that identity's peer, best
     /// effort.
     fn send(&self, to: PublicKey, blob: Vec<u8>);
+
+    /// G-81: one of my voice frames, for my current call's media targets
+    /// (sync checks the call, the targets and the caps).
+    fn media_frame(&self, frame: sync::VoiceFrame) {
+        let _ = frame;
+    }
+
+    /// G-81: my current call for voice media, or none.
+    fn set_media_call(&self, call: Option<sync::VoiceCall>) {
+        let _ = call;
+    }
 }
 
 /// Who may be in which call, and whom to tell: the core's member state.

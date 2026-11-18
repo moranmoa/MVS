@@ -252,7 +252,7 @@ fn main() -> ExitCode {
             let stop = &stop;
             scope.spawn(move || core.run_sync_loop(&hints, stop));
         }
-        let served = sidecar::serve(core, io::stdin().lock(), &out);
+        let served = sidecar::serve(core, io::BufReader::new(io::stdin()), &out);
         core.stop_updates();
         // Quitting leaves any call (its bye goes out).
         let _ = core.leave_call();

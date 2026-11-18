@@ -398,6 +398,8 @@ pub struct Core {
     /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
     /// waits, holding no server secrets.
     keys_locked: AtomicBool,
+    /// G-81: the `voiceFrame` fast path's gate (`voice_media`).
+    media: Arc<crate::voice_media::MediaGate>,
     /// G-78: app-lock attempts run one at a time, so the counter can't be
     /// raced past its delay.
     app_lock_gate: Mutex<()>,
@@ -615,6 +617,7 @@ impl Core {
             buddies_checked: Mutex::new(None),
             restore: Mutex::new(RestoreProgress::new(restore_state)),
             keys_locked: AtomicBool::new(false),
+            media: Arc::default(),
             app_lock_gate: Mutex::new(()),
         })
     }
@@ -1959,7 +1962,14 @@ impl Core {
 
     /// Voice: sync's voice transport (piece A). Without one, `joinCall`
     /// answers `not-implemented`.
+    /// G-81: the sidecar reader's handle for `voiceFrame` (`voice_media`):
+    /// never takes the core's lock.
+    pub fn voice_frames(&self) -> crate::VoiceFrames {
+        crate::VoiceFrames(self.media.clone())
+    }
+
     pub fn set_voice(&self, net: Arc<dyn VoiceNet>) {
+        self.media.set_net(net.clone());
         self.lock().calls.set_net(net);
     }
 

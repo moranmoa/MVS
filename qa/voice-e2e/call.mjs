@@ -29,6 +29,19 @@ const JOIN_ONLY = !!process.env.JOIN_ONLY;
 const EXPECT_PATH = process.env.EXPECT_PATH || '';
 const SETUP_MAX_MS = Number(process.env.SETUP_MAX_MS || 10_000);
 if (EXPECT_PATH && !['direct', 'relay'].includes(EXPECT_PATH)) throw new Error('EXPECT_PATH must be direct or relay');
+// G-81 two-NAT scenarios (run-two-nat.sh), inert unless set:
+// EXPECT_CONNECT=none: the call must fail ("no voice connection" within
+//   CONNECT_FAIL_MAX_MS, never a relay candidate); the audio checks are
+//   skipped and the run ends after the G81 checks (G81.3).
+// EXPECT_STUN=answered|unreachable: the voice settings' connection
+//   diagnostics show STUN as answered or unreachable (G81.4, needs #496).
+const EXPECT_CONNECT = process.env.EXPECT_CONNECT || '';
+const CONNECT_FAIL_MAX_MS = Number(process.env.CONNECT_FAIL_MAX_MS || 35_000);
+const EXPECT_STUN = process.env.EXPECT_STUN || '';
+if (EXPECT_CONNECT && EXPECT_CONNECT !== 'none') throw new Error('EXPECT_CONNECT must be none');
+if (EXPECT_STUN && !['answered', 'unreachable'].includes(EXPECT_STUN)) throw new Error('EXPECT_STUN must be answered or unreachable');
+/** Thrown to end an EXPECT_CONNECT=none run after its checks (not a failure). */
+const EARLY_END = Symbol('early end');
 /** When I pressed OK on the IP notice (the join), for the setup time. */
 let joinedAt = 0;
 const OTHER = ROLE === 'a' ? 'b' : 'a';
@@ -136,6 +149,22 @@ async function watchPeerConnections() {
     Object.setPrototypeOf(window.RTCPeerConnection, Native);
   });
 }
+
+/** G-63/G-64: records every tone the UI plays (its cues are oscillator notes). */
+async function watchTones() {
+  await page.evaluate(() => {
+    if (window.__tones) return;
+    window.__tones = [];
+    const start = OscillatorNode.prototype.start;
+    OscillatorNode.prototype.start = function (...a) {
+      window.__tones.push({ f: Math.round(this.frequency.value), at: Date.now() });
+      return start.apply(this, a);
+    };
+  });
+}
+const tonesSince = (at) => page.evaluate((t) => (window.__tones ?? []).filter((x) => x.at >= t).map((x) => x.f), at);
+const CUE = { join: [523, 784], leave: [659, 440] };
+const heard = (fs, cue) => cue.every((f) => fs.includes(f));
 
 /** Per live connection: state, the SDP's fingerprint, the presented cert, and audio counters. */
 function connectionReport() {
@@ -444,6 +473,7 @@ try {
 
   await openServer();
   log('server open in the UI');
+  await watchTones();
 
   await check('V1.1', 'one pinned "Join chat" row with the speaker icon in the sidebar', async () => {
     const n = await entry().count();
@@ -470,6 +500,18 @@ try {
   }
 
   await check('V1.4', 'both people show in the roster', () => until('2 in roster', () => rosterHas([NAME.a, NAME.b]), 30_000));
+  if (ROLE === 'a') {
+    await check('G64.1', 'A hears the join cue (two rising notes) when B joins', () =>
+      until('join cue', async () => heard(await tonesSince(0), CUE.join) && (await tonesSince(0)).join(','), 10_000),
+    );
+  } else {
+    await check('G64.2', 'B hears no join cue for its own join', async () => {
+      await sleep(1500);
+      const f = await tonesSince(0);
+      if (heard(f, CUE.join)) throw new Error(f.join(','));
+      return f.join(',') || 'no tones';
+    });
+  }
   await check('V2.1', 'the call bar is up with Mute and Leave', async () => {
     await page.locator('.call-bar .call-mute').waitFor({ timeout: 5000 });
     await page.locator('.call-bar .call-leave').waitFor({ timeout: 5000 });
@@ -501,7 +543,25 @@ try {
   }
 
   let connectedAfterMs = 0;
-  const connected = await check('V2.2', 'the WebRTC connection to the other side reaches "connected"', async () => {
+  /** Local candidate types per connection, from the SDP: "udp host" etc. Never an address. */
+  const localCandidateTypes = () =>
+    page.evaluate(() =>
+      (window.__pcs ?? [])
+        .filter((pc) => pc.connectionState !== 'closed')
+        .map((pc) => (pc.localDescription?.sdp.match(/a=candidate:[^\r\n]*/g) ?? []).map((c) => { const f = c.split(' '); return `${f[2].toLowerCase()} ${f[7]}`; })),
+    );
+  if (EXPECT_CONNECT === 'none') {
+    const from = Date.now();
+    await check('G81.3', `the call fails cleanly: "no voice connection" within ${CONNECT_FAIL_MAX_MS / 1000} s, never connected, no relay candidate`, async () => {
+      await until('peer-failed shown', async () => (await page.locator('.call-peer-failed').count()) > 0, CONNECT_FAIL_MAX_MS, 250);
+      const took = `${((Date.now() - from) / 1000).toFixed(1)} s`;
+      if ((await live()).some((x) => x.state === 'connected')) throw new Error(`a connection reached "connected" (${took})`);
+      const types = (await localCandidateTypes()).flat();
+      if (types.some((t) => t.endsWith(' relay'))) throw new Error(`a relay candidate: ${types.join(', ')}`);
+      return `shown after ${took}; local ${[...new Set(types)].join(', ') || 'none'}`;
+    });
+  }
+  const connected = EXPECT_CONNECT === 'none' ? false : await check('V2.2', 'the WebRTC connection to the other side reaches "connected"', async () => {
     const c = await until('connected', async () => (await live()).find((x) => x.state === 'connected'), 45_000, 250);
     if (joinedAt) connectedAfterMs = Date.now() - joinedAt;
     return `${c.candidates}, dtls ${c.dtls}`;
@@ -573,6 +633,50 @@ try {
     });
   }
 
+  // N10 (Security Lead): STUN only, so my candidates are host and srflx, and
+  // one host per transport. Types only, never an address.
+  await check('G81.5', 'my local candidates are only host and srflx, one host per transport', async () => {
+    const per = await localCandidateTypes();
+    if (!per.length || per.every((l) => !l.length)) throw new Error('no local candidates');
+    for (const list of per) {
+      const bad = list.filter((t) => !/ (host|srflx)$/.test(t));
+      if (bad.length) throw new Error(`not host/srflx: ${bad.join(', ')}`);
+      const hosts = {};
+      for (const t of list.filter((x) => x.endsWith(' host'))) hosts[t.split(' ')[0]] = (hosts[t.split(' ')[0]] ?? 0) + 1;
+      const many = Object.entries(hosts).filter(([, n]) => n !== 1);
+      if (many.length) throw new Error(`hosts per transport: ${JSON.stringify(hosts)}`);
+    }
+    return per.map((l) => [...new Set(l)].join(' + ')).join('; ');
+  });
+
+  // G-81 STUN diagnostics (#496): the call bar's voice settings, "connection diagnostics".
+  if (EXPECT_STUN) {
+    await check('G81.4', `the connection diagnostics show STUN ${EXPECT_STUN}`, async () => {
+      await page.locator('.call-bar .call-settings').click();
+      const dlg = page.locator('dialog.voice-settings, .voice-settings[role="dialog"]').first();
+      await dlg.waitFor({ state: 'visible', timeout: 5000 });
+      const diag = dlg.locator('details.voice-diag');
+      if (!(await diag.count())) throw new Error('no details.voice-diag (needs #496)');
+      if (!(await diag.evaluate((d) => d.open))) await diag.locator('summary').click();
+      const stun = diag.locator('.diag-stun');
+      await stun.waitFor({ state: 'visible', timeout: 15_000 });
+      // Give a pending probe a moment to settle, then read the class only.
+      await sleep(2000);
+      const cls = (await stun.getAttribute('class')) ?? '';
+      const got = /\berror\b/.test(cls) ? 'unreachable' : 'answered';
+      await page.keyboard.press('Escape').catch(() => {});
+      if (got !== EXPECT_STUN) throw new Error(`got ${got} (class "${cls}")`);
+      return `class "${cls}"`;
+    });
+  }
+
+  if (EXPECT_CONNECT === 'none') {
+    // Nothing else can run without a connection: end here, together.
+    put('g81-done');
+    await take('g81-done', 60_000).catch(() => {});
+    throw EARLY_END;
+  }
+
   // Permissions while in the call: microphone yes; camera, screen, desktop audio no.
   // The legacy desktop capture (chromeMediaSource) is probed last, in V6.4:
   // Chromium kills the renderer for it.
@@ -636,6 +740,73 @@ try {
     put('saw-unmute');
   }
 
+  // G-74 push to talk: A picks it in Settings → Voice with the key T. Idle,
+  // B hears nothing; while A holds T, B hears A. Then A goes back to open.
+  const voiceSettings = async (mode) => {
+    await page.locator('.me-profile').click();
+    const dlg = page.locator('.settings-dialog');
+    await dlg.getByRole('button', { name: /^(Voice|קול)$/ }).click();
+    await dlg.getByRole('radio', { name: mode === 'ptt' ? /Push to talk|לחיצה לדיבור/ : /Voice activity|פתוח לדיבור/ }).check();
+    if (mode === 'ptt') {
+      const cap = dlg.locator('.key-capture').first();
+      if (!(await cap.locator('kbd').count())) {
+        await cap.click();
+        await page.keyboard.press('KeyT');
+        await until('key captured', async () => (await cap.locator('kbd').count()) === 1, 5000);
+      }
+    }
+    await dlg.getByRole('button', { name: /^(Close|סגירה)$/ }).first().click();
+    await dlg.waitFor({ state: 'hidden', timeout: 5000 });
+  };
+  const energyOver = async (ms) => {
+    const a = (await live()).find((x) => x.state === 'connected');
+    await sleep(ms);
+    const b = (await live()).find((x) => x.state === 'connected');
+    return (b?.energyIn ?? 0) - (a?.energyIn ?? 0);
+  };
+  if (ROLE === 'a') {
+    const set = await check('G74.1', 'A turns on push to talk with the key T (Settings → Voice)', async () => {
+      await voiceSettings('ptt');
+      if ((await page.locator('.call-mute').getAttribute('aria-pressed')) === 'true') throw new Error('the mute button turned on');
+      return 'mute button still off';
+    });
+    put('ptt-idle', { set });
+    await take('ptt-measured');
+    if (set) {
+      await page.keyboard.down('KeyT');
+      await check('G74.2', 'holding T shows A as talking on the mute button', () =>
+        until('talking', async () => /\btalking\b/.test((await page.locator('.call-mute').getAttribute('class')) ?? ''), 5000),
+      );
+    }
+    put('ptt-held');
+    await take('ptt-heard');
+    if (set) {
+      await page.keyboard.up('KeyT');
+      await check('G74.3', 'letting go of T ends talking (after the release delay)', () =>
+        until('not talking', async () => !/\btalking\b/.test((await page.locator('.call-mute').getAttribute('class')) ?? ''), 3000),
+      );
+      await check('G74.4', 'A goes back to voice activity', () => voiceSettings('open').then(() => 'open'));
+    }
+    put('ptt-done');
+  } else {
+    const { set } = await take('ptt-idle');
+    await sleep(1500);
+    const idle = await energyOver(3000);
+    put('ptt-measured');
+    await take('ptt-held');
+    await sleep(1500);
+    const held = await energyOver(3000);
+    put('ptt-heard');
+    if (set) {
+      await check('G74.5', 'B hears nothing from A while push to talk is idle, and hears A while T is held', () => {
+        if (!(held > 0)) throw new Error(`no energy while held: ${held}`);
+        if (idle > held * 0.05) throw new Error(`idle ${idle} vs held ${held}`);
+        return `energy idle ${idle.toExponential(2)}, held ${held.toExponential(2)}`;
+      });
+    }
+    await take('ptt-done');
+  }
+
   // Leave: B leaves first; then A leaves while B watches from outside the call.
   if (ROLE === 'b') {
     await page.locator('.call-bar .call-leave').click();
@@ -670,6 +841,9 @@ try {
       await until('B gone', () => rosterHas([NAME.a]), 15_000);
       return `about ${((Date.now() - at) / 1000).toFixed(1)} s after B's click`;
     });
+    await check('G64.3', 'A hears the leave cue (two falling notes) when B leaves', () =>
+      until('leave cue', async () => heard(await tonesSince(at - 2000), CUE.leave) && (await tonesSince(at - 2000)).join(','), 10_000),
+    );
     await check('V2.4', 'A\'s connection to B ends', () =>
       until('no live connection', async () => !(await live()).some((c) => c.state === 'connected'), 30_000),
     );
@@ -825,9 +999,13 @@ try {
   });
   }
 } catch (e) {
-  ok = false;
-  record('FAIL', 'run', 'the scenario stopped', e?.message ?? String(e));
-  put('abort', { error: e?.message ?? String(e) });
+  if (e === EARLY_END) {
+    log('EXPECT_CONNECT=none: ended after the G81 checks');
+  } else {
+    ok = false;
+    record('FAIL', 'run', 'the scenario stopped', e?.message ?? String(e));
+    put('abort', { error: e?.message ?? String(e) });
+  }
 } finally {
   await page.screenshot({ path: join(RV, `${ROLE}-final.png`) }).catch(() => {});
   await sleep(2000);

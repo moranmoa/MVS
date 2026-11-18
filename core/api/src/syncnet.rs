@@ -48,6 +48,10 @@ pub type VoiceSignal = (PublicKey, Vec<u8>);
 /// (sync caps them at 30 at once and 10 a second from everyone).
 const TYPING_QUEUE: usize = 64;
 
+/// G-48: received report boxes waiting for the core; more are dropped (sync
+/// caps them at 20 at once and 2 a second from everyone, and acked them).
+const REPORT_QUEUE: usize = 32;
+
 /// A `--relay` address: a multiaddr that ends in `/p2p/<peer id>`, so Noise
 /// checks it reached that very relay. Without the peer ID it would accept
 /// whatever answers at the address (behind Cloudflare, anyone), so it is
@@ -127,6 +131,8 @@ pub struct SyncNetwork {
     voice: Mutex<Option<Receiver<VoiceSignal>>>,
     /// G-29: typing signals, as voice.
     typing: Mutex<Option<Receiver<VoiceSignal>>>,
+    /// G-48: report boxes, as voice.
+    reports: Mutex<Option<Receiver<VoiceSignal>>>,
     /// T8-02: invite publications members pushed, until the core takes them.
     invite_pushes: InvitePushes,
     /// Device link (new device): what arrived on the link.
@@ -232,6 +238,7 @@ impl SyncNetwork {
         let waker = hint.clone();
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
         let (typing_tx, typing) = std::sync::mpsc::sync_channel(TYPING_QUEUE);
+        let (report_tx, reports) = std::sync::mpsc::sync_channel(REPORT_QUEUE);
         let invite_pushes: InvitePushes = Arc::default();
         let pushes = invite_pushes.clone();
         let link_inbox: LinkInbox = Arc::default();
@@ -257,6 +264,11 @@ impl SyncNetwork {
                     // G-29: as voice.
                     NodeEvent::TypingSignal { from, bytes } => {
                         let _ = typing_tx.try_send((from, bytes));
+                        false
+                    }
+                    // G-48: as voice; sync acked it already.
+                    NodeEvent::ReportBox { from, bytes } => {
+                        let _ = report_tx.try_send((from, bytes));
                         false
                     }
                     NodeEvent::Stored { .. } | NodeEvent::Lagged { .. } => true,
@@ -300,6 +312,7 @@ impl SyncNetwork {
             waker,
             voice: Mutex::new(Some(voice)),
             typing: Mutex::new(Some(typing)),
+            reports: Mutex::new(Some(reports)),
             invite_pushes,
             link_inbox,
             relay: relay_copy,
@@ -314,6 +327,11 @@ impl SyncNetwork {
     /// G-29: the typing signals for [`deliver_typing`] (once; `None` after).
     pub fn take_typing(&self) -> Option<Receiver<VoiceSignal>> {
         self.typing.lock().expect("not poisoned").take()
+    }
+
+    /// G-48: the report boxes for [`deliver_reports`] (once; `None` after).
+    pub fn take_reports(&self) -> Option<Receiver<VoiceSignal>> {
+        self.reports.lock().expect("not poisoned").take()
     }
 
     /// The hints for `Core::run_sync_loop` (once; `None` after).
@@ -380,6 +398,37 @@ pub fn deliver_typing(signals: Receiver<VoiceSignal>, core: &Core) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         core.typing_tick();
+    }
+}
+
+/// G-48: hands each received report box to the core, and delivers its
+/// outbox about every 10 seconds, until the node stops. Its own thread:
+/// delivery waits for acks.
+pub fn deliver_reports(boxes: Receiver<VoiceSignal>, core: &Core) {
+    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    loop {
+        match boxes.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok((from, sealed)) => core.report_received(Some(from), &sealed),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if last.elapsed() >= std::time::Duration::from_secs(10) {
+            last = std::time::Instant::now();
+            core.report_tick();
+        }
+    }
+}
+
+impl crate::report::ReportNet for SyncNetwork {
+    /// `true` once the member's peer acked the box.
+    fn deliver(&self, to: PublicKey, blob: Vec<u8>) -> bool {
+        match self.runtime.block_on(self.node.report_send(to, blob)) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(%e, "report box not delivered");
+                false
+            }
+        }
     }
 }
 

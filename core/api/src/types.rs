@@ -340,6 +340,12 @@ pub enum ErrorCode {
     /// trying).
     LockedOut,
     DiskFull,
+    /// G-48: I already reported this message or member in the last 30 days.
+    AlreadyReported,
+    /// G-48: nobody can receive the report: the owner is reported and the
+    /// server has no admins. Nothing was signed; the UI points at the
+    /// abuse address (B24).
+    NoRecipient,
 }
 
 impl CoreError {
@@ -539,6 +545,14 @@ pub enum Event {
     /// that changes; at most one per channel per tick. Empty: nobody.
     #[serde(rename = "typing", rename_all = "camelCase")]
     Typing { channel_id: Id, user_ids: Vec<Id> },
+    /// G-48: a report reached me as the owner or an admin of `serverId`.
+    /// Never carries evidence: `getReportEvidence` on a click.
+    #[serde(rename = "report.received", rename_all = "camelCase")]
+    ReportReceived { server_id: Id, report: ReportSummary },
+    /// G-48: my report's delivery: staff who acked it, and who it still waits
+    /// for.
+    #[serde(rename = "report.status", rename_all = "camelCase")]
+    ReportStatus { report_id: Id, delivered: u32, pending: u32 },
     /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
     #[serde(rename = "memberRelay.changed")]
     MemberRelayChanged(MemberRelay),
@@ -887,4 +901,72 @@ pub struct DeviceLinkState {
 pub struct DeviceApproval {
     pub sas: String,
     pub expires_at: u64,
+}
+
+/// G-48: what `reportContent` reports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ReportTarget {
+    Message { message_id: Id, channel_id: Id },
+    Member { user_id: Id },
+}
+
+/// G-48: what `reportContent` takes as its target (the channel of a
+/// message is the core's to find).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ReportTargetInput {
+    Message { message_id: Id },
+    Member { user_id: Id },
+}
+
+/// G-48: a report as staff see it in `listReports` and `report.received`.
+/// Never the evidence itself: `getReportEvidence` on an explicit click.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportSummary {
+    pub id: Id,
+    pub server_id: Id,
+    pub reporter_id: Id,
+    pub target: ReportTarget,
+    /// The reported member: the message's author for a message.
+    pub reported_id: Id,
+    /// `spam`, `harassment`, `hate`, `violence`, `sexual`, `minor`,
+    /// `self-harm`, `illegal`, `impersonation` or `other`.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The reporter's clock, ms.
+    pub ts: u64,
+    pub received_at: u64,
+    pub dismissed: bool,
+    /// A message report whose evidence is that message (R4). False:
+    /// `getReportEvidence` says it is invalid.
+    pub evidence_valid: bool,
+    /// Reasons `sexual` and `minor`: the evidence is behind a click, and
+    /// withheld from me without an 18+ claim (`getReportEvidence` is then
+    /// `not-allowed`).
+    pub evidence_withheld: bool,
+}
+
+/// G-48: `getReportEvidence`, the reported message as its author signed it.
+/// Plain text only: never Markdown with live links, never HTML (R4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportEvidence {
+    pub author_id: Id,
+    pub channel_id: Id,
+    pub ts: u64,
+    /// Absent when I can't open it (no key for that channel's epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// G-48: `reportContent`'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportReceipt {
+    pub report_id: Id,
+    /// Staff it goes to (each acks separately; see `report.status`).
+    pub recipients: u32,
 }

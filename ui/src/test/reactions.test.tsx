@@ -2,7 +2,8 @@
 // the "+" chip and the menu, toggling mine, the picker (search, recent, keys), errors.
 
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { loadEmoji } from '../emoji';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
 import { MockCore } from '../core/mock';
@@ -12,6 +13,9 @@ vi.mock('../voice', () => ({
 }));
 
 const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
+
+// G-27: the emoji list is loaded lazily; load it once up front so the tests don't wait on it.
+beforeAll(() => loadEmoji(), 30_000);
 const plain = (s: string | null | undefined) => (s ?? '').replace(/[⁨⁩]/g, '');
 const click = async (el: Element) =>
   act(async () => {

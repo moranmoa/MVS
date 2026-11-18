@@ -2,12 +2,16 @@
 // silently, never sends past it, and keeps the text when the core refuses it.
 
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { loadEmoji } from '../emoji';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
 import { MockCore } from '../core/mock';
 
 const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
+
+// G-27: the emoji list is loaded lazily; load it once up front so the tests don't wait on it.
+beforeAll(() => loadEmoji(), 30_000);
 
 async function setup(core = new MockCore({ demo: true, speed: 0, simulateActivity: false })) {
   render(<App core={core} initialSettings={en} />);

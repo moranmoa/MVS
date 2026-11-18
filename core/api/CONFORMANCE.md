@@ -186,6 +186,8 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).
     - `found`: the live servers the backup lists (0 until found). `waiting`: of those, the ones not back yet.
     - The UI shows "searching" and "waiting" honestly on the restore screen, with the invite-link hint (PO G-91 criterion 2). A server I left, was removed from, or that closed never comes back and isn't counted as waiting.
+  - **Buddies, phase B (#461):** every 10 min the core checks its 3 backup buddies, at most one per owner group. A gone buddy, or two under one owner, is replaced at once; 2 or more stale buddies, or room for more, wait a day. A new set makes the next backup round write to the mailbox and to them (`Network::put_backup_to`, a no-op until dev-sync's network re-checks each recipient is a bound current co-member at send time; `BUDDIES` stays off until the Security Lead's re-review).
+    - **GAP-11 (local plaintext):** `member-seen`, when each co-member was last seen online, and `backup-buddies` are kept in `core.db` in the clear, like the rest of the store until GAP-11. They never go into the backup or `exportDiagnostics`.
   - **Holders:** the ports are no-ops until dev-sync's `/mvs/backup/1` and devops' mailbox exist. `LoopbackNetwork` holds them for tests.
 
 - `signOut({ words: string[] } | { withoutWords: true })` returns `null` (both read at the top level of `args`). It removes this identity from this computer.

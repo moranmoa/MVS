@@ -484,6 +484,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
+- Message links (G-30, `docs/design/g30-message-links.md` §4):
+  - `locateMessage(serverId, channelId, messageId)` returns `{ index }`: the message's place in `getMessages(channelId)` order, as of now. Local and read-only: it never asks peers or starts a sync. It costs one decryption pass over the channel, like `getMessages`.
+  - **One answer for everything I can't see** (Security Lead, R1): `not-found`, identical in every case, so a link never confirms that something hidden exists. That covers: not a member (servers I left or was removed from are purged), no such channel or one `listChannels` doesn't give me (an 18+ channel hidden by B7 §4), IDs that don't agree, a message that isn't here or doesn't open (no placeholders until #21), and a message still waiting to send (`pending-…`).
+  - `bad-request` only for an ID that isn't 64 hex (the UI never sends one).
+  - A deleted message keeps its index (the tombstone). A closed server answers as its `getMessages` does: its keys go at the close, so messages that no longer open are `not-found` there too.
+  - The index is a snapshot: a message with an earlier timestamp can arrive later and shift it. The UI checks the ID at the index and locates again if it moved.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

@@ -49,6 +49,8 @@ const COMMANDS = Object.freeze({
   // Safety
   blockUser: ['userId'],
   kickMember: ['serverId', 'userId'],
+  listRemovedMembers: ['serverId'],
+  undoKick: ['serverId', 'userId'],
   // Device link (device-link-slice.md)
   startDeviceLink: [],
   cancelDeviceLink: [],
@@ -56,6 +58,10 @@ const COMMANDS = Object.freeze({
   ackDeviceNotice: ['at'],
   beginDeviceApproval: ['qrOrCode'],
   confirmDeviceApproval: ['approve'],
+  // G-29 typing
+  setTyping: ['channelId', 'on'],
+  getSettings: [],
+  setTypingIndicator: ['on'],
   // G-91: servers coming back after a restore
   getServerRestore: [],
   // Voice (#223); voice rooms (0.4.3)

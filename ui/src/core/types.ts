@@ -256,6 +256,16 @@ export interface AppInfo {
   relayOnly?: boolean;
 }
 
+/** G-53 (core `listRemovedMembers`): an account the owner removed, who can't rejoin until the owner undoes it. */
+export interface RemovedMember {
+  id: Id;
+  shortCode: string;
+  /** Its last display name; '' if it never posted one. */
+  displayName: string;
+  /** When it was removed (the kick's time). */
+  removedAt: Timestamp;
+}
+
 /** An invite to a server (#214). `maxUses` 0 is unlimited; no `expiresAt` is never. */
 export interface Invite {
   id: Id;
@@ -362,6 +372,18 @@ export interface DeviceAdded {
 export interface DeviceApproval {
   sas: string;
   expiresAt: number;
+}
+
+/** G-29: who is typing in a channel now (ephemeral; at most 5). */
+export interface TypingState {
+  channelId: Id;
+  userIds: Id[];
+}
+
+/** Settings the core keeps on this device. */
+export interface CoreSettings {
+  /** G-29: "Show others when I'm typing" (default on). Off: nothing is sent; others are still shown. */
+  typingIndicator: boolean;
 }
 
 /**

@@ -1147,6 +1147,15 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
+// ---- G-29 typing (440, chat-and-voice-extras.md) --------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&typing=1', 'x');
+  await p.locator('.typing-text').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '440-typing-he');
+  await p.close();
+}
+
 // ---- G-26 reactions (441-442, chat-and-voice-extras.md §2-3) -----------------------
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
@@ -1308,6 +1317,108 @@ for (const [lang, theme, name, query] of [
   }
   await p.waitForTimeout(500);
   await shot(p, name);
+  await p.close();
+}
+
+// ---- G-25 Markdown in messages (480-483, docs/ux/specs/markdown.md §6) -----------
+{
+  const send = async (p, text) => {
+    const box = p.getByRole('textbox', { name: /כתיבה ב|^Message / });
+    await box.fill(text);
+    await box.press('Enter');
+    await p.waitForTimeout(300);
+  };
+  const lastRow = (p) => p.locator('[role=article]:has(.msg:not(.skeleton))').last();
+
+  // 480: each marker in Hebrew messages.
+  {
+    const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+    await send(p, 'זה **מודגש**, זה *נטוי*, זה ~~מחוק~~ ומריצים `npm i` באמצע שורה');
+    await send(p, '> צריך לסגור את הגרסה היום\nמסכימים, אני על זה');
+    await send(p, 'הסוף של הפרק: ||הוא היה הרוח כל הזמן||');
+    await p.mouse.move(1, 1);
+    await shot(p, '480-markdown-he');
+    // 483: the spoiler after reveal.
+    await lastRow(p).locator('button.md-spoiler').click();
+    await p.mouse.move(1, 1);
+    await shot(p, '483-markdown-spoiler-revealed-he');
+    await p.close();
+  }
+
+  // 481: a long code block with the copy button, English, dark.
+  {
+    const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999', 'x', { colorScheme: 'dark' });
+    const long = 'docker compose run --rm shots && ' + 'echo "a very long line that keeps going past the edge of the message" && '.repeat(3) + 'true';
+    await send(p, 'Run this from ui/:\n```sh\n' + long + '\nnpm run screenshots\n```');
+    await lastRow(p).locator('.md-code-block').hover();
+    await shot(p, '481-markdown-code-block-en-dark');
+    await p.close();
+  }
+
+  // 482: an English quote in a Hebrew message, and code in a Hebrew line.
+  {
+    const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+    await send(p, 'תראו מה הוא כתב:\n> I think we should ship it today\nומריצים `npm run build` לפני ששולחים');
+    await p.mouse.move(1, 1);
+    await shot(p, '482-markdown-mixed-he');
+    await p.close();
+  }
+}
+
+// ---- member search (473-474, G-41) -------------------------------------------
+for (const [query, name, text, dark] of [
+  ['lang=he&theme=light', '473-member-search-he', 'ta', false],
+  ['lang=en&theme=dark', '474-member-search-none-en-dark', 'qqqq', true],
+]) {
+  const p = await chat('?demo=1&still=1&update=999999&' + query, 'x', dark ? { colorScheme: 'dark' } : undefined);
+  await p.locator('.member-search-input').fill(text);
+  await p.waitForTimeout(500);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- removed accounts (187, G-53, B11) ----------------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: 'הגדרות השרת' }).click();
+  await p.getByRole('tab', { name: 'חברים' }).click();
+  const panel = p.getByRole('tabpanel');
+  // Remove two members (each from the list, then confirm on their card).
+  for (let i = 0; i < 2; i++) {
+    await panel.getByRole('button', { name: 'הרחקה מהשרת' }).nth(1).click();
+    await p.getByRole('alertdialog').getByRole('button', { name: 'הרחקה', exact: true }).click();
+    await p.getByRole('alertdialog').waitFor({ state: 'detached' });
+  }
+  await p.getByRole('tab', { name: 'חשבונות שהורחקו' }).click();
+  await p.locator('.removed-accounts .removed-row').nth(1).waitFor();
+  await p.waitForTimeout(250);
+  await shot(p, '187-server-settings-removed-he');
+  await p.close();
+}
+
+// ---- blocked accounts (470-472, G-47) ----------------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  // Block two members from their profile cards.
+  for (const i of [1, 2]) {
+    await p.locator('.members button.member').nth(i).click();
+    await p.getByRole('dialog').getByRole('button', { name: 'חסימה', exact: true }).click();
+    await p.keyboard.press('Escape');
+  }
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'פרטיות' }).click();
+  const list = p.locator('.blocked-list');
+  await list.locator('.blocked-row').nth(1).waitFor();
+  await list.scrollIntoViewIfNeeded();
+  await p.waitForTimeout(200);
+  await shot(p, '470-blocked-list-he');
+  await list.locator('.blocked-row button').first().click();
+  await list.locator('.blocked-undo').waitFor();
+  await shot(p, '472-blocked-undo-toast-he');
+  await list.locator('.blocked-row button').first().click();
+  await list.getByText('לא חסמת אף אחד.').waitFor();
+  await p.waitForTimeout(5200); // the Undo bar goes away
+  await shot(p, '471-blocked-empty-he');
   await p.close();
 }
 

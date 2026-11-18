@@ -13,6 +13,7 @@ import type {
   Id,
   Identity,
   Invite,
+  RemovedMember,
   JoinStatus,
   Member,
   Message,
@@ -29,6 +30,8 @@ import type {
   CallState,
   CallSignal,
   VoiceRoom,
+  CoreSettings,
+  TypingState,
   ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
@@ -154,6 +157,13 @@ export interface CoreCommands {
   // Safety
   blockUser(userId: Id): Promise<void>;
   kickMember(serverId: Id, userId: Id): Promise<void>;
+  /** G-53: owner only (`not-allowed` for anyone else): the accounts removed from the server, in no set order. */
+  listRemovedMembers(serverId: Id): Promise<RemovedMember[]>;
+  /**
+   * G-53: owner only. Lets a removed account join again through an invite
+   * (it isn't made a member). `not-allowed` for anyone else or someone not removed.
+   */
+  undoKick(serverId: Id, userId: Id): Promise<void>;
   // Device link (device-link-slice.md)
   /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
   startDeviceLink(): Promise<DeviceLinkOffer>;
@@ -166,6 +176,11 @@ export interface CoreCommands {
   beginDeviceApproval(qrOrCode: string): Promise<DeviceApproval>;
   /** The digits match (or not). Rejects not-found, bad-request (nothing in progress). */
   confirmDeviceApproval(approve: boolean): Promise<null>;
+  // G-29 typing (g29-typing-design.md)
+  /** true while typing (the core sends at most every 3 s), false on send or clear. Not sent with the setting off. */
+  setTyping(channelId: Id, on: boolean): Promise<null>;
+  getSettings(): Promise<CoreSettings>;
+  setTypingIndicator(on: boolean): Promise<null>;
   /** G-91: how far my servers are from coming back after a restore. */
   getServerRestore(): Promise<ServerRestore>;
   // Voice v1 (#223)
@@ -260,6 +275,8 @@ export interface CoreEvents {
   'call.signal': CallSignal;
   /** A server's rooms changed (create, join, leave, mute, edit, timeout), mine or not. Coalesced; a hint: re-read with listVoiceRooms. */
   'voice.rooms': { serverId: Id; rooms: VoiceRoom[] };
+  /** G-29: who is typing in a channel (coalesced, at most 5; a typer drops 6 s after the last "on"). */
+  typing: TypingState;
   /** G-91: sent when anything in the restore progress changes. */
   'serverRestore.changed': ServerRestore;
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */

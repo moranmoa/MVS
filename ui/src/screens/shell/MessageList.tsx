@@ -21,7 +21,8 @@ import {
   TrashIcon,
   SmilePlusIcon,
 } from '../../components/icons';
-import { paragraphs, textDir, useUiDir } from '../../app/textDir';
+import { textDir, useUiDir } from '../../app/textDir';
+import { excerptText, MarkdownBody, plainText } from '../../markdown';
 import { displayName, lookalikeIds, LookalikeTag } from './MemberList';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
@@ -127,7 +128,7 @@ export function MessageList({
             {
               key: 'copy',
               label: intl.formatMessage({ id: 'menu.copyText' }),
-              onSelect: async () => store.showFlash((await copyText(m.body)) ? 'common.copied' : 'menu.copyFailed'),
+              onSelect: async () => store.showFlash((await copyText(plainText(m.body))) ? 'common.copied' : 'menu.copyFailed'),
             },
           ]
         : [
@@ -136,8 +137,9 @@ export function MessageList({
           {
             key: 'copy',
             label: intl.formatMessage({ id: 'menu.copyText' }),
-            // The stored body: the direction marks are added only when it is shown.
-            onSelect: async () => store.showFlash((await copyText(m.body)) ? 'common.copied' : 'menu.copyFailed'),
+            // The stored body without the Markdown markers (G-25: spoilers masked);
+            // the direction marks are added only when it is shown.
+            onSelect: async () => store.showFlash((await copyText(plainText(m.body))) ? 'common.copied' : 'menu.copyFailed'),
           },
           {
             key: 'copy-id',
@@ -502,7 +504,7 @@ const MessageRow = memo(function MessageRow({
 } & Handlers) {
   const intl = useIntl();
   const uiDir = useUiDir();
-  const lines = useMemo(() => paragraphs(m.body, uiDir), [m.body, uiDir]);
+  const renderText = useCallback((text: string) => <MentionText text={text} message={m} />, [m]);
   const name = author ? displayName(author) : '…';
   const tab = actionsTabbable ? 0 : -1;
   const time = new Date(m.createdAt);
@@ -548,7 +550,7 @@ const MessageRow = memo(function MessageRow({
           <ReplyIcon />
           <Name>{replyAuthor ? displayName(replyAuthor) : '…'}</Name>
           <span dir={textDir(m.replyTo.excerpt, uiDir)} className="reply-excerpt user-text">
-            {m.replyTo.excerpt ? <MentionText text={m.replyTo.excerpt} message={m} plain /> : intl.formatMessage({ id: 'chat.deleted' })}
+            {m.replyTo.excerpt ? <MentionText text={excerptText(m.replyTo.excerpt)} message={m} plain /> : intl.formatMessage({ id: 'chat.deleted' })}
           </span>
         </button>
       )}
@@ -575,21 +577,24 @@ const MessageRow = memo(function MessageRow({
               </time>
             </div>
           )}
-          <p className="msg-body">
-            {lines.map((l, i) => (
-              <span key={i} className="msg-line user-text" dir={l.dir}>
-                <MentionText text={l.text} message={m} />
-                {m.editedAt && i === lines.length - 1 && (
+          <div className="msg-body">
+            {/* G-25: Markdown, rendered from tokens (src/markdown); mentions inside the plain runs. */}
+            <MarkdownBody
+              text={m.body}
+              uiDir={uiDir}
+              renderText={renderText}
+              trailing={
+                m.editedAt && (
                   <>
                     {' '}
                     <span className="edited" title={intl.formatDate(m.editedAt, { dateStyle: 'full', timeStyle: 'short' })}>
                       <FormattedMessage id="chat.edited" />
                     </span>
                   </>
-                )}
-              </span>
-            ))}
-          </p>
+                )
+              }
+            />
+          </div>
           {m.clipped && (
             <p className="muted small clipped-note">
               <FormattedMessage id="chat.clipped" />
@@ -786,7 +791,7 @@ function useNewMessageAnnouncement(
       const author = memberMap.get(p.last.authorId);
       const name = author ? displayName(author) : '…';
       if (p.n > 1) return setText(intl.formatMessage({ id: 'a11y.newMessages' }, { count: p.n }));
-      const body = (p.last.body ?? '').replace(/\s+/g, ' ').trim();
+      const body = plainText(p.last.body ?? '').replace(/\s+/g, ' ').trim();
       setText(
         preview && body
           ? intl.formatMessage({ id: 'a11y.newMessage' }, { name, phrase: body.length > ANNOUNCE_CHARS ? body.slice(0, ANNOUNCE_CHARS) + '…' : body })

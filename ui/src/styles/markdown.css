@@ -1,0 +1,141 @@
+/* G-25: Markdown in messages (spec docs/ux/specs/markdown.md §2). */
+
+/* Hebrew at 700 gets heavy. */
+.md-bold {
+  font-weight: 600;
+}
+
+.md-code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--bg-input);
+}
+
+.md-link {
+  color: var(--accent);
+  text-decoration: underline;
+  unicode-bidi: isolate;
+  overflow-wrap: anywhere;
+}
+
+/* Always LTR, left-aligned, scrolling sideways inside (never the page). */
+.md-code-block {
+  position: relative;
+  max-width: 100%;
+  margin: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  text-align: left;
+}
+
+.md-code-block pre {
+  margin: 0;
+  padding: 8px 12px;
+  /* Room for the copy button: the first line never runs under it (UX). */
+  padding-inline-end: 36px;
+  overflow-x: auto;
+  white-space: pre;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  line-height: 1.45;
+}
+
+.md-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.md-code-block:hover .md-copy,
+.md-copy:focus-visible,
+.md-copy:has(.md-copied) {
+  opacity: 1;
+}
+
+.md-copied {
+  font-size: 0.75rem;
+}
+
+/* The bar on the start side of the quote's own direction. */
+/* As wide as its text, on the interface side (the box follows the message,
+   the bar the quote): an English quote in a Hebrew chat keeps its bar next to it. */
+.md-quote {
+  width: fit-content;
+  max-width: 100%;
+  margin: 2px 0;
+  padding-inline-start: 10px;
+  border-inline-start: 3px solid var(--text-faint);
+  color: var(--text-muted);
+}
+
+/* Hidden: a solid box, nothing readable, selectable or copyable. */
+.md-spoiler {
+  display: inline;
+  padding: 0 2px;
+  border: 0;
+  border-radius: 3px;
+  background: var(--text-faint);
+  color: transparent;
+  font: inherit;
+  user-select: none;
+  cursor: pointer;
+}
+
+/* Colour emoji ignore color, and chips and code keep their backgrounds:
+   the content is hidden outright; the button keeps the box. */
+.md-spoiler:not(.revealed) > span {
+  visibility: hidden;
+}
+
+.md-spoiler.revealed {
+  background: var(--bg-hover);
+  color: inherit;
+  user-select: text;
+  cursor: auto;
+}
+
+/* No hover on touch screens: the copy button is always there. */
+@media (hover: none) {
+  .md-copy {
+    opacity: 1;
+  }
+}
+
+.md-spoiler.revealed:focus {
+  outline: none;
+}
+
+.md-spoiler.revealed:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* G-25 §3: the one-time formatting hint under the composer. */
+.composer-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 0;
+  padding-inline: 4px;
+}
+
+.composer-hint .icon-button {
+  width: 24px;
+  height: 24px;
+}

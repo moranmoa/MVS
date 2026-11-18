@@ -19,4 +19,9 @@ function demoFor({ packaged, env = process.env }) {
   return typeof v === 'string' && DEMO_VALUE.test(v) ? v : null;
 }
 
-module.exports = { DEMO_ARG, demoFor };
+/** The demo's own profile, beside (not inside) the checkout's real one. */
+function demoProfile(userData) {
+  return `${userData.replace(/[\\/]+$/, '')}-demo`;
+}
+
+module.exports = { DEMO_ARG, demoFor, demoProfile };

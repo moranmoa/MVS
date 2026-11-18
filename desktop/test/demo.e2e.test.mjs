@@ -56,3 +56,18 @@ test('no core is started, even with MVS_CORE_PATH set', async () => {
   assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(2)), true);
   assert.equal(await page.evaluate(() => window.mvs.retryCore()), false);
 });
+
+test('without a test profile, the demo gets its own profile beside the real one', async () => {
+  const config = mkdtempSync(join(tmpdir(), 'mvs-e2e-demo-xdg-'));
+  const env = { ...process.env, MVS_DEMO: '1', XDG_CONFIG_HOME: config };
+  delete env.MVS_TEST_USER_DATA;
+  const other = await electron.launch({ args: ['.'], env });
+  try {
+    const userData = await other.evaluate(({ app }) => app.getPath('userData'));
+    assert.ok(userData.endsWith('-demo'), userData);
+    assert.ok(userData.startsWith(config), userData);
+  } finally {
+    await other.close().catch(() => {});
+    rmSync(config, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
+});

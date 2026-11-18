@@ -5,7 +5,8 @@ import { useEffect, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { isMuted } from '../../app/mute';
-import { createGrouper, defaultNotifyPrefs, shellNotify, shouldNotify } from '../../app/notify';
+import { createGrouper, createSoundGate, defaultNotifyPrefs, shellNotify, shouldNotify, shouldSound } from '../../app/notify';
+import { loadDevices, playMessageCue } from '../../voice/devices';
 import { useSettings } from '../../app/settings';
 import { useCoreEvent, type Id, type Message } from '../../core';
 import { displayName } from './MemberList';
@@ -62,13 +63,15 @@ export function useDesktopNotifications(viewing: Id | null, open: (serverId: Id,
     if (viewing) grouper.current?.drop(viewing);
   }, [viewing]);
 
+  // G-63: one sound per 2 s at most, whatever arrives.
+  const soundGate = useRef(createSoundGate());
+
   useCoreEvent('message.added', (m) => {
-    if (!shellNotify()) return;
     const where = lookup(m.channelId);
     if (!where) return;
     const { viewing, prefs } = now.current;
     const author = where.s.members[where.serverId]?.find((x) => x.id === m.authorId);
-    const go = shouldNotify(m, {
+    const c = {
       prefs,
       serverId: where.serverId,
       myId: where.s.identity?.id,
@@ -76,8 +79,10 @@ export function useDesktopNotifications(viewing: Id | null, open: (serverId: Id,
       muted: isMuted(where.s.mutes, where.serverId, m.channelId),
       watching: viewing === m.channelId && document.hasFocus(),
       now: Date.now(),
-    });
-    if (go) grouper.current?.add(m.channelId, m);
+    };
+    if (shellNotify() && shouldNotify(m, c)) grouper.current?.add(m.channelId, m);
+    const inCall = (where.s.call?.participants.length ?? 0) > 0;
+    if (shouldSound(m, { ...c, inCall }) && soundGate.current(c.now)) void playMessageCue(loadDevices().output).catch(() => {});
   });
 
   useCoreEvent('notify.click', ({ channelId }) => {

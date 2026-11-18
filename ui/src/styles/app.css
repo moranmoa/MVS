@@ -3600,6 +3600,20 @@ input.switch:disabled {
   background: var(--border);
 }
 
+/* G-91: how far my servers are from coming back after a restore. */
+.restore-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .restore-progress .spinner {
+    animation: none;
+  }
+}
+
 .key-row {
   display: flex;
   align-items: center;

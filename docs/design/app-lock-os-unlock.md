@@ -1,6 +1,6 @@
 # G-78 v1.1: unlock with Windows Hello (and the OS method elsewhere)
 
-- **Status:** spike plan. The TL approved it at 9d81c29 (this version folds in the TL's checks and the owner-OK step); the SL's review is pending. The spike needs the owner's OK (§5), and no product code comes before its go/no-go.
+- **Status:** spike plan, approved by the TL and the SL at 9d81c29. This version folds in their build conditions and the owner-OK step. The spike needs the owner's OK (§5), and no product code comes before its go/no-go.
 - **Builds on:** `docs/design/app-lock.md` (#466), which made Windows Hello a v1.1 spike: "built from source, signed, licence-scanned". The passcode lock (v1) is #473, #476, #482 and #513.
 - **Owner:** dev-voice-shell (desktop); dev-identity (core verification, if the chosen path needs it); the UI is the existing lock screen's "Unlock with {method}" button (spec §1, `lock.os`).
 
@@ -61,6 +61,8 @@ The core calls `Windows.Security.Credentials.UI.UserConsentVerifier.RequestVerif
 
 - **Same gate, same counter:** an OS unlock goes through main → core, like the passcode. A failed or cancelled assertion is `wrong` against the same attempt counter; cancelling the OS prompt costs nothing.
 - **Challenge:** 32 random bytes from the core, single use, 60 s, bound to the request. A replayed assertion fails.
+  - **One outstanding challenge at a time (SL):** a new one cancels the old one. **None is issued while a `retryAfter` delay runs.**
+- **One counter rule (SL):** an assertion the core rejects counts as a wrong attempt; cancelling the OS prompt never reaches the core and counts for nothing.
 - **The page holds nothing secret:** the private key never leaves the OS authenticator (TPM-backed on most Windows PCs). The page passes opaque blobs; main size-caps them (assertion ≤ 4 KiB, attestation ≤ 8 KiB) and never logs them.
 - **No user handle, no names:** `user.id` is 16 random bytes made at enrolment. `user.name` and `displayName` are "MVS", never the account's name. `residentKey: 'discouraged'`, so nothing is listed in the OS passkey manager under a person's name.
 - **Path B (locked in a call):** the same, since the overlay is the same lock screen.
@@ -96,7 +98,7 @@ The core calls `Windows.Security.Credentials.UI.UserConsentVerifier.RequestVerif
 
 **Before it runs: the owner's explicit OK (TL).** The spike creates a real Windows Hello credential in the owner's own Windows account (RP ID `mvs`, user "MVS"). It is harmless but persists after the spike. Removing it: Windows Settings → Accounts → Passkeys → "MVS" → Delete (Windows 11 22H2+); on older builds, `certutil -csp NGC -key` lists it and `certutil -csp NGC -delkey <name>` removes it. The spike reports the exact entry it made. It uses only a checkout Electron with `MVS_TEST_USER_DATA` (a throwaway profile), never the installed app.
 
-1. In a checkout Electron with our `app://mvs` scheme setup, call `isUserVerifyingPlatformAuthenticatorAvailable()`, then `credentials.create` and `credentials.get` with `rp.id: 'mvs'`. Record: does the Hello prompt appear, and do the calls succeed or throw (which error)?
+1. In a checkout Electron with our `app://mvs` scheme setup, call `isUserVerifyingPlatformAuthenticatorAvailable()`, then `credentials.create` and `credentials.get` with `rp.id: 'mvs'`. Record: does the Hello prompt appear, and do the calls succeed or throw (which error)? **Record exactly (SL):** `clientDataJSON.origin`, the RP ID that `rpIdHash` hashes, `crossOrigin` and `topOrigin` (if present), and the `signCount` Hello reports.
 2. If step 1 fails on the origin: try Electron's WebAuthn configuration for Windows, if our Electron has one. Record the result.
 3. If W1 works: verify an assertion in a scratch Rust test with `ring`, from the SPKI key (`getPublicKey()`), with no CBOR.
 4. Write the result in this note. **Go:** W1 works with no origin change and `ring` verifies it. **No-go:** the origin is refused. W2 then comes back to the SL and TL as its own proposal.

@@ -587,6 +587,9 @@ pub struct RemovedMember {
 #[serde(rename_all = "camelCase")]
 pub struct BlockedUser {
     pub user_id: Id,
+    /// G-47b (UX-19): the identity code, as `Member.shortCode`, derived
+    /// from `userId`, so two rows without a name can be told apart.
+    pub short_code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }

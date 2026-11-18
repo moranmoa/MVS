@@ -32,6 +32,8 @@ test('the page opens on ?demo=1, unlocked, without invoke', async () => {
   const url = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getURL());
   assert.ok(url.endsWith('/index.html?demo=1'), url);
   assert.equal(await page.evaluate(() => typeof window.mvs.invoke), 'undefined');
+  // No core, no calls: no voice frames either (SL, #526).
+  assert.equal(await page.evaluate(() => typeof window.mvs.voice), 'undefined');
   for (const fn of ['onEvent', 'setUnreadCount', 'notify', 'copyText', 'setPushToTalk']) {
     assert.equal(await page.evaluate((f) => typeof window.mvs[f], fn), 'function', fn);
   }

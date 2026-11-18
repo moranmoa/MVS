@@ -70,11 +70,11 @@ describe('reactions (G-26)', () => {
     const { row } = await setup();
     await click(within(row).getByRole('button', { name: 'Add reaction' }));
     const search = within(picker()).getByRole('searchbox', { name: 'Search emoji' });
-    fireEvent.change(search, { target: { value: 'laugh' } });
+    fireEvent.change(search, { target: { value: 'tears of joy' } });
     expect((await within(picker()).findAllByRole('gridcell')).map((b) => b.textContent)).toContain('😂');
     fireEvent.change(search, { target: { value: 'nothing-like-this' } });
     expect(within(picker()).getByText('No emoji found')).toBeTruthy();
-    fireEvent.change(search, { target: { value: 'laugh' } });
+    fireEvent.change(search, { target: { value: 'tears of joy' } });
     await act(async () => {
       fireEvent.keyDown(search, { key: 'Enter' });
     });

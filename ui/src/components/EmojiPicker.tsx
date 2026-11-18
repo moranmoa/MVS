@@ -177,10 +177,15 @@ export function EmojiPicker({ open, onClose, onPick, mode, anchor, selected }: E
 
   // Keep the roving cell in range when the list changes (search, data).
   useEffect(() => setActive((a) => (a < cells.length ? a : 0)), [cells.length]);
+  // Focus follows the roving cell once its row is rendered (it may be
+  // scrolled in first).
+  const [, rerender] = useState(0);
   useLayoutEffect(() => {
     if (!focusAfter.current) return;
+    const el = scrollRef.current?.querySelector<HTMLButtonElement>(`[data-i="${active}"]`);
+    if (!el) return;
     focusAfter.current = false;
-    scrollRef.current?.querySelector<HTMLButtonElement>(`[data-i="${active}"]`)?.focus();
+    el.focus();
   });
 
   const focusCell = (i: number) => {
@@ -189,6 +194,7 @@ export function EmojiPicker({ open, onClose, onPick, mode, anchor, selected }: E
     setActive(i);
     focusAfter.current = true;
     virtualizer.scrollToIndex(c.row, { align: 'auto' });
+    rerender((n) => n + 1);
   };
 
   // The section at the top of the list marks its tab.

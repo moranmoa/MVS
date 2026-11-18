@@ -80,7 +80,16 @@ Over a cap, the frame is dropped; after a sustained flood, the stream is closed.
 - **Send:** `voiceFrame(callId, seq, ts, data)` is **fire-and-forget**, with no reply per frame. The core sends to **every peer in my current call** that is on B. The renderer can't name arbitrary targets, and it encodes **once per frame**, not once per peer.
 - **Receive:** event `voice.frame { callId, from, seq, ts, data }`.
 - **Both:** in `commands.js` and `guardCore`, accepted only when `fromUs` and only during an active call. `data` is base64 on the JSON channel, and its cap applies after decoding. They carry the same size and rate caps as the stream, so a compromised renderer can't pump traffic. While the app is locked, they're allowed only under G-78 path B (a call in progress), for that call.
-- **Channel:** the existing stdio JSON channel, **unless the spike misses its target** (§5). A binary side channel is new IPC surface, which needs SL review and has to earn its place.
+- **Channel (decided by the TL after the spike): the existing stdio pipe, with a fast path inside it, and no separate channel.**
+  - **Why:** the spike measured the pipe at p95 0.9 ms (1.5 ms with 1 MB replies sharing it). But `sidecar::serve` handles requests one at a time, so a slow command (a join waiting up to 5 s, a big page) would hold frames behind it.
+  - **Inbound (renderer → core):**
+    - `serve`'s reader recognises `voiceFrame` **before dispatch**, decodes it and size-checks it (base64 decoded, ≤ 400 B).
+    - It pushes the frame onto a **bounded per-peer queue (drop oldest)** owned by the voice-media sender.
+    - It never calls `Core::handle_value` and writes no reply.
+  - **The sender** checks the call and the caps against a **`CallSnapshot`** that the core updates on every call change (participants, call id, relay-only).
+  - **Outbound (core → renderer):** `voice.frame` goes through the normal event writer. It's serialized first, then written under the lock, so a frame never holds the lock while it's encoded.
+  - **Desktop main** forwards both directions fire-and-forget, under the existing gates (`fromUs`, active call, G-78 path B).
+  - **Owners:** dev-sync owns `serve`, `node.rs` and the sender; voice-d owns the renderer side.
 - **Path report:** `path_to(peer) -> Lan | Direct | Circuit | MemberCircuit | None`, for the switch and for the diagnostics panel (types only).
 
 **Encoding (TL A4):**
@@ -143,6 +152,11 @@ Over a cap, the frame is dropped; after a sustained flood, the stream is closed.
    - **Echo:** AEC with (a) plain Web Audio playout, and (b) `MediaStreamTrackGenerator` → a local loopback `RTCPeerConnection` (`iceServers: []`, in-process, no SDP leaves) → playout. A speaker-to-mic test records which one cancels echo. **If neither does, stop and go back to the TL.**
    - **IPC:** a renderer → core → renderer frame round trip over the **existing** stdio channel at 4 peers × 25 frames/s, **p95 < 20 ms**. If it misses, the binary channel goes to SL review.
    - **Path log:** QA logs the path type per call from here on, to get a real DCUtR rate.
+
+   **Results (2026-11-18, Windows 11, Electron 44.7.0; `spikes/g81-media/RESULTS.md` on `claude/g81-spike`):**
+   - **Encode and decode: pass.** p95 1.1 ms end to end, frames 108–119 B.
+   - **IPC pipe: pass.** p95 0.9 ms, or 1.5 ms with 1 MB replies on the pipe. The core's serial loop led to the fast path in §2.3.
+   - **Echo: open.** It needs a speaker test out loud, which waits on the owner. Steps 2a and 2b start now. The playout path and default-on wait for the echo result (TL).
 2. **In parallel, against the frozen contract (§2.3):**
    - **(a) dev-sync:** `/mvs/voice-media/1`: gate, caps, call binding, make-before-break, path upgrade, `path_to`, the core command and event, and CONFORMANCE. Tests:
      - two cores through a test relay;

@@ -38,7 +38,7 @@ The icon is too big for `ServerEdit`, so it gets its own control kind.
 | Body | `history u8` (reserved for D30, must be 0) ‖ `type u8` (1 = PNG, 2 = WebP) ‖ image bytes. A body of just the two bytes, with no image, clears the icon. |
 | Image | at most **8 KiB**, and **1 to 128 pixels** on each side, square or not (`ICON_MAX_BYTES`, `ICON_SIDE_MAX`) |
 | `max_body` | 2 + 8192 bytes |
-| Validation | strict, without decoding pixels, the same code as the profile picture (`avatar.rs`, generalised to a side limit). PNG: the signature, then IHDR, then a chunk walk to IEND, no `acTL` (no APNG). WebP: RIFF/WEBP with exactly one `VP8 ` or `VP8L`; `VP8X` without the animation flag; no `ANIM` or `ANMF`; every declared size must agree. The `type` byte must match the magic. |
+| Validation | strict, without decoding pixels, through **one validator shared with the profile picture** (`avatar.rs`, given a side limit). See R2 below for the order of checks. |
 | No SVG, GIF or JPEG | only these two types, by the type byte and the magic. Nothing else parses. |
 
 - **Not re-encoded:** the core has no image codec and adding one (a parser of untrusted pixels) is a bigger risk than strict header validation. The UI re-encodes on the way in: it draws the user's picture to a 128×128 canvas and exports WebP, as it does for the profile picture. Receivers only ever check, and the UI renders through `<img src="data:…">` under CSP `img-src 'self' data:`, as for avatars.
@@ -85,3 +85,17 @@ Like the name and channel topics, both sit unsealed in the control log, so every
 1. **Line breaks:** yes, `\n`, at most 5 lines. No `\r` and no U+2028/2029. No leading or trailing blank lines, and at most one empty line in a row (`server_description_ok`).
 2. **Icon size:** 128 px and 8 KiB, with a side parameter added to `avatar.rs`.
 3. **Rate limit:** the sender-side 10 minutes is enough for v1.
+
+## Security Lead review (#547)
+- **R1 (one rename, the same in every version):** this targeted the earlier draft, where the description was a `ServerEdit` field. Since Amendment 1 the description is its own kind (`ServerDescription = 24`), so a `ServerEdit` is exactly what it was. A bad description can't make new and old cores disagree about a rename. Old cores refuse the new kind, which is what the `server-meta-v1` gate is for. Duplicate JSON keys don't arise, since neither new body is JSON.
+- **R2 (the icon check, in this order, one validator shared with `avatar.rs`):**
+  1. the data URL prefix (`data:image/png;base64,` or `data:image/webp;base64,`);
+  2. a length cap on the base64 text before decoding (8 KiB rounded up to base64);
+  3. strict base64;
+  4. the record's `type` byte, the MIME type and the magic bytes all name the same format;
+  5. **PNG:** at most 64 chunks; IHDR first and IEND last, with nothing after IEND; no `acTL`;
+  6. **WebP:** exactly one `VP8 ` or `VP8L`, whose own dimensions are checked against `VP8X`'s (when present) and against 128 px; no animation flag, `ANIM` or `ANMF`;
+  7. every side within 1..=128.
+- **Q1:** `\n` only, at most 5 lines, every line `display_text_ok`. Shown as plain text with `white-space: pre-line`: no Markdown, no links.
+- **Q2 and Q3:** as the Tech Lead answered.
+- **Board (manager):** any display outside the server (an invite preview, a directory) must apply the server's age restriction.

@@ -619,6 +619,20 @@ export class MockCore implements CoreApi {
     return msg;
   }
 
+  /** Mock only (core #527): turn a message into a placeholder, or open it again (kind null). */
+  simulateUnreadable(channelId: Id, index: number, kind: 'no-key' | 'untrusted' | null): void {
+    const ch = this.channelIndex.get(channelId);
+    if (!ch) return;
+    const m = this.generated(ch, index);
+    if (kind === null) {
+      ch.overrides.delete(index);
+      this.emit('message.updated', m);
+      return;
+    }
+    const { reactions: _r, mentions: _m, replyTo: _t, sendState: _s, ...rest } = m;
+    this.put(ch, { ...rest, body: '', unreadable: kind, ...(kind === 'untrusted' ? { authorId: '' } : {}) }, false);
+  }
+
   private messageAt(ch: ChannelState, index: number): Message {
     return ch.overrides.get(index) ?? this.generated(ch, index);
   }

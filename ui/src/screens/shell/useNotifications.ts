@@ -68,6 +68,8 @@ export function useDesktopNotifications(viewing: Id | null, open: (serverId: Id,
   const soundGate = useRef(createSoundGate());
 
   useCoreEvent('message.added', (m) => {
+    // Core #527: nothing to say about a message that can't be opened.
+    if (m.unreadable) return;
     const where = lookup(m.channelId);
     if (!where) return;
     const { viewing, prefs } = now.current;

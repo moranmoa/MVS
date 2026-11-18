@@ -358,6 +358,20 @@ function cleanReactions(raw: unknown): Message['reactions'] {
 }
 
 export function cleanMessage(m: Message): Message {
+  // Core #527: a placeholder carries no text, author (untrusted) or extras.
+  const unreadable = m.unreadable === 'no-key' || m.unreadable === 'untrusted' ? m.unreadable : undefined;
+  if (unreadable) {
+    return {
+      id: id(m.id),
+      channelId: id(m.channelId),
+      index: typeof m.index === 'number' && Number.isInteger(m.index) && m.index >= 0 ? m.index : 0,
+      authorId: unreadable === 'untrusted' ? '' : id(m.authorId),
+      createdAt: typeof m.createdAt === 'number' && Number.isFinite(m.createdAt) ? m.createdAt : 0,
+      body: '',
+      unreadable,
+      mentionsMe: false,
+    };
+  }
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;

@@ -31,7 +31,7 @@ const COMMANDS = Object.freeze({
   renameServer: ['serverId', 'name'],
   leaveServer: ['serverId'],
   closeServer: ['serverId'],
-  getUpdateNeeded: ['serverId'],
+  getUpdateNeeded: ['serverId', 'cap'],
   createInvite: ['serverId', 'input'],
   listInvites: ['serverId'],
   revokeInvite: ['serverId', 'inviteId'],
@@ -41,6 +41,7 @@ const COMMANDS = Object.freeze({
   sendMessage: ['channelId', 'body', 'replyToId'],
   editMessage: ['messageId', 'body'],
   deleteMessage: ['messageId'],
+  react: ['messageId', 'emoji', 'on'],
   retryMessage: ['messageId'],
   moveChannel: ['serverId', 'channelId', 'before', 'after'],
   discardMessage: ['messageId'],
@@ -55,6 +56,8 @@ const COMMANDS = Object.freeze({
   ackDeviceNotice: ['at'],
   beginDeviceApproval: ['qrOrCode'],
   confirmDeviceApproval: ['approve'],
+  // G-91: servers coming back after a restore
+  getServerRestore: [],
   // Voice (#223); voice rooms (0.4.3)
   listVoiceRooms: ['serverId'],
   createVoiceRoom: ['serverId'],

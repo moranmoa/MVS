@@ -207,6 +207,11 @@ export interface Message {
    * member list, and a token whose id isn't here as a former member.
    */
   mentions?: string[];
+  /**
+   * G-26: at most 20 emoji (the most popular), listed in the order they first
+   * appeared; absent when there are none. `mine`: I have it on.
+   */
+  reactions?: { emoji: string; count: number; mine: boolean }[];
   /** Set by the UI when the text was too long or had too many lines to show in full. */
   clipped?: boolean;
   /**
@@ -357,6 +362,16 @@ export interface DeviceAdded {
 export interface DeviceApproval {
   sas: string;
   expiresAt: number;
+}
+
+/**
+ * G-91: my servers coming back after a restore or a device link (#457).
+ * `found`: live servers the backup lists (0 until found); `waiting`: of those, not back yet.
+ */
+export interface ServerRestore {
+  state: 'none' | 'searching' | 'waiting' | 'done';
+  found: number;
+  waiting: number;
 }
 
 /** WebRTC signalling between call members; for the voice engine (ui/src/voice). */

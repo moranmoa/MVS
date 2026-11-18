@@ -6,9 +6,11 @@
 // containing "offline" finds nobody online; one containing "adult" is 18+.
 
 import type { CoreApi, CoreEventName, CoreEvents, Unsubscribe } from './api';
+import { normalizeEmoji } from './emoji';
 import type {
   CallState,
   VoiceRoom,
+  ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
   MemberRelay,
@@ -90,6 +92,8 @@ export interface MockOptions {
   deviceLink?: 'confirm' | 'expired' | 'failed';
   /** Time between demo messages (default 47 s); hours make the last screen cross days (G-23). */
   messageGapMs?: number;
+  /** G-91: hold the restore progress at this state (screenshots); otherwise it plays out. */
+  restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
@@ -747,6 +751,7 @@ export class MockCore implements CoreApi {
     this.words = clean;
     this.persisted = { identity: this.identity, createdServers: [], joinedDemo: false, demo: false };
     this.save();
+    this.playRestore();
     return this.identity;
   }
 
@@ -813,6 +818,7 @@ export class MockCore implements CoreApi {
       this.save();
       this.emit('deviceLink.state', { state: 'done' });
       this.emit('identity.changed', this.identity);
+      this.playRestore();
       return;
     }
     this.emit('deviceLink.state', { state, ...(state === 'confirm' ? { sas: '482913' } : {}), ...(reason ? { reason } : {}) });
@@ -835,6 +841,32 @@ export class MockCore implements CoreApi {
     if (!this.approval) throw err({ code: 'bad-request' });
     this.approval = null;
     return null;
+  }
+
+  // ---- G-91: servers coming back after a restore ---------------------------------
+
+  private serverRestore: ServerRestore = { state: 'none', found: 0, waiting: 0 };
+
+  async getServerRestore(): Promise<ServerRestore> {
+    return { ...this.serverRestore };
+  }
+
+  /** Mock only: set the restore progress (and announce it). */
+  simulateServerRestore(next: ServerRestore): void {
+    this.serverRestore = next;
+    this.emit('serverRestore.changed', { ...next });
+  }
+
+  /** After a restore or a device link: searching, then 3 found with 2 waiting, then done. */
+  private playRestore(): void {
+    const hold = this.options.restore;
+    const states: ServerRestore[] = [
+      { state: 'searching', found: 0, waiting: 0 },
+      { state: 'waiting', found: 3, waiting: 2 },
+      { state: 'done', found: 3, waiting: 0 },
+    ];
+    const last = hold ? states.findIndex((s) => s.state === hold) : states.length - 1;
+    states.slice(0, last + 1).forEach((s, i) => this.timers.push(setTimeout(() => this.simulateServerRestore(s), i === 0 ? 0 : i * 1500)));
   }
 
   async signOut(words?: string[], withoutWords?: boolean): Promise<null> {
@@ -1080,9 +1112,11 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
+    // As the core: only cap names it knows.
+    if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
   }
 
@@ -1199,6 +1233,29 @@ export class MockCore implements CoreApi {
     const mine = m.authorId === this.identity?.id;
     if (!mine && s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
     this.put(ch, { ...m, body: '', deleted: true, replyTo: undefined }, false);
+  }
+
+  /** G-26, as the core: the same emoji check, gate and per-author cap (no fold, no rate). */
+  async react(messageId: Id, emoji: string, on: boolean): Promise<void> {
+    const e = normalizeEmoji(emoji);
+    if (e === null) throw err({ code: 'bad-request' });
+    const { ch, index } = this.parseId(messageId);
+    const m = this.messageAt(ch, index);
+    if (m.deleted) throw err({ code: 'not-found' });
+    this.lifecycleGate(this.serverOf(ch));
+    const chips = [...(m.reactions ?? [])];
+    const at = chips.findIndex((c) => c.emoji === e);
+    if ((at >= 0 && chips[at].mine) === on) return;
+    if (on) {
+      if (chips.filter((c) => c.mine).length >= 10) throw err({ code: 'bad-request' });
+      if (at >= 0) chips[at] = { ...chips[at], count: chips[at].count + 1, mine: true };
+      else chips.push({ emoji: e, count: 1, mine: true });
+    } else {
+      const count = chips[at].count - 1;
+      if (count > 0) chips[at] = { ...chips[at], count, mine: false };
+      else chips.splice(at, 1);
+    }
+    this.put(ch, { ...m, reactions: chips.length ? chips : undefined }, false);
   }
 
   async discardMessage(messageId: Id): Promise<null> {

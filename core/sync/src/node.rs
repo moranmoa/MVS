@@ -810,11 +810,17 @@ impl Node {
             relay_lost_at: Some(Instant::now()),
             member_listeners: HashMap::new(),
             member_reserved: HashSet::new(),
+            remembered_dialed: HashMap::new(),
+            remembered_checked: Instant::now(),
             relay_ping_misses: HashMap::new(),
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
         };
+        // A relay-only start keeps no member addresses either (Security Lead).
+        if task.relay_only {
+            task.forget_remembered();
+        }
         for log in config.logs {
             task.open(log, None);
         }
@@ -1546,6 +1552,9 @@ struct Task {
     member_listeners: HashMap<ListenerId, PeerId>,
     /// Member relay listeners whose reservation was accepted.
     member_reserved: HashSet<ListenerId>,
+    /// Remembered members dialled lately, and when the rows were last checked.
+    remembered_dialed: HashMap<PeerId, Instant>,
+    remembered_checked: Instant,
     /// Failed pings in a row to our relay, per connection (`relay_ping`):
     /// one dead connection among several (TCP and QUIC) is closed on its own
     /// count (Security Lead, #400).
@@ -1630,6 +1639,7 @@ impl Task {
                     self.expire_fetches();
                     self.link_tick();
                     self.lan_beacon_tick();
+                    self.check_remembered();
                     let gone = self.presence.expire(Instant::now());
                     self.went_offline(gone);
                 }
@@ -1645,6 +1655,7 @@ impl Task {
                 _ = discovery.tick() => {
                     self.discover();
                     self.member_relay_fallback();
+                    self.redial_remembered();
                 }
             }
         }
@@ -2495,6 +2506,8 @@ impl Task {
             // Relay-only users never relay for members (design #368 §1); the
             // core turns it on again, if it should be, once this is off.
             self.swarm.behaviour_mut().member_relay.stop();
+            // Nor keeps any member's address (Security Lead).
+            self.forget_remembered();
             for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
                 self.swarm.remove_listener(id);
             }
@@ -2612,7 +2625,7 @@ impl Task {
             debug!(%peer, lan, candidates = listen_addrs.len(), "no direct address to try");
             return;
         }
-        debug!(%peer, lan, ?addrs, "trying a direct connection");
+        debug!(%peer, lan, addrs = addrs.len(), "trying a direct connection");
         let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::Always).build();
         if let Err(err) = self.swarm.dial(opts) {
             debug!(%peer, ?err, "direct dial refused");
@@ -2892,7 +2905,7 @@ impl Task {
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
                 } else if self.connected.insert(peer_id) {
                     // Peer ID with its address only at debug level (PR checklist).
-                    debug!(%peer_id, address = %endpoint.get_remote_address(), "peer connected");
+                    debug!(%peer_id, relayed = is_relayed(&endpoint), "peer connected");
                     info!(%peer_id, "peer connected");
                     self.reached = true;
                     self.emit(NodeEvent::PeerConnected(peer_id));
@@ -3075,6 +3088,12 @@ impl Task {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                 for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
+                    // P0 on #416: our configured relay's own configured address
+                    // stays, DNS name or not (configured, not peer-learned):
+                    // without it the routing table is empty and nobody is found.
+                    if peer == self.relay_peer && is_configured_relay(addr, &self.relay_addr) {
+                        continue;
+                    }
                     // Also any DNS name a peer gave (hickory-advisories): never
                     // stored, so never resolved or served to others.
                     if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
@@ -3094,9 +3113,24 @@ impl Task {
                     {
                         continue;
                     }
-                    // Peer-supplied addresses: never let them point us into our own LAN.
-                    let addrs: Vec<Multiaddr> =
-                        peer.addrs.into_iter().filter(|a| self.reachable(a) && (!self.relay_only || via_relay(a, &self.relay_addr))).collect();
+                    // Peer-supplied addresses: never let them point us into our
+                    // own LAN, nor at a DNS name. A circuit through our own relay
+                    // (matched by its peer ID) is rebuilt from our configured
+                    // relay address instead (P0 on #416: the relay's announced
+                    // base can be a DNS name, or another port or transport).
+                    let mut addrs: Vec<Multiaddr> = Vec::new();
+                    for a in peer.addrs {
+                        let usable = if via_relay(&a, &self.relay_addr) {
+                            Some(a)
+                        } else if let Some(rebuilt) = our_relay_circuit(&a, &self.relay_addr, &peer.peer_id) {
+                            Some(rebuilt)
+                        } else {
+                            (!self.relay_only && reachable(&a, false)).then_some(a)
+                        };
+                        if let Some(a) = usable.filter(|a| !addrs.contains(a)) {
+                            addrs.push(a);
+                        }
+                    }
                     if addrs.is_empty() {
                         continue;
                     }
@@ -3510,7 +3544,9 @@ impl Task {
                 // A member's direct addresses (F2): try a direct connection.
                 let addrs: Vec<Multiaddr> =
                     response.direct_addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect();
-                debug!(peer = %key.0, ?addrs, relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                debug!(peer = %key.0, addrs = addrs.len(), relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                // Relay-down resilience: remembered, to redial after a restart.
+                self.remember_addrs(key.0, server, identity, &addrs);
                 if !addrs.is_empty() && self.relayed.contains_key(&key.0) {
                     self.direct_candidates.insert(key.0, direct_candidates_of(addrs));
                     self.try_direct(key.0);
@@ -4145,6 +4181,112 @@ impl Task {
     }
 }
 
+/// Relay-down resilience, remembered member addresses (design note and the
+/// leads' verdicts, 2026-11-17): direct addresses of verified members, kept
+/// in the store and redialled at start and while our relay is down. A dial
+/// hint only: Noise checks the peer ID, and the peer binds again before it
+/// counts as a member.
+/// Remembered members dialled per discovery round, and how often each one.
+const MAX_REMEMBERED_DIALS: usize = 16;
+const REMEMBERED_DIAL_EVERY: Duration = Duration::from_secs(30);
+/// How often remembered rows are checked against membership and expiry.
+const REMEMBERED_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+impl Task {
+    /// A bound member's direct addresses (from its pull answer): kept, if it
+    /// is a current member and we aren't relay-only. Only addresses we would
+    /// dial for a member; never logged.
+    fn remember_addrs(&mut self, peer: PeerId, server: ServerId, identity: PublicKey, addrs: &[Multiaddr]) {
+        if self.relay_only || !self.is_member(peer) {
+            return;
+        }
+        let keep: Vec<String> = direct_candidates_of(addrs.to_vec())
+            .into_iter()
+            .filter(|a| dialable(a, self.allow_lan))
+            .take(crate::store::MAX_REMEMBERED_ADDRS)
+            .map(|a| a.to_string())
+            .collect();
+        if keep.is_empty() {
+            return;
+        }
+        if let Err(err) = self.store.remember_peer(&server, &peer.to_bytes(), identity.as_bytes(), &keep, unix_now()) {
+            debug!(%err, "remembering a member failed");
+        }
+    }
+
+    /// Every discovery round while our relay doesn't hold our reservation
+    /// (at start too): dial the remembered members we aren't connected to,
+    /// directly. Never while relay-only.
+    fn redial_remembered(&mut self) {
+        // `direct_dials` off stands in for a firewall in tests: no redial either.
+        if self.relay_only || self.relay_lost_at.is_none() || !self.direct_dials {
+            return;
+        }
+        let now = Instant::now();
+        self.remembered_dialed.retain(|_, at| now.duration_since(*at) < REMEMBERED_DIAL_EVERY);
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let mut dials = 0;
+        for (_, peer, _, addrs) in rows {
+            if dials >= MAX_REMEMBERED_DIALS {
+                break;
+            }
+            let Ok(peer) = PeerId::from_bytes(&peer) else { continue };
+            if self.connected.contains(&peer) || self.remembered_dialed.contains_key(&peer) {
+                continue;
+            }
+            let addrs: Vec<Multiaddr> =
+                addrs.iter().filter_map(|a| a.parse().ok()).filter(|a| dialable(a, self.allow_lan)).collect();
+            if addrs.is_empty() {
+                continue;
+            }
+            self.remembered_dialed.insert(peer, now);
+            let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build();
+            if self.swarm.dial(opts).is_ok() {
+                dials += 1;
+            }
+        }
+        if dials > 0 {
+            debug!(dials, "redialling remembered members");
+        }
+    }
+
+    /// Every [`REMEMBERED_CHECK_EVERY`]: rows of peers that are no longer
+    /// members (kicked, left, removed by authority) go at once, and rows
+    /// past their 30 days.
+    fn check_remembered(&mut self) {
+        if self.remembered_checked.elapsed() < REMEMBERED_CHECK_EVERY {
+            return;
+        }
+        self.remembered_checked = Instant::now();
+        let _ = self.store.expire_peers(unix_now(), crate::store::REMEMBERED_TTL);
+        // No read gate: nobody can be shown to be a member, so nothing
+        // remembered stays (fail closed, Security Lead on #419).
+        let Some(gate) = self.access.read_gate.clone() else {
+            self.forget_remembered();
+            return;
+        };
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let gone: Vec<(ServerId, Vec<u8>)> = rows
+            .into_iter()
+            .filter(|(server, _, identity, _)| {
+                !self.secrets.contains_key(server)
+                    || !gate.may_read(&PublicKey::from_bytes(*identity), &self.store.control_log(*server))
+            })
+            .map(|(server, peer, _, _)| (server, peer))
+            .collect();
+        for (server, peer) in gone {
+            let _ = self.store.forget_peer(&server, &peer);
+        }
+    }
+
+    /// Relay-only: every remembered address goes (Security Lead).
+    fn forget_remembered(&mut self) {
+        if let Err(err) = self.store.forget_all_peers() {
+            warn!(%err, "forgetting remembered members failed");
+        }
+    }
+}
+
 /// The remote IP of a direct incoming connection; None for outgoing and
 /// relayed ones (a relayed connection's address is the relay's).
 fn incoming_ip(endpoint: &ConnectedPoint) -> Option<std::net::IpAddr> {
@@ -4278,6 +4420,49 @@ pub(crate) fn via_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
     let Some(circuit) = parts.iter().position(|p| *p == Protocol::P2pCircuit) else { return false };
     let prefix: Multiaddr = parts[..circuit].iter().cloned().collect();
     prefix == *relay
+}
+
+/// Whether `addr` is exactly our configured relay address, with or
+/// without its trailing `/p2p/<relay ID>` (Kademlia may store either).
+pub(crate) fn is_configured_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
+    if addr == relay {
+        return true;
+    }
+    let mut base = relay.clone();
+    matches!(base.pop(), Some(Protocol::P2p(_))) && *addr == base
+}
+
+/// P0 (#416 broke joins over a relay with a DNS name): a peer-learned
+/// circuit through *our configured relay*, matched by the relay's peer ID
+/// and rebuilt from our own configured `relay` address, so the
+/// peer-supplied base (a DNS name, another port, another transport) is
+/// never dialled (Security Lead's rules):
+/// - the shape is exactly `<base>/p2p/<relay ID>/p2p-circuit[/p2p/<target>]`:
+///   nothing else after `/p2p-circuit`, no nested circuits;
+/// - `<relay ID>` is our configured relay's (member relays get no
+///   exception);
+/// - `<target>`, when present, is `expected` (the peer being dialled).
+///
+/// The rebuilt `relay/p2p-circuit/p2p/<expected>`, or None.
+pub(crate) fn our_relay_circuit(addr: &Multiaddr, relay: &Multiaddr, expected: &PeerId) -> Option<Multiaddr> {
+    let relay_id = match relay.iter().last() {
+        Some(Protocol::P2p(id)) => id,
+        _ => return None,
+    };
+    let parts: Vec<Protocol<'_>> = addr.iter().collect();
+    let circuit = parts.iter().position(|p| *p == Protocol::P2pCircuit)?;
+    if circuit == 0 || parts[circuit - 1] != Protocol::P2p(relay_id) {
+        return None;
+    }
+    if parts[..circuit - 1].iter().any(|p| matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit)) {
+        return None;
+    }
+    match &parts[circuit + 1..] {
+        [] => {}
+        [Protocol::P2p(target)] if target == expected => {}
+        _ => return None,
+    }
+    Some(relay.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(*expected)))
 }
 
 /// Like [`dialable`], but a relay circuit is fine (it is how peers behind
@@ -4750,6 +4935,56 @@ mod tests {
             // Nor does the general rule let the LAN ones through without allow_lan.
             assert!(!reachable(&bad, false) || bad.iter().all(|p| !matches!(p, Protocol::Ip4(ip) if ip.is_private())));
         }
+    }
+
+    #[test]
+    fn a_circuit_through_our_dns_relay_is_rebuilt_from_our_own_address() {
+        // P0 on #416: the relay announces itself under a DNS name (or another
+        // port or transport) than ours; matched by its peer ID, the circuit
+        // is rebuilt from our configured address (Security Lead's rules).
+        let relay_id = PeerId::random();
+        let target = PeerId::random();
+        let ours: Multiaddr = format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}").parse().unwrap();
+        let want: Multiaddr = format!("{ours}/p2p-circuit/p2p/{target}").parse().unwrap();
+        let a = |s: String| s.parse::<Multiaddr>().unwrap();
+        // Our relay's ID with the configured base passes, and so do another
+        // name, port or transport for it: all rewritten to ours.
+        for base in [
+            "/dns4/relay.example/tcp/4001",
+            "/dns4/relay.example/tcp/443/wss",
+            "/dns4/other.example/udp/4001/quic-v1",
+            "/ip4/192.168.1.5/tcp/4001",
+        ] {
+            for tail in [format!("/p2p-circuit/p2p/{target}"), "/p2p-circuit".to_owned()] {
+                let got = our_relay_circuit(&a(format!("{base}/p2p/{relay_id}{tail}")), &ours, &target);
+                assert_eq!(got.as_ref(), Some(&want), "{base}{tail}");
+            }
+        }
+        // The same host with another peer ID: refused (a member relay too).
+        let member_relay = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{member_relay}/p2p-circuit/p2p/{target}")), &ours, &target).is_none());
+        // Another target than the peer being dialled.
+        let other = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}")), &ours, &target).is_none());
+        // Extra protocols after /p2p-circuit, nested circuits, a peer ID in the base.
+        for bad in [
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}/tcp/1"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/ip4/1.2.3.4/tcp/1/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/1.2.3.4/tcp/1/p2p/{other}/p2p-circuit/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}"),
+            format!("/p2p/{relay_id}/p2p-circuit/p2p/{target}/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}"),
+        ] {
+            assert!(our_relay_circuit(&a(bad.clone()), &ours, &target).is_none(), "{bad}");
+        }
+        // A plain DNS address stays unreachable (#416 unchanged).
+        assert!(!reachable(&a("/dns4/relay.example/tcp/4001".into()), false));
+        // Kademlia keeps our configured relay's own address (with or without
+        // its /p2p), and nothing else under that name.
+        assert!(is_configured_relay(&ours, &ours));
+        assert!(is_configured_relay(&a("/dns4/relay.example/tcp/4001".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/relay.example/tcp/443/wss".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/evil.example/tcp/4001".into()), &ours));
     }
 
     #[test]

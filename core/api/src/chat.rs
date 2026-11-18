@@ -24,6 +24,7 @@ use records::{ChannelId, Kind, PublicKey, Record, RecordId, Scope, ServerId, Stu
 
 use crate::model::Log;
 use crate::ports::{GroupCipher, Opened};
+use crate::reaction::{causal_order, Gate, Node, OnMessage, Reaction};
 
 /// The channel records of one server, as `authority` asks about them: full
 /// records, and the stubs of pruned ones (B6-p), served by `entry`.
@@ -151,6 +152,69 @@ pub(crate) struct Shown {
     pub edited_at: Option<u64>,
     /// A tombstone: the message keeps its place, its text is gone.
     pub deleted: bool,
+    /// G-26: the emoji shown under it and who has each on
+    /// (`reaction::OnMessage::shown`); none on a deleted message.
+    pub reactions: Vec<(String, Vec<PublicKey>)>,
+}
+
+/// G-26: the reactions of one channel, folded in causal order
+/// (`crate::reaction` has the rules).
+pub(crate) struct Reactions {
+    pub on: HashMap<RecordId, OnMessage>,
+    /// The time and rate rules, for a new reaction's checks.
+    pub gate: Gate,
+}
+
+/// Folds the accepted `Reaction` records of `channel` onto `live`, its
+/// shown messages that aren't deleted, at `now` (the core clock: records
+/// from more than ten minutes ahead wait).
+pub(crate) fn reactions(
+    cipher: &dyn GroupCipher,
+    server: ServerId,
+    channel: ChannelId,
+    log: &Log,
+    live: &HashSet<RecordId>,
+    now: u64,
+) -> Reactions {
+    let scope = Scope::Channel(channel);
+    let records: Vec<&Record> = log.channel.iter().filter(|r| r.scope() == scope).collect();
+    let mut folded = Reactions { on: HashMap::new(), gate: Gate::new(now) };
+    let nodes: Vec<Node> = records
+        .iter()
+        .map(|r| Node { id: r.id(), ts: r.ts(), deps: r.deps() })
+        .chain(
+            log.stubs
+                .values()
+                .filter(|s| s.scope() == scope)
+                .map(|s| Node { id: s.id(), ts: s.ts(), deps: s.deps() }),
+        )
+        .collect();
+    let by_id: HashMap<RecordId, &Record> = records.iter().map(|r| (r.id(), *r)).collect();
+    let index: HashMap<RecordId, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+    let graph = Graph::new(&log.channel, &log.stubs);
+    for (at, id) in causal_order(&nodes).into_iter().enumerate() {
+        let reaction = by_id
+            .get(&id)
+            .filter(|r| r.kind() == Kind::Reaction && accepted(&log.resolver, r, &graph));
+        // Every node feeds the effective times; a reaction is counted only
+        // within the time and rate rules (`Gate::take`).
+        if !folded.gate.take(index[&id], reaction.map(|r| r.author())) {
+            continue;
+        }
+        let Some(record) = reaction else { continue };
+        let opened = match cipher.decrypt(server, channel, record.author(), record.body()) {
+            Ok(Opened { plaintext, accepted: true }) => Reaction::decode(&plaintext),
+            _ => None,
+        };
+        let Some(reaction) = opened.filter(|r| live.contains(&r.target)) else { continue };
+        folded.on.entry(reaction.target).or_default().apply(
+            record.author(),
+            &reaction.emoji,
+            reaction.on,
+            at,
+        );
+    }
+    folded
 }
 
 /// Opens a message or edit body; `None` unless it opens under an accepted
@@ -184,6 +248,7 @@ pub(crate) fn messages(
     server: ServerId,
     channel: ChannelId,
     log: &Log,
+    now: u64,
 ) -> Vec<Shown> {
     if !known_channels(server, log.resolver.state()).contains(&channel) {
         return Vec::new();
@@ -210,6 +275,7 @@ pub(crate) fn messages(
                     text: String::new(),
                     edited_at: None,
                     deleted: true,
+                    reactions: Vec::new(),
                 });
             }
             if let Some(edit) = replaced.latest_edit.get(&meta.id) {
@@ -219,15 +285,29 @@ pub(crate) fn messages(
                     text,
                     edited_at: Some(edit.ts()),
                     deleted: false,
+                    reactions: Vec::new(),
                 });
             }
             // Neither deleted nor edited: only a full record has a text.
             let record = record?;
             let text = open(cipher, server, channel, record.author(), record.body())?;
-            Some(Shown { record: meta, text, edited_at: None, deleted: false })
+            Some(Shown { record: meta, text, edited_at: None, deleted: false, reactions: Vec::new() })
         })
         .collect();
     shown.sort_by_key(|s| (s.record.ts(), s.record.id()));
+    // Most channels have no reactions: skip the fold (and its causal order).
+    let scope = Scope::Channel(channel);
+    if !log.channel.iter().any(|r| r.kind() == Kind::Reaction && r.scope() == scope) {
+        return shown;
+    }
+    let live: HashSet<RecordId> =
+        shown.iter().filter(|s| !s.deleted).map(|s| s.record.id()).collect();
+    let folded = reactions(cipher, server, channel, log, &live, now);
+    for s in &mut shown {
+        if let Some(on) = folded.on.get(&s.record.id()) {
+            s.reactions = on.shown();
+        }
+    }
     shown
 }
 

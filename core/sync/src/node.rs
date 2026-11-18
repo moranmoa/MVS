@@ -57,7 +57,7 @@ use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
-use crate::report::{ReportError, ReportLimits, MAX_REPORT_BLOB};
+use crate::report::{ReportError, ReportLimits, MAX_PENDING as MAX_REPORT_PENDING, MAX_REPORT_BLOB};
 use crate::typing::{TypingError, TypingLimits, MAX_TYPING_BLOB};
 use crate::voice::{VoiceError, VoiceLimits, MAX_VOICE_BLOB};
 use crate::{
@@ -2139,6 +2139,10 @@ impl Task {
     fn report_send(&mut self, to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), ReportError>>) {
         if bytes.len() > MAX_REPORT_BLOB {
             let _ = reply.send(Err(ReportError::TooLarge));
+            return;
+        }
+        if self.report_pending.len() >= MAX_REPORT_PENDING {
+            let _ = reply.send(Err(ReportError::Busy));
             return;
         }
         let Some(peer) = self.member_peer(to) else {

@@ -36,6 +36,9 @@ pub(crate) const ALL_BURST: u32 = 20;
 pub(crate) const ALL_RATE: u32 = 2;
 /// Per-peer buckets remembered.
 const MAX_TRACKED: usize = 1024;
+/// Boxes sent and waiting for their ack at once; past it, a send is refused
+/// as [`ReportError::Busy`] (the outbox retries later).
+pub(crate) const MAX_PENDING: usize = 64;
 
 /// Why a report box wasn't delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,8 @@ pub enum ReportError {
     NotMember,
     /// Sent, but no ack came back (timeout, refused, or an older peer).
     NotAcked,
+    /// Already [`MAX_PENDING`] boxes wait for their ack.
+    Busy,
     /// The node has stopped.
     Stopped,
 }
@@ -56,6 +61,7 @@ impl std::fmt::Display for ReportError {
             ReportError::TooLarge => "report box too large",
             ReportError::NotMember => "no connected member with that identity",
             ReportError::NotAcked => "the report box wasn't acknowledged",
+            ReportError::Busy => "too many report boxes waiting for an ack",
             ReportError::Stopped => "the node has stopped",
         })
     }

@@ -1051,6 +1051,9 @@ export class MockCore implements CoreApi {
       this.pendingJoins.delete(clean);
       if (/offline/i.test(clean)) {
         this.emit('join.status', { phase: 'nobody-online', link: clean });
+      } else if (/removed/i.test(clean)) {
+        // G-53: a link with "removed" in it plays an account the owner removed.
+        this.emit('join.status', { phase: 'removed', link: clean });
       } else if (/adult/i.test(clean) && this.ageOf(this.identity!.birthDate) < 18) {
         this.emit('join.status', { phase: 'age-blocked', link: clean, required: '18+' });
       } else {

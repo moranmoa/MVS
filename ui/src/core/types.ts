@@ -232,7 +232,9 @@ export type JoinStatus =
   | { phase: 'nobody-online'; link: string }
   | { phase: 'joined'; link: string; serverId: Id }
   | { phase: 'invalid'; link: string }
-  | { phase: 'age-blocked'; link: string; required: AgeRestriction };
+  | { phase: 'age-blocked'; link: string; required: AgeRestriction }
+  /** G-53 (core #503): this account was removed from the server and not let back. Final: no retries. */
+  | { phase: 'removed'; link: string };
 
 export interface StorageUsage {
   usedBytes: number;

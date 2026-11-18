@@ -286,6 +286,11 @@ export function JoinDialog({
               <FormattedMessage id="join.ageBlocked" values={{ age: status.required.slice(0, 2) }} />
             </p>
           )}
+          {status?.phase === 'removed' && (
+            <p className="error">
+              <FormattedMessage id="join.removed" />
+            </p>
+          )}
           {status?.phase === 'joined' && (
             <p className="success">
               <FormattedMessage id="join.joined" />
@@ -297,14 +302,21 @@ export function JoinDialog({
             <button type="button" className="primary" onClick={onClose}>
               <FormattedMessage id="join.keepTrying" />
             </button>
+          ) : status?.phase === 'removed' ? (
+            // G-53 (B11a–d §5א): final, so no "Join"; "Close" only.
+            <button type="button" className="primary" onClick={onClose}>
+              <FormattedMessage id="common.close" />
+            </button>
           ) : (
             <button type="submit" className="primary" disabled={busy || !link.trim()}>
               <FormattedMessage id="join.submit" />
             </button>
           )}
-          <button type="button" className="secondary" onClick={cancel}>
-            <FormattedMessage id="common.cancel" />
-          </button>
+          {status?.phase !== 'removed' && (
+            <button type="button" className="secondary" onClick={cancel}>
+              <FormattedMessage id="common.cancel" />
+            </button>
+          )}
         </div>
       </form>
     </Dialog>

@@ -627,7 +627,7 @@ pub struct HolderStatus {
     pub last_seen: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reshare {
     /// A holder is gone.
     Gone,

@@ -29,6 +29,8 @@ pub mod reaction;
 mod recovery;
 #[allow(dead_code)]
 mod recovery_holder;
+#[allow(dead_code)]
+mod recovery_device;
 mod rekey;
 mod service;
 pub mod sidecar;

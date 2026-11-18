@@ -408,6 +408,11 @@
   "connection.direct.title": "יש חיבור ישיר (למשל באותה רשת)",
   "connection.relay.title": "החיבור עובר דרך ממסר של MVS. הממסר מעביר הודעות מוצפנות ולא יכול לקרוא אותן.",
   "members.me": "(אני)",
+  "members.search": "חיפוש חברים",
+  "members.search.placeholder": "חיפוש",
+  "members.search.count": "{count, plural, one {תוצאה אחת} two {שתי תוצאות} other {# תוצאות}}",
+  "members.search.none": "לא נמצאו חברים בשם הזה.",
+  "members.search.clear": "ניקוי החיפוש",
   "members.open": "הפרופיל של \u2068{name}\u2069",
 
   "profile.code": "קוד זהות",

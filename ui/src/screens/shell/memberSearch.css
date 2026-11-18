@@ -1,0 +1,47 @@
+/* G-41: the member list's search field. Theme colours only (AA in both themes); no motion. */
+.member-search {
+  padding: 0.5rem 0.75rem 0.25rem;
+}
+.member-search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.member-search-input {
+  width: 100%;
+  height: 2rem;
+  padding-block: 0;
+  padding-inline: 0.625rem 2rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.875rem;
+}
+.member-search-input::placeholder {
+  color: var(--text-muted);
+}
+/* Our own clear button instead of the browser's. */
+.member-search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+.member-search-clear {
+  position: absolute;
+  inset-inline-end: 0.25rem;
+  width: 1.5rem;
+  height: 1.5rem;
+  min-width: 1.5rem;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+}
+.member-search-clear svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+.member-search-none {
+  margin: 0.5rem 0 0;
+}

@@ -1,6 +1,6 @@
 # Link to a message, G-30 (design note)
 
-- **Status:** design only, no code.
+- **Status:** design only. The SL approved with R1, now folded into §4; UX's and dev-identity's changes are folded in too. The UI half is #528, on the mock.
 - **Reviews:**
   - UX: what people see, wording, and the highlight;
   - Security Lead: the deep-link parsing and what a link from outside may do (§3, §6);
@@ -55,36 +55,37 @@ mvs://m/<server id>/<channel id>/<message id>
   - A click is handled inside the app (§5), with no round trip through the OS.
   - Any other `mvs://` text stays plain text. An invite inside a message keeps today's behaviour.
 
-## 4. Core contract (proposal, for dev-identity)
+## 4. Core contract (for dev-identity; agreed in review)
 
 One new read-only command:
 
 ```
 locateMessage(serverId: Id, channelId: Id, messageId: Id)
-  → { index: number }            // its index in getMessages(channelId) order
-  | error 'not-found'            // not on this device, or the three don't match
-  | error 'not-allowed'          // I'm not a member of that server, or can't see that channel
-  | error 'bad-request'          // malformed IDs (the UI never sends these)
+  → { index: number }            // its index in getMessages(channelId) order, as of now
+  | error 'not-found'            // anything I can't see (below)
+  | error 'bad-request'          // an ID that isn't 64 hex (the UI never sends these)
 ```
 
-- **Local only:** it looks in the local store. It never asks peers and never triggers a sync of its own.
-- **The three IDs must agree:**
-  - the message's own channel is `channelId`;
-  - the channel belongs to `serverId`.
-  - Otherwise it returns `not-found`. A mismatch never says which part was wrong.
-- **`not-allowed`** means:
-  - I'm not a member;
-  - I've left or been removed;
-  - or the channel isn't one `listChannels` gives me, whatever rule hid it (for example, if B7 ever hides 18+ channels from a minor). Whether such a channel exists isn't revealed beyond that.
-- **The index** is the same one `getMessages` and `replyTo.index` use, so the UI jumps with the code that already handles a reply jump. It also covers rows that show something other than the message:
-  - a deleted message returns its tombstone's index;
-  - a message I can't open (the unreadable placeholder, dev-sync's contract) returns the placeholder's index;
-  - a blocked author's message returns its index, and the row shows what blocked rows show.
-  - Before-join history that isn't emitted at all is `not-found`.
+- **Local only:** it looks in the local store. It never asks peers and never triggers a sync of its own. The cost is one decryption pass over the channel, like `getMessages`.
+- **One answer for everything I can't see** (SL R1, dev-identity). There is no `not-allowed`, so a link can't confirm that something hidden exists. All of these return `not-found` and look the same:
+  - not a member, including servers I left or was removed from (the store purges those);
+  - no such channel, or a channel `listChannels` doesn't give me (for example, an 18+ channel hidden from a minor under B7 §4);
+  - IDs that don't agree: the message isn't in `channelId`, or the channel isn't in `serverId`;
+  - a message that isn't here, or doesn't open (unreadable). Today those are filtered out (TODO #21). Once #21 adds placeholders, a placeholder returns its index;
+  - a message still waiting to send (`pending-…` IDs aren't records).
+- **A closed server** (read-only, still listed) locates normally.
+- **The index** is the one `getMessages` and `replyTo.index` use: messages sorted by (record ts, id). An edited message keeps its place, a deleted one keeps its place as a tombstone and returns that index, and a blocked author's message returns its index.
+- **The index is a snapshot.** A message with an earlier ts can arrive by sync later and shift everything after it, so the UI checks it (§5).
 - **Desktop allow-list:** `locateMessage: ['serverId', 'channelId', 'messageId']`. It's read-only and returns no text. While locked it's refused like everything else.
-- **Mock:** MockCore implements it over its seeded channels, with a `?messageLink=` demo flag for screenshots.
+- **Mock:** MockCore implements it over its seeded channels.
+- **Core tests:**
+  - a match;
+  - each mismatch, a non-member, a hidden channel and a random channel all answer exactly `not-found` (the SL's identical-answer test);
+  - the tombstone index;
+  - a pending ID;
+  - a non-hex ID returns `bad-request`.
 
-There's no new event and no change to `Message`.
+There's no change to `Message`. There's one new event, `link.message` (§3).
 
 ## 5. UI behaviour
 
@@ -93,23 +94,23 @@ There's no new event and no change to `Message`.
 - **When it's hidden:**
   - on my own message that's still sending or failed (no final ID yet);
   - on held messages (#288);
-  - on unreadable placeholders.
+  - on unreadable placeholders, once #21 adds them.
 - **What it does:** `copyText(link)`, then a short toast: "הקישור הועתק" / "Link copied". It uses the existing clipboard path (`copyText`), which G-78 refuses while locked.
 
 ### Open
-1. **Clean the link** (§3). If it's not an exact message link, nothing happens.
-2. **Server:** it must be in my server list.
-   - If not, show a dialog (not a toast, so it isn't missed): "הקישור הוא להודעה בשרת שאינו ברשימה שלך. כדי לראות אותה צריך הזמנה מחבר בשרת." / "This link is to a message in a server you're not in. To see it, you need an invite from a member."
+1. **The event:** a `link.message { serverId, channelId, messageId }` event comes from main (§3), or later from a click inside the app.
+2. **Server:** the UI checks my own server list first, without asking the core.
+   - If the server isn't there, show a dialog (not a toast, so it isn't missed): "הקישור הוא להודעה בשרת שאינו ברשימה שלך. כדי לראות אותה צריך הזמנה ממי שכבר בשרת." / "This link is to a message in a server you're not in. To see it, you need an invite from someone who's in it."
    - The dialog has one button, "הבנתי" / "OK". No server name is shown, because we don't have one.
 3. **Locate:** call `locateMessage`.
    - **`{ index }`:**
-     - select the server and channel (on a phone, switch to the chat page);
-     - scroll to the index (`align: 'center'`) and highlight (below).
+     - fetch that one row (`getMessages(channelId, index, index + 1)`) and check that its ID is `messageId`;
+     - if it isn't (sync moved it), locate once more. If it still doesn't match, treat it as `not-found`;
+     - then select the server and channel (on a phone, switch to the chat page), scroll to the index (`align: 'center'`) and highlight (below).
    - **`not-found`:**
-     - open the channel at the bottom, as a normal open;
+     - select the server. Open the channel only if it's in my channel list; otherwise stay on the server's current channel. A hidden channel and a missing one then look exactly the same.
      - toast: "ההודעה לא נמצאה במחשב הזה. ייתכן שהיא עוד לא הגיעה, או שנמחקה." / "That message isn't on this computer. It may not have arrived yet, or it was deleted."
      - Nothing waits for it to arrive. There's no hidden pending state.
-   - **`not-allowed`:** the same dialog as step 2. Not being in the server and not being able to see the channel look the same from outside, and that's deliberate.
 4. **Unread is unchanged.** A jump marks nothing as read beyond what the normal visible-rows rule already does.
 
 ### Highlight
@@ -134,7 +135,8 @@ There's no new event and no change to `Message`.
   - It cannot make the app contact any host it wouldn't contact when I open that channel myself.
 - **Parsing:** one exact regex at three layers (deeplink.js, guardCore, the in-message linkifier). There's no URL parser and no partial matches.
 - **The not-member dialog** shows no data from the link besides the fact that it's a message link. The IDs are never rendered.
-- **No logging** of message links in main, the UI or the core (debug log included).
+- **No logging** of message links or argv in main, the UI or the core (debug log included).
+- **Focus throttle** (SL, non-blocking): main focuses the window for a deep link at most once every 2 s, and the latest link wins.
 - **Residual:** someone who can make me open a link can make the app show a channel I'm in, for example during a screen share. That's the same as a click inside the app, and acceptable.
 
 ## 7. Strings (for UX)
@@ -144,10 +146,13 @@ There's no new event and no change to `Message`.
 | `msglink.copy` | העתקת קישור להודעה | Copy message link |
 | `msglink.copied` | הקישור הועתק | Link copied |
 | `msglink.notMember.title` | הודעה בשרת אחר | A message in another server |
-| `msglink.notMember.body` | הקישור הוא להודעה בשרת שאינו ברשימה שלך. כדי לראות אותה צריך הזמנה מחבר בשרת. | This link is to a message in a server you're not in. To see it, you need an invite from a member. |
+| `msglink.notMember.body` | הקישור הוא להודעה בשרת שאינו ברשימה שלך. כדי לראות אותה צריך הזמנה ממי שכבר בשרת. | This link is to a message in a server you're not in. To see it, you need an invite from someone who's in it. |
+| `msglink.ok` | הבנתי | OK |
 | `msglink.notFound` | ההודעה לא נמצאה במחשב הזה. ייתכן שהיא עוד לא הגיעה, או שנמחקה. | That message isn't on this computer. It may not have arrived yet, or it was deleted. |
 
-There's no gendered second person and no "מפתח". Shot range: UX to assign (480–489 is G-25). I suggest 490–499 if it's free.
+There's no gendered second person and no "מפתח". There's no separate "no access" text, since that case is `not-found`.
+
+**Shots** (UX assigned 490–499): 490 `490-msglink-highlight-he`, 491 `491-msglink-not-member-he`, 492 `492-msglink-not-found-en-dark`.
 
 ## 8. Tests
 
@@ -159,11 +164,11 @@ There's no gendered second person and no "מפתח". Shot range: UX to assign (4
 - **UI:**
   - copy, plus the menu item hidden on pending, held and unreadable rows;
   - opening while loaded and while not loaded (skeleton, then highlight);
-  - not a member, `not-found` and `not-allowed`;
+  - not a member (from the server list), `not-found` for a hidden and for a random channel (identical), and a moved index (re-locate);
   - same channel and a second link;
   - a link while the join dialog is open;
   - reduced motion.
-- **Core:** a match; each mismatch returns `not-found`; a non-member and a hidden channel return `not-allowed`; the tombstone and placeholder indexes.
+- **Core:** see §4.
 
 ## 9. Order
 

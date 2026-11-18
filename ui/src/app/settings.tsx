@@ -4,6 +4,7 @@ import type { Locale } from '../core/types';
 import { directionOf, LOCALES, messagesFor, pickLocale } from '../i18n';
 import { cleanOrder } from './serverOrder';
 import { cleanNotifyPrefs, type NotifyPrefs } from './notify';
+import { cleanVoicePrefs, type VoicePrefs } from './voicePrefs';
 
 export type Theme = 'system' | 'light' | 'dark';
 
@@ -18,6 +19,8 @@ export interface Settings {
   serverOrder?: string[];
   /** G-61: desktop notifications, levels and mutes, on this computer only. */
   notify?: NotifyPrefs;
+  /** G-74: voice activity or push to talk, and the keys, on this computer only. */
+  voice?: VoicePrefs;
   /** G-64: a short sound when someone joins or leaves my call. On unless false. */
   callSounds?: boolean;
 }
@@ -57,6 +60,7 @@ function load(): Settings {
     fontSize: num(stored.fontSize, FONT_MIN, FONT_MAX, base.fontSize),
     serverOrder: cleanOrder(stored.serverOrder),
     notify: cleanNotifyPrefs(stored.notify),
+    voice: cleanVoicePrefs(stored.voice),
     ...(stored.callSounds === false ? { callSounds: false } : {}),
     ...(LOCALES.includes(lang as Locale) ? { locale: lang as Locale } : {}),
     ...(theme === 'light' || theme === 'dark' ? { theme } : {}),

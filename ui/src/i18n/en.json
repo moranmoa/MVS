@@ -93,7 +93,7 @@
   "onb.restored.title": "Your account is restored",
   "onb.restored.noneFound": "No servers to bring back were found.",
   "onb.restored.done": "All your servers are back.",
-  "onb.restored.waiting": "Found {found, plural, one {# server} other {# servers}}; {back, plural, =0 {none back yet} other {# back}}. The rest come back when one of their members is online.",
+  "onb.restored.waiting": "Found {found, plural, one {# server} other {# servers}}; {back, plural, =0 {none back yet} other {# back}}. The rest come back when someone from those servers is online.",
   "onb.restored.searching": "Looking for your servers…",
   "onb.restored.servers": "If a server doesn't appear within a few minutes, open an invite link to it – from another of your devices, or ask someone in the server. You'll be recognized as the same account, with your role.",
   "onb.profile.hint": "Members of your servers see this name. You can change it any time.",

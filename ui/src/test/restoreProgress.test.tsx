@@ -42,9 +42,9 @@ describe('servers coming back after a restore (G-91)', () => {
     expect(status().textContent).toBe('Looking for your servers…');
     expect(screen.getByText(/open an invite link to it/)).toBeTruthy();
     act(() => core.simulateServerRestore({ state: 'waiting', found: 3, waiting: 2 }));
-    expect(status().textContent).toBe('Found 3 servers; 1 back. The rest come back when one of their members is online.');
+    expect(status().textContent).toBe('Found 3 servers; 1 back. The rest come back when someone from those servers is online.');
     act(() => core.simulateServerRestore({ state: 'waiting', found: 1, waiting: 1 }));
-    expect(status().textContent).toBe('Found 1 server; none back yet. The rest come back when one of their members is online.');
+    expect(status().textContent).toBe('Found 1 server; none back yet. The rest come back when someone from those servers is online.');
     act(() => core.simulateServerRestore({ state: 'done', found: 3, waiting: 0 }));
     expect(status().textContent).toBe('All your servers are back.');
     expect(screen.getByText(/open an invite link to it/)).toBeTruthy();

@@ -74,7 +74,7 @@ Like the name and channel topics, both sit unsealed in the control log, so every
   - owner and admin accepted; moderator and member refused;
   - the latest wins; clearing works; a revoke voids concurrent edits;
   - a description edit never touches the name (its own kind), and a concurrent rename stays;
-  - malformed bodies don't parse: the history byte, a type/magic mismatch, an APNG, an animated WebP, two image chunks, 129 px, 8 KiB + 1, a description over 5 lines, with , U+2028 or a double blank line;
+  - malformed bodies don't parse: the history byte, a type/magic mismatch, an APNG, an animated WebP, two image chunks, 129 px, 8 KiB + 1, a description over 5 lines, or with ``, U+2028 or two blank lines in a row;
   - `resolve` equals the incremental `Resolver`.
 - **api:**
   - the commands' errors, both gates and the rate limit;

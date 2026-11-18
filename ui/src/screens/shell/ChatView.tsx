@@ -447,7 +447,7 @@ function Composer({
                 return;
               }
             }
-            const marker = shortcutMarker(e);
+            const marker = e.nativeEvent.isComposing ? null : shortcutMarker(e); // not mid-IME composition
             if (marker) {
               e.preventDefault();
               wrapSelection(e.currentTarget, marker);

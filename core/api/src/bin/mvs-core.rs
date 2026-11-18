@@ -1,7 +1,7 @@
 //! The core as a sidecar process: JSON lines on stdin and stdout (see
 //! `api::sidecar`). Logs go to stderr and never hold words, keys or text.
 //!
-//! Usage: `mvs-core --data-dir <dir> [--relay <multiaddr>]... [--bootstrap <multiaddr>]... [--update-root <dir>]`.
+//! Usage: `mvs-core --data-dir <dir> [--relay <multiaddr>]... [--bootstrap <multiaddr>]... [--update-root <dir>] [--abuse-address <text>]`.
 //! `--relay` is repeatable (at most `api::syncnet::MAX_RELAYS`, distinct
 //! relays, in order of preference; multi-relay part A). Until sync takes
 //! several, only the first is used.
@@ -14,6 +14,9 @@
 //! `--update-root` (the shell passes it only in a packaged app whose root
 //! checks out) turns in-app update on: HTTPS to the channel's GitHub release
 //! (B8, `api::update`). Without it the core never contacts the update host.
+//! `--abuse-address` (G-48; the shell passes the build's `abuseAddress` from
+//! mvs-config.json) is shown read-only through `getAppInfo`. One that isn't
+//! a plain e-mail address or `https://` URL is ignored with a warning.
 
 use std::io;
 use std::path::PathBuf;
@@ -64,6 +67,8 @@ struct Args {
     relays: Vec<String>,
     bootstrap: Vec<String>,
     update_root: Option<PathBuf>,
+    /// G-48, unchecked here: `Core::set_abuse_address` checks it.
+    abuse_address: Option<String>,
 }
 
 fn args() -> Option<Args> {
@@ -75,6 +80,7 @@ fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
     let mut relays = Vec::new();
     let mut bootstrap = Vec::new();
     let mut update_root = None;
+    let mut abuse_address = None;
     while let Some(flag) = args.next() {
         let value = args.next()?;
         match flag.to_str()? {
@@ -82,10 +88,11 @@ fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
             "--relay" if relays.len() < api::syncnet::MAX_RELAYS => relays.push(value.into_string().ok()?),
             "--bootstrap" if bootstrap.len() < MAX_BOOTSTRAP => bootstrap.push(value.into_string().ok()?),
             "--update-root" if update_root.is_none() => update_root = Some(PathBuf::from(value)),
+            "--abuse-address" if abuse_address.is_none() => abuse_address = Some(value.into_string().ok()?),
             _ => return None,
         }
     }
-    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root })
+    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root, abuse_address })
 }
 
 /// What is logged without RUST_LOG (see `init_logging`).
@@ -122,7 +129,7 @@ fn main() -> ExitCode {
     init_logging();
     let Some(args) = args() else {
         eprintln!(
-            "usage: mvs-core --data-dir <dir> [--relay <multiaddr>]... [--bootstrap <multiaddr>]... [--update-root <dir>]"
+            "usage: mvs-core --data-dir <dir> [--relay <multiaddr>]... [--bootstrap <multiaddr>]... [--update-root <dir>] [--abuse-address <text>]"
         );
         return ExitCode::from(2);
     };
@@ -226,6 +233,12 @@ fn main() -> ExitCode {
             Err(why) => eprintln!("mvs-core: updates off: {why}"),
         }
     }
+    if let Some(address) = args.abuse_address {
+        // The value isn't logged: only that it was refused, and why.
+        if let Err(why) = core.set_abuse_address(&address) {
+            eprintln!("mvs-core: --abuse-address ignored: {why}");
+        }
+    }
     // Lives until the process ends: the update thread below is never
     // joined, so a download in progress can't hold up the exit.
     let core: &'static Core = Box::leak(Box::new(core));
@@ -294,6 +307,14 @@ mod tests {
         }
         assert!(parsed(&many).is_none(), "more than {MAX_BOOTSTRAP} bootstrap addresses");
         assert!(parsed(&["--data-dir", "/d", "--bootstrap"]).is_none(), "a flag without its value");
+    }
+
+    #[test]
+    fn abuse_address_is_taken_once() {
+        assert_eq!(parsed(&["--data-dir", "/d"]).unwrap().abuse_address, None);
+        let one = parsed(&["--data-dir", "/d", "--abuse-address", "abuse@example.org"]).unwrap();
+        assert_eq!(one.abuse_address.as_deref(), Some("abuse@example.org"));
+        assert!(parsed(&["--data-dir", "/d", "--abuse-address", "a@b.org", "--abuse-address", "c@d.org"]).is_none());
     }
 
     #[test]

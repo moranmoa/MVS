@@ -424,6 +424,10 @@ pub struct AppInfo {
     /// through the relay, and calls are off.
     #[serde(default)]
     pub relay_only: bool,
+    /// G-48: where to report abuse (an e-mail address or `https://` URL),
+    /// from the build; absent when the build carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abuse_address: Option<String>,
 }
 
 /// `getRecoveryChallenge`'s result: 1-based positions.

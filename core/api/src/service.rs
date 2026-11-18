@@ -376,6 +376,9 @@ pub struct Core {
     app_version: String,
     /// In-app update; `None` unless `--update-root` (see `with_updates`).
     updates: Option<Arc<Updates>>,
+    /// G-48: where to report abuse, from the build (`--abuse-address`, see
+    /// `set_abuse_address`); `None` when unset.
+    abuse_address: Option<String>,
     /// Joins that found nobody online yet, by link: retried by `sync_now`.
     pending_joins: Mutex<HashMap<String, PendingJoin>>,
     /// Where `core.db` lives (`None` in memory): sign-out leaves its wipe
@@ -606,6 +609,7 @@ impl Core {
             ports,
             app_version: config.app_version,
             updates: None,
+            abuse_address: None,
             pending_joins: Mutex::default(),
             db_path: config.db_path,
             signed_out: AtomicBool::new(false),
@@ -2726,7 +2730,12 @@ impl Core {
             _ => UpdateChannel::Stable,
         };
         let relay_only = relay_only_in(&self.lock().db)?;
-        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only })
+        Ok(AppInfo {
+            version: self.app_version.clone(),
+            update_channel: channel,
+            relay_only,
+            abuse_address: self.abuse_address.clone(),
+        })
     }
 
     /// `setRelayOnly(on)` (GAP-6r): stored, then applied to the network. On
@@ -3079,6 +3088,16 @@ impl Core {
     pub fn with_updates(mut self, updates: Updates) -> Core {
         self.updates = Some(Arc::new(updates));
         self
+    }
+
+    /// G-48: the abuse-report address the build carries (`mvs-core
+    /// --abuse-address`), shown read-only through `getAppInfo`. Checked
+    /// here as well as in the UI: anything but a short e-mail address or
+    /// `https://` URL is refused (`Err` with the reason), and the core runs
+    /// without one.
+    pub fn set_abuse_address(&mut self, address: &str) -> Result<(), &'static str> {
+        self.abuse_address = Some(model::abuse_address(address)?);
+        Ok(())
     }
 
     fn updates(&self) -> CoreResult<&Updates> {

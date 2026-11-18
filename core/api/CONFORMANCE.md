@@ -484,6 +484,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
+- Where to report abuse (G-48): `AppInfo.abuseAddress?`, a read-only string from the build. The release writes the repository variable `MVS_ABUSE_ADDRESS` into mvs-config.json, and the shell passes it as `mvs-core --abuse-address`. It's never in the source. The field is absent when the build has none. The core accepts only a plain e-mail address or an `https://` URL with a dotted host: ASCII, no spaces, at most 200 characters, none of `<>"'\` or backquote. Anything else is ignored with a warning (the value isn't logged), and the field stays absent. No command sets it. The UI cleans it again before showing it.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

@@ -89,6 +89,49 @@ pub(crate) fn parse_hex32(id: &str) -> Option<[u8; 32]> {
     hex::decode(id).ok()?.try_into().ok()
 }
 
+/// G-48: the longest abuse-report address accepted.
+const ABUSE_ADDRESS_MAX: usize = 200;
+
+/// G-48: an abuse-report address from the build, trimmed: a plain e-mail
+/// address (`local@host.tld`) or an `https://` URL with a dotted host. ASCII
+/// only, no spaces or controls, at most [`ABUSE_ADDRESS_MAX`] characters;
+/// no characters that could break out of a link or markup (`<>"'\` and
+/// backquote). The UI cleans it again before showing it.
+pub(crate) fn abuse_address(text: &str) -> Result<String, &'static str> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > ABUSE_ADDRESS_MAX {
+        return Err("empty or too long");
+    }
+    if !text.bytes().all(|b| b.is_ascii_graphic() && !b"<>\"'\\`".contains(&b)) {
+        return Err("only plain ASCII, no spaces");
+    }
+    let host_ok = |host: &str| {
+        host.contains('.')
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+    };
+    if let Some(rest) = text.strip_prefix("https://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        return if host_ok(host) { Ok(text.to_owned()) } else { Err("not an https URL with a host") };
+    }
+    match text.split_once('@') {
+        Some((local, host))
+            if !local.is_empty()
+                && local.len() <= 64
+                && !host.contains('@')
+                && !local.bytes().any(|b| b"()[],;:".contains(&b))
+                && host_ok(host) =>
+        {
+            Ok(text.to_owned())
+        }
+        _ => Err("neither an e-mail address nor an https URL"),
+    }
+}
+
 // Hard caps on what the UI may hand in. The UI cleans and clips for display
 // (ui/src/core/sanitize.ts: 32 graphemes, 300-char bio); these only stop
 // oversize or unsafe input from being stored and sent.
@@ -898,6 +941,21 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_760), (2026, 11, 3));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn abuse_addresses_are_plain_mail_or_https() {
+        for ok in ["abuse@example.org", " report+mvs@mail.example.co.il ", "https://example.org/abuse", "https://a.b/x?y=1"] {
+            assert_eq!(abuse_address(ok).as_deref(), Ok(ok.trim()), "{ok}");
+        }
+        let long = format!("https://example.org/{}", "a".repeat(200));
+        for bad in [
+            "", "   ", "abuse", "abuse@localhost", "a@b@c.org", "@example.org", "abuse@-x.org", "abuse@x..org",
+            "http://example.org", "https://", "https://localhost/x", "javascript:alert(1)", "abuse @example.org",
+            "<abuse@example.org>", "a\"b@example.org", "דיווח@example.org", "x(y)@example.org", long.as_str(),
+        ] {
+            assert!(abuse_address(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

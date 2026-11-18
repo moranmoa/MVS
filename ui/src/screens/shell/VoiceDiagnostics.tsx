@@ -41,7 +41,7 @@ function Body({ read, names }: { read: () => Promise<Diagnostics | null>; names:
   return (
     <>
       <p className={`diag-stun ${d.stun && d.stunAnswered === false ? 'error' : ''}`}>
-        <FormattedMessage id={stun} />
+        <FormattedMessage id={stun} values={{ s: d.gatherWindowS }} />
       </p>
       {ids.length === 0 ? (
         <p className="hint">

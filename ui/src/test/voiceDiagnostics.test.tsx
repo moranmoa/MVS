@@ -14,6 +14,7 @@ const C = 'c'.repeat(64);
 const diag = (over: Partial<Diagnostics> = {}): Diagnostics => ({
   stun: true,
   stunAnswered: true,
+  gatherWindowS: 3,
   peers: {
     [B]: { state: 'connected', ice: 'connected', gathered: { host: 1, srflx: 1, prflx: 0, relay: 0 }, pair: { local: 'srflx', remote: 'srflx' }, gatherMs: 412.4, setupMs: 1834.6 },
     [C]: { state: 'connecting', ice: 'checking', gathered: null, pair: null, gatherMs: null, setupMs: null },
@@ -60,7 +61,7 @@ describe('voice diagnostics panel (G-81)', () => {
 
   it('says when STUN did not answer, and when there is none', async () => {
     let c = await open(async () => diag({ stunAnswered: false }), 'he');
-    expect(c.querySelector('.diag-stun.error')!.textContent).toContain('לא ענה');
+    expect(c.querySelector('.diag-stun.error')!.textContent).toBe('שרת STUN: לא ענה תוך \u20683\u2069 שניות. ייתכן ש-UDP אליו חסום, או שהשרת איטי או לא פעיל.');
     c = await open(async () => diag({ stun: false, stunAnswered: null }));
     expect(c.querySelector('.diag-stun')!.textContent).toContain('same network only');
   });

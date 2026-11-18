@@ -90,6 +90,8 @@ export interface VoiceDiagnostics {
   stun: boolean;
   /** Whether it answered (any srflx gathered); null before any gathering or without STUN. */
   stunAnswered: boolean | null;
+  /** How long gathering may take before the description goes out anyway, in seconds (UX: "no answer within {s} s"). */
+  gatherWindowS: number;
   peers: Record<Id, PeerDiagnostics>;
 }
 
@@ -1307,7 +1309,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       return out;
     },
     async diagnostics() {
-      const out: VoiceDiagnostics = { stun: stunConfigured, stunAnswered: null, peers: {} };
+      const out: VoiceDiagnostics = { stun: stunConfigured, stunAnswered: null, gatherWindowS: gatherTimeoutMs / 1000, peers: {} };
       for (const p of peers.values()) {
         const ice = p.pc.iceConnectionState;
         out.peers[p.id] = {

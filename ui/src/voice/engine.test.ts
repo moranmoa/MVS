@@ -1577,7 +1577,7 @@ describe('voice engine: G-81 diagnostics', () => {
   const ALLOWED = new Set([
     ...['host', 'srflx', 'prflx', 'relay', 'unknown'],
     ...['new', 'checking', 'connecting', 'connected', 'completed', 'failed', 'disconnected', 'closed'],
-    ...['stun', 'stunAnswered', 'peers', 'state', 'ice', 'gathered', 'pair', 'local', 'remote', 'gatherMs', 'setupMs'],
+    ...['stun', 'stunAnswered', 'gatherWindowS', 'peers', 'state', 'ice', 'gathered', 'pair', 'local', 'remote', 'gatherMs', 'setupMs'],
     A,
     B,
   ]);
@@ -1641,7 +1641,7 @@ describe('voice engine: G-81 diagnostics', () => {
   it('outside a call: no peers', async () => {
     const h = fakeEnv();
     const engine = createVoiceEngine(new FakeCore(A, [A, B]), { env: h.env, stunUrl: 'stun:stun.example.test:3478' });
-    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, peers: {} });
+    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, gatherWindowS: 3, peers: {} });
     engine.dispose();
   });
 
@@ -1697,7 +1697,7 @@ describe('voice engine: G-81 diagnostics', () => {
     expect(h.mics).toHaveLength(0);
     expect(core.sent).toEqual([]);
     expect(errors).toEqual([]);
-    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, peers: {} });
+    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, gatherWindowS: 3, peers: {} });
     engine.dispose();
   });
 });

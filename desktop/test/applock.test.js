@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { createAppLock, cleanPasscode, cleanWords, START_TIMEOUT_MS } = require('../src/applock');
+const { createAppLock, cleanPasscode, cleanWords, predatesLock, START_TIMEOUT_MS } = require('../src/applock');
 
 function harness({ config = { enabled: true, idleMinutes: 5, lockOnSleep: true }, verify = () => ({ result: 'ok' }), getDelay = 0 } = {}) {
   const calls = [];
@@ -67,12 +67,74 @@ test('start: pending (gated) until the core answers; lock off unlocks, lock on s
   assert.deepEqual(on.lock.state, { enabled: true, locked: true, pending: false, path: 'A' });
 });
 
-test('start: a core without the lock (bad-request / not-implemented) means off; down stays locked', async () => {
-  for (const code of ['bad-request', 'not-implemented']) {
-    const lock = createAppLock({ request: async () => ({ error: { code } }), inCall: () => false, onChange: () => {} });
-    await lock.start();
-    assert.equal(lock.state.locked, false, code);
+test('predatesLock: only a plain version below 0.4.8', () => {
+  for (const v of ['0.4.7', '0.4.7-beta.1', '0.3.9', '0.1.0', '0.0.1+abc']) assert.equal(predatesLock(v), true, v);
+  for (const v of ['0.4.8', '0.4.8-beta.1', '0.4.10', '0.5.0', '1.0.0', '10.0.0']) assert.equal(predatesLock(v), false, v);
+  for (const v of [undefined, null, 4, '', 'v0.4.7', '0.4', '0.4.7.1', ' 0.4.7', '0.4.7 ', '0.4.7\n', 'x'.repeat(65), '0.4.x']) {
+    assert.equal(predatesLock(v), false, String(v));
   }
+});
+
+test('start: bad-request / not-implemented means off only from a core older than 0.4.8', async () => {
+  const run = async (code, info) => {
+    const calls = [];
+    const lock = createAppLock({
+      request: async (cmd) => {
+        calls.push(cmd);
+        if (cmd === 'getAppLock') return { error: { code } };
+        if (typeof info === 'function') return info();
+        return info;
+      },
+      inCall: () => false,
+      onChange: () => {},
+    });
+    await lock.start();
+    return { lock, calls };
+  };
+  for (const code of ['bad-request', 'not-implemented']) {
+    const { lock, calls } = await run(code, { ok: { version: '0.4.7' } });
+    assert.equal(lock.state.locked, false, code);
+    assert.equal(lock.state.enabled, false, code);
+    assert.deepEqual(calls, ['getAppLock', 'getAppInfo']);
+    // A core with the lock that still says "no such command": a fault, locked.
+    for (const info of [
+      { ok: { version: '0.4.8' } },
+      { ok: { version: '0.5.0-beta.1' } },
+      { ok: { version: 'garbage' } },
+      { ok: {} },
+      { ok: null },
+      { error: { code: 'internal' } },
+      null,
+      () => {
+        throw new Error('down');
+      },
+    ]) {
+      const r = await run(code, info);
+      assert.equal(r.lock.state.locked, true, `${code} ${JSON.stringify(info)}`);
+      assert.equal(r.lock.state.pending, false);
+      assert.equal(r.lock.allows('getMessages', {}), false);
+    }
+  }
+  // Other errors never ask for the version.
+  const { calls } = await run('internal', { ok: { version: '0.4.7' } });
+  assert.deepEqual(calls, ['getAppLock']);
+});
+
+test('start: a lock-era core refusing getAppLock stays locked, and a later good answer still counts', async () => {
+  let answer = { error: { code: 'bad-request' } };
+  const lock = createAppLock({
+    request: async (cmd) => (cmd === 'getAppLock' ? answer : { ok: { version: '0.4.8' } }),
+    inCall: () => false,
+    onChange: () => {},
+  });
+  await lock.start();
+  assert.equal(lock.state.locked, true);
+  answer = { ok: { enabled: false } };
+  await lock.coreUp();
+  assert.equal(lock.state.locked, false);
+});
+
+test('start: down / timeout / internal stays locked', async () => {
   for (const code of ['core-unavailable', 'timeout', 'internal']) {
     const lock = createAppLock({ request: async () => ({ error: { code } }), inCall: () => false, onChange: () => {} });
     await lock.start();

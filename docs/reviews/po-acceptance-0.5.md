@@ -56,9 +56,11 @@ Manager decision (UX #427, option a): outside a call, only the speaker; the micr
 
 ## G-81 – calls across networks
 
-1. **0.5:** two members on different home networks, at least one of them behind a normal home NAT, can talk with audio in both directions, measured on the published build. **Later, with a TURN media relay:** one side on CGNAT or cellular. TURN for voice is already in the spec (helper servers, phase 2); it is a devops task, not a new decision.
+Owner decision (2026-11-18): the app works without any server. There's no STUN or TURN server, ours or public, and cross-network calls run over the P2P network only (`docs/design/g81-p2p-calls.md`).
+
+1. Two members on different home networks can talk with audio in both directions, measured on the published build, with no STUN, TURN or media server (our libp2p relay may still coordinate the hole punch, DCUtR). QA's test must include home NAT ↔ home NAT; CGNAT and cellular are measured and recorded, not required for 0.5. The release notes say exactly which pairs work.
 2. Setup within 10 s at p95, measured over pairs that have a path. If no path is found, the participant row says "אין חיבור קולי" (existing string), and the call continues for the others.
-3. Audio delay at p95 under 400 ms on a typical home connection, measured with WebRTC getStats. Results go to `qa/` with no IPs.
-4. The first-call IP notice (#225) still shows before the first direct call. The voice relay, if used, is disclosed the same way as member relays (#387).
+3. Audio delay at p95 under 400 ms on a typical home connection **over a direct path**, measured end to end in a way that works whatever the transport (getStats if WebRTC carries the media, otherwise the design's own timestamps). A relayed fallback (audio over the libp2p circuit) is **not required in 0.5**; if it ships, it is labelled in the call row and measured separately, with no promise in the release notes. Results go to `qa/` with no IPs.
+4. The first-call IP notice (v2, #494/#497) still shows before the first direct call. If audio is carried through another member's computer, that's disclosed the same way as member relays (#387).
 5. "ממסר בלבד" still means no calls (unchanged until a decision says otherwise).
-6. Release notes drop "same network only" only after QA's two-network test passes.
+6. Release notes drop "same network only" only after QA's two-network test passes, and they name the network types that were tested.

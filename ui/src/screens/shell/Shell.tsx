@@ -131,6 +131,19 @@ export function Shell() {
     if (settingsRequest) setSettingsOpen(true);
   }, [settingsRequest]);
 
+  // B18: joins left to the background. A final answer comes as a toast, so a
+  // removed account (or a closed server) is told why instead of nothing happening.
+  const backgroundJoins = useRef(new Set<string>());
+  useCoreEvent('join.status', (s) => {
+    if (!backgroundJoins.current.has(s.link) || s.phase === 'searching' || s.phase === 'nobody-online') return;
+    backgroundJoins.current.delete(s.link);
+    if (s.phase === 'removed') store.showFlash('join.removed');
+    else if (s.phase === 'closed') store.showFlash('join.closed');
+    else if (s.phase === 'age-blocked') store.showFlash('join.ageBlocked', { age: s.required.slice(0, 2) });
+    else if (s.phase === 'invalid') store.showFlash('join.invalid');
+    // joined: the server appears in the rail (server.added).
+  });
+
   useEffect(() => {
     if (!flash) return;
     const t = setTimeout(() => store.clearFlash(), 3000);
@@ -350,6 +363,7 @@ export function Shell() {
       <JoinDialog
         open={dialog === 'join'}
         initialLink={invite}
+        onBackground={(link) => backgroundJoins.current.add(link)}
         onClose={() => {
           setDialog(null);
           setInvite(undefined);

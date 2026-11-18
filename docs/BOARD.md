@@ -3,7 +3,7 @@
 The single source of truth for who does what, in which order, and what blocks the closed alpha.
 Owner: pm (see [`docs/TEAM.md`](TEAM.md)). Updated whenever a PR lands; if this board disagrees with a PR, a review or a chat, **the board wins until it is corrected here**.
 
-Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the open ones below. **Latest published release: v0.4.5** (pre-release, 2026-11-15). The 0.4.6 draft was never published; **0.4.7 replaces it** (CHANGELOG PR #465, in review) and carries the 0.4.6 line. **Now:** device link, member relays, voice settings (G-72, G-73, G-74, G-84) and the first 0.5.0 items (G-23, G-32, G-33, G-62) are on `main`; relay-down resilience and multi-relay are in flight; the next UI release is 0.5.0 "Conversation". Of the M2 order from #97, the code side is done; **B5 (real networks) and the T4 go-live are the open M2 gates**.
+Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 include #447, #459, #461, #475–#481, #483–#486, #488, #490–#493, #495; the relays were redeployed from `2852248` with the owner's OK. `main` has every PR up to #457 except the open ones below. **Latest published release: v0.4.5** (pre-release, 2026-11-15). The 0.4.6 draft was never published; **0.4.7 replaces it** (CHANGELOG PR #465, in review) and carries the 0.4.6 line. **Now:** device link, member relays, voice settings (G-72, G-73, G-74, G-84) and the first 0.5.0 items (G-23, G-32, G-33, G-62) are on `main`; relay-down resilience and multi-relay are in flight; the next UI release is 0.5.0 "Conversation". Of the M2 order from #97, the code side is done; **B5 (real networks) and the T4 go-live are the open M2 gates**.
 
 **Contents:** [Rules](#rules) · [Milestones](#milestones) · [Open PRs](#open-prs) · [Board](#board) · [Dependency map and critical path](#dependency-map-and-critical-path) · [Next assignments](#next-assignments) · [File ownership](#file-ownership) · [Risks and blockers](#risks-and-blockers) · [Owner decisions](#owner-decisions)
 
@@ -120,14 +120,14 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | T18 | **Presence (online/offline)**, an M2 gate: presence from live connections and pings plus an api event (dev-sync), then `core/api` (dev-identity) and UI (dev-ui). Design note first | dev-sync → dev-identity → dev-ui | done (sync #141, api #179; wording #131 #145 #147) | #141 #179 | GAP-4 | M | M2 |
 | T8-01 | "Core unavailable" error screen (product-lead, #117) | dev-ui + dev-voice-shell | done (typed core-unavailable error #191, screen #192, retry + open logs #193; keyring message with QA-20) | #191 #192 #193 | – | S | **M3, P0 before the next pre-release** |
 | T8-02 | Invite link ≤ 60 characters after `mvs://join/`, base58 with a checksum (contract change; product-lead, #117) | dev-sync + dev-identity; sec-lead reviews | done (codec #247, publication #249, sync #255, wired in #263) | #234 #247 #249 #255 #263 | – | M | done |
-| T8-04 | `MVS_DEMO` in Electron (product-lead, #117) | dev-voice-shell | todo | – | – | S | P2 |
+| T8-04 | `MVS_DEMO` in Electron (product-lead, #117) | dev-voice-shell | done | #485 | – | S | P2 |
 | V-C2 | Mic only during an active call: `desktop/src/main.js` sets a flag on a successful `joinCall` and clears it on leave/end; `allowPermissionRequest` refuses `media` while the flag is off (blocks silent recording via XSS, PR-CHECKLIST §8). Tests in `desktop/test/` | dev-voice-shell (voice C); sec-lead reviews | done | #254 | #228 | S | done |
 | CI-D1 | Run the desktop unit tests (`node --test`) and the Electron e2e (`desktop/test/e2e.test.mjs`, Windows) in PR CI | devops | done | #233 #270 | – | S | done |
-| T21 | Installer firewall rule: NSIS adds Windows Defender Firewall inbound allow rules for `mvs-core.exe`, TCP and UDP (QUIC, #243), private and public profiles; removed on uninstall. Today Windows prompts on the first direct listen, and "Cancel" silently blocks direct sync | devops | in progress (the prompt is explained, #260; the NSIS firewall rule is left) | #260 | #243 | S | M2 |
+| T21 | Installer firewall rule: NSIS adds Windows Defender Firewall inbound allow rules for `mvs-core.exe`, TCP and UDP (QUIC, #243), private and public profiles; removed on uninstall. Today Windows prompts on the first direct listen, and "Cancel" silently blocks direct sync | dev-ui (tip) + dev-sync (`sameLan`) | blocked: the NSIS firewall rule was **dropped by the owner** (#260); left is the in-app tip (dev-ui), which needs a per-member `sameLan` flag from dev-sync | #260 | #243 | S | M2 |
 | T22 | Third-party notices file: generate `THIRD_PARTY_NOTICES` from the lockfiles (core + desktop + ui), including the ring 0.16 OpenSSL clause and CDLA-Permissive-2.0 text for webpki-roots (#256); bundle it in every installer via `release.yml` and show it in Settings → About | devops | done | #258 | #256 | S | done |
 | T3b | libp2p 0.57 + ed25519-dalek 3 / curve25519-dalek 5 migration: one crypto PR across records, identity, groupkeys, updater, api, sync; clears hickory-proto RUSTSEC-2026-0118/0119 | dev-sync | deferred (blocked on duplicate crypto crates; the bump removes the vendored `libp2p-dns` and `libp2p-gossipsub`, #412) | #412 | #256 | M | sec-lead review |
 | T3r | Relay (`infra/relay`) libp2p 0.54 → 0.56 to match core; then drop the ring 0.16 deny exception | devops | done (relay on libp2p 0.56, #443; dropping the ring exception follows with B10) | #443 | #256 | S | live relay only from main, with the manager OK |
-| V-C3 | `setWebRTCIPHandlingPolicy("default_public_and_private_interfaces")` on the window webContents in `desktop/src/main.js` (sec-lead ship-blocker), unless #228 already carries it | voice C (dev-voice-shell); sec-lead reviews | todo | – | #228 | S | **before calls ship in a release** |
+| V-C3 | `setWebRTCIPHandlingPolicy("default_public_and_private_interfaces")` on the window webContents in `desktop/src/main.js` (sec-lead ship-blocker), unless #228 already carries it | voice C (dev-voice-shell); sec-lead reviews | done | `dd697f5` | #228 | S | **before calls ship in a release** |
 | V-A2 | Voice signalling fair share: the global 10/s bucket in `core/sync/src/voice.rs` can be drained by members of other servers; reserve a share for peers in my active call, or key the cap per server | dev-sync | todo | – | #238 | S | P3 |
 | V-E3 | Voice room UI: production `ROOM_ID` check accepts only 64-hex ids | dev-ui | todo | – | #239 | S | P3 |
 | B23-z2 | Use `display_name_ok` for profiles: `check_profile` + `display_names()` in `core/api/src/model.rs`, guardCore allows ZWJ in display names only, test that ZWJ is still refused as a server name; switch on one release after the reader ships (Tech Lead, #241) | dev-identity | todo | – | #241 | S | P2 |
@@ -171,7 +171,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 
 **Condition on every UI PR from now on:** AA contrast (G-112, B20) and reduced motion (G-114, B21). A UI PR that breaks either is not accepted.
 
-**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-48 core (report record: design note → sec-lead → core) → G-14 → G-51 · voice-c G-47 → G-53 UI → G-48 UI → G-41 · voice-d G-25 · dev-ui G-27 → G-05 → G-06 → G-78 UI → G-30. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
+**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-48 core (report record: design note → sec-lead → core) → G-14 → G-51 · voice-c G-47 → G-53 UI → G-48 UI → G-41 · voice-d G-25 · dev-ui #447 wiring → G-27 → G-05 → G-06 → G-30 · voice-shell G-78 UI. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
 
 | ID | Title | Owner | Status | PR | Depends on | Size | MS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -190,11 +190,16 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-22 | Message context menu: reply, copy, edit, delete (B25 §2, rest of #208) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #213 | B25 | S | 0.4.0 |
 | G-06 | Tooltip with the full server name in the rail (48-character names) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo (dev-ui after G-05; today only a native title, not shown on keyboard focus) | – | – | S | 0.4.0 |
 | **0.4.x** | **In parallel, infrastructure (P0)** | | | | | | |
-| G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d (+ devops for the relay move, dev-sync) | in progress (design #333, engine TURN #337, QUIC #243, STUN #222; relay move #220 open; TURN path behind a flag in review #433, voice-d, owner decision on running TURN pending; ICE restart on network change after #433, todo) | #333 #337 #433 | #220, STUN | L | 0.4.x |
+| G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d + dev-sync | **replanned** after the owner's "no central servers" decision: no STUN, no TURN (#433 closed). Next: a P2P calls design note (hybrid of libp2p media and direct); two-NAT harness #505 (draft) | #505 | #220, STUN | L | 0.4.x |
 | G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; restore progress part 1 #457; phase B buddies in review #461, dev-identity (sync side "BUDDIES on" by dev-sync only after multi-relay part B); restore screen in review #458) | #292 #317 #339 #340 #367 #457 #461 #458 | – | L | 0.4.x |
+| LM-1 | **P1 lost message:** groupkeys sealed under the old key on `RotationNeed::Add`. Fix: option (1), with the security lead's conditions C1–C6 (reviews: tech-lead, sec-lead) | dev-sync | in progress | – | – | S | **P1** |
+| JR-1 | **Join phase "removed"** (product-lead decision on #490): today a removed account gets a "searching" dead end. Core `JoinStatus` `removed` (dev-identity, draft #503); UI `join.removed` (voice-c) | dev-identity → voice-c | in progress | #503 | – | S | **P1, M3 (before the closed alpha)** |
+| UP-1 | **Unreadable-message placeholders** (product-lead decision): post-join with no key → a placeholder; untrusted → a contentless placeholder; pre-join stays hidden behind the existing `fromJoin` line. ux adds two strings to B18/B6 | dev-sync (core) → dev-ui (UI); ux strings | todo | – | – | M | M3 |
+| OE-1 | Desktop `openExternal` refuses IP-literal, `[IPv6]`, `localhost` and `*.localhost` hosts (trailing dot stripped), matching the UI's `safeHref` (#484). sec-lead follow-up | voice-shell | in progress | – | #484 | S | – |
+| MR-1 | Member recovery (dev-identity drafts #504, #506) | dev-identity | in progress | #504 #506 | – | M | – |
 | **0.5.0** | **"Conversation" (P1)** | | | | | | |
 | G-23 | Date divider (B16, UX-12) | dev-ui | done | #439 #449 | – | S | 0.5.0 |
-| G-29 | "Is typing…" (ephemeral, not stored) | dev-updater (core, spec `g29-typing-design.md`) + dev-ui | in progress (UI #447 accepted; core #475) | #447 #475 | – | M | 0.5.0 |
+| G-29 | "Is typing…" (ephemeral, not stored) | dev-updater (core, spec `g29-typing-design.md`) + dev-ui | in progress (core #475 and UI #447 merged; dev-ui wires them up first) | #447 #475 | – | M | 0.5.0 |
 | G-25 | Basic Markdown (mind direction, B17) | voice-d | todo (voice-d) | – | – | M | 0.5.0 |
 | G-26 | Emoji reactions (signed record) | dev-updater (records + api) → dev-ui | done, accepted | #454 #463 | – | M | 0.5.0 |
 | G-27 | Emoji picker | dev-ui | todo (dev-ui 1st) | – | – | M | 0.5.0 |
@@ -206,14 +211,14 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | done, accepted | #470 | – | S | 0.5.0 |
 | G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
-| G-53 | Removed accounts list + undo-kick UI (core ready, #110) | voice-c | todo (voice-c 2nd; core ready, #110) | – | – | S | 0.5.x |
+| G-53 | Removed accounts list + undo-kick UI (core ready, #110) | voice-c | done | #490 | – | S | 0.5.x |
 | G-52 | Age restriction setting (B7 §6; read-only today) | dev-ui | todo | – | – | S | 0.5.x |
 | G-51 | Server icon and description (signed record) | dev-updater | todo (dev-updater 3rd) | – | – | M | 0.5.x |
 | G-12 | Channel categories (signed record) | dev-records → dev-ui | todo | – | G-11 | L | 0.5.x |
 | G-13 | Collapse categories (local) | dev-ui | todo | – | G-12 | S | 0.5.x |
 | G-14 | Channel topic (signed record) | dev-updater | todo (dev-updater 2nd) | – | – | S | 0.5.x |
 | G-18 | Write-only-for-owners channel (signed record, channel permissions) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
-| G-47 | Blocked list with unblock (local) | voice-c | in progress (voice-c 1st) | – | – | S | 0.5.x |
+| G-47 | Blocked list with unblock (local) | voice-c | in progress (voice-c 1st; core `listBlocked`/`setBlocked` in dev-identity's draft #502) | #502 | – | S | 0.5.x |
 | G-48 | Report to the owners (signed record) | dev-updater (core) → voice-c (UI) | todo (dev-updater 1st: design note → sec-lead → core; then voice-c UI, 3rd) | – | – | M | 0.5.x |
 | G-41 | Search members (30+ member servers) | voice-c | todo (voice-c 4th) | – | – | S | 0.5.x |
 | G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | todo | – | – | S | 0.5.x |
@@ -226,7 +231,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | done (shell #444, UI #450) | #444 #450 | – | M | 0.6.0 |
 | G-64 | Join/leave notification sound | dev-ui | done, accepted | #456 | – | S | 0.6.0 |
 | G-83 | Participant count on room rows (covered by the voice rooms shipped in 0.4.3) | dev-identity → dev-ui | done | #369 #371 #375 | – | S | 0.6.0 |
-| G-78 | Optional app lock (design note first) | dev-voice-shell | in review (design note #466, approved by the tech lead with one change; awaiting the security lead) | #466 | – | M | – |
+| G-78 | Optional app lock (design note first) | dev-voice-shell | in review (design note #466, approved by the tech lead with one change; awaiting the security lead); **the lock UI is voice-shell's** (not dev-ui) | #466 | – | M | – |
 | **P2** | **P2 backlog, after the closed alpha: see [`docs/ux/GAPS.md`](ux/GAPS.md)** (G-28 files, G-31 search, G-34 link previews, G-15 pins, G-42 roles, G-43, G-44, G-45 DM, G-46, G-55, G-71, G-75, G-76, G-78, G-93, G-02, G-101–G-103, G-111, G-115) | product-lead | todo | – | – | – | – |
 | **Done** | | | | | | | |
 | G-35 | Owners delete any message (in B25) | – | done | #208 | – | – | – |
@@ -464,7 +469,7 @@ All rows below are **awaiting owner**: the recommendations are written, and the 
 | 5.12 | Legal entity for donations | Exempt dealer (עוסק פטור) when donations start | awaiting owner | – | Before donations |
 | 5.13 | Light lawyer review before open alpha | Yes (~₪3,000–8,000) | awaiting owner | – | Before open alpha |
 | MR-2c | Member relay 2c (throwaway IDs): accept the linkability, keep the real swarm off relays, or defer. Recommendation (manager, sec-lead): defer (c) and keep #368's honest copy | tech-lead, sec-lead | awaiting owner | MR-2c | Before open alpha |
-| G-81 | Run a TURN media relay for calls with CGNAT/cellular peers (G-81)? | Pending. Recommended: 0.5 promises "at least one side on a normal home NAT" | awaiting owner | G-81 (#433) | Before 0.5.0 |
+| G-81 | Run a TURN media relay for calls with CGNAT/cellular peers (G-81)? | **Decided: no.** The app works without a central server; calls go over the P2P network, no STUN/TURN server (owner, 2026-11-18) | decided | G-81 (#433) | Before 0.5.0 |
 
 (5.6 is the heading for 5.7–5.13 in the plan, not a decision.)
 | GAP-2 | `auth_deps` format: the kick names the kicker's channel heads so backdated messages are voided (technical, tech-lead + sec-lead; owner informed) | tech-lead, sec-lead | B4 | Now |

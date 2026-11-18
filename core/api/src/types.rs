@@ -127,6 +127,10 @@ pub struct Channel {
     /// key is informational only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<String>,
+    /// G-14: the channel's topic, one line; absent when there is none. It
+    /// is plaintext in the control log, readable by every member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     /// G-21: the index (as in `getMessages`) of the first message after my
     /// read marker that isn't mine; absent with nothing unread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -513,6 +517,10 @@ pub enum Event {
     MembersChanged { server_id: Id, members: Vec<Member> },
     #[serde(rename = "join.status")]
     JoinStatus(JoinStatus),
+    /// G-47: my block list changed (`setBlocked`, `blockUser`); the whole
+    /// list, as `listBlocked` returns it.
+    #[serde(rename = "blocks.changed")]
+    BlocksChanged { blocked: Vec<BlockedUser> },
     #[serde(rename = "message.updated")]
     MessageUpdated(Message),
     #[serde(rename = "message.added")]
@@ -584,6 +592,20 @@ pub struct RemovedMember {
     pub display_name: String,
     /// When it was kicked (the kick's claimed time).
     pub removed_at: Timestamp,
+}
+
+/// G-47 (`listBlocked`): an account I blocked, whether or not we share a
+/// server now. `name`: its display name where we share a server, else the
+/// one known when I blocked it; absent if none was ever known.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedUser {
+    pub user_id: Id,
+    /// G-47b (UX-19): the identity code, as `Member.shortCode`, derived
+    /// from `userId`, so two rows without a name can be told apart.
+    pub short_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Rust addition (`createInvite`, #208): the new invite and its link.

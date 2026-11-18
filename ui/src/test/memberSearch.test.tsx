@@ -59,6 +59,8 @@ describe('G-41: the member list search', () => {
   it(`is there from ${SEARCH_FROM} members; filters live, keeps the groups with filtered counts`, async () => {
     const { members } = await setup();
     expect(members.length).toBeGreaterThanOrEqual(SEARCH_FROM);
+    // UX on #492: the query's own direction.
+    expect(field().getAttribute('dir')).toBe('auto');
     const target = members.find((x) => x.displayName && x.presence === 'offline')!;
     const q = target.displayName.slice(0, 2);
     const expected = members.filter(memberMatcher(q));

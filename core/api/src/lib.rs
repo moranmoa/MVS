@@ -10,6 +10,7 @@
 //! crates are merged.
 
 mod access;
+mod applock;
 pub mod avatar;
 pub mod backup;
 mod chat;

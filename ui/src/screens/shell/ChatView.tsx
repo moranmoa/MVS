@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
-import { isCoreError, useCore, type Member, type Message, type ServerSummary } from '../../core';
+import { isCoreError, useCore, type Id, type Member, type Message, type ServerSummary } from '../../core';
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
 import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
 import { EmojiPicker } from '../../components/EmojiPicker';
 import { useUserTextProps } from '../../app/textDir';
 import { mentionQuery, toDisplay, toTokens } from '../../app/mentions';
+import { applyEdit, dismissHint, hintDue, insideOpenFence, shortcutMarker, wrapEdit } from '../../markdown/composer';
 import { BODY_MAX, BODY_MAX_BYTES, isHeld } from '../../core/sanitize';
 
 /** The character counter shows from here on (B6/QA-17 acceptance: 3,800). */
@@ -104,6 +105,25 @@ export function ChatView({
   };
 
   const channelName = channel?.name ?? '';
+  // G-29: tell the core while there's text (it sends at most every 3 s); stop on send,
+  // clear, or leaving the channel. Nothing goes out with the privacy switch off.
+  const typingOn = useStore(store, (st) => st.typingIndicator);
+  const typingSent = useRef(0);
+  const onTyping = (on: boolean) => {
+    if (!typingOn) return;
+    const now = Date.now();
+    if (on && now - typingSent.current < 1000) return;
+    if (!on && !typingSent.current) return;
+    typingSent.current = on ? now : 0;
+    void core.setTyping(channelId, on).catch(() => {});
+  };
+  useEffect(
+    () => () => {
+      if (typingSent.current) void core.setTyping(channelId, false).catch(() => {});
+      typingSent.current = 0;
+    },
+    [core, channelId],
+  );
 
   return (
     <section className="chat" aria-label={intl.formatMessage({ id: 'chat.messages' }, { channel: channelName })}>
@@ -165,6 +185,7 @@ export function ChatView({
         onRetry={onRetry}
       />
       </MemberNames.Provider>
+      {!server.closed && <TypingLine channelId={channelId} myId={myId} members={members} />}
       {server.closed ? (
         // Closed by its owner (#261): read-only until it is removed 30 days later.
         <div className="closed-banner" role="status">
@@ -183,6 +204,7 @@ export function ChatView({
             setEditing(null);
           }}
           onEditLast={editLast}
+          onTyping={onTyping}
           onSubmit={async (body) => {
             if (editing) {
               if (body !== editing.body) await core.editMessage(editing.id, body);
@@ -222,6 +244,46 @@ export function ChatView({
   );
 }
 
+/** G-29: who is typing here; one quiet line above the composer, not announced. */
+const TYPING_MS = 6000;
+function TypingLine({ channelId, myId, members }: { channelId: Id; myId: Id; members: Member[] }) {
+  const store = useAppStore();
+  const entry = useStore(store, (st) => st.typing[channelId]);
+  const [, tick] = useState(0);
+  // The backstop: a typer the core hasn't refreshed for 6 s is gone.
+  useEffect(() => {
+    if (!entry) return;
+    const t = setTimeout(() => tick((n) => n + 1), Math.max(0, entry.at + TYPING_MS - Date.now()) + 10);
+    return () => clearTimeout(t);
+  }, [entry]);
+  const fresh = entry && Date.now() - entry.at < TYPING_MS ? entry.userIds : [];
+  const byId = new Map(members.map((m) => [m.id, m]));
+  // Not me, and not blocked accounts (PO #426).
+  const names = fresh.filter((id) => id !== myId && !byId.get(id)?.blocked).map((id) => byId.get(id)?.displayName || byId.get(id)?.shortCode || '…');
+  return (
+    <div className="typing-line" aria-live="off">
+      {names.length > 0 && (
+        <>
+          <span className="typing-dots" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
+          <span className="typing-text">
+            {names.length === 1 ? (
+              <FormattedMessage id="typing.one" values={{ name: names[0] }} />
+            ) : names.length === 2 ? (
+              <FormattedMessage id="typing.two" values={{ a: names[0], b: names[1] }} />
+            ) : (
+              <FormattedMessage id="typing.many" />
+            )}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Composer({
   members,
   myId,
@@ -231,6 +293,7 @@ function Composer({
   editing,
   onCancel,
   onEditLast,
+  onTyping,
   onSubmit,
 }: {
   members: Member[];
@@ -241,6 +304,8 @@ function Composer({
   editing: Message | null;
   onCancel: () => void;
   onEditLast: () => void;
+  /** G-29: true while there is text being typed, false when it is sent or cleared. */
+  onTyping: (on: boolean) => void;
   onSubmit: (body: string) => Promise<void>;
 }) {
   const intl = useIntl();
@@ -293,6 +358,26 @@ function Composer({
     requestAnimationFrame(() => el.setSelectionRange(at, at));
   };
 
+  // G-25: the formatting hint, once: shown the first time markers appear, until ✕.
+  const [hint, setHint] = useState(false);
+  useEffect(() => {
+    if (!hint && hintDue(text)) setHint(true);
+  }, [text, hint]);
+
+  /** G-25: wrap the selection in a marker; one Ctrl+Z undoes it (the native edit stack). */
+  const wrapSelection = (el: HTMLTextAreaElement, marker: string) => {
+    const edit = wrapEdit(el.value, el.selectionStart ?? 0, el.selectionEnd ?? 0, marker);
+    el.setSelectionRange(edit.from, edit.to);
+    // insertText goes through the textarea's own undo stack and its input event.
+    const native = typeof document.execCommand === 'function' && document.execCommand('insertText', false, edit.insert);
+    if (native) {
+      el.setSelectionRange(edit.selStart, edit.selEnd);
+    } else {
+      setText(applyEdit(el.value, edit));
+      requestAnimationFrame(() => el.setSelectionRange(edit.selStart, edit.selEnd));
+    }
+  };
+
   // Entering edit mode swaps the draft out and the message text in.
   useEffect(() => {
     if (editing) {
@@ -331,6 +416,7 @@ function Composer({
     const body = toTokens(text.trim(), mentionMap.current);
     if (!body || tooLong) return;
     setFailed(null);
+    onTyping(false);
     if (!editing) setText('');
     try {
       await onSubmit(body);
@@ -436,6 +522,8 @@ function Composer({
               value = value.slice(0, at - 1) + value.slice(at);
             }
             setText(value);
+            // G-29: not while editing an old message; an emptied box stops it.
+            if (!editing) onTyping(value.trim() !== '');
             const q = mentionQuery(e.target.value, e.target.selectionStart ?? e.target.value.length);
             setSuggest(q ? { ...q, index: 0 } : null);
           }}
@@ -459,7 +547,13 @@ function Composer({
                 return;
               }
             }
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            const marker = e.nativeEvent.isComposing ? null : shortcutMarker(e); // not mid-IME composition
+            if (marker) {
+              e.preventDefault();
+              wrapSelection(e.currentTarget, marker);
+            } else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              // G-25: inside an open ``` fence, Enter is a newline until the fence is closed.
+              if (insideOpenFence(text, e.currentTarget.selectionStart ?? text.length)) return;
               e.preventDefault();
               void submit();
             } else if (e.key === 'Escape' && (replyTo || editing)) {
@@ -477,6 +571,24 @@ function Composer({
           <SendIcon />
         </button>
       </form>
+      {hint && (
+        <p className="composer-hint muted small">
+          <span className="user-text">
+            <FormattedMessage id="md.hint" />
+          </span>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={intl.formatMessage({ id: 'common.close' })}
+            onClick={() => {
+              dismissHint();
+              setHint(false);
+            }}
+          >
+            <CloseIcon />
+          </button>
+        </p>
+      )}
       {(nearLimit || failed) && (
         <p id="composer-status" className={`composer-status ${tooLong || failed ? 'error' : 'muted'}`} role={tooLong || failed ? 'alert' : undefined}>
           {failed ? (

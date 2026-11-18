@@ -6,7 +6,14 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import { serverMuteKey } from '../app/mute';
-import { cleanNotifyPrefs, createGrouper, defaultNotifyPrefs, GROUP_MS, shouldNotify, withLevel, type NotifyContext, type NotifyPrefs } from '../app/notify';
+import { cleanNotifyPrefs, createGrouper, createSoundGate, defaultNotifyPrefs, GROUP_MS, shouldNotify, shouldSound, SOUND_GAP_MS, withLevel, type NotifyContext, type NotifyPrefs } from '../app/notify';
+import { playMessageCue } from '../voice/devices';
+
+// G-63: the sound is recorded, not played (jsdom has no Web Audio).
+vi.mock('../voice/devices', async (orig) => ({
+  ...(await orig<typeof import('../voice/devices')>()),
+  playMessageCue: vi.fn(async () => {}),
+}));
 import type { Settings } from '../app/settings';
 import type { CoreEvents } from '../core/api';
 import { MockCore } from '../core/mock';
@@ -69,7 +76,35 @@ describe('which messages notify', () => {
     expect(cleanNotifyPrefs(undefined)).toEqual(defaultNotifyPrefs());
     expect(
       cleanNotifyPrefs({ desktop: 'yes', preview: false, servers: { a: { level: 'loud' }, b: { level: 'all' }, c: 5 }, channels: [] }),
-    ).toEqual({ desktop: true, preview: false, servers: { b: { level: 'all' } }, channels: {} });
+    ).toEqual({ desktop: true, preview: false, badge: true, sound: true, soundInCall: false, servers: { b: { level: 'all' } }, channels: {} });
+    expect(cleanNotifyPrefs({ sound: false, soundInCall: 'yes' })).toMatchObject({ sound: false, soundInCall: false });
+  });
+
+  it('G-63: the sound follows what would notify, with its own switch; not during a call unless asked', () => {
+    const c = (prefs: NotifyPrefs, over: Partial<NotifyContext> & { inCall?: boolean } = {}) => ({ ...ctx(prefs, over), inCall: over.inCall ?? false });
+    expect(defaultNotifyPrefs()).toMatchObject({ sound: true, soundInCall: false });
+    expect(shouldSound(msg(), c(all))).toBe(true);
+    // Desktop notifications off: the sound has its own switch.
+    expect(shouldSound(msg(), c({ ...all, desktop: false }))).toBe(true);
+    expect(shouldSound(msg(), c({ ...all, sound: false }))).toBe(false);
+    // The same rules as a notification: mine, watching, muted, level.
+    expect(shouldSound(msg({ authorId: 'u-me' }), c(all))).toBe(false);
+    expect(shouldSound(msg(), c(all, { watching: true }))).toBe(false);
+    expect(shouldSound(msg(), c(all, { muted: true }))).toBe(false);
+    expect(shouldSound(msg(), c(defaultNotifyPrefs()))).toBe(false); // mentions only
+    expect(shouldSound(msg({ mentionsMe: true }), c(defaultNotifyPrefs()))).toBe(true);
+    // During a call: only with "also during a call".
+    expect(shouldSound(msg(), c(all, { inCall: true }))).toBe(false);
+    expect(shouldSound(msg(), c({ ...all, soundInCall: true }, { inCall: true }))).toBe(true);
+  });
+
+  it('G-63: at most one sound every 2 s', () => {
+    const gate = createSoundGate();
+    expect(SOUND_GAP_MS).toBe(2000);
+    expect(gate(NOW)).toBe(true);
+    expect(gate(NOW + 500)).toBe(false);
+    expect(gate(NOW + 1999)).toBe(false);
+    expect(gate(NOW + 2000)).toBe(true);
   });
 
   it('3 messages within 10 s: the first at once, then one "3 new messages"', () => {
@@ -165,6 +200,23 @@ describe('desktop notifications in the app', () => {
     vi.mocked(document.hasFocus).mockReturnValue(true);
     emit('message.added', msg({ channelId: 'c-general', authorId: author.id, createdAt: Date.now() }));
     expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('G-63: a message that would notify plays the sound, once per 2 s', async () => {
+    const played = vi.mocked(playMessageCue);
+    played.mockClear();
+    const { author, emit } = await setup(all);
+    emit('message.added', msg({ id: 'm-s1', channelId: 'c-clips', authorId: author.id, createdAt: Date.now() }));
+    emit('message.added', msg({ id: 'm-s2', channelId: 'c-clips', authorId: author.id, createdAt: Date.now() }));
+    expect(played).toHaveBeenCalledTimes(1);
+  });
+
+  it('G-63: with the sound turned off, none', async () => {
+    const played = vi.mocked(playMessageCue);
+    played.mockClear();
+    const { emit, author } = await setup({ ...all, sound: false });
+    emit('message.added', msg({ id: 'm-s3', channelId: 'c-clips', authorId: author.id, createdAt: Date.now() }));
+    expect(played).not.toHaveBeenCalled();
   });
 
   it('a click opens the channel', async () => {

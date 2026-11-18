@@ -192,8 +192,10 @@ class FakePC {
     this.closed = true;
     this.connectionState = 'closed';
   }
+  /** ICE never connects again (a network with no path to the peer); signalling still works. */
+  neverConnect = false;
   private maybeConnect() {
-    if (this.signalingState !== 'stable' || !this.localDescription || !this.remoteDescription) return;
+    if (this.neverConnect || this.signalingState !== 'stable' || !this.localDescription || !this.remoteDescription) return;
     setTimeout(() => {
       if (this.closed) return;
       if (this.remoteSends()) this.ontrack?.({ track: new FakeTrack(), streams: [new FakeStream()] });
@@ -208,6 +210,57 @@ class FakeAnalyser {
   level = 0;
   getFloatTimeDomainData(buf: Float32Array) {
     buf.fill(this.level);
+  }
+}
+
+/** G-73: a node that records what it is connected to. */
+class FakeNode {
+  out: unknown[] = [];
+  connect(n: unknown) {
+    this.out.push(n);
+  }
+  disconnect() {
+    this.out = [];
+  }
+}
+
+/** G-73: the Web Audio playback path (gain, limiter, setSinkId); off in the plain fake. */
+class FakeWebAudioContext {
+  analysers: FakeAnalyser[] = [];
+  gains: (FakeNode & { gain: { value: number } })[] = [];
+  sources: FakeNode[] = [];
+  limiters: (FakeNode & { threshold: { value: number } })[] = [];
+  destination = new FakeNode();
+  sinks: string[] = [];
+  closed = false;
+  constructor(private sinkFails = false) {}
+  createMediaStreamSource() {
+    const n = new FakeNode();
+    this.sources.push(n);
+    return n;
+  }
+  createAnalyser() {
+    const a = new FakeAnalyser();
+    this.analysers.push(a);
+    return a;
+  }
+  createGain() {
+    const g = Object.assign(new FakeNode(), { gain: { value: 1 } });
+    this.gains.push(g);
+    return g;
+  }
+  createDynamicsCompressor() {
+    const c = Object.assign(new FakeNode(), { threshold: { value: 0 }, knee: { value: 0 }, ratio: { value: 0 }, attack: { value: 0 }, release: { value: 0 } });
+    this.limiters.push(c);
+    return c;
+  }
+  async setSinkId(id: string) {
+    if (this.sinkFails && id) throw Object.assign(new Error('no'), { name: 'NotAllowedError' });
+    this.sinks.push(id);
+  }
+  async resume() {}
+  async close() {
+    this.closed = true;
   }
 }
 
@@ -231,37 +284,77 @@ class FakeAudioContext {
 interface Harness {
   env: VoiceEnv;
   mics: FakeStream[];
-  contexts: FakeAudioContext[];
-  audios: { srcObject: unknown; paused: boolean }[];
+  contexts: (FakeAudioContext | FakeWebAudioContext)[];
+  audios: { srcObject: unknown; paused: boolean; muted: boolean; volume: number }[];
   pcs: FakePC[];
+  /** G-72: the devices on the computer; a chosen ID not in it fails like an unplugged device. */
+  devices: MediaDeviceInfo[];
+  /** The deviceId each getUserMedia asked for (undefined: the default). */
+  asked: (string | undefined)[];
+  /** Plugs devices in or out, then fires devicechange. */
+  changeDevices: (list: MediaDeviceInfo[]) => Promise<void>;
+  /** Fires the network-change event (online / another interface). */
+  changeNetwork: () => void;
 }
 
-function fakeEnv(opts: { micError?: string } = {}): Harness {
-  const h: Harness = { mics: [], contexts: [], audios: [], pcs: [], env: null as unknown as VoiceEnv };
+function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } } = {}): Harness {
+  let onChange: (() => void) | null = null;
+  let onNet: (() => void) | null = null;
+  const h: Harness = {
+    mics: [],
+    contexts: [],
+    audios: [],
+    pcs: [],
+    env: null as unknown as VoiceEnv,
+    devices: [
+      { kind: 'audioinput', deviceId: 'mic1', label: 'Mic' },
+      { kind: 'audiooutput', deviceId: 'spk1', label: '' },
+    ] as MediaDeviceInfo[],
+    asked: [],
+    changeDevices: async (list) => {
+      h.devices = list;
+      onChange?.();
+      await flush();
+    },
+    changeNetwork: () => onNet?.(),
+  };
   h.env = {
     createPeerConnection: (config) => {
       const pc = new FakePC(config);
       h.pcs.push(pc);
       return pc as unknown as RTCPeerConnection;
     },
-    getUserMedia: async () => {
+    getUserMedia: async (c) => {
       if (opts.micError) throw Object.assign(new Error('no'), { name: opts.micError });
+      const wanted = ((c.audio as MediaTrackConstraints | undefined)?.deviceId as { exact?: string } | undefined)?.exact;
+      h.asked.push(wanted);
+      if (wanted && !h.devices.some((d) => d.kind === 'audioinput' && d.deviceId === wanted)) {
+        throw Object.assign(new Error('gone'), { name: 'OverconstrainedError' });
+      }
       const s = new FakeStream();
       h.mics.push(s);
       return s as unknown as MediaStream;
     },
-    enumerateDevices: async () =>
-      [
-        { kind: 'audioinput', deviceId: 'mic1', label: 'Mic' },
-        { kind: 'audiooutput', deviceId: 'spk1', label: '' },
-      ] as MediaDeviceInfo[],
+    enumerateDevices: async () => h.devices,
+    onDeviceChange: (cb) => {
+      onChange = cb;
+      return () => {
+        onChange = null;
+      };
+    },
+    onNetworkChange: (cb) => {
+      onNet = cb;
+      return () => {
+        onNet = null;
+      };
+    },
     createAudioContext: () => {
-      const c = new FakeAudioContext();
+      const c = opts.webAudio ? new FakeWebAudioContext(opts.webAudio.sinkFails) : new FakeAudioContext();
       h.contexts.push(c);
       return c as unknown as AudioContext;
     },
     createAudioElement: () => {
-      const a = { srcObject: null as unknown, paused: true, autoplay: false, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
+      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
       h.audios.push(a);
       return a as unknown as HTMLAudioElement;
     },
@@ -321,9 +414,9 @@ const flush = async (n = 10) => {
 };
 
 /** Two engines whose cores pass signals to each other, as two verifying cores would. */
-function pair(ids: [Id, Id] = [A, B], opts: Omit<VoiceEngineOptions, 'env'> = {}) {
+function pair(ids: [Id, Id] = [A, B], opts: Omit<VoiceEngineOptions, 'env'> = {}, xEnv: Parameters<typeof fakeEnv>[0] = {}) {
   const [x, y] = ids;
-  const hx = fakeEnv();
+  const hx = fakeEnv(xEnv);
   const hy = fakeEnv();
   const cx = new FakeCore(x, [x, y]);
   const cy = new FakeCore(y, [y, x]);
@@ -395,6 +488,156 @@ describe('voice engine', () => {
       { identity: A, state: 'connected' },
       { identity: B, state: 'connected' },
     ]);
+  });
+
+  it('G-84: deafen silences everyone, also audio that starts later, and undeafen plays it again', async () => {
+    const { hx, hy, cx, cy, ex, ey } = pair();
+    ex.setDeafened(true);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.audios).toHaveLength(1);
+    expect(hx.audios[0]!.muted).toBe(true); // connected while deafened
+    expect(hy.audios[0]!.muted).toBe(false); // the other side is unaffected
+    ex.setDeafened(false);
+    expect(hx.audios[0]!.muted).toBe(false);
+    ex.setDeafened(true);
+    expect(hx.audios[0]!.muted).toBe(true);
+  });
+
+  it('G-73: a per-person volume applies now and to audio that starts later, clamped to 0..1', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    ex.setPeerVolume(B, 0.3); // before B connects
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.audios[0]!.volume).toBe(0.3);
+    ex.setPeerVolume(B, 0.8);
+    expect(hx.audios[0]!.volume).toBe(0.8);
+    ex.setPeerVolume(B, 7);
+    expect(hx.audios[0]!.volume).toBe(1);
+    ex.setPeerVolume(B, -1);
+    expect(hx.audios[0]!.volume).toBe(0);
+    ex.setPeerVolume(B, Number.NaN);
+    expect(hx.audios[0]!.volume).toBe(1);
+  });
+
+  it('G-72: a chosen mic that is gone at the start falls back to the default, once, and says which', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    const fallbacks = record<{ kind: string; deviceId: string }>((cb) => ex.on('deviceFallback', cb));
+    await ex.setInputDevice('mic-gone'); // remembered from an earlier run
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(hx.asked).toEqual(['mic-gone', undefined]);
+    expect(fallbacks).toEqual([{ kind: 'input', deviceId: 'mic-gone' }]);
+    expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics[0]!.tracks[0]); // still talking
+  });
+
+  it('G-72: unplugging the chosen mic or speaker mid-call switches to the default and says which', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    const fallbacks = record<{ kind: string; deviceId: string }>((cb) => ex.on('deviceFallback', cb));
+    const changed = record<null>((cb) => ex.on('devicesChanged', cb));
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    await ex.setInputDevice('mic1');
+    await ex.setOutputDevice('spk1');
+    // A headset plugged in: nothing chosen is gone, only the lists changed.
+    await hx.changeDevices([...hx.devices, { kind: 'audioinput', deviceId: 'mic2', label: 'Headset' } as MediaDeviceInfo]);
+    expect(changed).toHaveLength(1);
+    expect(fallbacks).toEqual([]);
+    // Both chosen devices unplugged.
+    await hx.changeDevices([{ kind: 'audioinput', deviceId: 'mic2', label: 'Headset' } as MediaDeviceInfo]);
+    expect(fallbacks).toEqual([
+      { kind: 'output', deviceId: 'spk1' },
+      { kind: 'input', deviceId: 'mic1' },
+    ]);
+    expect(hx.asked.at(-1)).toBeUndefined(); // the default mic
+    expect(hx.pcs[0]!.transceivers[0]!.sender.track).toBe(hx.mics.at(-1)!.tracks[0]);
+  });
+
+  it('G-72: hear myself plays my mic on my speaker, follows a new mic, and stops with the call', async () => {
+    const { hx, cx, cy, ex, ey } = pair();
+    ex.setSelfMonitor(true); // not in a call: nothing
+    expect(hx.audios).toHaveLength(0);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const before = hx.audios.length;
+    ex.setSelfMonitor(true);
+    expect(hx.audios).toHaveLength(before + 1);
+    const monitor = hx.audios.at(-1)!;
+    expect(monitor.srcObject).toBe(hx.mics[0]);
+    await ex.setInputDevice('mic1');
+    expect(monitor.srcObject).toBe(hx.mics.at(-1));
+    ex.detach();
+    expect(monitor.srcObject).toBeNull();
+    expect(monitor.paused).toBe(true);
+  });
+
+  it('G-73: Web Audio playback: each verified peer gets a gain into a limiter; 0..200%, deafen at 0', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: {} });
+    ex.setPeerVolume(B, 1.5);
+    await ex.attach(cx.state(), A);
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains).toHaveLength(0); // nothing from a peer before it is verified
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(ctx.gains).toHaveLength(1);
+    const [gain] = ctx.gains;
+    const [limiter] = ctx.limiters;
+    expect(gain!.gain.value).toBe(1.5);
+    expect(gain!.out).toEqual([limiter]);
+    expect(limiter!.out).toEqual([ctx.destination]);
+    expect(limiter!.threshold.value).toBe(-3);
+    expect(hx.audios[0]!.muted).toBe(true); // the element only feeds Web Audio
+    ex.setPeerVolume(B, 5);
+    expect(gain!.gain.value).toBe(2);
+    ex.setDeafened(true);
+    expect(gain!.gain.value).toBe(0);
+    ex.setDeafened(false);
+    expect(gain!.gain.value).toBe(2);
+  });
+
+  it('G-73: at 100% or less a peer stays on the element path (no Web Audio); above, a gain; back down, the element again', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: {} });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains).toHaveLength(0); // 100%: today's path
+    expect(hx.audios[0]!.muted).toBe(false);
+    ex.setPeerVolume(B, 0.6);
+    expect(ctx.gains).toHaveLength(0);
+    expect(hx.audios[0]!.volume).toBe(0.6);
+    ex.setPeerVolume(B, 1.4);
+    expect(ctx.gains).toHaveLength(1);
+    expect(ctx.gains[0]!.gain.value).toBe(1.4);
+    expect(hx.audios[0]!.muted).toBe(true);
+    ex.setPeerVolume(B, 0.9);
+    expect(ctx.gains[0]!.out).toEqual([]); // disconnected
+    expect(hx.audios[0]!.muted).toBe(false);
+    expect(hx.audios[0]!.volume).toBe(0.9);
+  });
+
+  it('G-73: a speaker the context cannot use falls back to the element path, capped at 100%', async () => {
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { sinkFails: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    ex.setPeerVolume(B, 1.6);
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.gains[0]!.gain.value).toBe(1.6);
+    await ex.setOutputDevice('spk1');
+    await flush();
+    expect(ctx.gains[0]!.out).toEqual([]); // disconnected
+    expect(hx.audios[0]!.muted).toBe(false);
+    expect(hx.audios[0]!.volume).toBe(1);
+    ex.setPeerVolume(B, 0.4);
+    expect(hx.audios[0]!.volume).toBe(0.4);
+    ex.setDeafened(true);
+    expect(hx.audios[0]!.muted).toBe(true);
   });
 
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {
@@ -740,9 +983,11 @@ describe('voice engine', () => {
 
     mic.level = 0.2;
     await vi.advanceTimersByTimeAsync(100);
+    expect(events.at(-1)?.[A]).not.toBe(true); // not yet: 150 ms first (G-82)
+    await vi.advanceTimersByTimeAsync(200);
     expect(events.at(-1)).toEqual({ [A]: true });
     mic.level = 0;
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(200);
     expect(events.at(-1)).toEqual({ [A]: true }); // held
     await vi.advanceTimersByTimeAsync(400);
     expect(events.at(-1)).toEqual({ [A]: false });
@@ -1116,5 +1361,179 @@ describe('voice engine with TURN', () => {
     const types = await ex.connectionTypes();
     expect(types).toEqual({ [B]: { local: 'relay', remote: 'srflx' } });
     expect(JSON.stringify(types)).not.toMatch(/\d+\.\d+\.\d+\.\d+/);
+  });
+});
+
+// ---- ICE restart: a call that survives a network change ---------------------------
+
+describe('voice engine: ICE restart on a network change', () => {
+  /** The connection's ICE path drops, as on a Wi-Fi/LAN switch or a VPN toggle. */
+  const drop = (pc: FakePC, state: RTCPeerConnectionState = 'disconnected') => {
+    pc.connectionState = state;
+    (pc.onconnectionstatechange as (() => void) | null)?.();
+  };
+
+  async function connectedPair() {
+    vi.useFakeTimers();
+    const p = pair();
+    const errors = record<VoiceError>((cb) => p.ex.on('error', cb));
+    const errorsY = record<VoiceError>((cb) => p.ey.on('error', cb));
+    const partsX = record<VoiceParticipant[]>((cb) => p.ex.on('participants', cb));
+    await p.ex.attach(p.cx.state(), A);
+    await p.ey.attach(p.cy.state(), B);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(p.hx.pcs[0]!.connectionState).toBe('connected');
+    expect(p.cx.sent.map((s) => s.kind)).toEqual(['offer']);
+    return { ...p, errors, errorsY, partsX };
+  }
+
+  it('a dropped call restarts ICE on the same connection and comes back', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors, errorsY, partsX } = await connectedPair();
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(1_900); // within the 2 s grace: nothing yet
+    expect(hx.pcs[0]!.restarts).toBe(0);
+    const before = partsX.length;
+    await vi.advanceTimersByTimeAsync(150);
+    // Shown as reconnecting while it restarted.
+    expect(partsX.slice(before).some((list) => list.some((p) => p.identity === B && p.state === 'connecting'))).toBe(true);
+    // The offerer (A, the lower identity) restarted and re-offered; B answered on the same connection.
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(hy.pcs[0]!.restarts).toBe(0);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer', 'offer']);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
+    expect(hx.pcs).toHaveLength(1);
+    expect(hy.pcs).toHaveLength(1);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    expect(partsX.at(-1)).toContainEqual({ identity: B, state: 'connected' });
+    expect(hx.audios).toHaveLength(1); // the same audio, not a second player
+    // Recovered: no give-up later.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(errors).toEqual([]);
+    expect(errorsY).toEqual([]);
+    expect(cx.sent).toHaveLength(2);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a network change (online, another interface) restarts at once, before ICE notices', async () => {
+    const { hx, cx, cy, ex, ey, errors } = await connectedPair();
+    hx.changeNetwork();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer', 'offer']);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('the answerer never offers (glare): it waits for the offerer, whose restart brings it back', async () => {
+    const { hx, hy, cy, ex, ey, errorsY } = await connectedPair();
+    drop(hy.pcs[0]!);
+    hy.changeNetwork();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(hy.pcs[0]!.restarts).toBe(0);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer']);
+    // The offerer's side notices too and restarts (after its 2 s grace).
+    drop(hx.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(2_050);
+    expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
+    expect(hy.pcs[0]!.connectionState).toBe('connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(errorsY).toEqual([]); // the answerer's give-up timer was cleared
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a short "disconnected" that comes back within 2 s restarts nothing', async () => {
+    const { hx, hy, cx, ex, ey, errors } = await connectedPair();
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(1_000);
+    drop(hx.pcs[0]!, 'connected');
+    drop(hy.pcs[0]!, 'connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(hx.pcs[0]!.restarts).toBe(0);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer']);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a restart answer naming another certificate is refused before it is applied (pinned fingerprint)', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors } = await connectedPair();
+    // B's side answers the restart with another certificate (a man in the middle).
+    const realSend = cy.sendSignal.bind(cy);
+    cy.wire = null;
+    cy.sendSignal = async (to, kind, payload) => {
+      const swapped = payload.replace(/a=fingerprint:sha-256 \S+/, `a=fingerprint:sha-256 ${newFingerprint()}`);
+      setTimeout(() => cx.emitSignal({ from: B, kind, payload: swapped, fingerprintVerified: true }), 0);
+      return realSend(to, kind, payload);
+    };
+    const offerer = hx.pcs[0]!;
+    const remoteBefore = offerer.remoteDescription;
+    drop(offerer, 'failed');
+    drop(hy.pcs[0]!, 'failed');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(offerer.restarts).toBe(1);
+    expect(errors).toEqual([{ code: 'fingerprint-mismatch', peer: B }]);
+    expect(offerer.closed).toBe(true);
+    expect(offerer.remoteDescription).toBe(remoteBefore); // never applied
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('"failed" after a working call restarts too, instead of a new connection', async () => {
+    const { hx, hy, cx, ex, ey, errors } = await connectedPair();
+    drop(hx.pcs[0]!, 'failed');
+    drop(hy.pcs[0]!, 'failed');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(hx.pcs).toHaveLength(1);
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer', 'offer']);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('no path back: a fresh restart offer every 5 s, then after 15 s "no voice connection" on both sides', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors, errorsY } = await connectedPair();
+    // The new network can't reach the other side: signalling still works, ICE never connects.
+    hx.pcs[0]!.neverConnect = true;
+    hy.pcs[0]!.neverConnect = true;
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(2_050); // the 2 s grace, then the first restart
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(hx.pcs[0]!.restarts).toBe(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(hx.pcs[0]!.restarts).toBe(3);
+    expect(errors).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5_000); // 15 s after the restart began
+    expect(errors).toEqual([{ code: 'peer-failed', peer: B }]);
+    expect(errorsY).toEqual([{ code: 'peer-failed', peer: A }]);
+    expect(hx.pcs[0]!.closed && hy.pcs[0]!.closed).toBe(true);
+    // Gone for good: no more offers.
+    const offers = cx.sent.length;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(cx.sent.length).toBe(offers);
+    expect(cy.sent.every((s) => s.kind === 'answer')).toBe(true);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a network change outside a call does nothing', async () => {
+    const h = fakeEnv();
+    const core = new FakeCore(A, [A, B]);
+    const engine = createVoiceEngine(core, { env: h.env });
+    h.changeNetwork();
+    expect(h.pcs).toHaveLength(0);
+    expect(core.sent).toEqual([]);
+    engine.dispose();
   });
 });

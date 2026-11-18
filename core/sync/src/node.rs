@@ -161,6 +161,11 @@ pub const BACKUP_FETCH_WAIT: Duration = Duration::from_secs(3);
 const BACKUP_LOOKUP_EVERY: Duration = Duration::from_secs(60);
 /// Providers of a backup tag one fetch asks.
 const MAX_BACKUP_PROVIDERS: usize = 8;
+/// How long [`Node::fetch_notices`] waits for holders.
+pub const NOTICE_FETCH_WAIT: Duration = Duration::from_secs(3);
+/// Holders one notice fetch asks (Tech Lead: the first answer merged with
+/// at most one more, not every holder).
+const NOTICE_HOLDERS: usize = 2;
 /// Peers one envelope fetch asks.
 const MAX_FETCH_PEERS: usize = 16;
 /// Traffic on every connection at least this often, well under the 100 s a
@@ -398,6 +403,10 @@ enum Command {
     FetchInvite { handle: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
     PutBackup { blob: Vec<u8>, reply: oneshot::Sender<bool> },
     FetchBackup { tag: [u8; 32], reply: oneshot::Sender<Vec<Vec<u8>>> },
+    PutNotice { blob: Vec<u8>, reply: oneshot::Sender<bool> },
+    FetchNotices { reply: oneshot::Sender<Vec<Vec<u8>>> },
+    NoticeSigner { signer: Option<Arc<dyn crate::notice::NoticeSigner>> },
+    LanBeacon { port: u16, reply: oneshot::Sender<bool> },
     LinkOpen { rv: [u8; 32], e_new_pub: [u8; 32], reply: oneshot::Sender<Option<(PeerId, Multiaddr)>> },
     LinkClose,
     LinkFind { rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>> },
@@ -502,6 +511,8 @@ struct Behaviour {
     invite_ask: crate::invite::AskBehaviour,
     /// Server-list backups (`/mvs/backup/1`, G-91).
     backup: crate::backup::BackupBehaviour,
+    /// Holder notice slot (`/mvs/notice/1`).
+    notice: crate::notice::NoticeBehaviour,
     /// "Approve on your other device" (`/mvs/device-link/1`), relay circuit
     /// only (`device_link`).
     device_link: crate::device_link::LinkBehaviour,
@@ -694,6 +705,7 @@ impl Node {
         let (events, event_rx) = mpsc::channel(EVENT_BUFFER);
         let (answers, answer_rx) = mpsc::unbounded_channel();
         let (decoded, decoded_rx) = mpsc::unbounded_channel();
+        let (beacons, beacon_rx) = mpsc::channel(64);
         let link_peers = swarm.behaviour().guard.link_peers.clone();
         let mut task = Task {
             swarm,
@@ -775,6 +787,16 @@ impl Node {
             backup_lookups: HashMap::new(),
             backups_expired: Instant::now(),
             backup_looked_up: HashMap::new(),
+            notice_limits: crate::notice::NoticeLimits::new(),
+            notice_fetch_of: HashMap::new(),
+            notice_signer: None,
+            beacon: None,
+            beacon_port: crate::lan_beacon::BEACON_PORT,
+            beacons,
+            beacon_limits: crate::lan_beacon::BeaconLimits::new(),
+            beacon_next: Instant::now(),
+            beacon_round: 0,
+            tcp_port: None,
             link_host: None,
             link_peers,
             link_until: HashMap::new(),
@@ -788,15 +810,21 @@ impl Node {
             relay_lost_at: Some(Instant::now()),
             member_listeners: HashMap::new(),
             member_reserved: HashSet::new(),
+            remembered_dialed: HashMap::new(),
+            remembered_checked: Instant::now(),
             relay_ping_misses: HashMap::new(),
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
         };
+        // A relay-only start keeps no member addresses either (Security Lead).
+        if task.relay_only {
+            task.forget_remembered();
+        }
         for log in config.logs {
             task.open(log, None);
         }
-        tokio::spawn(task.run(command_rx, answer_rx, decoded_rx));
+        tokio::spawn(task.run(command_rx, answer_rx, decoded_rx, beacon_rx));
         Ok((Node { peer_id, commands }, event_rx))
     }
 
@@ -1047,6 +1075,46 @@ impl Node {
         Ok(rx.await?)
     }
 
+    /// Holder notice slot: keeps my notice here (announced under its tag)
+    /// and hands it to the holders: my own other devices that are
+    /// connected, and the relay. False, nothing kept or sent, if it fails
+    /// `notice::check` (size, tag, signature, `at` at most a day ahead).
+    /// Best effort.
+    pub async fn put_notice(&self, blob: Vec<u8>) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::PutNotice { blob, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Holder notice slot: the notices held for my tag, here and by at
+    /// most two holders, each asked with a fetch signed by the
+    /// [`crate::NoticeSigner`] (none sent without one, or while it is
+    /// locked). Within [`crate::node::NOTICE_FETCH_WAIT`]. Untrusted: the
+    /// core checks and opens each, removes duplicates by (`at`, hash) and
+    /// ignores anything older than its last acknowledgement (holders can
+    /// replay).
+    pub async fn fetch_notices(&self) -> Result<Vec<Vec<u8>>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::FetchNotices { reply })?;
+        Ok(rx.await?)
+    }
+
+    /// The core's `w_n` signer for notice fetches (None: no fetches).
+    pub fn set_notice_signer(&self, signer: Option<Arc<dyn crate::NoticeSigner>>) -> Result<()> {
+        self.send(Command::NoticeSigner { signer })
+    }
+
+    /// Starts the member-only LAN beacon (`lan_beacon`) on UDP `port`
+    /// ([`crate::LAN_BEACON_PORT`] in the app): co-members on this LAN find
+    /// us, and we them, with no relay. It sends and reads only while "LAN
+    /// allowed" is on, relay-only is off and a server is open. False if the
+    /// socket can't be had (the node works without it).
+    pub async fn start_lan_beacon(&self, port: u16) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::LanBeacon { port, reply })?;
+        Ok(rx.await?)
+    }
+
     /// Closes all connections and the store.
     /// Device link, new device: opens (or replaces) the one link. We become
     /// a DHT provider of `rv` for [`crate::DEVICE_LINK_TTL`] and answer one
@@ -1213,6 +1281,7 @@ async fn build_swarm(
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
                 backup: crate::backup::behaviour(),
+                notice: crate::notice::behaviour(),
                 device_link: crate::device_link::behaviour(),
             })
         })?
@@ -1447,6 +1516,21 @@ struct Task {
     backups_expired: Instant,
     /// When each tag's providers were last looked up.
     backup_looked_up: HashMap<[u8; 32], Instant>,
+    /// Holder notice slot: caps, fetches in flight, and the core's `w_n`
+    /// signer (present while unlocked; without it no fetch is sent).
+    notice_limits: crate::notice::NoticeLimits,
+    notice_fetch_of: HashMap<request_response::OutboundRequestId, u64>,
+    notice_signer: Option<Arc<dyn crate::notice::NoticeSigner>>,
+    /// The member-only LAN beacon (`lan_beacon`): its socket once started,
+    /// the port beacons go to, where read beacons arrive, its caps, when the
+    /// next is due, which servers take the slots next, and our TCP port.
+    beacon: Option<Arc<tokio::net::UdpSocket>>,
+    beacon_port: u16,
+    beacons: mpsc::Sender<(std::net::IpAddr, Vec<u8>)>,
+    beacon_limits: crate::lan_beacon::BeaconLimits,
+    beacon_next: Instant,
+    beacon_round: usize,
+    tcp_port: Option<u16>,
     /// Device link, new device: the one open link.
     link_host: Option<LinkHost>,
     /// Device-link peers (either side), reached through the relay only, and
@@ -1468,6 +1552,9 @@ struct Task {
     member_listeners: HashMap<ListenerId, PeerId>,
     /// Member relay listeners whose reservation was accepted.
     member_reserved: HashSet<ListenerId>,
+    /// Remembered members dialled lately, and when the rows were last checked.
+    remembered_dialed: HashMap<PeerId, Instant>,
+    remembered_checked: Instant,
     /// Failed pings in a row to our relay, per connection (`relay_ping`):
     /// one dead connection among several (TCP and QUIC) is closed on its own
     /// count (Security Lead, #400).
@@ -1514,6 +1601,7 @@ impl Task {
         mut commands: mpsc::UnboundedReceiver<Command>,
         mut answers: mpsc::UnboundedReceiver<Answer>,
         mut decoded: mpsc::UnboundedReceiver<Decoded>,
+        mut beacon_rx: mpsc::Receiver<(std::net::IpAddr, Vec<u8>)>,
     ) {
         let mut anti_entropy = tokio::time::interval(ANTI_ENTROPY);
         // The first discovery runs as soon as the relay connection is up;
@@ -1535,6 +1623,7 @@ impl Task {
                 event = self.swarm.select_next_some() => self.on_swarm_event(event),
                 Some(answer) = answers.recv() => self.send_answer(answer),
                 Some((key, records, more, acked)) = decoded.recv() => self.on_decoded(key, records, more, acked),
+                Some((ip, packet)) = beacon_rx.recv() => self.on_beacon(ip, packet),
                 _ = soon.tick() => {
                     // T24: send what the outgoing rate held back.
                     let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
@@ -1549,6 +1638,8 @@ impl Task {
                     self.recheck_member_relay();
                     self.expire_fetches();
                     self.link_tick();
+                    self.lan_beacon_tick();
+                    self.check_remembered();
                     let gone = self.presence.expire(Instant::now());
                     self.went_offline(gone);
                 }
@@ -1564,6 +1655,7 @@ impl Task {
                 _ = discovery.tick() => {
                     self.discover();
                     self.member_relay_fallback();
+                    self.redial_remembered();
                 }
             }
         }
@@ -1679,6 +1771,14 @@ impl Task {
                 let _ = reply.send(self.put_backup(blob));
             }
             Command::FetchBackup { tag, reply } => self.fetch_backup(tag, reply),
+            Command::PutNotice { blob, reply } => {
+                let _ = reply.send(self.put_notice(blob));
+            }
+            Command::FetchNotices { reply } => self.fetch_notices(reply),
+            Command::NoticeSigner { signer } => self.notice_signer = signer,
+            Command::LanBeacon { port, reply } => {
+                let _ = reply.send(self.start_lan_beacon(port));
+            }
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
@@ -2019,12 +2119,16 @@ impl Task {
         let live: HashSet<u64> = self.fetches.keys().copied().collect();
         self.fetch_of.retain(|_, id| live.contains(id));
         self.backup_fetch_of.retain(|_, id| live.contains(id));
+        self.notice_fetch_of.retain(|_, id| live.contains(id));
         self.backup_lookups.retain(|_, (id, _)| live.contains(id));
         // Others' backups past their retention (phase B; mine stay).
         if self.backups_expired.elapsed() >= Duration::from_secs(3600) {
             self.backups_expired = Instant::now();
             if let Err(err) = self.store.expire_backups(unix_now(), crate::backup::RETENTION.as_secs()) {
                 warn!(%err, "expiring held backups failed");
+            }
+            if let Err(err) = self.store.expire_notices(unix_now(), crate::notice::RETENTION.as_secs()) {
+                warn!(%err, "expiring held notices failed");
             }
         }
     }
@@ -2155,6 +2259,218 @@ impl Task {
         self.fetches.insert(id, Fetch { reply, waiting, answers, until });
     }
 
+
+    /// See [`Node::put_notice`].
+    fn put_notice(&mut self, blob: Vec<u8>) -> bool {
+        let Some((tag, at)) = crate::notice::check(&blob, unix_now()) else { return false };
+        if let Err(err) = self.store.put_notice(&tag, at, &blob, unix_now()) {
+            warn!(%err, "keeping my notice failed");
+        }
+        self.provide_backup(tag);
+        for peer in self.notice_holders(usize::MAX) {
+            self.swarm.behaviour_mut().notice.send_request(&peer, crate::notice::Request::Put(blob.clone()));
+        }
+        true
+    }
+
+    /// Holders for my notices: my own other devices that are connected,
+    /// then the relay (its mailbox, once devops adds `/mvs/notice/1`; an
+    /// older one fails at negotiation). At most `max`.
+    fn notice_holders(&self, max: usize) -> Vec<PeerId> {
+        let mut holders = self.my_devices();
+        if self.swarm.is_connected(&self.relay_peer) {
+            holders.push(self.relay_peer);
+        }
+        holders.truncate(max);
+        holders
+    }
+
+    /// `/mvs/notice/1` from a peer. A fetch, if signed for us within the
+    /// minute skew and within the caps, gets the notices held under its
+    /// tag, newest first; anything else the same empty answer (R3). A write
+    /// is kept only from my own other devices (the backup gate, phase A),
+    /// within its caps, if it passes `check`.
+    fn on_notice_request(&mut self, peer: PeerId, request: crate::notice::Request, channel: ResponseChannel<Vec<u8>>) {
+        let now = Instant::now();
+        // The cheap gates (rate caps, my own device) come before any
+        // signature check (Security Lead on #425).
+        let answer = match request {
+            crate::notice::Request::Get(fetch) => {
+                let me = *self.swarm.local_peer_id();
+                let tag = Some(())
+                    .filter(|_| self.notice_limits.allow_fetch(peer, now))
+                    .and_then(|_| fetch.verify(&me, unix_now() / 60));
+                let held = tag.and_then(|tag| self.store.notices(&tag).ok()).unwrap_or_default();
+                crate::notice::encode_answer(&held)
+            }
+            crate::notice::Request::Put(blob) => {
+                let me = self.access.binder.as_ref().map(|b| *b.identity().as_bytes());
+                let from = self.member_identity(peer).map(|identity| *identity.as_bytes());
+                // Phase A: my own devices only (no buddies for notices).
+                let mine = crate::backup::write_owner(from, me) == Some(None);
+                let kept = crate::notice::claimed_tag(&blob)
+                    .filter(|_| mine)
+                    .filter(|tag| self.notice_limits.allow_write(peer, *tag, now))
+                    .and_then(|_| crate::notice::check(&blob, unix_now()))
+                    .filter(|(tag, at)| self.store.put_notice(tag, *at, &blob, unix_now()).unwrap_or(false));
+                if let Some((tag, _)) = kept {
+                    self.provide_backup(tag);
+                }
+                vec![u8::from(kept.is_some())]
+            }
+        };
+        let _ = self.swarm.behaviour_mut().notice.send_response(channel, answer);
+    }
+
+    /// See [`Node::fetch_notices`]: what I hold for my tag, plus one signed
+    /// fetch to each of at most [`NOTICE_HOLDERS`] holders.
+    fn fetch_notices(&mut self, reply: oneshot::Sender<Vec<Vec<u8>>>) {
+        let Some(signer) = self.notice_signer.clone() else {
+            let _ = reply.send(Vec::new());
+            return;
+        };
+        let Some(key) = signer.key() else {
+            let _ = reply.send(Vec::new());
+            return;
+        };
+        let answers = self.store.notices(&crate::notice::tag_of(&key)).unwrap_or_default();
+        let id = self.next_fetch;
+        self.next_fetch += 1;
+        let minute = unix_now() / 60;
+        let mut waiting = 0;
+        for peer in self.notice_holders(NOTICE_HOLDERS) {
+            let Some(fetch) = crate::notice::Fetch::sign(&*signer, &peer, minute) else { continue };
+            let request = self.swarm.behaviour_mut().notice.send_request(&peer, crate::notice::Request::Get(fetch));
+            self.notice_fetch_of.insert(request, id);
+            waiting += 1;
+        }
+        if waiting == 0 {
+            let _ = reply.send(answers);
+            return;
+        }
+        let until = Instant::now() + NOTICE_FETCH_WAIT;
+        self.fetches.insert(id, Fetch { reply, waiting, answers, until });
+    }
+
+    /// A holder's notice answer (or failure) for fetch `id`.
+    fn on_notice_answer(&mut self, request: request_response::OutboundRequestId, answer: Option<Vec<u8>>) {
+        let Some(id) = self.notice_fetch_of.remove(&request) else { return };
+        // Only valid notices under my own tag come back (Security Lead on
+        // #425): the core checks again, but junk never reaches it.
+        let mine = self.notice_signer.as_ref().and_then(|s| s.key()).map(|key| crate::notice::tag_of(&key));
+        if let Some(fetch) = self.fetches.get_mut(&id) {
+            for notice in crate::notice::decode_answer(&answer.unwrap_or_default()) {
+                let valid = crate::notice::check(&notice, unix_now()).is_some_and(|(tag, _)| Some(tag) == mine);
+                if valid && !fetch.answers.contains(&notice) {
+                    fetch.answers.push(notice);
+                }
+            }
+        }
+        self.fetch_answered(id, None);
+    }
+
+    /// See [`Node::start_lan_beacon`].
+    fn start_lan_beacon(&mut self, port: u16) -> bool {
+        if self.beacon.is_some() {
+            return true;
+        }
+        match crate::lan_beacon::socket(port) {
+            Ok(socket) => {
+                let socket = Arc::new(socket);
+                crate::lan_beacon::spawn_reader(socket.clone(), self.beacons.clone());
+                self.beacon = Some(socket);
+                self.beacon_port = port;
+                self.beacon_next = Instant::now();
+                true
+            }
+            Err(err) => {
+                warn!(%err, "LAN beacon unavailable");
+                false
+            }
+        }
+    }
+
+    /// The beacon runs only with "LAN allowed", not relay-only, direct dials
+    /// on, and some server open (Security Lead §B.6).
+    fn beacon_on(&self) -> bool {
+        self.beacon.is_some() && self.allow_lan && !self.relay_only && self.direct_dials && !self.secrets.is_empty()
+    }
+
+    /// Our open servers' beacon keys.
+    fn beacon_keys(&self) -> Vec<(ServerId, [u8; 32])> {
+        let mut keys: Vec<(ServerId, [u8; 32])> =
+            self.secrets.iter().map(|(server, secret)| (*server, crate::lan_beacon::k_lan(secret))).collect();
+        keys.sort_by_key(|(server, _)| *server.as_bytes());
+        keys
+    }
+
+    /// Sends our beacon when due. With more open servers than slots, they
+    /// take turns.
+    fn lan_beacon_tick(&mut self) {
+        let now = Instant::now();
+        if !self.beacon_on() || now < self.beacon_next {
+            return;
+        }
+        self.beacon_next = crate::lan_beacon::next_beacon(now);
+        let (Some(socket), Some(port)) = (self.beacon.clone(), self.tcp_port) else { return };
+        let mut keys: Vec<[u8; 32]> = self.beacon_keys().into_iter().map(|(_, k)| k).collect();
+        if keys.len() > crate::lan_beacon::SLOTS {
+            let start = self.beacon_round % keys.len();
+            keys.rotate_left(start);
+            self.beacon_round = self.beacon_round.wrapping_add(crate::lan_beacon::SLOTS);
+        }
+        let epoch = crate::lan_beacon::epoch_of(unix_now());
+        // Our LAN addresses (sealed, so members dial only those): the ones
+        // we listen on, loopback last.
+        let mut ips: Vec<std::net::Ipv4Addr> = self
+            .swarm
+            .listeners()
+            .filter_map(|a| match a.iter().next() {
+                Some(Protocol::Ip4(ip)) if crate::lan_beacon::lan_scope(ip) => Some(ip),
+                _ => None,
+            })
+            .collect();
+        ips.sort_by_key(|ip| (ip.is_loopback(), *ip));
+        ips.dedup();
+        let Some(packet) = crate::lan_beacon::encode(&keys, epoch, port, self.swarm.local_peer_id(), &ips) else { return };
+        let to = std::net::SocketAddr::from((crate::lan_beacon::GROUP, self.beacon_port));
+        if let Err(err) = socket.try_send_to(&packet, to) {
+            debug!(%err, "LAN beacon send failed");
+        }
+    }
+
+    /// A beacon heard on the LAN: if it is a co-member's (a tag of one of
+    /// our servers) and its LAN-scope source is one of the addresses it
+    /// sealed, dial that address at its port, expecting its peer ID. A
+    /// replay from any other host is never dialled (#460). Never answered.
+    fn on_beacon(&mut self, ip: std::net::IpAddr, packet: Vec<u8>) {
+        let now = Instant::now();
+        let lan = matches!(ip, std::net::IpAddr::V4(v4) if crate::lan_beacon::lan_scope(v4));
+        if !lan || !self.beacon_on() || !self.beacon_limits.allow_read(now) {
+            return;
+        }
+        let epoch = crate::lan_beacon::epoch_of(unix_now());
+        let Some(beacon) = crate::lan_beacon::decode(&packet, &self.beacon_keys(), epoch) else { return };
+        let Some(source) = crate::lan_beacon::dial_target(ip, &beacon) else {
+            debug!("a LAN beacon from an address it didn't seal: not dialled");
+            return;
+        };
+        let (port, peer) = (beacon.port, beacon.peer);
+        let ip = std::net::IpAddr::V4(source);
+        if peer == *self.swarm.local_peer_id() || self.direct.contains_key(&peer) || self.link_blocks(&peer) {
+            return;
+        }
+        if !self.beacon_limits.allow_dial(std::net::SocketAddr::new(ip, port), now) {
+            return;
+        }
+        let addr = Multiaddr::from(ip).with(Protocol::Tcp(port));
+        debug!(%peer, "a co-member's LAN beacon: dialling it");
+        let opts = DialOpts::peer_id(peer).addresses(vec![addr]).condition(PeerCondition::Always).build();
+        if let Err(err) = self.swarm.dial(opts) {
+            debug!(%peer, ?err, "LAN beacon dial refused");
+        }
+    }
+
     /// Providers found for a backup fetch's tag: each asked once, through
     /// our relay's circuit (R3), at most [`MAX_BACKUP_PROVIDERS`]. The
     /// lookup's own wait ends on its last step.
@@ -2190,6 +2506,8 @@ impl Task {
             // Relay-only users never relay for members (design #368 §1); the
             // core turns it on again, if it should be, once this is off.
             self.swarm.behaviour_mut().member_relay.stop();
+            // Nor keeps any member's address (Security Lead).
+            self.forget_remembered();
             for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
                 self.swarm.remove_listener(id);
             }
@@ -2307,7 +2625,7 @@ impl Task {
             debug!(%peer, lan, candidates = listen_addrs.len(), "no direct address to try");
             return;
         }
-        debug!(%peer, lan, ?addrs, "trying a direct connection");
+        debug!(%peer, lan, addrs = addrs.len(), "trying a direct connection");
         let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::Always).build();
         if let Err(err) = self.swarm.dial(opts) {
             debug!(%peer, ?err, "direct dial refused");
@@ -2587,7 +2905,7 @@ impl Task {
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
                 } else if self.connected.insert(peer_id) {
                     // Peer ID with its address only at debug level (PR checklist).
-                    debug!(%peer_id, address = %endpoint.get_remote_address(), "peer connected");
+                    debug!(%peer_id, relayed = is_relayed(&endpoint), "peer connected");
                     info!(%peer_id, "peer connected");
                     self.reached = true;
                     self.emit(NodeEvent::PeerConnected(peer_id));
@@ -2701,6 +3019,9 @@ impl Task {
                     // which may not hold us. And the backups we hold are
                     // announced again (a restarted relay forgot them).
                     self.swarm.add_external_address(self.relay_addr.clone().with(Protocol::P2pCircuit));
+                    for tag in self.store.notice_tags().unwrap_or_default() {
+                        self.provide_backup(tag);
+                    }
                     for tag in self.store.backup_tags().unwrap_or_default() {
                         self.provide_backup(tag);
                     }
@@ -2709,6 +3030,9 @@ impl Task {
             }
             SwarmEvent::NewListenAddr { listener_id, address } if Some(listener_id) == self.listener => {
                 save_port(&self.port_file, &address);
+                if let Some(Protocol::Tcp(port)) = address.iter().find(|p| matches!(p, Protocol::Tcp(_))) {
+                    self.tcp_port = Some(port);
+                }
                 // QUIC once the TCP port is known, on the same port, so one
                 // router or firewall rule (and NAT mapping) covers both.
                 // Removed with the TCP listener while relay-only.
@@ -2764,6 +3088,12 @@ impl Task {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
                 for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
+                    // P0 on #416: our configured relay's own configured address
+                    // stays, DNS name or not (configured, not peer-learned):
+                    // without it the routing table is empty and nobody is found.
+                    if peer == self.relay_peer && is_configured_relay(addr, &self.relay_addr) {
+                        continue;
+                    }
                     // Also any DNS name a peer gave (hickory-advisories): never
                     // stored, so never resolved or served to others.
                     if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
@@ -2783,9 +3113,24 @@ impl Task {
                     {
                         continue;
                     }
-                    // Peer-supplied addresses: never let them point us into our own LAN.
-                    let addrs: Vec<Multiaddr> =
-                        peer.addrs.into_iter().filter(|a| self.reachable(a) && (!self.relay_only || via_relay(a, &self.relay_addr))).collect();
+                    // Peer-supplied addresses: never let them point us into our
+                    // own LAN, nor at a DNS name. A circuit through our own relay
+                    // (matched by its peer ID) is rebuilt from our configured
+                    // relay address instead (P0 on #416: the relay's announced
+                    // base can be a DNS name, or another port or transport).
+                    let mut addrs: Vec<Multiaddr> = Vec::new();
+                    for a in peer.addrs {
+                        let usable = if via_relay(&a, &self.relay_addr) {
+                            Some(a)
+                        } else if let Some(rebuilt) = our_relay_circuit(&a, &self.relay_addr, &peer.peer_id) {
+                            Some(rebuilt)
+                        } else {
+                            (!self.relay_only && reachable(&a, false)).then_some(a)
+                        };
+                        if let Some(a) = usable.filter(|a| !addrs.contains(a)) {
+                            addrs.push(a);
+                        }
+                    }
                     if addrs.is_empty() {
                         continue;
                     }
@@ -2850,6 +3195,25 @@ impl Task {
                 request_id,
                 ..
             })) => self.on_invite_answer(request_id, None),
+            SwarmEvent::Behaviour(BehaviourEvent::Notice(request_response::Event::Message { peer, message, .. })) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.on_notice_request(peer, request, channel)
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        self.on_notice_answer(request_id, Some(response))
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Notice(request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            })) => {
+                debug!(%peer, %error, "notice request failed");
+                self.on_notice_answer(request_id, None);
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Backup(request_response::Event::Message { peer, message, .. })) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => {
@@ -3180,7 +3544,9 @@ impl Task {
                 // A member's direct addresses (F2): try a direct connection.
                 let addrs: Vec<Multiaddr> =
                     response.direct_addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect();
-                debug!(peer = %key.0, ?addrs, relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                debug!(peer = %key.0, addrs = addrs.len(), relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                // Relay-down resilience: remembered, to redial after a restart.
+                self.remember_addrs(key.0, server, identity, &addrs);
                 if !addrs.is_empty() && self.relayed.contains_key(&key.0) {
                     self.direct_candidates.insert(key.0, direct_candidates_of(addrs));
                     self.try_direct(key.0);
@@ -3815,6 +4181,112 @@ impl Task {
     }
 }
 
+/// Relay-down resilience, remembered member addresses (design note and the
+/// leads' verdicts, 2026-11-17): direct addresses of verified members, kept
+/// in the store and redialled at start and while our relay is down. A dial
+/// hint only: Noise checks the peer ID, and the peer binds again before it
+/// counts as a member.
+/// Remembered members dialled per discovery round, and how often each one.
+const MAX_REMEMBERED_DIALS: usize = 16;
+const REMEMBERED_DIAL_EVERY: Duration = Duration::from_secs(30);
+/// How often remembered rows are checked against membership and expiry.
+const REMEMBERED_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+impl Task {
+    /// A bound member's direct addresses (from its pull answer): kept, if it
+    /// is a current member and we aren't relay-only. Only addresses we would
+    /// dial for a member; never logged.
+    fn remember_addrs(&mut self, peer: PeerId, server: ServerId, identity: PublicKey, addrs: &[Multiaddr]) {
+        if self.relay_only || !self.is_member(peer) {
+            return;
+        }
+        let keep: Vec<String> = direct_candidates_of(addrs.to_vec())
+            .into_iter()
+            .filter(|a| dialable(a, self.allow_lan))
+            .take(crate::store::MAX_REMEMBERED_ADDRS)
+            .map(|a| a.to_string())
+            .collect();
+        if keep.is_empty() {
+            return;
+        }
+        if let Err(err) = self.store.remember_peer(&server, &peer.to_bytes(), identity.as_bytes(), &keep, unix_now()) {
+            debug!(%err, "remembering a member failed");
+        }
+    }
+
+    /// Every discovery round while our relay doesn't hold our reservation
+    /// (at start too): dial the remembered members we aren't connected to,
+    /// directly. Never while relay-only.
+    fn redial_remembered(&mut self) {
+        // `direct_dials` off stands in for a firewall in tests: no redial either.
+        if self.relay_only || self.relay_lost_at.is_none() || !self.direct_dials {
+            return;
+        }
+        let now = Instant::now();
+        self.remembered_dialed.retain(|_, at| now.duration_since(*at) < REMEMBERED_DIAL_EVERY);
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let mut dials = 0;
+        for (_, peer, _, addrs) in rows {
+            if dials >= MAX_REMEMBERED_DIALS {
+                break;
+            }
+            let Ok(peer) = PeerId::from_bytes(&peer) else { continue };
+            if self.connected.contains(&peer) || self.remembered_dialed.contains_key(&peer) {
+                continue;
+            }
+            let addrs: Vec<Multiaddr> =
+                addrs.iter().filter_map(|a| a.parse().ok()).filter(|a| dialable(a, self.allow_lan)).collect();
+            if addrs.is_empty() {
+                continue;
+            }
+            self.remembered_dialed.insert(peer, now);
+            let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build();
+            if self.swarm.dial(opts).is_ok() {
+                dials += 1;
+            }
+        }
+        if dials > 0 {
+            debug!(dials, "redialling remembered members");
+        }
+    }
+
+    /// Every [`REMEMBERED_CHECK_EVERY`]: rows of peers that are no longer
+    /// members (kicked, left, removed by authority) go at once, and rows
+    /// past their 30 days.
+    fn check_remembered(&mut self) {
+        if self.remembered_checked.elapsed() < REMEMBERED_CHECK_EVERY {
+            return;
+        }
+        self.remembered_checked = Instant::now();
+        let _ = self.store.expire_peers(unix_now(), crate::store::REMEMBERED_TTL);
+        // No read gate: nobody can be shown to be a member, so nothing
+        // remembered stays (fail closed, Security Lead on #419).
+        let Some(gate) = self.access.read_gate.clone() else {
+            self.forget_remembered();
+            return;
+        };
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let gone: Vec<(ServerId, Vec<u8>)> = rows
+            .into_iter()
+            .filter(|(server, _, identity, _)| {
+                !self.secrets.contains_key(server)
+                    || !gate.may_read(&PublicKey::from_bytes(*identity), &self.store.control_log(*server))
+            })
+            .map(|(server, peer, _, _)| (server, peer))
+            .collect();
+        for (server, peer) in gone {
+            let _ = self.store.forget_peer(&server, &peer);
+        }
+    }
+
+    /// Relay-only: every remembered address goes (Security Lead).
+    fn forget_remembered(&mut self) {
+        if let Err(err) = self.store.forget_all_peers() {
+            warn!(%err, "forgetting remembered members failed");
+        }
+    }
+}
+
 /// The remote IP of a direct incoming connection; None for outgoing and
 /// relayed ones (a relayed connection's address is the relay's).
 fn incoming_ip(endpoint: &ConnectedPoint) -> Option<std::net::IpAddr> {
@@ -3948,6 +4420,49 @@ pub(crate) fn via_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
     let Some(circuit) = parts.iter().position(|p| *p == Protocol::P2pCircuit) else { return false };
     let prefix: Multiaddr = parts[..circuit].iter().cloned().collect();
     prefix == *relay
+}
+
+/// Whether `addr` is exactly our configured relay address, with or
+/// without its trailing `/p2p/<relay ID>` (Kademlia may store either).
+pub(crate) fn is_configured_relay(addr: &Multiaddr, relay: &Multiaddr) -> bool {
+    if addr == relay {
+        return true;
+    }
+    let mut base = relay.clone();
+    matches!(base.pop(), Some(Protocol::P2p(_))) && *addr == base
+}
+
+/// P0 (#416 broke joins over a relay with a DNS name): a peer-learned
+/// circuit through *our configured relay*, matched by the relay's peer ID
+/// and rebuilt from our own configured `relay` address, so the
+/// peer-supplied base (a DNS name, another port, another transport) is
+/// never dialled (Security Lead's rules):
+/// - the shape is exactly `<base>/p2p/<relay ID>/p2p-circuit[/p2p/<target>]`:
+///   nothing else after `/p2p-circuit`, no nested circuits;
+/// - `<relay ID>` is our configured relay's (member relays get no
+///   exception);
+/// - `<target>`, when present, is `expected` (the peer being dialled).
+///
+/// The rebuilt `relay/p2p-circuit/p2p/<expected>`, or None.
+pub(crate) fn our_relay_circuit(addr: &Multiaddr, relay: &Multiaddr, expected: &PeerId) -> Option<Multiaddr> {
+    let relay_id = match relay.iter().last() {
+        Some(Protocol::P2p(id)) => id,
+        _ => return None,
+    };
+    let parts: Vec<Protocol<'_>> = addr.iter().collect();
+    let circuit = parts.iter().position(|p| *p == Protocol::P2pCircuit)?;
+    if circuit == 0 || parts[circuit - 1] != Protocol::P2p(relay_id) {
+        return None;
+    }
+    if parts[..circuit - 1].iter().any(|p| matches!(p, Protocol::P2p(_) | Protocol::P2pCircuit)) {
+        return None;
+    }
+    match &parts[circuit + 1..] {
+        [] => {}
+        [Protocol::P2p(target)] if target == expected => {}
+        _ => return None,
+    }
+    Some(relay.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(*expected)))
 }
 
 /// Like [`dialable`], but a relay circuit is fine (it is how peers behind
@@ -4420,6 +4935,56 @@ mod tests {
             // Nor does the general rule let the LAN ones through without allow_lan.
             assert!(!reachable(&bad, false) || bad.iter().all(|p| !matches!(p, Protocol::Ip4(ip) if ip.is_private())));
         }
+    }
+
+    #[test]
+    fn a_circuit_through_our_dns_relay_is_rebuilt_from_our_own_address() {
+        // P0 on #416: the relay announces itself under a DNS name (or another
+        // port or transport) than ours; matched by its peer ID, the circuit
+        // is rebuilt from our configured address (Security Lead's rules).
+        let relay_id = PeerId::random();
+        let target = PeerId::random();
+        let ours: Multiaddr = format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}").parse().unwrap();
+        let want: Multiaddr = format!("{ours}/p2p-circuit/p2p/{target}").parse().unwrap();
+        let a = |s: String| s.parse::<Multiaddr>().unwrap();
+        // Our relay's ID with the configured base passes, and so do another
+        // name, port or transport for it: all rewritten to ours.
+        for base in [
+            "/dns4/relay.example/tcp/4001",
+            "/dns4/relay.example/tcp/443/wss",
+            "/dns4/other.example/udp/4001/quic-v1",
+            "/ip4/192.168.1.5/tcp/4001",
+        ] {
+            for tail in [format!("/p2p-circuit/p2p/{target}"), "/p2p-circuit".to_owned()] {
+                let got = our_relay_circuit(&a(format!("{base}/p2p/{relay_id}{tail}")), &ours, &target);
+                assert_eq!(got.as_ref(), Some(&want), "{base}{tail}");
+            }
+        }
+        // The same host with another peer ID: refused (a member relay too).
+        let member_relay = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{member_relay}/p2p-circuit/p2p/{target}")), &ours, &target).is_none());
+        // Another target than the peer being dialled.
+        let other = PeerId::random();
+        assert!(our_relay_circuit(&a(format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}")), &ours, &target).is_none());
+        // Extra protocols after /p2p-circuit, nested circuits, a peer ID in the base.
+        for bad in [
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}/tcp/1"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/ip4/1.2.3.4/tcp/1/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other}/p2p-circuit/p2p/{target}"),
+            format!("/ip4/1.2.3.4/tcp/1/p2p/{other}/p2p-circuit/dns4/relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target}"),
+            format!("/p2p/{relay_id}/p2p-circuit/p2p/{target}/p2p/{target}"),
+            format!("/dns4/relay.example/tcp/4001/p2p/{relay_id}"),
+        ] {
+            assert!(our_relay_circuit(&a(bad.clone()), &ours, &target).is_none(), "{bad}");
+        }
+        // A plain DNS address stays unreachable (#416 unchanged).
+        assert!(!reachable(&a("/dns4/relay.example/tcp/4001".into()), false));
+        // Kademlia keeps our configured relay's own address (with or without
+        // its /p2p), and nothing else under that name.
+        assert!(is_configured_relay(&ours, &ours));
+        assert!(is_configured_relay(&a("/dns4/relay.example/tcp/4001".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/relay.example/tcp/443/wss".into()), &ours));
+        assert!(!is_configured_relay(&a("/dns4/evil.example/tcp/4001".into()), &ours));
     }
 
     #[test]

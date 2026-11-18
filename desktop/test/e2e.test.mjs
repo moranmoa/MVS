@@ -107,6 +107,9 @@ const until = async (cond, ms = 5_000) => {
   }
   return true;
 };
+/** A real key event through Electron's input pipeline (Playwright's skip before-input-event). */
+const key = (type, keyCode) =>
+  app.evaluate(({ BrowserWindow }, [t, k]) => BrowserWindow.getAllWindows()[0].webContents.sendInputEvent({ type: t, keyCode: k }), [type, keyCode]);
 
 test('permissions are refused, except the microphone during a call', async () => {
   // V-C2: no call, no microphone.
@@ -189,8 +192,62 @@ test('legacy desktop capture never gives a stream', async () => {
 test('the page sees only copyText, invoke, notify, onEvent, the core-down actions and the title bar', async () => {
   const keys = await page.evaluate(() => Object.keys(window.mvs).sort());
   const frame = process.platform === 'darwin' ? [] : ['windowControl', 'windowFrame'];
-  assert.deepEqual(keys, ['copyText', 'invoke', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', ...frame].sort());
+  assert.deepEqual(keys, ['copyText', 'invoke', 'lock', 'notify', 'onEvent', 'openLogsFolder', 'retryCore', 'setPushToTalk', 'setUnreadCount', ...frame].sort());
   assert.equal(await page.evaluate(() => typeof window.ipcRenderer), 'undefined');
+});
+
+test('push-to-talk: only the chosen key, only in a call, released after 200 ms (G-74)', async () => {
+  for (const bad of [null, 'KeyV', [], { key: 'MetaLeft' }, { key: 'v' }, { globalMute: 'M' }, { globalMute: 'Super+M' }, { globalMute: 'CommandOrControl+C' }, { globalMute: 'Alt+F4' }, { globalMute: 'Shift+F10' }]) {
+    assert.equal(await page.evaluate((s) => window.mvs.setPushToTalk(s), bad), 'invalid', JSON.stringify(bad));
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setPushToTalk({ key: 'KeyV', globalMute: null })), 'ok');
+  await page.evaluate(() => {
+    window.__ptt = [];
+    window.__pttOff = window.mvs.onEvent((name) => name.startsWith('ptt.') && window.__ptt.push(name));
+  });
+  // Not in a call: nothing.
+  await key('keyDown', 'V');
+  await key('keyUp', 'V');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), []);
+  // In a call: down, then up after the release delay; other keys say nothing.
+  assert.ok((await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]))).ok);
+  await key('keyDown', 'B');
+  await key('keyUp', 'B');
+  await key('keyDown', 'V');
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), ['ptt.down']);
+  await key('keyUp', 'V');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), ['ptt.down'], 'held for the release delay');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(await page.evaluate(() => window.__ptt), ['ptt.down', 'ptt.up']);
+  // A global toggle-mute shortcut: registered with the OS only during a call.
+  const registered = () => app.evaluate(({ globalShortcut }) => globalShortcut.isRegistered('Alt+Shift+F13'));
+  const set = await page.evaluate(() => window.mvs.setPushToTalk({ key: 'KeyV', globalMute: 'Alt+Shift+F13' }));
+  assert.ok(set === 'ok' || set === 'shortcut-taken', set);
+  if (set === 'ok') {
+    assert.equal(await registered(), true);
+    // The same settings again change nothing.
+    assert.equal(await page.evaluate(() => window.mvs.setPushToTalk({ key: 'KeyV', globalMute: 'Alt+Shift+F13' })), 'ok');
+    assert.equal(await registered(), true);
+    await page.evaluate(() => window.mvs.invoke('leaveCall', []));
+    assert.ok(await until(async () => !(await registered())), 'released when the call ends');
+    assert.ok((await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]))).ok);
+    assert.equal(await registered(), true, 'back for the next call');
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setPushToTalk({ key: null, globalMute: null })), 'ok');
+  assert.equal(await registered(), false);
+  await page.evaluate(() => window.__pttOff());
+  await page.evaluate(() => window.mvs.invoke('leaveCall', []));
+});
+
+test('setUnreadCount takes whole numbers 0..9999 only (G-62)', async () => {
+  for (const bad of [-1, 1.5, 10000, '3', null, NaN, Infinity, { n: 1 }]) {
+    assert.equal(await page.evaluate((v) => window.mvs.setUnreadCount(v), bad), false);
+  }
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(12)), true);
+  assert.equal(await page.evaluate(() => window.mvs.setUnreadCount(0)), true);
 });
 
 test('copyText writes plain text only, through main', async () => {

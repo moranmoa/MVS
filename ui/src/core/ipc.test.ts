@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createIpcCore, hasDesktopBridge, type DesktopBridge } from './ipc';
+import { createIpcCore, hasDesktopBridge, setUnreadCount, type DesktopBridge } from './ipc';
 
 function fakeBridge(answer: (cmd: string, args: unknown[]) => { ok?: unknown; error?: { code: string } }) {
   let emit: (event: string, payload: unknown) => void = () => {};
@@ -95,5 +95,26 @@ describe('ipc core', () => {
 
   it('detects the bridge', () => {
     expect(hasDesktopBridge()).toBe(false);
+  });
+});
+
+describe('setUnreadCount (G-62)', () => {
+  const bridge = (impl?: (n: number) => Promise<boolean>): DesktopBridge => ({
+    invoke: async () => ({ ok: null }),
+    onEvent: () => () => {},
+    ...(impl ? { setUnreadCount: impl } : {}),
+  });
+
+  it('passes the count to the shell and returns its answer', async () => {
+    const impl = vi.fn(async (n: number) => n === 3);
+    await expect(setUnreadCount(3, bridge(impl))).resolves.toBe(true);
+    await expect(setUnreadCount(-1, bridge(impl))).resolves.toBe(false);
+    expect(impl).toHaveBeenCalledWith(3);
+  });
+
+  it('resolves false without the bridge or when the shell throws', async () => {
+    await expect(setUnreadCount(1, undefined)).resolves.toBe(false);
+    await expect(setUnreadCount(1, bridge())).resolves.toBe(false);
+    await expect(setUnreadCount(1, bridge(async () => { throw new Error('x'); }))).resolves.toBe(false);
   });
 });

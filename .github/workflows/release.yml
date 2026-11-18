@@ -95,6 +95,27 @@ jobs:
             echo "dry run: newest CHANGELOG section ($newest) is readable"
           fi
 
+  # Run by hand before a tag: the real relay variables, checked by the same
+  # script the tag build uses (forms, counts, relay and bootstrap lists that
+  # agree). Prints counts only, never the values; writes nothing anyone keeps.
+  relay-vars:
+    name: check relay variables
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Relay variables agree
+        env:
+          RELAY: ${{ vars.MVS_RELAY_ADDR }}
+          RELAYS: ${{ vars.MVS_RELAY_ADDRS }}
+          RELAY_TCP: ${{ vars.MVS_RELAY_TCP_ADDR }}
+          RELAYS_TCP: ${{ vars.MVS_RELAY_TCP_ADDRS }}
+          STUN: ${{ vars.MVS_STUN_URL }}
+        run: node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-vars.json"
+
   ui:
     name: ui build
     needs: check
@@ -234,17 +255,17 @@ jobs:
           got=$(cat "$RUNNER_TEMP/relay-selftest.json")
           [ "$got" = "$want" ] || { echo "::error::stun config was altered on the way: $got"; exit 1; }
           # Multi-relay (part A): a two-line list wins over RELAY; "relay" is
-          # its first entry. RELAYS_TCP pairs by order.
+          # its first entry. Part C: the bootstrap list covers both relays.
           RELAYS=$'/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt\n' \
-          RELAYS_TCP=/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc \
+          RELAYS_TCP=$'/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/4011/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt' \
             node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
-          want='{"relay":"/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","relays":["/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt"],"bootstrap":["/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc"]}'
+          want='{"relay":"/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","relays":["/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt"],"bootstrap":["/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","/dns4/relay2.example.org/tcp/4011/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt"]}'
           got=$(cat "$RUNNER_TEMP/relay-selftest.json")
           [ "$got" = "$want" ] || { echo "::error::relay list config was altered on the way: $got"; exit 1; }
           # The same lists comma-separated (spaces and empty entries ignored):
           # the same config.
           RELAYS='/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc, /dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt,' \
-          RELAYS_TCP='/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc,' \
+          RELAYS_TCP='/dns4/relay.example.org/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc, /dns4/relay2.example.org/tcp/4011/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt,' \
             node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
           got=$(cat "$RUNNER_TEMP/relay-selftest.json")
           [ "$got" = "$want" ] || { echo "::error::comma-separated relay list config was altered on the way: $got"; exit 1; }
@@ -253,6 +274,25 @@ jobs:
             node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
             echo "::error::a relay listed twice was accepted"; exit 1
           fi
+          # Part C: TCP and QUIC for each of two relays (4 entries) pass...
+          A=12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc B=12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt
+          R="/dns4/relay.example.org/tcp/443/wss/p2p/$A,/dns4/relay2.example.org/tcp/443/wss/p2p/$B"
+          RELAYS="$R" RELAYS_TCP="/dns4/relay.example.org/tcp/4001/p2p/$A,/dns4/relay.example.org/udp/4001/quic-v1/p2p/$A,/dns4/relay2.example.org/tcp/4011/p2p/$B,/dns4/relay2.example.org/udp/4011/quic-v1/p2p/$B" \
+            node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
+          # ...and every mismatch or wrong form fails the build.
+          refused() { # <what> then env assignments
+            what=$1; shift
+            if env "$@" node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
+              echo "::error::accepted: $what"; exit 1
+            fi
+          }
+          refused "a relay with no bootstrap entry" RELAYS="$R" RELAYS_TCP="/dns4/relay.example.org/tcp/4001/p2p/$A"
+          refused "a bootstrap entry for no configured relay" RELAYS="/dns4/relay.example.org/tcp/443/wss/p2p/$A" RELAYS_TCP="/dns4/relay.example.org/tcp/4001/p2p/$A,/dns4/x.example.org/tcp/4011/p2p/$B"
+          refused "wss in the bootstrap list" RELAYS="$R" RELAYS_TCP="/dns4/relay.example.org/tcp/443/wss/p2p/$A,/dns4/relay2.example.org/tcp/4011/p2p/$B"
+          refused "a circuit in the bootstrap list" RELAYS="/dns4/relay.example.org/tcp/443/wss/p2p/$A" RELAYS_TCP="/dns4/r.example.org/tcp/4001/p2p/$B/p2p-circuit/p2p/$A"
+          refused "one relay and transport twice" RELAYS="/dns4/relay.example.org/tcp/443/wss/p2p/$A" RELAYS_TCP="/dns4/relay.example.org/tcp/4001/p2p/$A,/dns4/relay.example.org/tcp/4002/p2p/$A"
+          refused "five bootstrap entries" RELAYS="$R" RELAYS_TCP="/dns4/a.example.org/tcp/1/p2p/$A,/dns4/a.example.org/udp/1/quic-v1/p2p/$A,/dns4/b.example.org/tcp/1/p2p/$B,/dns4/b.example.org/udp/1/quic-v1/p2p/$B,/dns4/c.example.org/tcp/2/p2p/$B"
+          refused "single bootstrap for another relay" RELAY="/dns4/relay.example.org/tcp/443/wss/p2p/$A" RELAY_TCP="/dns4/relay.example.org/tcp/4001/p2p/$B"
           # G-81: voice TURN on, with an explicit host (off unless VOICE_TURN=1).
           VOICE_TURN=1 TURN_HOST=turn.example.org \
             node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json"
@@ -262,12 +302,14 @@ jobs:
           if VOICE_TURN=1 TURN_HOST=turn:turn.example.org:3478 node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
             echo "::error::a TURN host with a scheme and port was accepted"; exit 1
           fi
-          echo "ok: relay, relay list, bootstrap, stun and voice TURN reach the config unchanged"
+          echo "ok: relay, relay list, bootstrap, stun and voice TURN reach the config unchanged; mismatches fail"
       - name: Build-time config (relay)
         env:
           RELAY: ${{ github.event_name == 'push' && vars.MVS_RELAY_ADDR || '' }}
           # Multi-relay (part A): one multiaddr per line, 1-4, preferred over
-          # MVS_RELAY_ADDR when set; MVS_RELAY_TCP_ADDRS pairs with it by order.
+          # MVS_RELAY_ADDR when set. Part C: MVS_RELAY_TCP_ADDRS, 1-4 TCP/QUIC
+          # entries, preferred over MVS_RELAY_TCP_ADDR, must cover exactly the
+          # same relays (write-relay-config.mjs fails the build otherwise).
           RELAYS: ${{ github.event_name == 'push' && vars.MVS_RELAY_ADDRS || '' }}
           # Plain-TCP route to the relay (DCUtR, #219); optional.
           RELAY_TCP: ${{ github.event_name == 'push' && vars.MVS_RELAY_TCP_ADDR || '' }}

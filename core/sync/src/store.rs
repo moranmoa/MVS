@@ -19,6 +19,15 @@ use records::{Kind, ServerId, Stub};
 
 use crate::{log_name, log_of, Authorizer, Record, RecordId, Scope, StubGate, StubVerdict, Verdict};
 
+/// Remembered member addresses (relay-down resilience): per member, and in
+/// all; a row lives this long after it was last confirmed.
+pub const MAX_REMEMBERED_ADDRS: usize = 8;
+pub const MAX_REMEMBERED_PEERS: usize = 256;
+pub const REMEMBERED_TTL: u64 = 30 * 24 * 3600;
+
+/// A remembered member: (server, peer ID bytes, identity, addresses).
+pub type RememberedPeer = (ServerId, Vec<u8>, [u8; 32], Vec<String>);
+
 /// Most `have` ids looked at per [`Store::missing_since`] call; the rest are
 /// ignored. [`Store::have_markers`] never produces more.
 pub const MAX_HAVE: usize = 64;
@@ -238,6 +247,25 @@ impl Store {
                  version    INTEGER NOT NULL,
                  blob       BLOB NOT NULL,
                  written_at INTEGER NOT NULL
+             );
+             -- Remembered member addresses (relay-down resilience): direct
+             -- addresses of verified members, a dial hint only. Never in the
+             -- backup, logs or diagnostics (Security Lead).
+             CREATE TABLE IF NOT EXISTS peer_addrs (
+                 server   BLOB NOT NULL,
+                 peer     BLOB NOT NULL,
+                 identity BLOB NOT NULL,
+                 addrs    TEXT NOT NULL,
+                 seen     INTEGER NOT NULL,
+                 PRIMARY KEY (server, peer)
+             );
+             CREATE TABLE IF NOT EXISTS notices (
+                 tag      BLOB NOT NULL,
+                 hash     BLOB NOT NULL,
+                 at       INTEGER NOT NULL,
+                 received INTEGER NOT NULL,
+                 blob     BLOB NOT NULL,
+                 PRIMARY KEY (tag, hash)
              );",
         )?;
         // Stores made before stubs (B6-p) lack the column.
@@ -311,6 +339,119 @@ impl Store {
             "DELETE FROM backups WHERE owner IS NOT NULL AND written_at < ?1",
             [now.saturating_sub(retention) as i64],
         )
+    }
+
+    /// Remembers a verified member's direct addresses for `server` (at most
+    /// [`MAX_REMEMBERED_ADDRS`] of them; the caller filters), replacing what
+    /// was there. At most [`MAX_REMEMBERED_PEERS`] rows: the least recently
+    /// seen go first.
+    pub fn remember_peer(
+        &mut self,
+        server: &ServerId,
+        peer: &[u8],
+        identity: &[u8; 32],
+        addrs: &[String],
+        now: u64,
+    ) -> rusqlite::Result<()> {
+        let addrs: Vec<&str> = addrs.iter().take(MAX_REMEMBERED_ADDRS).map(String::as_str).collect();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO peer_addrs (server, peer, identity, addrs, seen) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (server, peer) DO UPDATE SET identity = ?3, addrs = ?4, seen = ?5",
+            params![server.as_bytes().as_slice(), peer, identity.as_slice(), addrs.join("\n"), now as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM peer_addrs WHERE rowid NOT IN
+             (SELECT rowid FROM peer_addrs ORDER BY seen DESC LIMIT ?1)",
+            [MAX_REMEMBERED_PEERS as i64],
+        )?;
+        tx.commit()
+    }
+
+    /// Every remembered member seen since `now - ttl`: (server, peer,
+    /// identity, addresses).
+    pub fn remembered_peers(&self, now: u64, ttl: u64) -> rusqlite::Result<Vec<RememberedPeer>> {
+        let mut stmt =
+            self.conn.prepare("SELECT server, peer, identity, addrs FROM peer_addrs WHERE seen >= ?1 ORDER BY seen DESC")?;
+        let rows = stmt.query_map([now.saturating_sub(ttl) as i64], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?))
+        })?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .filter_map(|(server, peer, identity, addrs)| {
+                let server = ServerId::from_bytes(server.try_into().ok()?);
+                let identity: [u8; 32] = identity.try_into().ok()?;
+                Some((server, peer, identity, addrs.lines().map(String::from).collect()))
+            })
+            .collect())
+    }
+
+    /// Forgets one member's addresses for `server` (it stopped being one).
+    pub fn forget_peer(&mut self, server: &ServerId, peer: &[u8]) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM peer_addrs WHERE server = ?1 AND peer = ?2", params![server.as_bytes().as_slice(), peer])
+    }
+
+    /// Forgets every remembered address (relay-only turned on).
+    pub fn forget_all_peers(&mut self) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM peer_addrs", [])
+    }
+
+    /// Forgets the rows not confirmed since `now - ttl`.
+    pub fn expire_peers(&mut self, now: u64, ttl: u64) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM peer_addrs WHERE seen < ?1", [now.saturating_sub(ttl) as i64])
+    }
+
+    /// Holder notice slot: keeps a checked notice (`notice::check`) under
+    /// `tag`, received at `now`. Per tag only the
+    /// [`crate::notice::MAX_PER_TAG`] newest by (`at`, hash) stay, and a
+    /// duplicate (same hash) isn't kept twice; at most
+    /// [`crate::notice::MAX_TAGS`] tags, a new one refused past that. True
+    /// if kept.
+    pub fn put_notice(&mut self, tag: &[u8; 32], at: u64, blob: &[u8], now: u64) -> rusqlite::Result<bool> {
+        let hash = blake3::hash(blob);
+        let tx = self.conn.transaction()?;
+        let known: bool = tx.prepare("SELECT 1 FROM notices WHERE tag = ?1 LIMIT 1")?.exists([tag.as_slice()])?;
+        if !known {
+            let tags: i64 = tx.query_row("SELECT COUNT(DISTINCT tag) FROM notices", [], |row| row.get(0))?;
+            if tags as usize >= crate::notice::MAX_TAGS {
+                return Ok(false);
+            }
+        }
+        let added = tx.execute(
+            "INSERT OR IGNORE INTO notices (tag, hash, at, received, blob) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![tag.as_slice(), hash.as_bytes().as_slice(), at as i64, now as i64, blob],
+        )?;
+        // Past the cap the oldest by (at, hash) go, possibly this one.
+        tx.execute(
+            "DELETE FROM notices WHERE tag = ?1 AND hash NOT IN
+             (SELECT hash FROM notices WHERE tag = ?1 ORDER BY at DESC, hash DESC LIMIT ?2)",
+            params![tag.as_slice(), crate::notice::MAX_PER_TAG as i64],
+        )?;
+        let kept: bool = tx
+            .prepare("SELECT 1 FROM notices WHERE tag = ?1 AND hash = ?2")?
+            .exists(params![tag.as_slice(), hash.as_bytes().as_slice()])?;
+        tx.commit()?;
+        Ok(added == 1 && kept)
+    }
+
+    /// The notices held under `tag`, newest first.
+    pub fn notices(&self, tag: &[u8; 32]) -> rusqlite::Result<Vec<Vec<u8>>> {
+        let mut stmt = self.conn.prepare("SELECT blob FROM notices WHERE tag = ?1 ORDER BY at DESC, hash DESC")?;
+        let rows = stmt.query_map([tag.as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect()
+    }
+
+    /// Every tag with notices held (to announce as a provider).
+    pub fn notice_tags(&self) -> rusqlite::Result<Vec<[u8; 32]>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT tag FROM notices")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        Ok(rows.filter_map(|r| r.ok().and_then(|t| t.try_into().ok())).collect())
+    }
+
+    /// Notices received more than `retention` seconds before `now` go (by
+    /// the holder's receive time, never by `at`).
+    pub fn expire_notices(&mut self, now: u64, retention: u64) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM notices WHERE received < ?1", [now.saturating_sub(retention) as i64])
     }
 
     pub fn has(&self, id: &RecordId) -> rusqlite::Result<bool> {
@@ -668,6 +809,34 @@ mod tests {
     use super::*;
     use crate::testutil::{channel, control_by, genesis, message, message_chain, message_with_auth, naming, post, server};
     use crate::AcceptAll;
+
+    /// Relay-down resilience: a member's row replaces its last, keeps at
+    /// most 8 addresses, the table keeps the 256 most recently seen, and rows
+    /// go when forgotten, purged or past 30 days.
+    #[test]
+    fn remembered_members_are_bounded_and_forgotten() {
+        let mut store = Store::in_memory().unwrap();
+        let id = [7u8; 32];
+        let addrs = |n: usize| -> Vec<String> { (0..n).map(|i| format!("/ip4/192.168.1.{i}/tcp/4001")).collect() };
+        store.remember_peer(&server(), b"peer-a", &id, &addrs(12), 1_000).unwrap();
+        let rows = store.remembered_peers(1_000, REMEMBERED_TTL).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3.len(), MAX_REMEMBERED_ADDRS);
+        store.remember_peer(&server(), b"peer-a", &id, &addrs(1), 2_000).unwrap();
+        assert_eq!(store.remembered_peers(2_000, REMEMBERED_TTL).unwrap()[0].3, addrs(1), "replaced, not added");
+        for i in 0..(MAX_REMEMBERED_PEERS as u64 + 10) {
+            store.remember_peer(&server(), format!("peer-{i}").as_bytes(), &id, &addrs(1), 3_000 + i).unwrap();
+        }
+        let now = 3_000 + MAX_REMEMBERED_PEERS as u64 + 10;
+        assert_eq!(store.remembered_peers(now, REMEMBERED_TTL).unwrap().len(), MAX_REMEMBERED_PEERS);
+        assert_eq!(store.forget_peer(&server(), b"peer-0").unwrap(), 0, "the oldest went first");
+        assert_eq!(store.forget_peer(&server(), format!("peer-{}", MAX_REMEMBERED_PEERS + 9).as_bytes()).unwrap(), 1);
+        assert!(store.remembered_peers(now + REMEMBERED_TTL + 10, REMEMBERED_TTL).unwrap().is_empty(), "past 30 days");
+        store.expire_peers(now + REMEMBERED_TTL + 10, REMEMBERED_TTL).unwrap();
+        store.remember_peer(&server(), b"peer-b", &id, &addrs(1), now).unwrap();
+        assert_eq!(store.forget_all_peers().unwrap(), 1, "relay-only purges what is left");
+        assert!(store.remembered_peers(now, REMEMBERED_TTL).unwrap().is_empty());
+    }
 
     fn chan() -> String {
         log_name(server(), Scope::Channel(channel()))

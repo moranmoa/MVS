@@ -1,6 +1,6 @@
 //! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -19,6 +19,7 @@ use crate::avatar;
 use crate::backup;
 use crate::devicelink::{self, OneTimeKey, Target};
 use crate::chat;
+use crate::reaction;
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
 use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
@@ -106,6 +107,10 @@ pub const BACKUP_REPUBLISH_MS: u64 = 24 * 3_600_000;
 /// to at most 1 h (Tech Lead); back to 1 min once it's done.
 pub const BACKUP_RETRY_FIRST_MS: u64 = 60_000;
 pub const BACKUP_RETRY_MAX_MS: u64 = 60 * 60_000;
+/// G-91: once the backup is found, the servers still waiting are tried
+/// this often (no backup fetch), so each is back within 2 minutes of a
+/// member of it being reachable (PO acceptance).
+pub const REJOIN_EVERY_MS: u64 = 30_000;
 
 pub struct Config {
     /// `None` keeps everything in memory (tests).
@@ -260,6 +265,8 @@ struct Approval {
 
 struct Inner {
     db: Db,
+    /// The core clock (G-26: the reaction fold skips records from the future).
+    clock: Arc<dyn crate::ports::Clock>,
     vault: Vault<SharedSecrets>,
     me: Option<Me>,
     /// The OS keychain failed at startup (QA-20).
@@ -327,6 +334,7 @@ impl KeyPending {
             replaces: None,
             mentions: None,
             mentions_me: None,
+            reactions: None,
         }
     }
 }
@@ -352,6 +360,30 @@ pub struct Core {
     /// the wait after it (ms, core clock): 1 min doubling to 1 h, reset
     /// once the restore is done.
     backup_retry: Mutex<(u64, u64)>,
+    /// G-91: the restore under way, once its backup is found.
+    restore: Mutex<RestoreProgress>,
+    /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
+    /// waits, holding no server secrets.
+    keys_locked: AtomicBool,
+}
+
+/// G-91: a restore's progress. The backup is fetched until found (with
+/// backoff: a holder lookup is slow); after that only the servers still
+/// waiting are tried, every [`REJOIN_EVERY_MS`], so each comes back soon
+/// after a member of it is reachable (PO: within 2 minutes).
+struct RestoreProgress {
+    /// Live servers the backup lists (`None` until it's found).
+    found: Option<u32>,
+    /// Those not back yet: server → its sync secret.
+    waiting: BTreeMap<ServerId, Zeroizing<[u8; 32]>>,
+    /// What `getServerRestore` answers; announced when it changes.
+    status: ServerRestore,
+}
+
+impl RestoreProgress {
+    fn new(state: ServerRestoreState) -> RestoreProgress {
+        RestoreProgress { found: None, waiting: BTreeMap::new(), status: ServerRestore { state, found: 0, waiting: 0 } }
+    }
 }
 
 struct PendingJoin {
@@ -446,16 +478,11 @@ fn parse_server(id: &str) -> CoreResult<ServerId> {
     model::parse_hex32(id).map(ServerId::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
 
-/// Server lifecycle's rollout gate (#229): every current, non-kicked member
-/// but `me` has `server-lifecycle-v1` in their latest profile post (none
-/// counts as needing an update).
-fn gate_open(view: &ServerView, me: PublicKey) -> bool {
-    let caps = view.lifecycle_caps();
-    view.state
-        .members
-        .iter()
-        .filter(|m| **m != me && !view.state.kicked.contains(m))
-        .all(|m| caps.get(m) == Some(&true))
+/// A rollout gate (#229, G-26): every current, non-kicked member but `me`
+/// has `cap` in their latest profile post (none counts as needing an
+/// update).
+fn gate_open(view: &ServerView, me: PublicKey, cap: &str) -> bool {
+    view.lacking(cap, me).is_empty()
 }
 
 impl Core {
@@ -464,6 +491,7 @@ impl Core {
         let vault = Vault::new(SharedSecrets(ports.secrets.clone()));
         let mut inner = Inner {
             db,
+            clock: ports.clock.clone(),
             vault,
             me: None,
             keyring_unavailable: false,
@@ -503,6 +531,13 @@ impl Core {
         }
         // The first member relay value: later changes are announced.
         inner.check_member_relay(&ports, &mut Vec::new());
+        // G-91: a restore that was still bringing servers back before a
+        // restart searches again.
+        let restore_state = if inner.db.get(KV_BACKUP_PENDING)?.is_some() {
+            ServerRestoreState::Searching
+        } else {
+            ServerRestoreState::None
+        };
         Ok(Core {
             inner: Mutex::new(inner),
             ports,
@@ -514,6 +549,8 @@ impl Core {
             backup_started: AtomicBool::new(false),
             notices_announced: AtomicBool::new(false),
             backup_retry: Mutex::new((0, BACKUP_RETRY_FIRST_MS)),
+            restore: Mutex::new(RestoreProgress::new(restore_state)),
+            keys_locked: AtomicBool::new(false),
         })
     }
 
@@ -524,6 +561,14 @@ impl Core {
         let _ = self.leave_call();
         self.ports.cipher.lock();
         self.ports.network.lock();
+        self.keys_locked.store(true, Ordering::SeqCst);
+        // G-91 (Security Lead on #457): the server secrets a restore took
+        // from the backup go too; the backup is fetched again after unlock.
+        let mut restore = self.restore.lock().expect("not poisoned");
+        restore.found = None;
+        restore.waiting.clear();
+        drop(restore);
+        *self.backup_retry.lock().expect("not poisoned") = (0, BACKUP_RETRY_FIRST_MS);
     }
 
     /// `signOut({ words } | { withoutWords: true })`: removes this identity
@@ -615,6 +660,7 @@ impl Core {
     /// After the app lock: the cipher gets our secret back. The next read or
     /// send replays what it lost (see `unlock_cipher`).
     pub fn unlock_keys(&self) {
+        self.keys_locked.store(false, Ordering::SeqCst);
         unlock_cipher(&self.ports, self.lock().me.as_ref());
     }
 
@@ -816,10 +862,35 @@ impl Core {
         // Restore servers (#291 phase A): my backup on the network brings
         // my servers back, rejoined as the same member (the #290 path).
         self.lock().db.set(KV_BACKUP_PENDING, b"1")?;
-        if !self.restore_from_backup() {
-            self.schedule_backup_retry(false);
-        }
+        *self.restore.lock().expect("not poisoned") = RestoreProgress::new(ServerRestoreState::None);
+        self.set_restore_status(ServerRestoreState::Searching);
+        let done = self.restore_from_backup();
+        self.schedule_backup_retry(done);
         Ok(identity)
+    }
+
+    /// G-91: `getServerRestore`.
+    pub fn get_server_restore(&self) -> ServerRestore {
+        self.restore.lock().expect("not poisoned").status
+    }
+
+    /// Sets the restore's state (counts from the progress) and announces
+    /// `serverRestore.changed` if anything changed.
+    fn set_restore_status(&self, state: ServerRestoreState) {
+        let changed = {
+            let mut progress = self.restore.lock().expect("not poisoned");
+            let status = ServerRestore {
+                state,
+                found: progress.found.unwrap_or(0),
+                waiting: progress.waiting.len() as u32,
+            };
+            let changed = progress.status != status;
+            progress.status = status;
+            changed.then_some(status)
+        };
+        if let Some(status) = changed {
+            self.emit(vec![Event::ServerRestoreChanged(status)]);
+        }
     }
 
     /// Restore servers (#291 phase A): fetches my backup from the holders,
@@ -827,63 +898,95 @@ impl Core {
     /// yet as the same member (`Inner::join`: no new join, nothing posted
     /// over what the server holds). A server it lists that no longer has
     /// me as a member isn't entered (a stale backup can't undo a leave or a
-    /// kick). Servers nobody can be reached for are tried again each sync
-    /// round until all are in.
+    /// kick). Servers nobody can be reached for are tried again (G-91: every
+    /// [`REJOIN_EVERY_MS`], without fetching the backup again) until all
+    /// are in. Returns whether the restore is done.
     fn restore_from_backup(&self) -> bool {
         let Some(keys) = self.lock().me.as_ref().map(|me| me.identity.backup_keys()) else {
             return true;
         };
-        let answers = self.ports.network.fetch_backup(keys.tag());
-        // No backup found (yet): try again later.
-        let Some(plain) = backup::newest(&keys, &answers) else { return false };
-        let mut waiting = false;
-        for (id, entry) in plain.servers.iter().filter(|(_, e)| e.live()) {
-            let (Some(server), Some(secret)) = (
-                model::parse_hex32(id).map(ServerId::from_bytes),
-                model::parse_hex32(&entry.secret).map(Zeroizing::new),
-            ) else {
-                continue;
+        if self.restore.lock().expect("not poisoned").found.is_none() {
+            let answers = self.ports.network.fetch_backup(keys.tag());
+            // No backup found (yet): try again later.
+            let Some(plain) = backup::newest(&keys, &answers) else {
+                self.set_restore_status(ServerRestoreState::Searching);
+                return false;
             };
+            let live: Vec<(ServerId, Zeroizing<[u8; 32]>)> = plain
+                .servers
+                .iter()
+                .filter(|(_, e)| e.live())
+                .filter_map(|(id, entry)| {
+                    Some((
+                        model::parse_hex32(id).map(ServerId::from_bytes)?,
+                        model::parse_hex32(&entry.secret).map(Zeroizing::new)?,
+                    ))
+                })
+                .collect();
+            let mut progress = self.restore.lock().expect("not poisoned");
+            progress.found = Some(live.len() as u32);
+            progress.waiting = live.into_iter().collect();
+        }
+        let tries: Vec<(ServerId, Zeroizing<[u8; 32]>)> = {
+            let progress = self.restore.lock().expect("not poisoned");
+            progress.waiting.iter().map(|(server, secret)| (*server, secret.clone())).collect()
+        };
+        for (server, secret) in tries {
             if self.lock().db.has_server(server).unwrap_or(true) {
+                self.restore.lock().expect("not poisoned").waiting.remove(&server);
                 continue;
             }
             let fetched = self.open_and_fetch(server, &secret);
+            // "Invalid" is final only with evidence in the log (Security Lead
+            // on #457): a partial log could otherwise drop a server I'm in.
+            let me = self.lock().me.as_ref().map(Me::key);
+            let judged = me.is_some_and(|me| removal_shown(server, me, &fetched));
             let status = self.run(|inner, ports, events| {
                 // No invite: a member I still am needs none; anyone else is
                 // refused by authority and nothing is stored or sent.
                 let none = RecordId::from_bytes([0; 32]);
                 inner.join(ports, server, none, &secret, "", fetched, events)
             });
-            match status {
-                Ok(JoinStatus::NobodyOnline { .. }) => waiting = true,
-                Ok(JoinStatus::Joined { .. }) => {}
-                _ => {
+            if restore_settles(&status, judged) {
+                self.restore.lock().expect("not poisoned").waiting.remove(&server);
+                if !matches!(status, Ok(JoinStatus::Joined { .. })) {
                     let _ = self.close_candidate(server);
                 }
             }
         }
-        if !waiting {
+        let done = self.restore.lock().expect("not poisoned").waiting.is_empty();
+        if done {
             let _ = self.lock().db.delete(KV_BACKUP_PENDING);
         }
-        !waiting
+        self.set_restore_status(if done { ServerRestoreState::Done } else { ServerRestoreState::Waiting });
+        done
     }
 
-    /// After a restore attempt that isn't done: the next one after the
-    /// current wait, and the wait after that doubled, at most
-    /// [`BACKUP_RETRY_MAX_MS`]. `done`: back to [`BACKUP_RETRY_FIRST_MS`].
+    /// After a restore attempt that isn't done: while the backup isn't
+    /// found, the next fetch after the current wait, and the wait after
+    /// that doubled, at most [`BACKUP_RETRY_MAX_MS`]; once it's found, the
+    /// waiting servers again after [`REJOIN_EVERY_MS`]. `done`: back to
+    /// [`BACKUP_RETRY_FIRST_MS`].
     fn schedule_backup_retry(&self, done: bool) {
         let now = self.ports.clock.now_ms();
+        let found = self.restore.lock().expect("not poisoned").found.is_some();
         let mut retry = self.backup_retry.lock().expect("not poisoned");
         *retry = if done {
             (0, BACKUP_RETRY_FIRST_MS)
+        } else if found {
+            (now + REJOIN_EVERY_MS, retry.1)
         } else {
             (now + retry.1, (retry.1 * 2).min(BACKUP_RETRY_MAX_MS))
         };
     }
 
     /// Each sync round: a pending restore is tried again only when its
-    /// backoff is up (dev-sync on #339: a real holder lookup is slow).
+    /// wait is up (dev-sync on #339: a real holder lookup is slow; G-91:
+    /// found servers every [`REJOIN_EVERY_MS`]).
     fn retry_backup_restore(&self) {
+        if self.keys_locked.load(Ordering::SeqCst) {
+            return;
+        }
         if self.lock().db.get(KV_BACKUP_PENDING).ok().flatten().is_none() {
             return;
         }
@@ -1319,7 +1422,7 @@ impl Core {
         self.run(|inner, ports, events| {
             inner.load_mine(server)?;
             inner.lifecycle_role(server, authority::Role::Admin)?;
-            inner.lifecycle_gate(server)?;
+            inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP)?;
             inner.publish_control(ports, server, &Action::ServerEdit { name: name.to_owned() })?;
             let summary = inner.counted_summary(&*ports.cipher, server)?;
             events.push(Event::ServerUpdated(summary.clone()));
@@ -1346,7 +1449,7 @@ impl Core {
             let leave =
                 inner.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
             inner.db.set_leave(server, &leave)?;
-            if inner.lifecycle_gate(server).is_ok() {
+            if inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
                 ports.network.publish(&leave);
             }
             // Gone from the UI at once; only the sync secret and the control
@@ -1385,25 +1488,22 @@ impl Core {
         }
     }
 
-    /// `getUpdateNeeded`: the members whose latest profile post lacks
-    /// `server-lifecycle-v1` (or who have none), so the UI can say who
-    /// blocks a rename or a delete (`update-needed`). Empty: the gate is
-    /// open.
-    pub fn get_update_needed(&self, server_id: &str) -> CoreResult<Vec<Id>> {
+    /// `getUpdateNeeded`: the members whose latest profile post lacks `cap`
+    /// (or who have none), so the UI can say who blocks it
+    /// (`update-needed`). No cap: `server-lifecycle-v1` (a rename or a
+    /// delete); `"reactions-v1"`: reactions (G-26). Any other name is
+    /// `bad-request`. Empty: the gate is open.
+    pub fn get_update_needed(&self, server_id: &str, cap: Option<&str>) -> CoreResult<Vec<Id>> {
+        let cap = match cap {
+            None => model::SERVER_LIFECYCLE_CAP,
+            Some(cap) => *model::CAPS.iter().find(|c| **c == cap).ok_or(ErrorCode::BadRequest)?,
+        };
         let server = parse_server(server_id)?;
         self.run(|inner, _, _| {
             inner.load_mine(server)?;
             let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
             let view = inner.view(server)?;
-            let caps = view.lifecycle_caps();
-            Ok(view
-                .state
-                .members
-                .iter()
-                .filter(|m| **m != me && !view.state.kicked.contains(m))
-                .filter(|m| caps.get(m) != Some(&true))
-                .map(|m| model::hex_id(m.as_bytes()))
-                .collect())
+            Ok(view.lacking(cap, me).iter().map(|m| model::hex_id(m.as_bytes())).collect())
         })
     }
 
@@ -1417,7 +1517,7 @@ impl Core {
         self.run(|inner, ports, events| {
             inner.load_mine(server)?;
             inner.lifecycle_role(server, authority::Role::Owner)?;
-            inner.lifecycle_gate(server)?;
+            inner.cap_gate(server, model::SERVER_LIFECYCLE_CAP)?;
             inner.publish_control(ports, server, &Action::ServerClose)?;
             inner.close_locally(ports, server, events)
         })
@@ -1808,6 +1908,11 @@ impl Core {
         self.voice(|calls, ctx, inner| calls.set_muted(ctx, inner, muted))
     }
 
+    /// G-84b `setDeafened`: shown to the others in my call (with mute).
+    pub fn set_deafened(&self, deafened: bool) -> CoreResult<()> {
+        self.voice(|calls, ctx, inner| calls.set_deafened(ctx, inner, deafened))
+    }
+
     /// `sendSignal`: to a participant of my call.
     pub fn send_signal(&self, to: &str, kind: SignalKind, payload: String) -> CoreResult<()> {
         let to = parse_user(to)?;
@@ -1963,7 +2068,7 @@ impl Core {
         }
         let message = self.run(|inner, ports, events| {
             let (server, channel) = inner.find_channel(channel_id)?;
-            let sealed = match inner.seal(ports, server, channel, body) {
+            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
                     let message = inner.hold_for_key(ports, server, channel, body)?;
@@ -1995,7 +2100,7 @@ impl Core {
         }
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
-            let sealed = inner.seal(ports, server, channel, body)?;
+            let sealed = inner.seal(ports, server, channel, body.as_bytes())?;
             let body = [target.as_bytes().as_slice(), &sealed].concat();
             inner.tombstone_or_edit(ports, events, server, channel, target, Kind::MessageEdit, body)
         })
@@ -2028,6 +2133,77 @@ impl Core {
                 Kind::MessageDelete,
                 body,
             )
+        })
+    }
+
+    /// G-26: turns my `emoji` on or off under a message, as a sealed
+    /// `Reaction` record (`crate::reaction` has the rules every core folds
+    /// by). Nothing is signed when it is already so.
+    /// - `bad-request`: not an emoji `reaction::normalize` accepts, or an
+    ///   11th emoji of mine on this message;
+    /// - `not-found`: no such message I can see, or it is deleted;
+    /// - `not-allowed`: I may not write in that channel now;
+    /// - `update-needed`: another member's version can't read reactions
+    ///   (`getUpdateNeeded(serverId, "reactions-v1")` says who);
+    /// - `rate-limited`: 30 reactions of mine in this channel within a
+    ///   minute.
+    pub fn react(&self, message_id: &str, emoji: &str, on: bool) -> CoreResult<()> {
+        let emoji = reaction::normalize(emoji).ok_or(ErrorCode::BadRequest)?;
+        self.run(|inner, ports, events| {
+            let (server, channel, target, _) = inner.find_message(message_id)?;
+            // 18+ channels only with an accepted 18+ claim (B7).
+            if !inner.visible(server)?.contains(&channel) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+            let view = inner.view(server)?;
+            if !view.state.is_member(me) || view.is_kicked(&me) || view.state.closed.is_some() {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.cap_gate(server, model::REACTIONS_CAP)?;
+            let cipher = &*ports.cipher;
+            let shown = inner.shown(cipher, server, channel)?;
+            let live: HashSet<RecordId> =
+                shown.iter().filter(|s| !s.deleted).map(|s| s.record.id()).collect();
+            if !live.contains(&target) {
+                return Err(ErrorCode::NotFound.into());
+            }
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let now = ports.clock.now_ms();
+            let folded = chat::reactions(cipher, server, channel, log, &live, now);
+            let mine = folded.on.get(&target);
+            if mine.is_some_and(|m| m.is_on(&emoji, me)) == on {
+                return Ok(());
+            }
+            if on && mine.is_some_and(|m| m.count_of(me) >= reaction::PER_AUTHOR) {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            // Counted the way every core will count the record I'd sign.
+            if folded.gate.near(me) >= reaction::RATE_LIMIT {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            let plaintext =
+                reaction::Reaction::encode(target, &emoji, on).ok_or(ErrorCode::BadRequest)?;
+            let sealed = inner.seal(ports, server, channel, &plaintext)?;
+            // Signed at its effective time, never before its deps: a clock
+            // that runs behind the others' must not make every core ignore
+            // it as backdated. (Sealing may have added a key rotation.)
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            let deps = chat::channel_deps(log, channel);
+            let ts = folded.gate.sign_at(&deps);
+            let seq = chat::channel_seq(log, channel, &me);
+            let auth = auth_deps(&inner.view(server)?);
+            let record =
+                inner.sign_channel(server, channel, seq, deps, auth, ts, Kind::Reaction, sealed)?;
+            let log = inner.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            if !chat::would_accept(log, &record) {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            inner.store(server, record.clone())?;
+            ports.network.publish(&record);
+            let message = inner.message(cipher, server, channel, target)?;
+            events.push(Event::MessageUpdated(message));
+            Ok(())
         })
     }
 
@@ -2989,6 +3165,12 @@ impl Inner {
         let current = self.backup_set()?;
         let remote = backup::newest(&keys, answers);
         if remote.is_none() && current.is_empty() && known.is_empty() {
+            // Nothing to back up, and that's settled until my server set
+            // changes or the republish is due. Without this, a new account
+            // (or a restore whose backup isn't found yet) fetched on every
+            // round: a real mailbox allows 60 fetches an hour (G-91).
+            self.db.set(KV_BACKUP_WRITTEN, &Self::backup_fingerprint(&current))?;
+            self.db.set(KV_BACKUP_PUT_AT, &now.to_le_bytes())?;
             return Ok(None);
         }
         let remote = remote.unwrap_or_default();
@@ -3337,7 +3519,7 @@ impl Inner {
             let seen = self.announced.entry(server).or_default();
             for (index, s) in shown.iter().enumerate() {
                 let state = announced(s, me, &Status { net: &*self.net, db: &self.db });
-                let event = match seen.insert(s.record.id(), state) {
+                let event = match seen.insert(s.record.id(), state.clone()) {
                     None if Some(s.record.author()) != me && !fresh.contains(&channel) => {
                         fresh.push(channel);
                         Event::MessageAdded(message_json(
@@ -3450,7 +3632,7 @@ impl Inner {
             let body = self.key_pending[i].body.clone();
             let waiting = self.db.has_server(server)? && {
                 self.load(server)?;
-                match self.seal(ports, server, channel, &body) {
+                match self.seal(ports, server, channel, body.as_bytes()) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
                         let record =
@@ -3508,7 +3690,7 @@ impl Inner {
         ports: &Ports,
         server: ServerId,
         channel: ChannelId,
-        text: &str,
+        plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
@@ -3518,12 +3700,12 @@ impl Inner {
         let auth_deps = auth_deps(&view);
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        match cipher.encrypt(server, channel, text.as_bytes()) {
+        match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).
                 self.rotate_channel(ports, server, channel, &members, &auth_deps)
                     .map_err(|_| CoreError::from(ErrorCode::NotAllowed))?;
-                cipher.encrypt(server, channel, text.as_bytes()).map_err(cipher_error)
+                cipher.encrypt(server, channel, plaintext).map_err(cipher_error)
             }
             other => other.map_err(cipher_error),
         }
@@ -3803,11 +3985,12 @@ impl Inner {
         server: ServerId,
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
+        let now = self.clock.now_ms();
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log))
+        Ok(chat::messages(cipher, server, channel, log, now))
     }
 
     /// G-21: my read marker in `channel`: the last message I read, as
@@ -4104,7 +4287,7 @@ impl Inner {
         if matches!(state, Some(SendState::Sent | SendState::Received)) {
             return finish(&self.db);
         }
-        if !gate_open(&view, me) || state == Some(SendState::Pending) {
+        if !gate_open(&view, me, model::SERVER_LIFECYCLE_CAP) || state == Some(SendState::Pending) {
             return Ok(());
         }
         ports.network.publish(leave);
@@ -4126,20 +4309,21 @@ impl Inner {
         Ok(())
     }
 
-    /// Server lifecycle's rollout gate (#229): `update-needed` unless every
-    /// other current member's latest profile post carries
-    /// `server-lifecycle-v1` (no profile post counts as needing an update).
+    /// A rollout gate (server lifecycle #229, reactions G-26):
+    /// `update-needed` unless every other current member's latest profile
+    /// post carries `cap` (no profile post counts as needing an update).
     /// This version reads them itself. Checked before anything is signed.
-    fn lifecycle_gate(&self, server: ServerId) -> CoreResult<()> {
+    fn cap_gate(&self, server: ServerId, cap: &str) -> CoreResult<()> {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
-        if !gate_open(&self.view(server)?, me) {
+        if !gate_open(&self.view(server)?, me, cap) {
             return Err(ErrorCode::UpdateNeeded.into());
         }
         Ok(())
     }
 
-    /// Release N of server lifecycle: my latest profile post in `server`
-    /// lacks the cap (posted by an older version), so post it again, once.
+    /// The release that adds a cap: my latest profile post in `server` lacks
+    /// one of [`model::CAPS`] (posted by an older version), so post it
+    /// again, once.
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());
@@ -4147,8 +4331,8 @@ impl Inner {
         let (me_small, me_color) = (me.profile.avatar_small.clone(), me.profile.color.clone());
         let view = self.view(server)?;
         let member = view.state.is_member(key) && !view.state.kicked.contains(&key);
-        if !member || view.state.closed.is_some() || view.lifecycle_caps().get(&key) == Some(&true)
-        {
+        let has_all = model::CAPS.iter().all(|cap| view.caps(cap).get(&key) == Some(&true));
+        if !member || view.state.closed.is_some() || has_all {
             return Ok(());
         }
         let (small, color) = (me_small, me_color);
@@ -4536,8 +4720,9 @@ fn auth_deps(view: &ServerView) -> Vec<RecordId> {
     heads[heads.len().saturating_sub(records::MAX_AUTH_DEPS)..].to_vec()
 }
 
-/// What was last announced of a message: edit time, deleted, my send state.
-type Announced = (Option<u64>, bool, Option<SendState>);
+/// What `message.updated` compares: the edit, the deletion, the send state
+/// and (G-26) the reactions shown.
+type Announced = (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>);
 
 /// Where my messages' send states come from: the network's live state and
 /// the last one stored, so a restart doesn't lose it.
@@ -4547,7 +4732,7 @@ struct Status<'a> {
 }
 
 fn announced(s: &chat::Shown, me: Option<PublicKey>, st: &Status) -> Announced {
-    (s.edited_at, s.deleted, send_state(s, me, st))
+    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone())
 }
 
 /// B6, on my own messages only: `pending` until it left this device,
@@ -4611,7 +4796,21 @@ fn message_json(
         replaces: None,
         mentions: (!listed.is_empty()).then_some(listed),
         mentions_me: me.filter(|me| tokens.contains(me)).map(|_| true),
+        reactions: reactions_json(&s.reactions, me),
     }
+}
+
+/// G-26: `Message.reactions`, absent when there are none.
+fn reactions_json(shown: &[(String, Vec<PublicKey>)], me: Option<PublicKey>) -> Option<Vec<ReactionCount>> {
+    let list: Vec<ReactionCount> = shown
+        .iter()
+        .map(|(emoji, authors)| ReactionCount {
+            emoji: emoji.clone(),
+            count: authors.len() as u32,
+            mine: me.is_some_and(|me| authors.contains(&me)),
+        })
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 /// Can't write yet (no key, or a rotation only a moderator can make):
 /// `not-allowed`. No group encryption: `not-implemented`.
@@ -4636,6 +4835,40 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
 }
 
 /// A join status's name for the join log (no link, no IDs).
+/// G-91 (Security Lead on #457): whether a restore's join answer settles
+/// that server for good. Only a definite answer does:
+/// - `Joined`: it's back;
+/// - `Closed`: its owner closed it;
+/// - `Invalid` with evidence ([`removal_shown`]): the log shows an accepted
+///   kick or leave of me, so authority refuses the join.
+///
+/// Anything else waits for the next try: `NobodyOnline`, `Searching`,
+/// `AgeBlocked` (it depends on whether the log shows me as a member, which
+/// a partial log can miss: Security Lead on #457),
+/// `Invalid` without that evidence (a partial log), and every error
+/// (locked, network, internal). One bad round never loses a server.
+/// G-91 (Security Lead on #457): whether the fetched log shows I left this
+/// server: an accepted kick of me, or an accepted leave of mine. Only then
+/// is a restore's "invalid" final; a log missing my join (or the kick)
+/// proves nothing, and the server waits for a fuller answer.
+fn removal_shown(server: ServerId, me: PublicKey, fetched: &[Record]) -> bool {
+    let log = Log::new(server, fetched.iter().cloned());
+    let Some(view) = ServerView::build(server, &log) else { return false };
+    if view.state.is_member(me) {
+        return false;
+    }
+    view.is_kicked(&me)
+        || log.records.iter().any(|r| r.kind() == Kind::Leave && r.author() == me && log.accepted(&r.id()))
+}
+
+fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
+    match status {
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,
+        Ok(JoinStatus::Invalid { .. }) => judged,
+        Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. } | JoinStatus::AgeBlocked { .. }) | Err(_) => false,
+    }
+}
+
 fn join_status_name(status: &JoinStatus) -> &'static str {
     match status {
         JoinStatus::Searching { .. } => "searching",
@@ -4717,7 +4950,30 @@ mod relay_only_tests {
 
 #[cfg(test)]
 mod device_notice_tests {
-    use super::{notice_label, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+    use super::{notice_label, restore_settles, Db, KV_DEVICE_NOTICES, MAX_DEVICE_NOTICES};
+    use crate::types::{AgeRestriction, ErrorCode, JoinStatus};
+
+    /// G-91 (Security Lead on #457): only a definite answer drops a server
+    /// from a restore; a temporary one waits for the next try.
+    #[test]
+    fn only_definite_join_answers_settle_a_restored_server() {
+        let link = String::new;
+        let joined = JoinStatus::Joined { link: link(), server_id: "s".into() };
+        let blocked = JoinStatus::AgeBlocked { link: link(), required: AgeRestriction::Eighteen };
+        for status in [joined, JoinStatus::Closed { link: link() }] {
+            assert!(restore_settles(&Ok(status.clone()), false), "{status:?}");
+        }
+        assert!(!restore_settles(&Ok(blocked), true), "age-blocked waits: a partial log can miss my membership");
+        let invalid = JoinStatus::Invalid { link: link() };
+        assert!(restore_settles(&Ok(invalid.clone()), true), "kicked or not a member");
+        assert!(!restore_settles(&Ok(invalid), false), "a partial fetch: not yet");
+        for status in [JoinStatus::NobodyOnline { link: link() }, JoinStatus::Searching { link: link() }] {
+            assert!(!restore_settles(&Ok(status.clone()), true), "{status:?}");
+        }
+        for code in [ErrorCode::Internal, ErrorCode::NotFound, ErrorCode::NotAllowed, ErrorCode::BadRequest] {
+            assert!(!restore_settles(&Err(code.into()), true), "{code:?}");
+        }
+    }
 
     /// Security Lead on #415: a label is plain text, at most 64 characters.
     #[test]

@@ -63,6 +63,9 @@ services:
       JOIN_ONLY: ${JOIN_ONLY:-}
       CHECK_LOG: ${CHECK_LOG:-}
       MVS_DEBUG_LOG: ${MVS_DEBUG_LOG:-}
+      # G-81: EXPECT_PATH=direct|relay makes G81.1 strict; SETUP_MAX_MS the G81.2 limit.
+      EXPECT_PATH: ${EXPECT_PATH:-}
+      SETUP_MAX_MS: ${SETUP_MAX_MS:-10000}
       MVS_RELAY: ${MVS_RELAY:-}
       MVS_CORE_PATH: /build/mvs-core
       MVS_UI_DIR: /build/ui

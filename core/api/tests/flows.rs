@@ -72,6 +72,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::CallSignal { .. } => "call.signal",
             Event::VoiceRooms { .. } => "voice.rooms",
             Event::MemberRelayChanged(_) => "memberRelay.changed",
+            Event::ServerRestoreChanged(_) => "serverRestore.changed",
             Event::DeviceLinkState(_) => "deviceLink.state",
             Event::DeviceAdded { .. } => "account.deviceAdded",
         })
@@ -3093,14 +3094,14 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     }
     // The UI can say who blocks it.
     let old_id = hex::encode(old.verifying_key().to_bytes());
-    assert_eq!(owner.core.get_update_needed(&server.id).unwrap(), [old_id]);
+    assert_eq!(owner.core.get_update_needed(&server.id, None).unwrap(), [old_id]);
     assert_eq!(world.network.fetch(server_key).len(), signed + 1, "signed past the gate");
     // It updates: the cap in its latest profile post opens the gate.
     world.network.publish(&profile(r#","caps":["server-lifecycle-v1"]"#, 3));
     for peer in [&owner, &guest, &third] {
         peer.core.sync_now().unwrap();
     }
-    assert!(owner.core.get_update_needed(&server.id).unwrap().is_empty());
+    assert!(owner.core.get_update_needed(&server.id, None).unwrap().is_empty());
 
     // Leave: not the owner; a member leaves and the server leaves their
     // device; the others see them gone.
@@ -4176,11 +4177,15 @@ fn a_restore_brings_my_servers_back_from_the_backup() {
     // Nothing more to do: the next rounds don't re-add or re-post.
     laptop.core.sync_now().unwrap();
     assert_eq!(laptop.core.list_servers().unwrap().len(), expected.len());
+    // G-91: done, counting the live servers only (not the one I left).
+    let done = laptop.core.get_server_restore();
+    assert_eq!((done.state, done.found, done.waiting), (ServerRestoreState::Done, 4, 0));
 
-    // Another account's words find nothing of mine.
+    // Another account's words find nothing of mine: still searching.
     let stranger = world.peer();
     stranger.core.restore_identity(LEGAL.split(' ').map(String::from).collect()).unwrap();
     assert!(stranger.core.list_servers().unwrap().is_empty());
+    assert_eq!(stranger.core.get_server_restore().state, ServerRestoreState::Searching);
 }
 
 /// A network that counts backup fetches and puts.
@@ -4250,6 +4255,30 @@ fn unchanged_rounds_neither_fetch_nor_put_the_backup() {
     me.core.sync_now().unwrap();
     me.core.sync_now().unwrap();
     assert_eq!(net.counts(), (3, 3));
+}
+
+/// G-91: an account with no servers and no backup anywhere fetched the
+/// backup on every 2-second round (nothing marked the empty set as
+/// checked). Now it's once, then again only when the set changes or the
+/// 24-hour republish is due.
+#[test]
+fn an_account_without_servers_fetches_the_backup_once() {
+    let world = World::new();
+    let net = Arc::new(CountingNet {
+        world: world.network.clone(),
+        fetches: Default::default(),
+        puts: Default::default(),
+    });
+    let me = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    sign_up(&me, "New");
+    for _ in 0..30 {
+        me.core.sync_now().unwrap();
+        advance(&world, 2_000);
+    }
+    assert_eq!(net.counts(), (1, 0), "one fetch, nothing to put");
+    me.core.create_server("First", AgeRestriction::None).unwrap();
+    me.core.sync_now().unwrap();
+    assert_eq!(net.counts(), (2, 1));
 }
 
 /// A channel-order post signed by `key` directly (as a client that skips
@@ -4547,11 +4576,32 @@ fn mentions_mark_the_message_and_count_until_read() {
 }
 
 /// A network that holds backups but can't reach any server's records until
-/// `reachable` is set; it counts backup fetches.
+/// `reachable` is set, and hides the backups while `hidden` is set; it
+/// counts backup fetches and server fetches.
 struct FarServers {
     world: Arc<LoopbackNetwork>,
     reachable: std::sync::atomic::AtomicBool,
+    hidden: std::sync::atomic::AtomicBool,
+    /// Peers answer without the genesis (a partial fetch).
+    partial: std::sync::atomic::AtomicBool,
+    /// Peers answer without this member's join records.
+    hide_joins_of: std::sync::Mutex<Option<PublicKey>>,
     fetches: std::sync::atomic::AtomicUsize,
+    server_fetches: std::sync::atomic::AtomicUsize,
+}
+
+impl FarServers {
+    fn new(world: &World) -> Arc<FarServers> {
+        Arc::new(FarServers {
+            world: world.network.clone(),
+            reachable: Default::default(),
+            hidden: Default::default(),
+            partial: Default::default(),
+            hide_joins_of: Default::default(),
+            fetches: Default::default(),
+            server_fetches: Default::default(),
+        })
+    }
 }
 
 impl Network for FarServers {
@@ -4559,8 +4609,16 @@ impl Network for FarServers {
         self.world.publish(record);
     }
     fn fetch(&self, server: ServerId) -> Vec<records::Record> {
+        self.server_fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.reachable.load(std::sync::atomic::Ordering::SeqCst) {
-            self.world.fetch(server)
+            let mut records = self.world.fetch(server);
+            if self.partial.load(std::sync::atomic::Ordering::SeqCst) {
+                records.retain(|r| r.kind() != Kind::Genesis);
+            }
+            if let Some(hidden) = *self.hide_joins_of.lock().unwrap() {
+                records.retain(|r| !(r.kind() == Kind::Join && r.author() == hidden));
+            }
+            records
         } else {
             Vec::new()
         }
@@ -4570,30 +4628,54 @@ impl Network for FarServers {
     }
     fn fetch_backup(&self, tag: [u8; 32]) -> Vec<Vec<u8>> {
         self.fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.world.fetch_backup(tag)
+        if self.hidden.load(std::sync::atomic::Ordering::SeqCst) {
+            Vec::new()
+        } else {
+            self.world.fetch_backup(tag)
+        }
     }
 }
 
-/// dev-sync on #339: a restore whose servers nobody can be reached for is
-/// retried with backoff (1 min, 2, 4, … up to 1 h), not every sync round,
-/// and stops once every server is back.
-#[test]
-fn a_waiting_restore_backs_off() {
-    let world = World::new();
+/// The `serverRestore.changed` payloads since the last take.
+fn restore_events(peer: &Peer) -> Vec<ServerRestore> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ServerRestoreChanged(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+fn restore(state: ServerRestoreState, found: u32, waiting: u32) -> ServerRestore {
+    ServerRestore { state, found, waiting }
+}
+
+/// An identity with one server of its own, backed up.
+fn backed_up_owner(world: &World) -> Vec<String> {
     let me = world.peer();
     let created = me.core.create_identity(adult()).unwrap();
     assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
     me.core.create_server("Mine", AgeRestriction::None).unwrap();
     me.core.sync_now().unwrap();
+    created.words
+}
 
-    let net = Arc::new(FarServers {
-        world: world.network.clone(),
-        reachable: Default::default(),
-        fetches: Default::default(),
-    });
+/// dev-sync on #339: while no backup is found, the search is retried with
+/// backoff (1 min, 2, 4, … up to 1 h), not every sync round. G-91: the
+/// state says `searching` meanwhile.
+#[test]
+fn a_restore_searches_for_its_backup_with_backoff() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    net.hidden.store(true, std::sync::atomic::Ordering::SeqCst);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
     let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
-    laptop.core.restore_identity(created.words.clone()).unwrap();
-    assert!(laptop.core.list_servers().unwrap().is_empty(), "nobody online yet");
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::None, 0, 0));
+    laptop.core.restore_identity(words).unwrap();
+    assert_eq!(restore_events(&laptop), [restore(ServerRestoreState::Searching, 0, 0)]);
     let fetches = || net.fetches.load(std::sync::atomic::Ordering::SeqCst);
     laptop.core.sync_now().unwrap(); // the login backup round fetches once too
     let base = fetches();
@@ -4615,13 +4697,93 @@ fn a_waiting_restore_backs_off() {
     assert_eq!(round(32 * 60_000 + 1_000), 6, "then 32");
     assert_eq!(round(30 * 60_000), 6, "not yet: the wait is an hour now");
     assert_eq!(round(30 * 60_000 + 1_000), 7, "then at most an hour");
-    assert_eq!(round(60 * 60_000 + 1_000), 8);
-    // The servers can be reached: the next retry restores them, then stops.
-    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Searching, 0, 0));
+    assert!(restore_events(&laptop).is_empty(), "no event without a change");
+    // The backup can be found: the next retry brings the server back, then stops.
+    net.hidden.store(false, std::sync::atomic::Ordering::SeqCst);
     // (+1: the server set changed, so that round also writes the backup.)
-    assert_eq!(round(60 * 60_000 + 1_000), 10);
+    assert_eq!(round(60 * 60_000 + 1_000), 9);
     assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
-    assert_eq!(round(2 * 60 * 60_000), 10, "done: no more retries");
+    assert_eq!(restore_events(&laptop), [restore(ServerRestoreState::Done, 1, 0)]);
+    assert_eq!(round(2 * 60 * 60_000), 9, "done: no more retries");
+}
+
+/// G-91 (PO criterion 3): a server I was kicked from after my last backup,
+/// or that was closed, still reads as live in that backup, but doesn't come
+/// back, and isn't left counted as waiting.
+#[test]
+fn a_restore_leaves_out_servers_i_was_kicked_from_or_that_closed() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let my_id = me.core.get_identity().unwrap().unwrap().id;
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let mine = me.core.create_server("Mine", AgeRestriction::None).unwrap();
+    let kicked = bob.core.create_server("Kicked", AgeRestriction::None).unwrap();
+    let closed = bob.core.create_server("Closed", AgeRestriction::None).unwrap();
+    me.core.join_server(&kicked.invite_link).unwrap();
+    me.core.join_server(&closed.invite_link).unwrap();
+    me.core.sync_now().unwrap(); // the backup lists all three as live
+    bob.core.sync_now().unwrap();
+    bob.core.kick_member(&kicked.id, &my_id).unwrap();
+    bob.core.close_server(&closed.id).unwrap();
+    bob.core.sync_now().unwrap();
+
+    let laptop = world.peer();
+    laptop.core.restore_identity(created.words).unwrap();
+    let back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(back, [mine.id]);
+    let done = laptop.core.get_server_restore();
+    assert_eq!((done.state, done.found, done.waiting), (ServerRestoreState::Done, 3, 0));
+}
+
+/// G-91 (PO criterion 1): once the backup is found, a server nobody can be
+/// reached for is tried again every 30 s, without fetching the backup
+/// again, so it is back within 2 minutes of a member being reachable. The
+/// state says `waiting` with the count meanwhile, then `done`.
+#[test]
+fn a_found_restore_rejoins_soon_after_a_member_is_reachable() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert!(laptop.core.list_servers().unwrap().is_empty(), "nobody online yet");
+    assert_eq!(
+        restore_events(&laptop),
+        [restore(ServerRestoreState::Searching, 0, 0), restore(ServerRestoreState::Waiting, 1, 1)]
+    );
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+    laptop.core.sync_now().unwrap();
+    let (fetches, tries) = (load(&net.fetches), load(&net.server_fetches));
+    // An hour of rounds every 2 s: one try every 30 s, and no backup fetch.
+    for _ in 0..1_800 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(load(&net.fetches), fetches, "the backup isn't fetched again");
+    let retried = load(&net.server_fetches) - tries;
+    assert!((119..=121).contains(&retried), "{retried} tries in an hour");
+    assert!(restore_events(&laptop).is_empty());
+    // A member is reachable: back within 30 s.
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut waited = 0;
+    while laptop.core.list_servers().unwrap().is_empty() {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+        waited += 2_000;
+        assert!(waited <= 30_000, "not back within 30 s");
+    }
+    assert_eq!(restore_events(&laptop), [restore(ServerRestoreState::Done, 1, 0)]);
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+    assert!(restore_events(&laptop).is_empty(), "done stays done");
 }
 
 /// Owner bug (v0.4.1): unread dots stuck at the channel or server level. The
@@ -5401,4 +5563,107 @@ fn a_link_that_cant_be_stored_says_keyring() {
         .unwrap();
     assert_eq!((last.state, last.reason), (DeviceLinkPhase::Failed, Some(DeviceLinkReason::Keyring)));
     assert!(new.get_identity().unwrap().is_none());
+}
+
+/// G-91 (Security Lead on #457): an answer that can't be judged (peers
+/// sent the log without its genesis) keeps the server waiting; the next
+/// full answer brings it back. One bad round never loses a server.
+#[test]
+fn a_partial_answer_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    net.partial.store(true, std::sync::atomic::Ordering::SeqCst);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "still waiting");
+    net.partial.store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): the app lock drops the server secrets a
+/// waiting restore holds and pauses it; after unlock the backup is fetched
+/// again and the server still comes back.
+#[test]
+fn a_waiting_restore_pauses_while_locked_and_resumes_after() {
+    let world = World::new();
+    let words = backed_up_owner(&world);
+    let net = FarServers::new(&world);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(words).unwrap();
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1));
+    let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+
+    laptop.core.lock_keys();
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let tries = load(&net.server_fetches);
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty(), "nothing while locked");
+    assert_eq!(load(&net.server_fetches), tries, "no tries while locked");
+
+    let fetches = load(&net.fetches);
+    laptop.core.unlock_keys();
+    laptop.core.sync_now().unwrap();
+    assert!(load(&net.fetches) > fetches, "the backup is fetched again after unlock");
+    assert_eq!(laptop.core.list_servers().unwrap().len(), 1);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+/// G-91 (Security Lead on #457): a log that has the genesis but lacks my
+/// join makes the join look refused ("invalid"), yet proves nothing: the
+/// server keeps waiting, and comes back once a full log arrives. Only an
+/// accepted kick or leave of me (or a close) drops it.
+#[test]
+fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
+    let world = World::new();
+    let me = world.peer();
+    let created = me.core.create_identity(adult()).unwrap();
+    assert!(answer(&me, &created.words, &[]).1.unwrap().ok);
+    let bob = world.peer();
+    sign_up(&bob, "Bob");
+    let server = bob.core.create_server("Bob's", AgeRestriction::None).unwrap();
+    me.core.join_server(&server.invite_link).unwrap();
+    me.core.sync_now().unwrap();
+    let my_key = peer_key(&me);
+
+    let net = FarServers::new(&world);
+    net.reachable.store(true, std::sync::atomic::Ordering::SeqCst);
+    *net.hide_joins_of.lock().unwrap() = Some(my_key);
+    let laptop = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
+    laptop.core.restore_identity(created.words).unwrap();
+    for _ in 0..30 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    assert!(laptop.core.list_servers().unwrap().is_empty());
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Waiting, 1, 1), "not dropped");
+
+    *net.hide_joins_of.lock().unwrap() = None;
+    for _ in 0..16 {
+        advance(&world, 2_000);
+        laptop.core.sync_now().unwrap();
+    }
+    let back: Vec<String> = laptop.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(back, [server.id]);
+    assert_eq!(laptop.core.get_server_restore(), restore(ServerRestoreState::Done, 1, 0));
+}
+
+fn peer_key(peer: &Peer) -> PublicKey {
+    let id = peer.core.get_identity().unwrap().unwrap().id;
+    PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
 }

@@ -40,6 +40,19 @@ fn start_relay_counting(
     circuits: Arc<std::sync::Mutex<Vec<(PeerId, bool)>>>,
     circuits_only: bool,
 ) -> tokio::task::JoinHandle<()> {
+    let external = format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap();
+    start_relay_external(key, port, circuits, circuits_only, external)
+}
+
+/// [`start_relay_counting`], announcing `external` (as infra/relay does
+/// from EXTERNAL_ADDRS, e.g. a DNS name).
+fn start_relay_external(
+    key: identity::Keypair,
+    port: u16,
+    circuits: Arc<std::sync::Mutex<Vec<(PeerId, bool)>>>,
+    circuits_only: bool,
+    external: Multiaddr,
+) -> tokio::task::JoinHandle<()> {
     let mut swarm = SwarmBuilder::with_existing_identity(key)
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
@@ -76,7 +89,7 @@ fn start_relay_counting(
     swarm.listen_on(addr.clone()).unwrap();
     // Reservations carry the relay's external addresses; a client refuses
     // one without (infra/relay sets them from EXTERNAL_ADDRS).
-    swarm.add_external_address(addr);
+    swarm.add_external_address(external);
     // QUIC, reached only as a bootstrap address (the punch tests), so
     // reservations keep the TCP address alone. On its own free UDP port, not
     // the TCP port's number: on Windows runners that number can fall in a
@@ -1438,6 +1451,245 @@ async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
     assert!(!reserved_via(&d, &via_a).await, "a relay-only member used a member relay");
 
     for node in [a, b, c, d] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A bound member like [`bound_node`] (LAN allowed, every member accepted),
+/// in the folder `name` names: wiped first, or kept (a restart).
+async fn member_in(name: &str, relay: &Multiaddr, key: u8, wipe: bool) -> (Node, std::path::PathBuf) {
+    let (server, channel) = test_server();
+    let dir = std::env::temp_dir().join(format!("sync-relay-{}-{name}", std::process::id()));
+    if wipe {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let config = NodeConfig {
+        relay: relay.clone(),
+        data_dir: dir.clone(),
+        logs: vec![],
+        authorizer: Arc::new(AcceptAll),
+        listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        bootstrap: vec![],
+        allow_lan: true,
+        relay_only: false,
+    };
+    let access = Access {
+        binder: Some(Arc::new(SigningKey::from_bytes(&[key; 32]))),
+        read_gate: Some(Arc::new(AcceptAll)),
+        ..Access::default()
+    };
+    let (node, _events) = Node::start_with(config, access).await.unwrap();
+    node.open_server(server, ServerSecret::from_bytes([42; 32])).unwrap();
+    node.open_channel(server, channel).await.unwrap();
+    (node, dir)
+}
+
+/// What a node remembers, read from its store.
+fn remembered(dir: &std::path::Path) -> usize {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let Ok(store) = sync::Store::open_read_only(dir.join("store.db")) else { return 0 };
+    store.remembered_peers(now, 3600).map(|rows| rows.len()).unwrap_or(0)
+}
+
+/// Relay-down resilience (1): two members on one LAN who met through our
+/// relay remember each other's direct address. The relay goes down and one
+/// of them restarts: it redials the other at the remembered address, and
+/// they sync again. Turning relay-only on purges what it remembers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_with_the_relay_down_reconnects_to_a_remembered_member() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let id = |n: u8| records::PublicKey::from_bytes(SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes());
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let our_relay = start_relay(relay_key, port);
+    let (a, a_dir) = member_in("rem-a", &relay, 41, true).await;
+    let (b, _) = member_in("rem-b", &relay, 42, true).await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !(a.presence(test_server().0).await.unwrap().online.contains(&id(42)) && remembered(&a_dir) > 0) {
+        assert!(Instant::now() < deadline, "A never bound B or never remembered its address");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Our relay goes down, and A restarts in the same folder.
+    our_relay.abort();
+    a.shutdown().await.unwrap();
+    let (a, a_dir) = member_in("rem-a", &relay, 41, false).await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !a.presence(test_server().0).await.unwrap().online.contains(&id(42)) {
+        assert!(Instant::now() < deadline, "the restarted member never reached the remembered one");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(a.direct_peers().await.unwrap().contains(&b.peer_id()), "not a direct connection");
+    // And they sync: a record B writes now reaches A.
+    let (server, channel) = test_server();
+    let log = log_name(server, Scope::Channel(channel));
+    b.append(messages(1).remove(0)).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while a.state(&log).await.unwrap().count < 1 {
+        assert!(Instant::now() < deadline, "B's record never reached A");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Relay-only: everything remembered goes.
+    a.set_relay_only(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while remembered(&a_dir) > 0 {
+        assert!(Instant::now() < deadline, "relay-only kept remembered addresses");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for node in [a, b] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A notice as the core makes it (`notice-slot-spec.md`): the header, a
+/// fixed-size opaque body, and the `w_n` signature. `seed` makes `w_n`.
+fn notice_blob(seed: u8, at: u64) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let w = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let w_pub = w.verifying_key().to_bytes();
+    let mut blob = b"mvsn1".to_vec();
+    blob.extend_from_slice(&sync::notice_tag(&w_pub));
+    blob.extend_from_slice(&w_pub);
+    blob.extend_from_slice(&at.to_le_bytes());
+    blob.extend_from_slice(&[7; 24]);
+    blob.extend_from_slice(&[9; sync::NOTICE_BODY]);
+    let sig = w.sign(&blob).to_bytes();
+    blob.extend_from_slice(&sig);
+    assert_eq!(blob.len(), sync::NOTICE_LEN);
+    blob
+}
+
+/// Holder notice slot, relay only: my device puts a notice, my other
+/// device keeps it, and a third device of mine that never got the put
+/// fetches it with a signed fetch, all over relay circuits. A fetch signed
+/// by another key gets nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn my_other_device_fetches_a_notice_through_the_relay() {
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let circuits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _relay = start_relay_counting(relay_key, port, circuits, true);
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let device = |name: &'static str| {
+        let (relay, listen) = (relay.clone(), listen.clone());
+        async move {
+            let node = bound_node_on_events(name, &relay, 43, false, Arc::new(AcceptAll), listen, vec![], true).await.0;
+            let w_n: Arc<dyn sync::NoticeSigner> = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[6; 32]));
+            node.set_notice_signer(Some(w_n)).unwrap();
+            node
+        }
+    };
+    let a = device("notice-a").await;
+    let a2 = device("notice-a2").await;
+    let start = Instant::now();
+    while !a.peers().await.unwrap().contains(&a2.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(60), "my devices never met");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let notice = notice_blob(6, now);
+    let mut forged = notice.clone();
+    forged[100] ^= 1;
+    assert!(!a.put_notice(forged).await.unwrap(), "a malformed notice is refused");
+    assert!(!a.put_notice(notice[..100].to_vec()).await.unwrap(), "so is a wrong size");
+    // A2 keeps it once it has bound A (at most 4 writes an hour per tag).
+    for _ in 0..3 {
+        assert!(a.put_notice(notice.clone()).await.unwrap());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    assert!(a2.fetch_notices().await.unwrap().contains(&notice), "my other device didn't keep it");
+
+    // A third device of mine, which never got the put, fetches it.
+    let a3 = device("notice-a3").await;
+    let start = Instant::now();
+    loop {
+        if a3.fetch_notices().await.unwrap().contains(&notice) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(90), "my third device never fetched it");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Another key's fetch: nothing (the same empty answer as "none").
+    let other: Arc<dyn sync::NoticeSigner> = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[8; 32]));
+    a3.set_notice_signer(Some(other)).unwrap();
+    assert!(a3.fetch_notices().await.unwrap().is_empty());
+    // No signer: no fetch.
+    a3.set_notice_signer(None).unwrap();
+    assert!(a3.fetch_notices().await.unwrap().is_empty());
+    for node in [a, a2, a3] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The member-only LAN beacon (relay-down resilience, part 2): with the
+/// relay unreachable and nothing remembered (fresh data folders), two
+/// members of one server on one LAN find each other by beacon and connect
+/// directly. Without "LAN allowed" they don't.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_on_one_lan_find_each_other_by_beacon_with_no_relay() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    // A relay nobody listens on.
+    let dead = free_port();
+    let relay: Multiaddr =
+        format!("/ip4/127.0.0.1/tcp/{dead}/p2p/{}", PeerId::from(identity::Keypair::generate_ed25519().public()))
+            .parse()
+            .unwrap();
+    // Every interface: the beacon is dialled at its packet's source address.
+    let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0".parse().unwrap();
+    for allow_lan in [true, false] {
+        let beacon_port = free_udp_port();
+        let node = |name: String, key: u8| {
+            let (relay, listen) = (relay.clone(), listen.clone());
+            async move {
+                let gate: Arc<dyn ReadGate> = Arc::new(AcceptAll);
+                let node = bound_node_on_events(&name, &relay, key, allow_lan, gate, listen, vec![], false).await.0;
+                assert!(node.start_lan_beacon(beacon_port).await.unwrap(), "no beacon socket");
+                node
+            }
+        };
+        let a = node(format!("beacon-a-{allow_lan}"), 61).await;
+        let b = node(format!("beacon-b-{allow_lan}"), 62).await;
+        let start = Instant::now();
+        let met = loop {
+            if a.peers().await.unwrap().contains(&b.peer_id()) {
+                break true;
+            }
+            if start.elapsed() > Duration::from_secs(if allow_lan { 90 } else { 40 }) {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert_eq!(met, allow_lan, "LAN allowed: {allow_lan}");
+        for node in [a, b] {
+            node.shutdown().await.unwrap();
+        }
+    }
+}
+
+/// P0 on #416: the relay named by DNS (its external address and our
+/// configured one both `/dns4/localhost/...`, as the live relay and QA's
+/// join-matrix use): two members meet through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_meet_through_a_relay_named_by_dns() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay_id = PeerId::from(relay_key.public());
+    let relay: Multiaddr = format!("/dns4/localhost/tcp/{port}/p2p/{relay_id}").parse().unwrap();
+    let external: Multiaddr = format!("/dns4/localhost/tcp/{port}").parse().unwrap();
+    let circuits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _relay = start_relay_external(relay_key, port, circuits, true, external);
+    let a = bound_node("dns-relay-a", &relay, 71, false, Arc::new(AcceptAll)).await;
+    let b = bound_node("dns-relay-b", &relay, 72, false, Arc::new(AcceptAll)).await;
+    let start = Instant::now();
+    while !a.peers().await.unwrap().contains(&b.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(60), "members never met through a DNS-named relay");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for node in [a, b] {
         node.shutdown().await.unwrap();
     }
 }

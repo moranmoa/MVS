@@ -9,6 +9,7 @@
 
 import { cleanStunUrl, cleanTurnHost } from '../voice/sdp';
 import type { CoreApi, CoreEventName, CoreEvents } from './api';
+import { normalizeEmoji } from './emoji';
 import type {
   AgeRestriction,
   Channel,
@@ -21,6 +22,7 @@ import type {
   ServerSummary,
   CallState,
   VoiceRoom,
+  ServerRestore,
   DeviceApproval,
   DeviceLinkOffer,
   DeviceLinkState,
@@ -301,16 +303,40 @@ function cleanMentions(raw: unknown): string[] | undefined {
   return ids.length ? ids : undefined;
 }
 
+/**
+ * G-26: at most 20 chips, each an emoji the core's check accepts in its
+ * stored form, a whole count of at least 1, and no emoji twice. Anything
+ * else is dropped.
+ */
+function cleanReactions(raw: unknown): Message['reactions'] {
+  if (!Array.isArray(raw)) return undefined;
+  const seen = new Set<string>();
+  const chips = raw
+    .filter(
+      (r): r is { emoji: string; count: number; mine: unknown } =>
+        typeof r?.emoji === 'string' &&
+        normalizeEmoji(r.emoji) === r.emoji &&
+        Number.isSafeInteger(r.count) &&
+        r.count >= 1,
+    )
+    .filter((r) => !seen.has(r.emoji) && !!seen.add(r.emoji))
+    .slice(0, 20)
+    .map((r) => ({ emoji: r.emoji, count: r.count, mine: r.mine === true }));
+  return chips.length ? chips : undefined;
+}
+
 export function cleanMessage(m: Message): Message {
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
-  const { replaces: _ignored, mentions: rawMentions, ...rest } = m;
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
   const mentions = cleanMentions(rawMentions);
+  const reactions = cleanReactions(rawReactions);
   return {
     ...rest,
     ...(replaces ? { replaces } : {}),
     ...(mentions ? { mentions } : {}),
+    ...(reactions ? { reactions } : {}),
     body: text,
     clipped: clipped || undefined,
     replyTo: m.replyTo && { ...m.replyTo, excerpt: cleanExcerpt(m.replyTo.excerpt) },
@@ -354,7 +380,12 @@ export function cleanCall(c: CallState): CallState {
     channelId: cleanHexId(c?.channelId),
     participants: participants
       .slice(0, 5)
-      .map((p) => ({ identity: cleanHexId(p?.identity), muted: p?.muted === true }))
+      .map((p) => ({
+        identity: cleanHexId(p?.identity),
+        muted: p?.muted === true,
+        // G-84b: shown only together with muted.
+        ...(p?.deafened === true && p?.muted === true ? { deafened: true } : {}),
+      }))
       .filter((p) => p.identity),
     full: c?.full === true,
     ...(c?.relayOnly === true ? { relayOnly: true } : {}),
@@ -392,10 +423,11 @@ export function cleanVoiceRoom(r: unknown): VoiceRoom | null {
   if (relayOnly !== undefined && typeof relayOnly !== 'boolean') return null;
   const out: VoiceRoom['members'] = [];
   for (const p of members as unknown[]) {
-    if (!p || typeof p !== 'object' || !onlyKeys(p, ['userId', 'muted', 'joinedAt'])) return null;
-    const { userId, muted, joinedAt } = p as Record<string, unknown>;
+    if (!p || typeof p !== 'object' || !onlyKeys(p, ['userId', 'muted', 'deafened', 'joinedAt'])) return null;
+    const { userId, muted, deafened, joinedAt } = p as Record<string, unknown>;
     if (!isRoomId(userId) || typeof muted !== 'boolean' || !isTime(joinedAt) || out.some((x) => x.userId === userId)) return null;
-    out.push({ userId, muted, joinedAt });
+    if (deafened !== undefined && typeof deafened !== 'boolean') return null;
+    out.push({ userId, muted, ...(deafened === true && muted ? { deafened: true } : {}), joinedAt });
   }
   if (!out.some((p) => p.userId === masterId)) return null;
   const clean = cleanName(name, VOICE_ROOM_NAME_MAX);
@@ -493,6 +525,16 @@ export function cleanDeviceAdded(r: unknown): DeviceAdded | null {
   return { at, ...(clean ? { label: clean } : {}) };
 }
 
+/** G-91: a known state, whole counts, and no more waiting than found; anything else is dropped. */
+export function cleanServerRestore(r: unknown): ServerRestore | null {
+  if (!r || typeof r !== 'object' || !onlyKeys(r, ['state', 'found', 'waiting'])) return null;
+  const { state, found, waiting } = r as Record<string, unknown>;
+  const st = (['none', 'searching', 'waiting', 'done'] as const).find((x) => x === state);
+  const count = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 10_000;
+  if (!st || !count(found) || !count(waiting) || waiting > found) return null;
+  return { state: st, found, waiting };
+}
+
 /** A cleaner may return null to drop the event altogether. */
 const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[E] | null } = {
   'identity.changed': cleanIdentity,
@@ -520,6 +562,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'memberRelay.changed': (r) => cleanMemberRelay(r),
   'deviceLink.state': (r) => cleanDeviceLinkState(r),
   'account.deviceAdded': (r) => cleanDeviceAdded(r),
+  'serverRestore.changed': (r) => cleanServerRestore(r),
   'voice.rooms': (p) => {
     const rooms = cleanVoiceRooms(p?.serverId, p?.rooms);
     return rooms ? { serverId: p.serverId, rooms } : null;
@@ -587,6 +630,12 @@ export function guardCore(core: CoreApi): CoreApi {
         return rooms;
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
+    getServerRestore: () =>
+      core.getServerRestore().then((r) => {
+        const clean = cleanServerRestore(r);
+        if (!clean) throw { code: 'internal' };
+        return clean;
+      }),
     startDeviceLink: () =>
       core.startDeviceLink().then((r) => {
         const clean = cleanDeviceLinkOffer(r);

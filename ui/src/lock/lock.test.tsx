@@ -8,8 +8,8 @@ import { MockCore } from '../core/mock';
 import { cleanLockState } from '../core/ipc';
 import { newPasscodeProblem } from './AppLockSection';
 import { formatWait, lockScreenFromUrl } from './useLock';
-import en from '../i18n/en.json';
-import he from '../i18n/he.json';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
@@ -50,10 +50,15 @@ const LOCKED_A = { enabled: true, locked: true, pending: false, path: 'A', inCal
 describe('locale files', () => {
   // UTF-8 read as Windows-1252 and written back (e.g. a PowerShell write
   // without -Encoding utf8) turns "…" into "â€¦" and Hebrew into "×…".
-  it('hold no double-encoded text', () => {
-    for (const [name, messages] of Object.entries({ he, en } as Record<string, Record<string, string>>)) {
-      const bad = Object.entries(messages).filter(([, v]) => /×|â€|Ã|Â/.test(v));
-      expect(bad, name).toEqual([]);
+  it('hold no double-encoded text (every catalog in i18n/), and no BOM', () => {
+    const dir = join(__dirname, '..', 'i18n');
+    const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+    expect(files).toEqual(expect.arrayContaining(['he.json', 'en.json']));
+    for (const f of files) {
+      const raw = readFileSync(join(dir, f), 'utf8');
+      expect(raw.charCodeAt(0), `${f} starts with a BOM`).not.toBe(0xfeff);
+      const bad = Object.entries(JSON.parse(raw) as Record<string, string>).filter(([, v]) => /×|â€|Ã|Â/.test(v));
+      expect(bad, f).toEqual([]);
     }
   });
 });

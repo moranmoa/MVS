@@ -46,7 +46,6 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         working-directory: core
-        continue-on-error: true
 
   updater-windows:
     # The key-file ACL code is `#[cfg(windows)]` (updater, sync keyfile.rs, api data dir): build and

@@ -1850,6 +1850,27 @@ describe('voice engine: G-81 C2 (LAN WebRTC, else media over the P2P network)', 
     ey.dispose();
   });
 
+  it('the core stops reporting a path for a LAN WebRTC peer (it is no B target): the call stays on WebRTC', async () => {
+    const { hx, cx, ex, ey, errors, parts } = await call('lan');
+    expect(cx.webrtcPeers.at(-1)).toEqual([B]);
+    delete cx.paths[B]; // dev-sync: no path for peers excluded from B
+    cx.emitState(cx.state());
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(hx.pcs).toHaveLength(1);
+    expect(hx.pcs[0]!.closed).toBe(false);
+    expect(yB(parts)).toBe('connected');
+    expect(errors).toEqual([]);
+    // WebRTC gives up later: the peer goes to B, and the core is told (it then reports a path again).
+    hx.pcs[0]!.neverConnect = true;
+    hx.pcs[0]!.connectionState = 'failed';
+    (hx.pcs[0]!.onconnectionstatechange as (() => void) | null)?.();
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(cx.webrtcPeers.at(-1)).toEqual([]);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
   it('a LAN attempt that never connects falls to B after 3 s, with no error', async () => {
     const { hx, ex, ey, errors, parts } = await call('lan', { lanNeverConnects: true });
     expect(hx.pcs).toHaveLength(1);

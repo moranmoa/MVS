@@ -62,6 +62,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::ChannelRemoved { .. } => "channel.removed",
             Event::MembersChanged { .. } => "members.changed",
             Event::JoinStatus(_) => "join.status",
+            Event::BlocksChanged { .. } => "blocks.changed",
             Event::UpdateReady(_) => "update.ready",
             Event::UpdateInstalled { .. } => "update.installed",
             Event::UpdateRolledBack { .. } => "update.rolledBack",

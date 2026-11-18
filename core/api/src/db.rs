@@ -561,16 +561,27 @@ impl Db {
             .map_err(internal)
     }
 
-    /// Flips the block; returns whether the user is now blocked.
-    pub fn toggle_block(&self, user: &PublicKey) -> Result<bool, CoreError> {
+    /// G-47: sets the block; returns whether anything changed.
+    pub fn set_block(&self, user: &PublicKey, blocked: bool) -> Result<bool, CoreError> {
         let key = user.as_bytes().as_slice();
-        if self.is_blocked(user)? {
-            self.conn.execute("DELETE FROM blocked WHERE user = ?1", [key]).map_err(internal)?;
-            Ok(false)
+        let sql = if blocked {
+            "INSERT OR IGNORE INTO blocked (user) VALUES (?1)"
         } else {
-            self.conn.execute("INSERT INTO blocked (user) VALUES (?1)", [key]).map_err(internal)?;
-            Ok(true)
+            "DELETE FROM blocked WHERE user = ?1"
+        };
+        self.conn.execute(sql, [key]).map(|n| n > 0).map_err(internal)
+    }
+
+    /// G-47: everyone I blocked, by key.
+    pub fn blocked_users(&self) -> Result<Vec<PublicKey>, CoreError> {
+        let mut stmt = self.conn.prepare("SELECT user FROM blocked ORDER BY user").map_err(internal)?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)).map_err(internal)?;
+        let mut out = Vec::new();
+        for user in rows {
+            let bytes: [u8; 32] = user.map_err(internal)?.try_into().map_err(internal)?;
+            out.push(PublicKey::from_bytes(bytes));
         }
+        Ok(out)
     }
 
     pub fn size_bytes(&self) -> Result<u64, CoreError> {

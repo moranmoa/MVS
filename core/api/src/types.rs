@@ -511,6 +511,10 @@ pub enum Event {
     MembersChanged { server_id: Id, members: Vec<Member> },
     #[serde(rename = "join.status")]
     JoinStatus(JoinStatus),
+    /// G-47: my block list changed (`setBlocked`, `blockUser`); the whole
+    /// list, as `listBlocked` returns it.
+    #[serde(rename = "blocks.changed")]
+    BlocksChanged { blocked: Vec<BlockedUser> },
     #[serde(rename = "message.updated")]
     MessageUpdated(Message),
     #[serde(rename = "message.added")]
@@ -574,6 +578,17 @@ pub struct RemovedMember {
     pub display_name: String,
     /// When it was kicked (the kick's claimed time).
     pub removed_at: Timestamp,
+}
+
+/// G-47 (`listBlocked`): an account I blocked, whether or not we share a
+/// server now. `name`: its display name where we share a server, else the
+/// one known when I blocked it; absent if none was ever known.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedUser {
+    pub user_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Rust addition (`createInvite`, #208): the new invite and its link.

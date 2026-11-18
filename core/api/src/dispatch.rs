@@ -259,6 +259,13 @@ struct UserArg {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBlockedArgs {
+    user_id: String,
+    blocked: bool,
+}
+
+#[derive(Deserialize)]
 struct BytesArg {
     bytes: u64,
 }
@@ -449,6 +456,11 @@ impl Core {
 
             "markRead" => ok(self.mark_read(&args::<ChannelIdArg>(raw)?.channel_id)),
             "blockUser" => ok(self.block_user(&args::<UserArg>(raw)?.user_id)),
+            "setBlocked" => {
+                let a: SetBlockedArgs = args(raw)?;
+                ok(self.set_blocked(&a.user_id, a.blocked))
+            }
+            "listBlocked" => ok(self.list_blocked()),
             // Server lifecycle (#251).
             "renameServer" => {
                 let a: RenameServerArgs = args(raw)?;

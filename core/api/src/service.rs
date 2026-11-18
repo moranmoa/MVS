@@ -516,6 +516,11 @@ fn parse_user(id: &str) -> CoreResult<PublicKey> {
     model::parse_hex32(id).map(PublicKey::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
 
+/// G-47: where the name known when `user` was blocked is kept.
+fn blocked_name_key(user: &PublicKey) -> String {
+    format!("blocked-name/{}", model::hex_id(user.as_bytes()))
+}
+
 fn parse_server(id: &str) -> CoreResult<ServerId> {
     model::parse_hex32(id).map(ServerId::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
@@ -2584,22 +2589,33 @@ impl Core {
         })
     }
 
+    /// `blockUser`: a toggle, kept as it was for older shells. G-47's
+    /// [`Core::set_blocked`] is the idempotent form.
     pub fn block_user(&self, user_id: &str) -> CoreResult<()> {
         let user = parse_user(user_id)?;
         self.run(|inner, _, events| {
-            inner.db.toggle_block(&user)?;
-            for server in inner.db.servers()? {
-                inner.load(server)?;
-                let view = inner.view(server)?;
-                if view.members().iter().any(|m| m.key == user) {
-                    events.push(Event::MembersChanged {
-                        server_id: model::hex_id(server.as_bytes()),
-                        members: inner.members_json(&view)?,
-                    });
-                }
-            }
-            Ok(())
+            let blocked = !inner.db.is_blocked(&user)?;
+            inner.set_blocked(user, blocked, events)
         })
+    }
+
+    /// G-47 `setBlocked(userId, blocked)`: idempotent; setting what's
+    /// already set changes nothing and sends no event. Blocking myself is
+    /// `bad-request`.
+    pub fn set_blocked(&self, user_id: &str, blocked: bool) -> CoreResult<()> {
+        let user = parse_user(user_id)?;
+        self.run(|inner, _, events| {
+            if inner.me.as_ref().map(Me::key) == Some(user) {
+                return Err(ErrorCode::BadRequest.into());
+            }
+            inner.set_blocked(user, blocked, events)
+        })
+    }
+
+    /// G-47 `listBlocked()`: everyone I blocked, also those I share no
+    /// server with now, ordered by key.
+    pub fn list_blocked(&self) -> CoreResult<Vec<BlockedUser>> {
+        self.lock().blocked_list()
     }
 
     // ---- app --------------------------------------------------------------
@@ -4768,6 +4784,67 @@ impl Inner {
         }
         self.load(server)?;
         Ok(server)
+    }
+
+    /// G-47: blocks or unblocks `user`. On a change: the name as known now
+    /// is kept for the list (a blocked account often shares no server
+    /// later), the members of servers it's in are re-sent, and
+    /// `blocks.changed` carries the new list.
+    fn set_blocked(&mut self, user: PublicKey, blocked: bool, events: &mut Events) -> CoreResult<()> {
+        let name = if blocked { self.known_names(&[user])?.remove(&user) } else { None };
+        if !self.db.set_block(&user, blocked)? {
+            return Ok(());
+        }
+        match name {
+            Some(name) => self.db.set(&blocked_name_key(&user), name.as_bytes())?,
+            None => self.db.delete(&blocked_name_key(&user))?,
+        }
+        for server in self.db.servers()? {
+            self.load(server)?;
+            let view = self.view(server)?;
+            if view.members().iter().any(|m| m.key == user) {
+                events.push(Event::MembersChanged {
+                    server_id: model::hex_id(server.as_bytes()),
+                    members: self.members_json(&view)?,
+                });
+            }
+        }
+        events.push(Event::BlocksChanged { blocked: self.blocked_list()? });
+        Ok(())
+    }
+
+    /// G-47: the display names `users` have in the servers I'm in.
+    fn known_names(&mut self, users: &[PublicKey]) -> CoreResult<BTreeMap<PublicKey, String>> {
+        let mut out = BTreeMap::new();
+        if users.is_empty() {
+            return Ok(out);
+        }
+        for server in self.db.servers()? {
+            self.load(server)?;
+            for (key, name) in self.view(server)?.display_names() {
+                if users.contains(&key) {
+                    out.insert(key, name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// G-47: the block list, each with its name in a shared server, else
+    /// the one kept when it was blocked.
+    fn blocked_list(&mut self) -> CoreResult<Vec<BlockedUser>> {
+        let users = self.db.blocked_users()?;
+        let mut names = self.known_names(&users)?;
+        users
+            .into_iter()
+            .map(|user| {
+                let name = match names.remove(&user) {
+                    Some(name) => Some(name),
+                    None => self.db.get(&blocked_name_key(&user))?.and_then(|b| String::from_utf8(b).ok()),
+                };
+                Ok(BlockedUser { user_id: model::hex_id(user.as_bytes()), name })
+            })
+            .collect()
     }
 
     /// A loaded server's view.

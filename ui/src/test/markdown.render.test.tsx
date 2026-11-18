@@ -1,11 +1,21 @@
 // G-25: Markdown as React elements: what reaches the DOM.
 
 import { act, fireEvent, render } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { IntlProvider } from 'react-intl';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import en from '../i18n/en.json';
 import he from '../i18n/he.json';
 import { MarkdownBody, safeHref } from '../markdown/render';
+
+describe('markdown: hidden spoiler CSS (source rule)', () => {
+  // color: transparent alone leaks colour emoji and chip/code backgrounds.
+  it('hides the content outright, not just its colour', () => {
+    const css = readFileSync(join(__dirname, '..', 'styles', 'markdown.css'), 'utf8');
+    expect(css).toMatch(/\.md-spoiler:not\(\.revealed\) > span \{\s*visibility: hidden;\s*\}/);
+  });
+});
 
 describe('markdown: safeHref', () => {
   it('https with a host only; credentials and other schemes refused', () => {

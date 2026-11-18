@@ -48,6 +48,11 @@ describe('markdown: inline', () => {
     expect(parseInline('``a ` b``')).toEqual([{ t: 'code', v: 'a ` b' }]);
   });
 
+  it('links keep a ")" that closes a "(" inside them', () => {
+    expect(parseInline('see https://en.example.org/wiki/Foo_(bar).')).toEqual([t('see '), { t: 'link', v: 'https://en.example.org/wiki/Foo_(bar)' }, t('.')]);
+    expect(parseInline('(https://en.example.org/wiki/Foo_(bar))')).toEqual([t('('), { t: 'link', v: 'https://en.example.org/wiki/Foo_(bar)' }, t(')')]);
+  });
+
   it('links: https only, at a word start, trailing punctuation left out', () => {
     expect(parseInline('see https://example.org/a_b*c_d.')).toEqual([t('see '), { t: 'link', v: 'https://example.org/a_b*c_d' }, t('.')]);
     expect(parseInline('http://example.org')).toEqual([t('http://example.org')]);
@@ -166,6 +171,14 @@ describe('markdown: hostile input', () => {
     const t0 = performance.now();
     for (let i = 0; i < runs; i++) parse(msg);
     expect((performance.now() - t0) / runs).toBeLessThan(5);
+  });
+
+  it('unclosed backtick runs inside an open marker stay linear (one scan per run length)', () => {
+    for (const s of ['**a' + ' `x'.repeat(1300) + '**', '||' + ' ``y'.repeat(1000) + '||', '*' + '`'.repeat(1) + 'a `'.repeat(1300)]) {
+      const t0 = performance.now();
+      parse(s);
+      expect(performance.now() - t0).toBeLessThan(50);
+    }
   });
 
   it('pathological input (unclosed markers everywhere) stays fast', () => {

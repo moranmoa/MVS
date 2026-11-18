@@ -91,8 +91,10 @@
   cursor: pointer;
 }
 
-.md-spoiler:not(.revealed) * {
-  color: transparent;
+/* Colour emoji ignore color, and chips and code keep their backgrounds:
+   the content is hidden outright; the button keeps the box. */
+.md-spoiler:not(.revealed) > span {
+  visibility: hidden;
 }
 
 .md-spoiler.revealed {

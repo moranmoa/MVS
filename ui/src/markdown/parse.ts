@@ -27,7 +27,7 @@ const MAX_DEPTH = 5;
 /** A bare link: only https (the desktop shell opens nothing else). */
 const LINK = /^https:\/\/[^\s<>"'`]+/;
 /** Trailing characters that end a sentence rather than the link. */
-const LINK_TRAIL = /[.,;:!?)\]}'"*_~|]+$/;
+const LINK_TRAIL = new Set([...'.,;:!?)]}\'"*_~|']);
 const MENTION = /^<@[^>\s]{1,128}>/;
 const WORD = /[\p{L}\p{N}]/u;
 const SPACE = /\s/u;
@@ -43,15 +43,36 @@ function runLength(s: string, i: number, ch: string): number {
   return n;
 }
 
+/**
+ * For the string last searched: per run length, the earliest position from
+ * which no closing run exists. A run with no closer from i has none from any
+ * later i either, so unclosed backticks cost one scan, not one per marker.
+ */
+let codeMemo: { s: string; none: Map<number, number> } = { s: '', none: new Map() };
+
 /** Where a closing run of exactly n backticks starts after i, or -1. */
 function codeCloser(s: string, from: number, n: number): number {
+  if (codeMemo.s !== s) codeMemo = { s, none: new Map() };
+  const none = codeMemo.none.get(n);
+  if (none !== undefined && from >= none) return -1;
   let k = s.indexOf('`', from);
   while (k !== -1) {
     const r = runLength(s, k, '`');
     if (r === n) return k;
     k = s.indexOf('`', k + r);
   }
+  codeMemo.none.set(n, none === undefined ? from : Math.min(from, none));
   return -1;
+}
+
+/** Trailing punctuation off a link, keeping a ")" that closes a "(" in it: Foo_(bar). */
+function trimLink(url: string): string {
+  for (;;) {
+    const last = url[url.length - 1];
+    if (last === undefined || !LINK_TRAIL.has(last)) return url;
+    if (last === ')' && url.split('(').length >= url.split(')').length) return url;
+    url = url.slice(0, -1);
+  }
 }
 
 /** A link at i (when it starts a word), with its trailing punctuation left out. */
@@ -59,7 +80,7 @@ function linkAt(s: string, i: number): string | null {
   if (!s.startsWith('https://', i) || isWord(s[i - 1])) return null;
   const m = LINK.exec(s.slice(i, i + 2048));
   if (!m) return null;
-  const url = m[0].replace(LINK_TRAIL, '');
+  const url = trimLink(m[0]);
   return url.length > 'https://'.length ? url : null;
 }
 

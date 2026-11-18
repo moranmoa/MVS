@@ -3896,6 +3896,25 @@ input.switch:disabled {
   gap: 0.5rem;
 }
 
+/* G-06: the rail's tooltip (the full server name), beside the button. */
+.rail-tip {
+  position: fixed;
+  z-index: 50;
+  transform: translateY(-50%);
+  max-width: 16rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: var(--radius-s);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
 /* Voice IP notice v2: "Privacy settings" on the start side, Cancel and Got it at the end. */
 .ip-notice .ip-notice-settings {
   margin-inline-end: auto;

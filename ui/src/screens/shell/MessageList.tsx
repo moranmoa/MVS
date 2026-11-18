@@ -24,6 +24,7 @@ import { displayName, lookalikeIds, LookalikeTag } from './MemberList';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
 import { useAppStore } from '../../app/App';
+import { useSettings } from '../../app/settings';
 
 const GROUP_GAP_MS = 5 * 60_000;
 const BOTTOM_SLACK_PX = 48;
@@ -94,6 +95,7 @@ export function MessageList({
   const flagged = useMemo(() => lookalikeIds([...memberMap.values()]), [memberMap]);
   const store = useAppStore();
   const { bind, menu } = useContextMenu();
+  const announcement = useNewMessageAnnouncement(win, count, atBottom, myId, memberMap);
   // B25 §2: the message menu, the same actions as the row's toolbar. Deleted
   // messages and hidden (blocked) ones have no items, so no menu opens.
   const authorName = (m: Message) => {
@@ -290,6 +292,10 @@ export function MessageList({
 
   return (
     <div className="message-area">
+      {/* G-113: a new message while I'm at the bottom, for screen readers. */}
+      <span className="visually-hidden" aria-live="polite">
+        {announcement}
+      </span>
       <div
         ref={scrollRef}
         className="message-scroll"
@@ -655,4 +661,73 @@ function MentionText({ text, message, plain = false }: { text: string; message: 
       })}
     </>
   );
+}
+
+/** G-113: at most one announcement this often; messages in between are counted into it. */
+export const ANNOUNCE_GAP_MS = 1500;
+/** G-113: how much of a message is read out. */
+export const ANNOUNCE_CHARS = 100;
+
+/**
+ * G-113: a polite screen-reader line for messages that arrive while I'm at
+ * the bottom of the channel on screen: "{name}: {first 100 characters}", or
+ * "New message from {name}" when notification previews are off (the same
+ * privacy choice). Not my own, deleted or blocked authors' messages; nothing
+ * for what was already there when the channel opened. Throttled: several
+ * within 1.5 s become one "{count} new messages".
+ */
+function useNewMessageAnnouncement(
+  win: MessageWindow,
+  count: number,
+  atBottom: { current: boolean },
+  myId: string,
+  memberMap: Map<string, Member>,
+): string {
+  const intl = useIntl();
+  const preview = useSettings().settings.notify?.preview === true;
+  const [text, setText] = useState('');
+  const seen = useRef<number | null>(null);
+  const pending = useRef<{ last: Message; n: number } | null>(null);
+  const lastAt = useRef(-Infinity);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const now = useRef({ intl, preview, memberMap });
+  now.current = { intl, preview, memberMap };
+  useEffect(() => () => clearTimeout(timer.current), []);
+  useEffect(() => {
+    if (!win.ready) return;
+    const before = seen.current;
+    seen.current = count;
+    // The channel just opened: what's there was there before.
+    if (before === null || count <= before || !atBottom.current) return;
+    const fresh: Message[] = [];
+    for (let i = before; i < count; i++) {
+      const m = win.get(i);
+      if (m && !m.deleted && m.authorId !== myId && !now.current.memberMap.get(m.authorId)?.blocked) fresh.push(m);
+    }
+    if (fresh.length === 0) return;
+    pending.current = { last: fresh[fresh.length - 1]!, n: (pending.current?.n ?? 0) + fresh.length };
+    const say = () => {
+      const p = pending.current;
+      pending.current = null;
+      if (!p) return;
+      lastAt.current = Date.now();
+      const { intl, preview, memberMap } = now.current;
+      const author = memberMap.get(p.last.authorId);
+      const name = author ? displayName(author) : '…';
+      if (p.n > 1) return setText(intl.formatMessage({ id: 'a11y.newMessages' }, { count: p.n }));
+      const body = (p.last.body ?? '').replace(/\s+/g, ' ').trim();
+      setText(
+        preview && body
+          ? intl.formatMessage({ id: 'a11y.newMessage' }, { name, text: body.length > ANNOUNCE_CHARS ? body.slice(0, ANNOUNCE_CHARS) + '…' : body })
+          : intl.formatMessage({ id: 'a11y.newMessageFrom' }, { name }),
+      );
+    };
+    const wait = ANNOUNCE_GAP_MS - (Date.now() - lastAt.current);
+    if (wait <= 0) say();
+    else timer.current ??= setTimeout(() => {
+      timer.current = undefined;
+      say();
+    }, wait);
+  }, [win, win.ready, count, myId, atBottom]);
+  return text;
 }

@@ -95,7 +95,7 @@ export function TopicDialog({
               <>
                 {' '}
                 {/* Only once it shows is it a live region (UX). */}
-                <span className={tooLong ? 'error' : undefined} aria-live="polite">
+                <span className={tooLong ? 'error' : undefined} dir="ltr" aria-live="polite">
                   <FormattedMessage id="channel.topic.counter" values={{ n: length }} />
                 </span>
               </>

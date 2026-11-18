@@ -94,7 +94,10 @@ describe('channel topic (G-14)', () => {
     fireEvent.change(field, { target: { value: 'x'.repeat(199) } });
     expect(screen.queryByText('199/256')).toBeNull();
     fireEvent.change(field, { target: { value: 'x'.repeat(257) } });
-    expect(screen.getByText('257/256')).toBeTruthy();
+    const counter = screen.getByText('257/256');
+    // Numbers read left to right even in the Hebrew UI (the isolates alone flipped it to 256/257).
+    expect(counter.getAttribute('dir')).toBe('ltr');
+    expect(counter.getAttribute('aria-live')).toBe('polite');
     expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
   });
 

@@ -78,3 +78,61 @@ describe('join statuses through the app (the sanitizer between core and UI)', ()
     expect(await within(dialog).findByText(/This account was removed from the server/)).toBeTruthy();
   });
 });
+
+describe("#261: joining a server its owner closed", () => {
+  it('says so, with role="alert" and Close only', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    render(<App core={core} initialSettings={en} />);
+    await screen.findByRole('textbox', { name: /^Message / });
+    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+    fireEvent.click(await screen.findByRole('button', { name: /Join with a link/ }));
+    const dialog = screen.getByRole('dialog', { name: 'Join a server' });
+    const input = within(dialog).getByRole('textbox', { name: 'Invite link' });
+    fireEvent.change(input, { target: { value: 'mvs://join/closed-one' } });
+    await act(async () => {
+      fireEvent.submit(input.closest('form')!);
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert.textContent).toBe("The owner closed this server, so it can't be joined.");
+    expect(within(dialog).queryByRole('button', { name: 'Join' })).toBeNull();
+    expect(within(dialog).queryByRole('button', { name: 'Cancel' })).toBeNull();
+    expect(dialog.querySelector('.actions .primary')?.textContent).toBe('Close');
+  });
+});
+
+describe('B18: a join left to the background ends with a toast (PO JR-1)', () => {
+  it.each([
+    ['removed', "This account was removed from the server, so it can't join. You can contact the owner."],
+    ['closed', "The owner closed this server, so it can't be joined."],
+  ])('%s: the toast says why', async (phase, text) => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const emit = (core as unknown as { emit: (e: string, p: unknown) => void }).emit.bind(core);
+    core.joinServer = async (link: string) => {
+      const status = { phase: 'nobody-online' as const, link };
+      setTimeout(() => emit('join.status', status));
+      return status;
+    };
+    render(<App core={core} initialSettings={en} />);
+    await screen.findByRole('textbox', { name: /^Message / });
+    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+    fireEvent.click(await screen.findByRole('button', { name: /Join with a link/ }));
+    const dialog = screen.getByRole('dialog', { name: 'Join a server' });
+    const input = within(dialog).getByRole('textbox', { name: 'Invite link' });
+    fireEvent.change(input, { target: { value: 'mvs://join/later' } });
+    await act(async () => {
+      fireEvent.submit(input.closest('form')!);
+    });
+    await act(async () => {
+      fireEvent.click(await within(dialog).findByRole('button', { name: 'Keep looking in the background' }));
+    });
+    expect(screen.queryByRole('dialog', { name: 'Join a server' })).toBeNull();
+    // Later, the core's final answer for that link.
+    await act(async () => {
+      emit('join.status', { phase, link: 'mvs://join/later' });
+    });
+    expect((await screen.findByText(text)).closest('.toast')).toBeTruthy();
+  });
+});

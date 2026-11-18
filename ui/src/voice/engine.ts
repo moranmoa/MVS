@@ -89,6 +89,11 @@ export interface VoiceEnv {
   opusCodecs(): RTCRtpCodec[] | null;
   /** G-72: calls back when devices are plugged in or out; returns an unsubscribe. Optional. */
   onDeviceChange?(cb: () => void): () => void;
+  /**
+   * Calls back when the network changes (back online, or another interface:
+   * Wi-Fi to LAN, a VPN on or off); returns an unsubscribe. Optional.
+   */
+  onNetworkChange?(cb: () => void): () => void;
 }
 
 export interface VoiceEngineOptions {
@@ -109,6 +114,12 @@ export interface VoiceEngineOptions {
   turnFetchTimeoutMs?: number;
   /** RMS level above which someone counts as speaking (0..1). */
   speakingThreshold?: number;
+  /** A connected call that drops (network change): how long ICE restarts may try before giving up. Default 15 s. */
+  recoverTimeoutMs?: number;
+  /** While recovering, the offerer sends a fresh restart offer this often. Default 5 s. */
+  restartResendMs?: number;
+  /** How long `disconnected` may last before a restart (it often recovers by itself). Default 2 s. */
+  disconnectGraceMs?: number;
 }
 
 export interface VoiceEngine {
@@ -180,6 +191,10 @@ interface Peer {
   /** Offerer: which offer this is (1-based). */
   attempt: number;
   watchdog: ReturnType<typeof setTimeout> | null;
+  /** A verified call that dropped: the give-up timer and the offerer's re-sends. */
+  recovery: { giveUp: ReturnType<typeof setTimeout>; resend: ReturnType<typeof setInterval> | null } | null;
+  /** A short wait on `disconnected` before restarting: it often comes back by itself. */
+  grace: ReturnType<typeof setTimeout> | null;
 }
 
 interface Meter {
@@ -201,6 +216,17 @@ export function browserEnv(): VoiceEnv {
       if (!md?.addEventListener) return () => {};
       md.addEventListener('devicechange', cb);
       return () => md.removeEventListener('devicechange', cb);
+    },
+    onNetworkChange: (cb) => {
+      // `online` after an outage; NetworkInformation `change` when the
+      // interface or type changes (Chromium), e.g. Wi-Fi to LAN or a VPN.
+      const conn = (navigator as Navigator & { connection?: EventTarget }).connection;
+      window.addEventListener('online', cb);
+      conn?.addEventListener?.('change', cb);
+      return () => {
+        window.removeEventListener('online', cb);
+        conn?.removeEventListener?.('change', cb);
+      };
     },
     opusCodecs: () => {
       try {
@@ -226,6 +252,9 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const threshold = options.speakingThreshold ?? 0.02;
   const answerTimeoutMs = options.answerTimeoutMs ?? 5000;
   const connectTimeoutMs = options.connectTimeoutMs ?? 30_000;
+  const recoverTimeoutMs = options.recoverTimeoutMs ?? 15_000;
+  const restartResendMs = options.restartResendMs ?? 5000;
+  const disconnectGraceMs = options.disconnectGraceMs ?? 2000;
   const turnFetchTimeoutMs = options.turnFetchTimeoutMs ?? 2000;
   /** Cleaned TURN credentials, and when to refresh them (80% of the ttl). */
   let turn: TurnCredentials | null = null;
@@ -397,6 +426,9 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
 
   const unsubscribe = [core.onState((s) => onState(s)), core.onSignal((s) => void onSignal(s))];
   if (env.onDeviceChange) unsubscribe.push(env.onDeviceChange(() => void onDevicesChanged()));
+  // A network change: every connected call restarts ICE at once instead of
+  // waiting for ICE to notice the old path is gone.
+  if (env.onNetworkChange) unsubscribe.push(env.onNetworkChange(() => onNetworkChanged()));
 
   function emitParticipants() {
     if (!active || !me) return;
@@ -570,6 +602,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       closed: false,
       attempt,
       watchdog: null,
+      recovery: null,
+      grace: null,
     };
     peers.set(id, peer);
     peer.watchdog = setTimeout(
@@ -602,11 +636,81 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     pc.onconnectionstatechange = () => {
       if (peer.closed) return;
       const s = pc.connectionState;
-      if (s === 'connected') void checkCertificate(peer);
-      else if (s === 'failed') retryOrFail(peer);
+      if (s === 'connected') {
+        clearGrace(peer);
+        endRecovery(peer);
+        void checkCertificate(peer); // again after a restart: same certificate, or the peer goes
+      } else if (s === 'disconnected' || s === 'failed') {
+        // A call that worked: ICE restart on this connection (after a short
+        // grace for `disconnected`, at once for `failed`). One that never
+        // connected: the offerer's fresh-connection retries, as before.
+        if (peer.verified) {
+          if (s === 'failed' || peer.recovery) recover(peer);
+          else if (!peer.grace) {
+            peer.grace = setTimeout(() => {
+              peer.grace = null;
+              if (!peer.closed && peer.pc.connectionState !== 'connected') recover(peer);
+            }, disconnectGraceMs);
+          }
+        } else if (s === 'failed') retryOrFail(peer);
+      }
     };
     emitParticipants();
     return peer;
+  }
+
+  // ---- ICE restart: a call that survives a network change -----------------
+  // A verified call whose connection drops (disconnected, failed) or whose
+  // device changes network restarts ICE on the same connection: the offerer
+  // (lower identity, as for the first offer: no glare) sends a restart offer
+  // over the existing signalling, again every restartResendMs while it's down;
+  // the answerer answers on the same connection (onSignal). The certificate
+  // can't change: the same checks run. Not back within recoverTimeoutMs: the
+  // peer is dropped as peer-failed ("no voice connection").
+
+  function recover(peer: Peer) {
+    if (peer.closed || !peer.verified) return;
+    clearGrace(peer);
+    if (!peer.recovery) {
+      peer.state = 'connecting';
+      emitParticipants();
+      const giveUp = setTimeout(() => {
+        if (peer.recovery) dropPeer(peer, 'peer-failed');
+      }, recoverTimeoutMs);
+      const resend = peer.offerer ? setInterval(() => restartIce(peer), restartResendMs) : null;
+      peer.recovery = { giveUp, resend };
+    }
+    if (peer.offerer) restartIce(peer);
+  }
+
+  function restartIce(peer: Peer) {
+    if (peer.closed || !peer.recovery) return;
+    const st = peer.pc.signalingState;
+    if (st !== 'stable' && st !== 'have-local-offer') return;
+    try {
+      peer.pc.restartIce();
+    } catch {
+      return;
+    }
+    void sendDescription(peer, 'offer').catch(() => {});
+  }
+
+  function clearGrace(peer: Peer) {
+    if (peer.grace) clearTimeout(peer.grace);
+    peer.grace = null;
+  }
+
+  function endRecovery(peer: Peer) {
+    if (!peer.recovery) return;
+    clearTimeout(peer.recovery.giveUp);
+    if (peer.recovery.resend) clearInterval(peer.recovery.resend);
+    peer.recovery = null;
+  }
+
+  /** The device changed network: every connected call restarts now. */
+  function onNetworkChanged() {
+    if (!active) return;
+    for (const p of [...peers.values()]) if (p.verified && !p.closed) recover(p);
   }
 
   /** The offerer offers again on a fresh connection while it has tries left. */
@@ -626,6 +730,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     peer.closed = true;
     if (peer.watchdog) clearTimeout(peer.watchdog);
     peer.watchdog = null;
+    endRecovery(peer);
+    clearGrace(peer);
     peer.state = 'failed';
     try {
       peer.pc.close();
@@ -780,7 +886,9 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
 
   async function applyRemote(peer: Peer, type: 'offer' | 'answer', sdp: string): Promise<boolean> {
     const fingerprint = soleFingerprint(sdp);
-    if (!fingerprint) {
+    // Pinned: once a peer has a fingerprint, every later offer or answer (an
+    // ICE restart) must name the same one; refused before it's applied.
+    if (!fingerprint || (peer.fingerprint !== null && fingerprint !== peer.fingerprint)) {
       dropPeer(peer, 'fingerprint-mismatch');
       return false;
     }

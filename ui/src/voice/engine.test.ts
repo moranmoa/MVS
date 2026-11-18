@@ -1,10 +1,12 @@
 // Voice v1, piece D: the mesh engine against fake WebRTC and a fake core.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CallSignal, CallState, Id } from '../core/types';
+import type { CallPath, CallSignal, CallState, Id } from '../core/types';
 import type { SignalKind, VoiceCore } from './adapter';
 import { candidateCounts, createVoiceEngine, type VoiceEngineOptions, type VoiceEnv, type VoiceError, type VoiceParticipant } from './engine';
 import { cleanTurnCredentials, fingerprints, iceServersFor, normalizeFingerprint, soleFingerprint } from './sdp';
+import type { MediaEnv } from './media/session';
+import { loopback } from './media/transport';
 
 const A: Id = 'a'.repeat(64);
 const B: Id = 'b'.repeat(64);
@@ -272,6 +274,16 @@ class FakeWebAudioContext {
     this.limiters.push(c);
     return c;
   }
+  // G-81 B playback: a clock and buffer sources (what MediaSession schedules).
+  currentTime = 0;
+  scheduled: { at: number; out: unknown }[] = [];
+  createBuffer(_c: number, n: number) {
+    return { length: n, copyToChannel() {} };
+  }
+  createBufferSource() {
+    const node = Object.assign(new FakeNode(), { buffer: null as unknown, start: (at: number) => this.scheduled.push({ at, out: node.out[0] }) });
+    return node;
+  }
   async setSinkId(id: string) {
     if (this.sinkFails && id) throw Object.assign(new Error('no'), { name: 'NotAllowedError' });
     this.sinks.push(id);
@@ -391,9 +403,20 @@ class FakeCore implements VoiceCore {
   wire: ((to: Id, kind: SignalKind, payload: string) => void) | null = null;
   /** G-81: mocked TURN credentials (the core api does not have it yet). */
   getTurnCredentials?: () => Promise<unknown>;
+  /** G-81 B (2a, mocked): the core's path to each participant, and the call id. */
+  paths: Partial<Record<Id, CallPath>> = {};
+  callId: string | undefined = undefined;
+  /** G-81 B (2a, mocked): what the engine said about live LAN WebRTC peers. */
+  webrtcPeers: Id[][] = [];
+  setCallWebrtcPeers?: (ids: Id[]) => Promise<unknown>;
   constructor(readonly me: Id, readonly participants: Id[]) {}
   state(): CallState {
-    return { channelId: CH, participants: this.participants.map((identity) => ({ identity, muted: false })), full: false };
+    return {
+      channelId: CH,
+      participants: this.participants.map((identity) => ({ identity, muted: false, ...(this.paths[identity] ? { path: this.paths[identity] } : {}) })),
+      full: false,
+      ...(this.callId ? { callId: this.callId } : {}),
+    };
   }
   async joinCall() {
     return this.state();
@@ -1724,5 +1747,173 @@ describe('SL S3: ICE servers only from a plain stun:host:port', () => {
       'stun:' + 'a'.repeat(260),
     ])
       expect(iceServersFor(bad), bad).toEqual([]);
+  });
+});
+
+// ---- G-81 B: the C2 switch (docs/design/g81-p2p-calls.md §2.2) ----------------------
+
+describe('voice engine: G-81 C2 (LAN WebRTC, else media over the P2P network)', () => {
+  const CALL_ID = 'c'.repeat(32);
+
+  /** A fake mic and codec for MediaSession: push(n) makes the mic produce n frames. */
+  function fakeMedia() {
+    const queue: ({ close(): void } | null)[] = [];
+    let wake: (() => void) | null = null;
+    const env: MediaEnv = {
+      readTrack: () => ({
+        async read() {
+          while (!queue.length) await new Promise<void>((r) => (wake = r));
+          return queue.shift() as unknown as AudioData | null;
+        },
+        cancel() {
+          queue.push(null);
+          wake?.();
+        },
+      }),
+      createEncoder: ({ output }) => {
+        let n = 0;
+        return {
+          configure() {},
+          encode: () => output({ byteLength: 60, timestamp: ++n * 40_000, copyTo: (d) => d.fill(7) }),
+          close() {},
+        };
+      },
+      createDecoder: ({ output }) => ({ configure() {}, decode: () => output({ numberOfFrames: 1920, copyTo: (d) => d.fill(0.1), close() {} }), close() {} }),
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
+    };
+    return {
+      env,
+      async push(n: number) {
+        for (let i = 0; i < n; i++) queue.push({ close() {} });
+        wake?.();
+        await vi.advanceTimersByTimeAsync(1);
+      },
+    };
+  }
+
+  async function call(path: CallPath | undefined, o: { relayOnly?: boolean; lanNeverConnects?: boolean } = {}) {
+    vi.useFakeTimers();
+    const hx = fakeEnv({ webAudio: {} });
+    const hy = fakeEnv({ webAudio: {} });
+    const cx = new FakeCore(A, [A, B]);
+    const cy = new FakeCore(B, [B, A]);
+    for (const c of [cx, cy]) {
+      c.callId = CALL_ID;
+      c.setCallWebrtcPeers = async (ids) => void c.webrtcPeers.push(ids);
+    }
+    if (path) {
+      cx.paths[B] = path;
+      cy.paths[A] = path;
+    }
+    cx.wire = (to, kind, payload) => to === B && setTimeout(() => cy.emitSignal({ from: A, kind, payload, fingerprintVerified: true }), 0);
+    cy.wire = (to, kind, payload) => to === A && setTimeout(() => cx.emitSignal({ from: B, kind, payload, fingerprintVerified: true }), 0);
+    const net = loopback([A, B], {}, (fn) => fn());
+    const mx = fakeMedia();
+    const my = fakeMedia();
+    const opts = { stunUrl: null, p2p: true, relayOnly: o.relayOnly };
+    const ex = createVoiceEngine(cx, { env: hx.env, ...opts, media: { transport: () => net[A]!, env: mx.env } });
+    const ey = createVoiceEngine(cy, { env: hy.env, ...opts, media: { transport: () => net[B]!, env: my.env } });
+    const errors = record<VoiceError>((cb) => ex.on('error', cb));
+    const parts = record<VoiceParticipant[]>((cb) => ex.on('participants', cb));
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    if (o.lanNeverConnects) for (const pc of [...hx.pcs, ...hy.pcs]) pc.neverConnect = true;
+    await vi.advanceTimersByTimeAsync(50);
+    return { hx, hy, cx, cy, ex, ey, mx, my, errors, parts };
+  }
+  const yB = (parts: VoiceParticipant[][]) => parts.at(-1)?.find((p) => p.identity === B)?.state;
+  const scheduledOn = (h: { contexts: unknown[] }) => (h.contexts[0] as { scheduled: unknown[] }).scheduled.length;
+
+  it('a peer on another network (circuit): no RTCPeerConnection; audio goes over B, and B shows connected', async () => {
+    const { hx, hy, cx, ex, ey, mx, errors, parts } = await call('circuit');
+    expect(hx.pcs).toHaveLength(0);
+    expect(hy.pcs).toHaveLength(0);
+    expect(cx.sent).toEqual([]); // no WebRTC signalling at all
+    await mx.push(5);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(scheduledOn(hy)).toBeGreaterThan(0); // B's side scheduled A's audio
+    expect(yB(parts)).toBe('connected');
+    expect(cx.webrtcPeers.at(-1)).toEqual([]); // no LAN WebRTC: the core sends B to everyone
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a peer on my LAN: WebRTC as before, and the core is told to leave it out of B', async () => {
+    const { hx, cx, ex, ey, errors } = await call('lan');
+    expect(hx.pcs).toHaveLength(1);
+    expect(hx.pcs[0]!.connectionState).toBe('connected');
+    expect(cx.webrtcPeers.at(-1)).toEqual([B]);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a LAN attempt that never connects falls to B after 3 s, with no error', async () => {
+    const { hx, ex, ey, errors, parts } = await call('lan', { lanNeverConnects: true });
+    expect(hx.pcs).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(hx.pcs[0]!.closed).toBe(true);
+    expect(errors).toEqual([]);
+    expect(yB(parts)).toBe('connected'); // on B now (the core has a LAN path to them)
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('relay-only with B on: the call runs on B, never an RTCPeerConnection, even toward a LAN peer', async () => {
+    const { hx, hy, cx, ex, ey, mx } = await call('lan', { relayOnly: true });
+    expect(hx.pcs).toHaveLength(0);
+    expect(hy.pcs).toHaveLength(0);
+    expect(cx.sent).toEqual([]);
+    await mx.push(3);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(scheduledOn(hy)).toBeGreaterThan(0);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('an offer from a peer not on my LAN is ignored: a peer cannot force WebRTC', async () => {
+    // To B (the higher identity, which takes offers): A's offer must not open WebRTC there.
+    const { hy, cy, ex, ey } = await call('circuit');
+    cy.emitSignal({ from: A, kind: 'offer', payload: `v=0\r\na=fingerprint:sha-256 ${newFingerprint()}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n`, fingerprintVerified: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(hy.pcs).toHaveLength(0);
+    expect(cy.sent).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('no usable path within the connect timeout: peer-failed once, shown failed', async () => {
+    const { ex, ey, errors, parts } = await call('none');
+    expect(yB(parts)).toBe('connecting');
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(errors).toEqual([{ code: 'peer-failed', peer: B }]);
+    expect(yB(parts)).toBe('failed');
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('muted: nothing goes out over B', async () => {
+    const { hy, ex, ey, mx } = await call('circuit');
+    ex.setMicMuted(true);
+    await mx.push(5);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(scheduledOn(hy)).toBe(0);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('with the flag off, nothing changes: WebRTC to everyone, whatever the path', async () => {
+    vi.useFakeTimers();
+    const p = pair();
+    p.cx.paths[B] = 'circuit';
+    p.cx.callId = CALL_ID;
+    await p.ex.attach(p.cx.state(), A);
+    await p.ey.attach(p.cy.state(), B);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(p.hx.pcs).toHaveLength(1);
+    p.ex.dispose();
+    p.ey.dispose();
   });
 });

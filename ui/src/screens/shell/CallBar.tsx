@@ -9,6 +9,7 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Dialog, Name } from '../../components/common';
 import { VoiceDiagnostics } from './VoiceDiagnostics';
+import { useVoiceP2p } from '../../voice/useVoiceP2p';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
@@ -46,7 +47,9 @@ export function useCallEngine(myId: Id): CallEngine {
   const stunUrl = useStunUrl();
   // SL S1 (G-81): relay-only means no voice; the engine never starts a call then.
   const relayOnly = useStore(store, (s) => s.relayOnly);
-  const view = useVoiceEngine(call, myId, { stunUrl, relayOnly });
+  // G-81 B (voiceP2p): LAN peers on WebRTC, everyone else over the P2P network.
+  const p2p = useVoiceP2p();
+  const view = useVoiceEngine(call, myId, { stunUrl, relayOnly, p2p });
   const sim = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('voiceSim') : null;
   const error = call && sim === 'noMic' ? 'no-device' : call && sim === 'rejoin' ? 'rejoin-to-talk' : view.error;
   const other = call?.participants.find((p) => p.identity !== myId)?.identity;

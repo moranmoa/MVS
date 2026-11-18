@@ -1338,10 +1338,12 @@ export class MockCore implements CoreApi {
 
   /** Like the core, by 64-hex account id (the sanitizer drops anything else). */
   private blockedList(): BlockedUser[] {
+    const codes = new Map<Id, string>();
+    for (const s of this.servers.values()) for (const m of s.members) codes.set(m.id, m.shortCode);
     return [...this.blockedIds()]
-      .map(([id, name]) => [asAccountId(id), name] as const)
+      .map(([id, name]) => [asAccountId(id), name, codes.get(id) ?? ''] as const)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([userId, name]) => (name ? { userId, name } : { userId }));
+      .map(([userId, name, shortCode]) => ({ userId, shortCode, ...(name ? { name } : {}) }));
   }
 
   /** A demo member id, given as itself or as its 64-hex account id. */

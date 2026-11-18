@@ -256,7 +256,8 @@ export function cleanInvite(i: Invite): Invite {
 export function cleanBlockedUser(b: BlockedUser): BlockedUser | null {
   if (typeof b?.userId !== 'string' || !/^[0-9a-f]{64}$/.test(b.userId)) return null;
   const name = cleanName(b.name);
-  return name ? { userId: b.userId, name } : { userId: b.userId };
+  const shortCode = cleanCode(b.shortCode);
+  return { userId: b.userId, ...(shortCode ? { shortCode } : {}), ...(name ? { name } : {}) };
 }
 const cleanBlockedList = (l: unknown): BlockedUser[] =>
   Array.isArray(l) ? l.map(cleanBlockedUser).filter((b): b is BlockedUser => b !== null) : [];

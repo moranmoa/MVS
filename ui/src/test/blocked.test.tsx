@@ -250,3 +250,27 @@ describe('G-47: the sanitizer', () => {
     expect(cleanBlockedUser(null as never)).toBeNull();
   });
 });
+
+describe('G-47b (UX-19): the short code on every row', () => {
+  it("strangers show the core's code, so two unknown accounts can be told apart", async () => {
+    await setup((core) =>
+      vi.spyOn(core, 'listBlocked').mockResolvedValue([
+        { userId: 'a'.repeat(64), shortCode: 'AAAA-1111' },
+        { userId: 'b'.repeat(64), shortCode: 'BBBB-2222' },
+      ]),
+    );
+    const region = await openPrivacy();
+    const rows = await within(region).findAllByRole('listitem');
+    expect(rows.map((r) => r.querySelector('.blocked-code')?.textContent)).toEqual(['AAAA-1111', 'BBBB-2222']);
+  });
+
+  it('the sanitizer keeps a clean short code', async () => {
+    const { cleanBlockedUser } = await import('../core/sanitize');
+    expect(cleanBlockedUser({ userId: 'a'.repeat(64), shortCode: 'AAAA-1111', name: 'Rina' })).toEqual({
+      userId: 'a'.repeat(64),
+      shortCode: 'AAAA-1111',
+      name: 'Rina',
+    });
+    expect(cleanBlockedUser({ userId: 'a'.repeat(64) })).toEqual({ userId: 'a'.repeat(64) });
+  });
+});

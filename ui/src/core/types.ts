@@ -263,6 +263,8 @@ export interface AppInfo {
  */
 export interface BlockedUser {
   userId: Id;
+  /** UX-19 (core #525): the identity short code, as on Member, so nameless rows can be told apart. */
+  shortCode?: string;
   name?: string;
 }
 

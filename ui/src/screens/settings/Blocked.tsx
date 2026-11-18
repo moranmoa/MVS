@@ -39,19 +39,20 @@ export interface BlockedRow {
 export function blockedRows(core: BlockedUser[] | null, members: Record<Id, Member[]>, myId: Id | undefined, locale: string): BlockedRow[] {
   const known = new Map<Id, Member>();
   for (const list of Object.values(members)) for (const m of list) if (!known.has(m.id)) known.set(m.id, m);
-  const row = (id: Id, name: string | undefined): BlockedRow => {
+  const row = (id: Id, name: string | undefined, code?: string): BlockedRow => {
     const m = known.get(id);
+    const shortCode = m?.shortCode || code;
     return {
       id,
       name: m?.displayName || name || '',
-      ...(m ? { shortCode: m.shortCode } : {}),
+      ...(shortCode ? { shortCode } : {}),
       ...(m?.avatarDataUrl ? { avatarDataUrl: m.avatarDataUrl } : {}),
       color: m ? (m.color ?? m.avatarColor) : NEUTRAL,
     };
   };
   const rows = new Map<Id, BlockedRow>();
   if (core) {
-    for (const b of core) if (b.userId !== myId && !rows.has(b.userId)) rows.set(b.userId, row(b.userId, b.name));
+    for (const b of core) if (b.userId !== myId && !rows.has(b.userId)) rows.set(b.userId, row(b.userId, b.name, b.shortCode));
   } else {
     for (const list of Object.values(members)) {
       for (const m of list) if (m.blocked && m.id !== myId && !rows.has(m.id)) rows.set(m.id, row(m.id, m.displayName));

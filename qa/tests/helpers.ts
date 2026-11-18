@@ -85,7 +85,8 @@ export async function onboard(page: Page, opts: OnboardOptions = {}): Promise<st
 
   await page.getByLabel(he.displayName).fill(displayName);
   await page.getByRole('button', { name: he.done }).click();
-  await expect(homeHeading(page)).toBeVisible();
+  // G-92: onboard() always creates a new account, so its first Home says so.
+  await expect(page.getByRole('heading', { name: he.homeFirstRunTitle })).toBeVisible();
   return words;
 }
 
@@ -142,6 +143,6 @@ export function trackErrors(page: Page): string[] {
 }
 
 /** Home's heading: the usual one, or (G-92) the first visit after sign-up. */
-export function homeHeading(page: import('@playwright/test').Page) {
+export function homeHeading(page: Page) {
   return page.getByRole('heading', { name: he.homeTitle }).or(page.getByRole('heading', { name: he.homeFirstRunTitle }));
 }

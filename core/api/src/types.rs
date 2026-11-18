@@ -285,6 +285,10 @@ pub struct CoreError {
     /// 1-based word positions that were not recognised (restore).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<usize>>,
+    /// G-77 `owns-restricted-server`: the names of the servers I own whose
+    /// age restriction is above the corrected age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub servers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +323,10 @@ pub enum ErrorCode {
     UpdateNeeded,
     /// G-77 (B7 §2): a birth-date correction to under 16. Nothing changed.
     TooYoung,
+    /// G-77 (PO): a lowering below the restriction of a server I own (an
+    /// owner can't leave, and its restriction is never lifted for me).
+    /// `servers` names them. Nothing changed.
+    OwnsRestrictedServer,
     /// Rust addition: malformed command JSON or arguments.
     BadRequest,
     /// Rust addition: in the contract, not done by this core yet.
@@ -344,7 +352,7 @@ pub enum ErrorCode {
 
 impl CoreError {
     pub fn new(code: ErrorCode) -> CoreError {
-        CoreError { code, positions: None }
+        CoreError { code, positions: None, servers: None }
     }
 }
 
@@ -683,6 +691,9 @@ pub enum AgeCorrectionKind {
     Raise,
     /// Under 16: refused (`correctBirthDate` rejects with `too-young`).
     TooYoung,
+    /// A lowering below the restriction of a server I own: refused
+    /// (`owns-restricted-server`); `blockedBy` lists them.
+    OwnsRestrictedServer,
 }
 
 /// G-77: a server or channel a lowering would take away.
@@ -706,6 +717,9 @@ pub struct AgeCorrectionPreview {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effective_at: Option<Timestamp>,
     pub loses: Vec<AgeLoss>,
+    /// For `owns-restricted-server`: my servers in the way (no `channel`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub blocked_by: Vec<AgeLoss>,
 }
 
 /// Voice rooms: a live room and who is in it, from verified hellos (soft

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! request:  { "cmd": "createServer", "args": { "name": "...", "ageRestriction": "none" } }
-//! response: { "ok": <result> }  or  { "error": { "code": "not-allowed", "positions"?: [...] } }
+//! response: { "ok": <result> }  or  { "error": { "code": "not-allowed", "positions"?: [...], "servers"?: [...] } }
 //! event:    { "event": "server.added", "payload": <ServerSummary> }   (via EventSink)
 //! ```
 //!

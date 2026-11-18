@@ -103,6 +103,10 @@ fn an_earlier_birthday_at_the_same_age_still_waits() {
     let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
     assert!(me.core.check_recovery_words(answers).unwrap().ok);
 
+    // One day earlier is a raise too (Security Lead on #512).
+    let one_day = me.core.preview_birth_date_correction("2008-12-31").unwrap();
+    assert_eq!(one_day.kind, AgeCorrectionKind::Raise);
+
     // 17 either way today (2026-11-03); 18 on 2026-11-19 with the new date.
     let preview = me.core.correct_birth_date("2008-11-19").unwrap();
     assert_eq!(preview.kind, AgeCorrectionKind::Raise);
@@ -191,15 +195,36 @@ fn a_lowering_leaves_adult_servers_and_hides_adult_channels_at_once() {
     assert_eq!(member.core.list_servers().unwrap().len(), 1);
 }
 
+
+/// PO on #512: lowering below the restriction of a server I own is refused
+/// (an owner can't leave, and the restriction is never lifted for me).
+/// Nothing changes: the date, the server, my claims there.
 #[test]
-fn an_owner_keeps_its_own_adult_server() {
+fn an_owner_cant_lower_below_its_own_servers_restriction() {
     let world = World::new();
     let owner = world.peer();
     sign_up(&owner, "Owner");
     let mine = owner.core.create_server("Mine", AgeRestriction::Eighteen).unwrap();
-    let preview = owner.core.preview_birth_date_correction("2009-06-01").unwrap();
-    assert!(preview.loses.is_empty(), "{:?}", preview.loses);
-    owner.core.correct_birth_date("2009-06-01").unwrap();
-    assert_eq!(owner.core.list_servers().unwrap().len(), 1);
-    assert_eq!(owner.core.list_servers().unwrap()[0].id, mine.id);
+    let night = owner.core.create_channel(&mine.id, "night", true).unwrap();
+    let open = owner.core.create_server("Open", AgeRestriction::None).unwrap();
+
+    let preview = call(&owner, "previewBirthDateCorrection", json!({ "date": "2009-06-01" })).unwrap();
+    assert_eq!(
+        preview,
+        json!({ "kind": "owns-restricted-server", "loses": [], "blockedBy": [{ "serverId": mine.id, "name": "Mine" }] })
+    );
+    owner.events.take();
+    let line = json!({ "cmd": "correctBirthDate", "args": { "date": "2009-06-01" } }).to_string();
+    let answer: Value = serde_json::from_str(&owner.core.handle(&line)).unwrap();
+    assert_eq!(answer["error"], json!({ "code": "owns-restricted-server", "servers": ["Mine"] }));
+
+    assert!(owner.events.take().is_empty(), "nothing changed, nothing fired");
+    assert_eq!(identity(&owner).birth_date, "1990-05-01");
+    let servers: Vec<String> = owner.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(servers, [mine.id.clone(), open.id.clone()]);
+    assert!(owner.core.list_channels(&mine.id).unwrap().iter().any(|c| c.id == night.id), "still adult there");
+
+    // Still allowed: a date that keeps me 18 or over, and any raise.
+    assert_eq!(owner.core.correct_birth_date("1990-06-01").unwrap().kind, AgeCorrectionKind::Lower);
+    assert_eq!(owner.core.correct_birth_date("1980-01-01").unwrap().kind, AgeCorrectionKind::Raise);
 }

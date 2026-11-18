@@ -1,4 +1,4 @@
-        Some(if self.cap_waiting(now) { age.min(17) } else { age })//! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
+//! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -554,7 +554,7 @@ pub fn finish_sign_out(
 
 fn phrase_error(e: PhraseError) -> CoreError {
     let positions = e.positions().into_iter().map(|p| p + 1).collect();
-    CoreError { code: ErrorCode::InvalidWords, positions: Some(positions) }
+    CoreError { code: ErrorCode::InvalidWords, positions: Some(positions), servers: None }
 }
 
 fn parse_user(id: &str) -> CoreResult<PublicKey> {
@@ -2659,25 +2659,35 @@ impl Core {
         self.lock().age_correction(date, now)
     }
 
-    /// `correctBirthDate(date)`, compared with my age as it counts now:
-    /// - **same:** the date is replaced (a waiting correction is dropped);
-    /// - **lower:** at once. The new claim goes to every server I'm in; an
-    ///   18+ server I'm no longer old enough for is left (`server.removed`,
-    ///   `reason: 'age'`, `required`), unless I own it; elsewhere its 18+
-    ///   channels go (`channel.removed`, `reason: 'age'`);
-    /// - **raise:** pending for 30 days (`Identity.pendingBirthDate`); a new
-    ///   correction replaces it;
+    /// `correctBirthDate(date)`, by date against my current birth date:
+    /// - **same** (the identical date): a waiting correction is dropped;
+    /// - **lower** (a later date): at once. The new claim goes to every
+    ///   server I'm in; an 18+ server I'm no longer old enough for is left
+    ///   (`server.removed`, `reason: 'age'`, `required`); elsewhere its 18+
+    ///   channels go (`channel.removed`, `reason: 'age'`). A waiting restore
+    ///   cap stays. Refused (`owns-restricted-server`, `servers`) while I
+    ///   own a server whose restriction is above the new age (PO);
+    /// - **raise** (an earlier date): pending for 30 days
+    ///   (`Identity.pendingBirthDate`); a new correction replaces it;
     /// - **under 16:** `too-young`, nothing changed.
     ///
-    /// `identity.changed` follows any change. Never promotes the date to
-    /// "the one my claims come from": a restored date stays untrusted, so
-    /// a date a day short of 18 still waits 30 days after turning 18.
+    /// `identity.changed` follows any change. Same and lower never make the
+    /// date "the one my claims come from" (a restored date stays untrusted,
+    /// so a date a day short of 18 still waits 30 days after turning 18); a
+    /// raise does once it settles, having waited its own 30 days.
     pub fn correct_birth_date(&self, date: &str) -> CoreResult<AgeCorrectionPreview> {
         let preview = self.run(|inner, ports, events| {
             let now = ports.clock.now_ms();
             let preview = inner.age_correction(date, now)?;
             match preview.kind {
                 AgeCorrectionKind::TooYoung => return Err(ErrorCode::TooYoung.into()),
+                AgeCorrectionKind::OwnsRestrictedServer => {
+                    return Err(CoreError {
+                        code: ErrorCode::OwnsRestrictedServer,
+                        positions: None,
+                        servers: Some(preview.blocked_by.iter().map(|s| s.name.clone()).collect()),
+                    });
+                }
                 kind => {
                     let effective_at = preview.effective_at.unwrap_or(0);
                     inner.update_profile_with(|p| p.correct(kind, date, effective_at, now))?;
@@ -3597,48 +3607,54 @@ impl Inner {
         Ok(())
     }
 
-    /// G-77: what correcting my birth date to `date` would do at `now`,
-    /// against my age as it counts now (a waiting raise counts as not yet).
+    /// G-77: what correcting my birth date to `date` would do at `now`, by
+    /// date against my current birth date (a waiting raise counts as not
+    /// yet).
     fn age_correction(&mut self, date: &str, now: u64) -> CoreResult<AgeCorrectionPreview> {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         if !model::valid_birth_date(date, now) {
             return Err(ErrorCode::BadRequest.into());
         }
         let new = model::age_on(date, now).ok_or(ErrorCode::BadRequest)?;
-        let plain = |kind| AgeCorrectionPreview { kind, effective_at: None, loses: Vec::new() };
+        let preview = |kind, effective_at| AgeCorrectionPreview {
+            kind,
+            effective_at,
+            loses: Vec::new(),
+            blocked_by: Vec::new(),
+        };
         if new < 16 {
-            return Ok(plain(AgeCorrectionKind::TooYoung));
+            return Ok(preview(AgeCorrectionKind::TooYoung, None));
         }
         // By date, not by whole years: an earlier date that leaves my age the
         // same today still makes me older sooner, so it's a raise and waits
-        // (Tech Lead on #512). Valid dates compare as strings.
+        // (Tech Lead and Security Lead on #512). Valid dates compare as
+        // strings.
         let key = me.key();
         let waiting = me.profile.pending_birth_date.as_ref().filter(|p| p.correction && now < p.effective_at);
         Ok(match date.cmp(me.profile.birth_date.as_str()) {
-            std::cmp::Ordering::Equal => plain(AgeCorrectionKind::Same),
+            std::cmp::Ordering::Equal => preview(AgeCorrectionKind::Same, None),
             // The same raise again keeps its clock.
-            std::cmp::Ordering::Less if waiting.is_some_and(|p| p.date == date) => AgeCorrectionPreview {
-                kind: AgeCorrectionKind::Raise,
-                effective_at: waiting.map(|p| p.effective_at),
-                loses: Vec::new(),
-            },
-            std::cmp::Ordering::Less => AgeCorrectionPreview {
-                kind: AgeCorrectionKind::Raise,
-                effective_at: Some(now + AGE_RAISE_DELAY_MS),
-                loses: Vec::new(),
-            },
-            std::cmp::Ordering::Greater => AgeCorrectionPreview {
-                kind: AgeCorrectionKind::Lower,
-                effective_at: None,
-                loses: self.age_losses(key, new)?,
-            },
+            std::cmp::Ordering::Less if waiting.is_some_and(|p| p.date == date) => {
+                preview(AgeCorrectionKind::Raise, waiting.map(|p| p.effective_at))
+            }
+            std::cmp::Ordering::Less => preview(AgeCorrectionKind::Raise, Some(now + AGE_RAISE_DELAY_MS)),
+            std::cmp::Ordering::Greater => {
+                let (loses, blocked_by) = self.age_losses(key, new)?;
+                // PO: never below the restriction of a server I own.
+                if blocked_by.is_empty() {
+                    AgeCorrectionPreview { loses, ..preview(AgeCorrectionKind::Lower, None) }
+                } else {
+                    AgeCorrectionPreview { blocked_by, ..preview(AgeCorrectionKind::OwnsRestrictedServer, None) }
+                }
+            }
         })
     }
 
     /// G-77: what an age of `age` takes away: 18+ servers I'm a member of
-    /// but don't own (whole), else the 18+ channels I see now.
-    fn age_losses(&mut self, key: PublicKey, age: u32) -> CoreResult<Vec<AgeLoss>> {
-        let mut out = Vec::new();
+    /// but don't own (whole), else the 18+ channels I see now. Second: the
+    /// servers I own whose restriction is above `age` (they refuse it).
+    fn age_losses(&mut self, key: PublicKey, age: u32) -> CoreResult<(Vec<AgeLoss>, Vec<AgeLoss>)> {
+        let (mut out, mut owned) = (Vec::new(), Vec::new());
         for server in self.db.servers()? {
             if self.db.closed_at(server)?.is_some() {
                 continue;
@@ -3651,8 +3667,9 @@ impl Inner {
             let server_id = model::hex_id(server.as_bytes());
             let name = view.state.server_name.clone().unwrap_or_else(|| view.genesis.name.clone());
             let owner = view.state.role(key) == authority::Role::Owner;
-            if view.genesis.age_restriction.min_age() > age && !owner {
-                out.push(AgeLoss { server_id, name, channel: None });
+            if view.genesis.age_restriction.min_age() > age {
+                let loss = AgeLoss { server_id, name, channel: None };
+                if owner { owned.push(loss) } else { out.push(loss) }
             } else if age < 18 && view.state.adults.contains(&key) {
                 let mut channels: Vec<String> =
                     view.state.channels.values().filter(|c| c.adult).map(|c| c.name.clone()).collect();
@@ -3662,7 +3679,7 @@ impl Inner {
                 }
             }
         }
-        Ok(out)
+        Ok((out, owned))
     }
 
     /// G-77: after a lowering. The new claim goes to every server I'm in.

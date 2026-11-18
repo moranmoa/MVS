@@ -569,7 +569,7 @@ fn restore_and_identity_rules() {
     let world = World::new();
     let peer = world.peer();
     let err = peer.core.restore_identity(vec!["legal".into(); 11]).unwrap_err();
-    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]) });
+    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]), servers: None });
     let words: Vec<String> = LEGAL.split(' ').map(String::from).collect();
     let restored = peer.core.restore_identity(words.clone()).unwrap();
     assert!(restored.recovery_checked);

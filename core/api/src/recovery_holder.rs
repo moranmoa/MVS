@@ -198,12 +198,17 @@ impl HolderStore {
         self.held.iter().position(|e| e.h == *h)
     }
 
-    /// Drops handles nobody refreshed for [`EVICT_MS`], except one with a
-    /// pending recovery (the account's devices are gone then; that's when
-    /// the share is needed). Returns how many went.
+    /// Drops handles nobody refreshed for [`EVICT_MS`], except one whose
+    /// pending recovery is still live (the account's devices are gone then;
+    /// that's when the share is needed). A pending older than the hold plus
+    /// the token's validity is abandoned and protects nothing, or a handle
+    /// could be kept for ever (Security Lead on #504). Returns how many went.
     pub fn evict(&mut self, now: u64) -> usize {
         let before = self.held.len();
-        self.held.retain(|e| e.hold.pending_since.is_some() || now.saturating_sub(e.refreshed) <= EVICT_MS);
+        let live = |e: &Held| {
+            e.hold.pending_since.is_some_and(|since| now.saturating_sub(since) <= HOLD_MS + TOKEN_MAX_MS)
+        };
+        self.held.retain(|e| live(e) || now.saturating_sub(e.refreshed) <= EVICT_MS);
         before - self.held.len()
     }
 
@@ -211,6 +216,9 @@ impl HolderStore {
     /// handle bound to its key, then the version, then the caps; the `y` is
     /// sealed to `holder_pub` before it's kept. A newer version keeps the
     /// handle's hold and order state: a re-share doesn't reset a recovery.
+    /// The wiring must take `sender` from the sync binding (the identity
+    /// the delivering peer is bound to), never from the message itself, or
+    /// the per-sender cap means nothing (Security Lead on #504).
     pub fn offer(&mut self, record: &ShareRecord, sender: [u8; 32], holder_pub: &[u8; 32], now: u64) -> Offer {
         if !record.verify() {
             return Offer::BadSignature;
@@ -432,6 +440,10 @@ mod tests {
         assert_eq!(store.evict(NOW + EVICT_MS), 0, "90 days exactly still counts");
         assert_eq!(store.evict(NOW + EVICT_MS + 1), 1);
         assert_eq!(store.held[0].h, b.h, "the pending one stays");
+        // An abandoned pending protects it only for the hold plus the token.
+        let abandoned = NOW + EVICT_MS + HOLD_MS + TOKEN_MAX_MS;
+        assert_eq!(store.evict(abandoned), 0);
+        assert_eq!(store.evict(abandoned + 1), 1, "abandoned: not kept for ever");
         // A sender's slot frees up with the eviction.
         let mut store = HolderStore::default();
         store.offer(&record(&w(1), 1), [1; 32], &key.public(), NOW);

@@ -4,7 +4,7 @@
 mod common;
 
 use api::*;
-use common::{Peer, World, NOW_MS};
+use common::{Peer, World};
 use serde_json::{json, Value};
 
 const DAY_MS: u64 = 86_400_000;
@@ -36,6 +36,16 @@ fn call(peer: &Peer, command: &str, args: Value) -> Result<Value, String> {
     }
 }
 
+/// The test clock's reading (it ticks 1 ms per core reading).
+fn clock(world: &World) -> u64 {
+    *world.clock.0.lock().unwrap()
+}
+
+/// `at` is 30 days after a moment between `before` and `after`.
+fn in_30_days(at: u64, before: u64, after: u64) {
+    assert!((before + 30 * DAY_MS..=after + 30 * DAY_MS).contains(&at), "{at} not 30 days after {before}..={after}");
+}
+
 fn identity(peer: &Peer) -> Identity {
     peer.core.get_identity().unwrap().unwrap()
 }
@@ -55,16 +65,21 @@ fn same_raise_cancel_and_refusals() {
     assert_eq!(identity(&me).birth_date, "1990-06-01");
 
     // Older: a raise, pending for 30 days; the date stays until then.
+    let before = clock(&world);
     let preview = call(&me, "previewBirthDateCorrection", json!({ "date": "1980-01-01" })).unwrap();
-    let effective_at = NOW_MS + 30 * DAY_MS;
-    assert_eq!(preview, json!({ "kind": "raise", "effectiveAt": effective_at, "loses": [] }));
+    assert_eq!((preview["kind"].as_str(), &preview["loses"]), (Some("raise"), &json!([])));
+    in_30_days(preview["effectiveAt"].as_u64().unwrap(), before, clock(&world));
     assert!(identity(&me).pending_birth_date.is_none(), "a preview changes nothing");
     me.events.take();
+    let before = clock(&world);
     me.core.correct_birth_date("1980-01-01").unwrap();
     assert!(me.events.take().iter().any(|e| matches!(e, Event::IdentityChanged(_))));
     let now = identity(&me);
     assert_eq!(now.birth_date, "1990-06-01");
-    assert_eq!(now.pending_birth_date, Some(PendingBirthDate { date: "1980-01-01".into(), effective_at }));
+    let pending = now.pending_birth_date.unwrap();
+    assert_eq!(pending.date, "1980-01-01");
+    let effective_at = pending.effective_at;
+    in_30_days(effective_at, before, clock(&world));
 
     // The same raise again keeps its clock.
     *world.clock.0.lock().unwrap() += DAY_MS;
@@ -108,9 +123,10 @@ fn an_earlier_birthday_at_the_same_age_still_waits() {
     assert_eq!(one_day.kind, AgeCorrectionKind::Raise);
 
     // 17 either way today (2026-11-03); 18 on 2026-11-19 with the new date.
+    let before = clock(&world);
     let preview = me.core.correct_birth_date("2008-11-19").unwrap();
     assert_eq!(preview.kind, AgeCorrectionKind::Raise);
-    assert_eq!(preview.effective_at, Some(NOW_MS + 30 * DAY_MS));
+    in_30_days(preview.effective_at.unwrap(), before, clock(&world));
     assert_eq!(identity(&me).birth_date, "2009-01-01", "not until the 30 days");
     // On the new 18th birthday, still 17: the wait isn't over.
     *world.clock.0.lock().unwrap() += 17 * DAY_MS;
@@ -124,10 +140,12 @@ fn a_raise_takes_effect_after_30_days() {
     let me = world.peer();
     sign_up(&me, "Me");
     me.core.correct_birth_date("1980-01-01").unwrap();
-    *world.clock.0.lock().unwrap() += 30 * DAY_MS - 1;
+    // The test clock ticks 1 ms per reading: a second of margin either side.
+    let due = identity(&me).pending_birth_date.unwrap().effective_at;
+    *world.clock.0.lock().unwrap() = due - 1_000;
     me.core.sync_now().unwrap();
     assert_eq!(identity(&me).birth_date, "1990-05-01");
-    *world.clock.0.lock().unwrap() += 1;
+    *world.clock.0.lock().unwrap() = due + 1_000;
     me.events.take();
     me.core.sync_now().unwrap();
     let now = identity(&me);

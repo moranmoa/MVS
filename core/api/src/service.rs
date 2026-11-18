@@ -222,6 +222,13 @@ pub const SYNC_EVERY: Duration = Duration::from_secs(2);
 /// How long a message held for its channel key (the re-key a moderator
 /// makes when they read the join) waits before it is marked `failed`.
 pub const KEY_PENDING_FOR: Duration = Duration::from_secs(120);
+/// How long messages wait for a join re-key (lost-message P1): while
+/// current members can't read the channel's key (they just joined), a new
+/// message is held until a re-key covers them, so it isn't sealed under a
+/// key they never get. Counted per channel from when those members were
+/// first seen missing; past it (no moderator online to re-key), messages go
+/// out under the current key again, and the joiners can't read those.
+pub const JOIN_KEY_WAIT: Duration = Duration::from_secs(20);
 /// Provisional IDs of messages held for their key.
 pub const KEY_PENDING_PREFIX: &str = "pending-";
 /// Messages held for their key per channel at once; more get `not-allowed`.
@@ -325,6 +332,10 @@ struct Inner {
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
     key_pending: Vec<KeyPending>,
+    /// Channels whose current key some members can't read, and since when
+    /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
+    /// once nobody is missing.
+    join_key_wait: HashMap<(ServerId, ChannelId), u64>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -516,6 +527,13 @@ fn parse_user(id: &str) -> CoreResult<PublicKey> {
     model::parse_hex32(id).map(PublicKey::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
 
+/// G-47: where the name known when `user` was blocked is kept. Local only:
+/// never in the account backup (`backup_set` holds server secrets only) or
+/// `exportDiagnostics` (counts only); `tests/blocked.rs` checks the export.
+fn blocked_name_key(user: &PublicKey) -> String {
+    format!("blocked-name/{}", model::hex_id(user.as_bytes()))
+}
+
 fn parse_server(id: &str) -> CoreResult<ServerId> {
     model::parse_hex32(id).map(ServerId::from_bytes).ok_or_else(|| ErrorCode::NotFound.into())
 }
@@ -553,6 +571,7 @@ impl Core {
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
             key_pending: Vec::new(),
+            join_key_wait: HashMap::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -608,6 +627,13 @@ impl Core {
         self.ports.cipher.lock();
         self.ports.network.lock();
         self.keys_locked.store(true, Ordering::SeqCst);
+        // Messages held for a key: their text is dropped (zeroized) at lock
+        // and sign-out, never kept past them (lost-message P1, SL C3).
+        {
+            let mut inner = self.lock();
+            inner.key_pending.clear();
+            inner.join_key_wait.clear();
+        }
         // G-91 (Security Lead on #457): the server secrets a restore took
         // from the backup go too; the backup is fetched again after unlock.
         let mut restore = self.restore.lock().expect("not poisoned");
@@ -693,6 +719,8 @@ impl Core {
         inner.me = None;
         inner.logs.clear();
         inner.calls = voice::Calls::default();
+        inner.key_pending.clear();
+        inner.join_key_wait.clear();
         self.signed_out.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -2259,6 +2287,11 @@ impl Core {
             // G-29: a send ends my typing there (`off` once, if `on` went out).
             let stop = inner.typing.stopped(channel);
             inner.send_typing(ports.clock.now_ms(), stop.into_iter().collect());
+            if inner.waits_for_join_key(ports, server, channel)? {
+                let message = inner.hold_for_key(ports, server, channel, body)?;
+                events.push(Event::MessageAdded(message.clone()));
+                return Ok(message);
+            }
             let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
@@ -2621,22 +2654,28 @@ impl Core {
         })
     }
 
+    /// `blockUser`: a toggle, kept as it was for older shells. G-47's
+    /// [`Core::set_blocked`] is the idempotent form.
     pub fn block_user(&self, user_id: &str) -> CoreResult<()> {
         let user = parse_user(user_id)?;
         self.run(|inner, _, events| {
-            inner.db.toggle_block(&user)?;
-            for server in inner.db.servers()? {
-                inner.load(server)?;
-                let view = inner.view(server)?;
-                if view.members().iter().any(|m| m.key == user) {
-                    events.push(Event::MembersChanged {
-                        server_id: model::hex_id(server.as_bytes()),
-                        members: inner.members_json(&view)?,
-                    });
-                }
-            }
-            Ok(())
+            let blocked = !inner.db.is_blocked(&user)?;
+            inner.set_blocked(user, blocked, events)
         })
+    }
+
+    /// G-47 `setBlocked(userId, blocked)`: idempotent; setting what's
+    /// already set changes nothing and sends no event. Blocking myself is
+    /// `bad-request`.
+    pub fn set_blocked(&self, user_id: &str, blocked: bool) -> CoreResult<()> {
+        let user = parse_user(user_id)?;
+        self.run(|inner, _, events| inner.set_blocked(user, blocked, events))
+    }
+
+    /// G-47 `listBlocked()`: everyone I blocked, also those I share no
+    /// server with now, ordered by key.
+    pub fn list_blocked(&self) -> CoreResult<Vec<BlockedUser>> {
+        self.lock().blocked_list()
     }
 
     // ---- app --------------------------------------------------------------
@@ -3980,6 +4019,11 @@ impl Inner {
             let body = self.key_pending[i].body.clone();
             let waiting = self.db.has_server(server)? && {
                 self.load(server)?;
+                // Still within a join re-key's wait: neither sent nor failed.
+                if self.waits_for_join_key(ports, server, channel)? {
+                    i += 1;
+                    continue;
+                }
                 match self.seal(ports, server, channel, body.as_bytes()) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
@@ -4022,6 +4066,30 @@ impl Inner {
             });
         }
         Ok(())
+    }
+
+    /// Whether a new message in `channel` should wait for a join re-key:
+    /// some current members can't read its key yet, for less than
+    /// [`JOIN_KEY_WAIT`] so far. Sealed now, the message would never reach
+    /// them (lost-message P1). A moderator's sync round makes that re-key
+    /// (GAP-8 bucket); everyone else's arrives with it.
+    fn waits_for_join_key(&mut self, ports: &Ports, server: ServerId, channel: ChannelId) -> CoreResult<bool> {
+        let members = self.view(server)?.state.members.clone();
+        let cipher = &*ports.cipher;
+        cipher.membership_changed(server, &members);
+        chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        let missing = cipher.missing_readers(server, channel).len();
+        if missing == 0 {
+            self.join_key_wait.remove(&(server, channel));
+            return Ok(false);
+        }
+        let now = ports.clock.now_ms();
+        let since = *self.join_key_wait.entry((server, channel)).or_insert(now);
+        if now.saturating_sub(since) < JOIN_KEY_WAIT.as_millis() as u64 {
+            return Ok(true);
+        }
+        tracing::info!(target: "mvs::keys", missing, "join key wait over: sending under the current key");
+        Ok(false)
     }
 
     fn awaiting_key(&self, server: ServerId) -> CoreResult<bool> {
@@ -4737,6 +4805,9 @@ impl Inner {
     ) -> CoreResult<()> {
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
+        // Held text goes with the server (lost-message P1, SL C3).
+        self.key_pending.retain(|p| p.server != server);
+        self.join_key_wait.retain(|(s, _), _| *s != server);
         self.logs.remove(&server);
         self.announced.remove(&server);
         events.push(Event::ServerRemoved {
@@ -4833,6 +4904,71 @@ impl Inner {
         }
         self.load(server)?;
         Ok(server)
+    }
+
+    /// G-47: blocks or unblocks `user`. On a change: the name as known now
+    /// is kept for the list (a blocked account often shares no server
+    /// later), the members of servers it's in are re-sent, and
+    /// `blocks.changed` carries the new list.
+    fn set_blocked(&mut self, user: PublicKey, blocked: bool, events: &mut Events) -> CoreResult<()> {
+        // Never myself, from either command (Security Lead on #502).
+        if self.me.as_ref().map(Me::key) == Some(user) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let name = if blocked { self.known_names(&[user])?.remove(&user) } else { None };
+        if !self.db.set_block(&user, blocked)? {
+            return Ok(());
+        }
+        match name {
+            Some(name) => self.db.set(&blocked_name_key(&user), name.as_bytes())?,
+            None => self.db.delete(&blocked_name_key(&user))?,
+        }
+        for server in self.db.servers()? {
+            self.load(server)?;
+            let view = self.view(server)?;
+            if view.members().iter().any(|m| m.key == user) {
+                events.push(Event::MembersChanged {
+                    server_id: model::hex_id(server.as_bytes()),
+                    members: self.members_json(&view)?,
+                });
+            }
+        }
+        events.push(Event::BlocksChanged { blocked: self.blocked_list()? });
+        Ok(())
+    }
+
+    /// G-47: the display names `users` have in the servers I'm in.
+    fn known_names(&mut self, users: &[PublicKey]) -> CoreResult<BTreeMap<PublicKey, String>> {
+        let mut out = BTreeMap::new();
+        if users.is_empty() {
+            return Ok(out);
+        }
+        for server in self.db.servers()? {
+            self.load(server)?;
+            for (key, name) in self.view(server)?.display_names() {
+                if users.contains(&key) {
+                    out.insert(key, name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// G-47: the block list, each with its name in a shared server, else
+    /// the one kept when it was blocked.
+    fn blocked_list(&mut self) -> CoreResult<Vec<BlockedUser>> {
+        let users = self.db.blocked_users()?;
+        let mut names = self.known_names(&users)?;
+        users
+            .into_iter()
+            .map(|user| {
+                let name = match names.remove(&user) {
+                    Some(name) => Some(name),
+                    None => self.db.get(&blocked_name_key(&user))?.and_then(|b| String::from_utf8(b).ok()),
+                };
+                Ok(BlockedUser { user_id: model::hex_id(user.as_bytes()), short_code: model::short_code(&user), name })
+            })
+            .collect()
     }
 
     /// A loaded server's view.

@@ -129,7 +129,9 @@ The "core unavailable" screen (T8-01) stays reachable from it, because it shows 
 **Unlocking:**
 - The page sends `lock:unlock { passcode }` (or `{ os: true }`, which starts the OS prompt in main).
 - Main forwards the passcode to the core's `verifyAppLock` and gets `ok`, `wrong { retryAfter? }` or `rate-limited { retryAfter }`.
-- On `ok`, main sets the state to unlocked, reloads the page normally, and sends any `link.open` it held.
+- On `ok`, main sets the state to unlocked and sends any `link.open` it held. What else happens depends on the path:
+  - **Path A:** main reloads the page normally.
+  - **Path B:** there's no reload. Main sends `lock.state { locked: false }`, and the page removes `inert` and re-syncs its store from the core.
 - The passcode is never logged, and main keeps no copy after the call.
 
 ## 6. New interfaces (for review)

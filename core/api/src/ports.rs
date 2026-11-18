@@ -553,6 +553,14 @@ pub trait GroupCipher: Send + Sync {
         Err(CipherError::Unavailable)
     }
 
+    /// Current members who can't read the channel's current key (they
+    /// joined since it was made): a message sealed now never reaches them.
+    /// Empty when there is no key, or nobody is missing.
+    fn missing_readers(&self, server: ServerId, channel: records::ChannelId) -> Vec<PublicKey> {
+        let _ = (server, channel);
+        Vec::new()
+    }
+
     /// Opens a channel message body whose record `author` signed.
     fn decrypt(
         &self,

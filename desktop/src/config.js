@@ -151,11 +151,14 @@ const MAX_STUN = 256;
 
 /**
  * A plain STUN URL, the same rule as the UI's iceServersFor (ui/src/voice/
- * sdp.ts): `stun:` or `stuns:`, then a host (and port) with no whitespace,
- * credentials (@), path, query or fragment. TURN or anything else: no.
+ * sdp.ts cleanStunUrl): `stun:` or `stuns:`, then one host (a name, IPv4 or
+ * [IPv6]) and an optional port 1-65535. No credentials, path, query,
+ * fragment or list (SL S3, G-81). TURN or anything else: no.
  */
 function validStun(value) {
-  return typeof value === 'string' && value.length <= MAX_STUN && /^stuns?:[^\s@/?#]+$/i.test(value.trim());
+  if (typeof value !== 'string' || value.length > MAX_STUN) return false;
+  const m = /^stuns?:(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::(\d{1,5}))?$/i.exec(value.trim());
+  return !!m && (m[1] === undefined || (Number(m[1]) >= 1 && Number(m[1]) <= 65535));
 }
 
 /**

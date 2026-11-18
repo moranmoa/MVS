@@ -1,0 +1,40 @@
+/* G-81: connection diagnostics in the call's voice settings. */
+.voice-diag {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.voice-diag summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.diag-stun {
+  margin: 8px 0;
+}
+
+.diag-stun.error {
+  color: var(--danger);
+}
+
+/* Scrolls inside the dialog on narrow screens, never the page. */
+.diag-table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+
+.diag-table th,
+.diag-table td {
+  padding: 2px 8px;
+  text-align: start;
+  white-space: nowrap;
+}
+
+.diag-table thead th {
+  color: var(--text-muted);
+  font-weight: 600;
+}

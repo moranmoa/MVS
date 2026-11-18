@@ -119,8 +119,12 @@ export const FAILURE_TEXT: Record<PeerFailure, [text: string, hint: string]> = {
   refused: ['call.peerRefused', 'call.peerRefusedHint'],
 };
 
-/** docs/ux/specs/voice-ip-notice.md: shown once per computer, before the first join. */
-const IP_NOTICE_KEY = 'mvs.notices.voiceIp.v1';
+/**
+ * docs/ux/specs/voice-ip-notice.md: shown once per computer, before the first
+ * join. v2 (G-81, STUN: co-callers can see my public IP): everyone sees it
+ * once more; v1 is no longer read.
+ */
+const IP_NOTICE_KEY = 'mvs.notices.voiceIp.v2';
 export function ipNoticeSeen(): boolean {
   try {
     return localStorage.getItem(IP_NOTICE_KEY) === '1';

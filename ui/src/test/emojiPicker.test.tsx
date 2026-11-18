@@ -41,9 +41,13 @@ describe('the emoji bundle', () => {
   it('ranks whole words first: "לב" puts every heart before anything "לבן" (white)', async () => {
     const data = await loadEmoji();
     const found = search(data, 'לב');
-    const firstWhite = found.findIndex((e) => !e.words.includes('לב') && e.words.some((w) => w.startsWith('לבן')));
+    const exact = (e: (typeof found)[number]) => e.words.includes('לב');
+    const firstWhite = found.findIndex((e) => !exact(e) && e.words.some((w) => w.startsWith('לבן')));
     expect(firstWhite).toBeGreaterThan(found.indexOf(data.byKey.get('❤')!));
-    expect(found.slice(0, firstWhite).every((e) => e.words.includes('לב'))).toBe(true);
+    // Every whole-word match comes before every other match.
+    const lastExact = found.map(exact).lastIndexOf(true);
+    const firstOther = found.findIndex((e) => !exact(e));
+    expect(lastExact).toBeLessThan(firstOther);
   });
 });
 

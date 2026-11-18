@@ -256,6 +256,16 @@ export interface AppInfo {
   relayOnly?: boolean;
 }
 
+/**
+ * G-47 (core `listBlocked`, dev-identity #502): someone I blocked, whether
+ * or not we share a server. `name`: their name in a shared server, else the
+ * one kept from when I blocked them; absent if none was ever known.
+ */
+export interface BlockedUser {
+  userId: Id;
+  name?: string;
+}
+
 /** G-53 (core `listRemovedMembers`): an account the owner removed, who can't rejoin until the owner undoes it. */
 export interface RemovedMember {
   id: Id;

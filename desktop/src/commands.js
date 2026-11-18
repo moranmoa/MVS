@@ -48,6 +48,8 @@ const COMMANDS = Object.freeze({
   markRead: ['channelId'],
   // Safety
   blockUser: ['userId'],
+  listBlocked: [],
+  setBlocked: ['userId', 'blocked'],
   kickMember: ['serverId', 'userId'],
   listRemovedMembers: ['serverId'],
   undoKick: ['serverId', 'userId'],

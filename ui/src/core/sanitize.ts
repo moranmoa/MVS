@@ -16,6 +16,7 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  BlockedUser,
   JoinStatus,
   Member,
   Message,
@@ -246,6 +247,16 @@ export function cleanInvite(i: Invite): Invite {
     revoked: i.revoked === true,
   };
 }
+
+/** G-47: a blocked account from the core, or null without a usable id. */
+export function cleanBlockedUser(b: BlockedUser): BlockedUser | null {
+  const userId = cleanHexId(b?.userId);
+  if (!userId) return null;
+  const name = cleanName(b?.name);
+  return name ? { userId, name } : { userId };
+}
+const cleanBlockedList = (l: unknown): BlockedUser[] =>
+  Array.isArray(l) ? l.map(cleanBlockedUser).filter((b): b is BlockedUser => b !== null) : [];
 
 /**
  * G-53: a removed account from the core, or null when its id isn't 64
@@ -578,6 +589,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'channel.added': cleanChannel,
   'channel.removed': (p) => ({ serverId: p.serverId, channelId: p.channelId, name: cleanName(p.name, CHANNEL_NAME_MAX) || '…' }),
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
+  'blocks.changed': (p) => ({ blocked: cleanBlockedList(p?.blocked) }),
   'message.added': cleanMessage,
   'message.updated': cleanMessage,
   // Only the kinds the UI knows; anything else is dropped.
@@ -651,6 +663,7 @@ export function guardCore(core: CoreApi): CoreApi {
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listBlocked: wrap(core.listBlocked, cleanBlockedList),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
       Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
     ),

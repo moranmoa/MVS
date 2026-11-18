@@ -23,6 +23,7 @@ import type {
   CreatedInvite,
   Invite,
   RemovedMember,
+  BlockedUser,
   CoreError,
   Id,
   Identity,
@@ -1314,11 +1315,36 @@ export class MockCore implements CoreApi {
   // ---- safety --------------------------------------------------------------
 
   async blockUser(userId: Id): Promise<void> {
+    const now = this.blockedIds().has(userId);
     for (const s of this.servers.values()) {
       if (!s.members.some((m) => m.id === userId)) continue;
-      s.members = s.members.map((m) => (m.id === userId ? { ...m, blocked: !m.blocked } : m));
+      s.members = s.members.map((m) => (m.id === userId ? { ...m, blocked: !now } : m));
       this.emit('members.changed', { serverId: s.summary.id, members: s.members });
     }
+    this.emit('blocks.changed', { blocked: this.blockedList() });
+  }
+
+  /** G-47: the blocked members of my servers, once each, ordered by id (like the core). */
+  private blockedIds(): Map<Id, string> {
+    const out = new Map<Id, string>();
+    for (const s of this.servers.values()) for (const m of s.members) if (m.blocked && !out.has(m.id)) out.set(m.id, m.displayName);
+    return out;
+  }
+
+  async listBlocked(): Promise<BlockedUser[]> {
+    return this.blockedList();
+  }
+
+  private blockedList(): BlockedUser[] {
+    return [...this.blockedIds()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([userId, name]) => (name ? { userId, name } : { userId }));
+  }
+
+  async setBlocked(userId: Id, blocked: boolean): Promise<null> {
+    if (userId === this.identity?.id) throw err({ code: 'bad-request' });
+    if (this.blockedIds().has(userId) !== blocked) await this.blockUser(userId);
+    return null;
   }
 
   // ---- voice rooms (0.4.3): calls only, no audio in the mock ---------------------

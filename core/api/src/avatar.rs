@@ -38,6 +38,37 @@ pub fn valid_avatar(url: &str) -> bool {
     authority::image::still_size(&bytes, kind, AVATAR_SIDE_MAX).is_some()
 }
 
+/// G-51: a server icon from the UI's data URL, checked in the Security
+/// Lead's order (R2 on #547): the prefix names the type; a length cap on
+/// the base64 text before decoding; strict base64; then the shared
+/// validator, which checks the magic bytes against that type and the size
+/// against [`authority::ICON_SIDE_MAX`]. `None` for anything else.
+pub fn icon_from_data_url(url: &str) -> Option<authority::Icon> {
+    let (data, kind) = match (url.strip_prefix(WEBP_PREFIX), url.strip_prefix(PNG_PREFIX)) {
+        (Some(data), _) => (data, ImageType::Webp),
+        (_, Some(data)) => (data, ImageType::Png),
+        _ => return None,
+    };
+    if data.len() > records::MAX_SERVER_ICON_BYTES.div_ceil(3) * 4 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    if bytes.len() > records::MAX_SERVER_ICON_BYTES {
+        return None;
+    }
+    authority::image::still_size(&bytes, kind, authority::ICON_SIDE_MAX)?;
+    Some(authority::Icon { kind, bytes })
+}
+
+/// G-51: a server icon as the data URL `ServerSummary.iconDataUrl` carries.
+pub fn icon_data_url(icon: &authority::Icon) -> String {
+    let prefix = match icon.kind {
+        ImageType::Webp => WEBP_PREFIX,
+        ImageType::Png => PNG_PREFIX,
+    };
+    format!("{prefix}{}", base64::engine::general_purpose::STANDARD.encode(&icon.bytes))
+}
+
 /// `#rrggbb`.
 pub fn valid_color(color: &str) -> bool {
     color.len() == 7

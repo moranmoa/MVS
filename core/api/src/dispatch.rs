@@ -72,6 +72,23 @@ struct RenameServerArgs {
     name: String,
 }
 
+/// G-51 `setServerIcon`: `dataUrl` null (or absent) clears it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerIconArgs {
+    server_id: String,
+    #[serde(default)]
+    data_url: Option<String>,
+}
+
+/// G-51 `setServerDescription`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerDescriptionArgs {
+    server_id: String,
+    description: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditVoiceRoomArgs {
@@ -482,6 +499,14 @@ impl Core {
             "renameServer" => {
                 let a: RenameServerArgs = args(raw)?;
                 ok(self.rename_server(&a.server_id, &a.name))
+            }
+            "setServerIcon" => {
+                let a: ServerIconArgs = args(raw)?;
+                ok(self.set_server_icon(&a.server_id, a.data_url.as_deref()))
+            }
+            "setServerDescription" => {
+                let a: ServerDescriptionArgs = args(raw)?;
+                ok(self.set_server_description(&a.server_id, &a.description))
             }
             "leaveServer" => ok(self.leave_server(&args::<ServerArg>(raw)?.server_id)),
             "closeServer" => ok(self.close_server(&args::<ServerArg>(raw)?.server_id)),

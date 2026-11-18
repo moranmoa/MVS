@@ -7,6 +7,7 @@ import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
 import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
 import { useUserTextProps } from '../../app/textDir';
 import { mentionQuery, toDisplay, toTokens } from '../../app/mentions';
+import { applyEdit, dismissHint, hintDue, insideOpenFence, shortcutMarker, wrapEdit } from '../../markdown/composer';
 import { BODY_MAX, BODY_MAX_BYTES, isHeld } from '../../core/sanitize';
 
 /** The character counter shows from here on (B6/QA-17 acceptance: 3,800). */
@@ -276,6 +277,26 @@ function Composer({
     requestAnimationFrame(() => el.setSelectionRange(at, at));
   };
 
+  // G-25: the formatting hint, once: shown the first time markers appear, until ✕.
+  const [hint, setHint] = useState(false);
+  useEffect(() => {
+    if (!hint && hintDue(text)) setHint(true);
+  }, [text, hint]);
+
+  /** G-25: wrap the selection in a marker; one Ctrl+Z undoes it (the native edit stack). */
+  const wrapSelection = (el: HTMLTextAreaElement, marker: string) => {
+    const edit = wrapEdit(el.value, el.selectionStart ?? 0, el.selectionEnd ?? 0, marker);
+    el.setSelectionRange(edit.from, edit.to);
+    // insertText goes through the textarea's own undo stack and its input event.
+    const native = typeof document.execCommand === 'function' && document.execCommand('insertText', false, edit.insert);
+    if (native) {
+      el.setSelectionRange(edit.selStart, edit.selEnd);
+    } else {
+      setText(applyEdit(el.value, edit));
+      requestAnimationFrame(() => el.setSelectionRange(edit.selStart, edit.selEnd));
+    }
+  };
+
   // Entering edit mode swaps the draft out and the message text in.
   useEffect(() => {
     if (editing) {
@@ -426,7 +447,13 @@ function Composer({
                 return;
               }
             }
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            const marker = shortcutMarker(e);
+            if (marker) {
+              e.preventDefault();
+              wrapSelection(e.currentTarget, marker);
+            } else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              // G-25: inside an open ``` fence, Enter is a newline until the fence is closed.
+              if (insideOpenFence(text, e.currentTarget.selectionStart ?? text.length)) return;
               e.preventDefault();
               void submit();
             } else if (e.key === 'Escape' && (replyTo || editing)) {
@@ -443,6 +470,24 @@ function Composer({
           <SendIcon />
         </button>
       </form>
+      {hint && (
+        <p className="composer-hint muted small">
+          <span className="user-text">
+            <FormattedMessage id="md.hint" />
+          </span>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={intl.formatMessage({ id: 'common.close' })}
+            onClick={() => {
+              dismissHint();
+              setHint(false);
+            }}
+          >
+            <CloseIcon />
+          </button>
+        </p>
+      )}
       {(nearLimit || failed) && (
         <p id="composer-status" className={`composer-status ${tooLong || failed ? 'error' : 'muted'}`} role={tooLong || failed ? 'alert' : undefined}>
           {failed ? (

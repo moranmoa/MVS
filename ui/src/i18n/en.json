@@ -9,6 +9,7 @@
   "common.copy": "Copy",
   "common.copied": "Copied",
   "md.copyCode": "Copy",
+  "md.hint": "You can format: **bold**, *italic*, `code`, ||spoiler||",
   "md.copied": "Copied",
   "md.spoiler": "Spoiler, click to reveal",
   "common.copyFailed": "Couldn't copy. Select the link and press <kbd>Ctrl+C</kbd>.",

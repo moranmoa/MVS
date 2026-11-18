@@ -3600,6 +3600,80 @@ input.switch:disabled {
   background: var(--border);
 }
 
+/* G-26: reactions under a message. */
+.reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-block-start: 0.25rem;
+}
+
+.reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 1.75rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 0.8125rem;
+}
+
+.reaction.mine {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.reaction.add {
+  color: var(--text-muted);
+}
+
+.reaction-count {
+  font-weight: 600;
+}
+
+@media (pointer: coarse) {
+  .reaction {
+    min-height: 2.75rem;
+  }
+}
+
+/* The emoji picker (compact; the full set and categories are G-27). */
+.emoji-search {
+  width: 100%;
+  margin-block-end: 0.5rem;
+}
+
+.emoji-heading {
+  margin: 0.5rem 0 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+
+.emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 2.5rem);
+  gap: 0.125rem;
+}
+
+.emoji-cell {
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-s);
+  background: none;
+  font-size: 1.375rem;
+}
+
+.emoji-cell:hover,
+.emoji-cell:focus-visible {
+  background: var(--bg-hover);
+}
+
 /* G-91: how far my servers are from coming back after a restore. */
 .restore-progress {
   display: flex;

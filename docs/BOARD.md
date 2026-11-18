@@ -3,7 +3,7 @@
 The single source of truth for who does what, in which order, and what blocks the closed alpha.
 Owner: pm (see [`docs/TEAM.md`](TEAM.md)). Updated whenever a PR lands; if this board disagrees with a PR, a review or a chat, **the board wins until it is corrected here**.
 
-Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the open ones below. **Latest published release: v0.4.5** (pre-release, 2026-11-15; v0.4.2 stayed a draft and was replaced by v0.4.3). The 0.4.6 CHANGELOG is merged (#420, "approve on your other device, member relays"); that release is not published yet. **Now:** device link and member relays are on `main`; relay-down resilience and multi-relay are in flight; the next UI release is 0.5.0 "Conversation". Of the M2 order from #97, the code side is done; **B5 (real networks) and the T4 go-live are the open M2 gates**.
+Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the open ones below. **Latest published release: v0.4.5** (pre-release, 2026-11-15). The 0.4.6 draft was never published; **0.4.7 replaces it** (CHANGELOG PR #465, in review) and carries the 0.4.6 line. **Now:** device link, member relays, voice settings (G-72, G-73, G-74, G-84) and the first 0.5.0 items (G-23, G-32, G-33, G-62) are on `main`; relay-down resilience and multi-relay are in flight; the next UI release is 0.5.0 "Conversation". Of the M2 order from #97, the code side is done; **B5 (real networks) and the T4 go-live are the open M2 gates**.
 
 **Contents:** [Rules](#rules) · [Milestones](#milestones) · [Open PRs](#open-prs) · [Board](#board) · [Dependency map and critical path](#dependency-map-and-critical-path) · [Next assignments](#next-assignments) · [File ownership](#file-ownership) · [Risks and blockers](#risks-and-blockers) · [Owner decisions](#owner-decisions)
 
@@ -37,10 +37,15 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 
 | PR | What | Author | Required verdicts | Status | Next step |
 | --- | --- | --- | --- | --- | --- |
-| [#425](https://github.com/moranmoa/MVS/pull/425) | sync: holder notice slot (`/mvs/notice/1`, signed fetches) | dev-sync | tech-lead, sec-lead | in review | tech-lead APPROVE `a00a5de` (3 nits); dev-identity adds the notice fetch loop (once at start/unlock) |
-| [#424](https://github.com/moranmoa/MVS/pull/424) | ci: RustSec watch for the vendored `libp2p-dns` and `libp2p-gossipsub` | dev-updater | tech-lead | in review | – |
-| [#423](https://github.com/moranmoa/MVS/pull/423) | relay: keep client-reported DNS names out of the DHT (#416 follow-up) | devops | tech-lead, sec-lead | in review | deploy only from `main` with the manager OK |
-| [#419](https://github.com/moranmoa/MVS/pull/419) | sync: remember members' direct addresses, redial them when the relay is down (relay-down part 1) | dev-sync | tech-lead, sec-lead | in review | code APPROVE `cf645b1`; needs main merged (conflicts) and 2 nits, then a verdict on the new head |
+| [#465](https://github.com/moranmoa/MVS/pull/465) | docs: CHANGELOG 0.4.7 (replaces the unpublished 0.4.6) | pm / product-lead | product-lead | in review | merge, then the 0.4.7 go/no-go |
+| [#466](https://github.com/moranmoa/MVS/pull/466) | docs: G-78 optional app lock design note | dev-voice-shell | tech-lead, sec-lead | in review | tech-lead APPROVE with one change; awaiting sec-lead |
+| [#463](https://github.com/moranmoa/MVS/pull/463) | ui: emoji reactions UI (G-26) | dev-ui | tech-lead, product-lead (+ ux visual) | in review | core is merged (#454) |
+| [#461](https://github.com/moranmoa/MVS/pull/461) | identity: G-91 phase B, buddies | dev-identity | tech-lead, sec-lead | in review | sync side "BUDDIES on" by dev-sync only after multi-relay part B |
+| [#460](https://github.com/moranmoa/MVS/pull/460) | sync: LAN beacon (relay-down part 2, RD2) | dev-sync | tech-lead, sec-lead | in review | changes requested |
+| [#459](https://github.com/moranmoa/MVS/pull/459) | relay: `PEER_RELAYS` (multi-relay part C, relay side) | devops | tech-lead, sec-lead | in review | live relay only from `main` with the manager OK |
+| [#458](https://github.com/moranmoa/MVS/pull/458) | ui: G-91 restore screen | dev-ui | tech-lead, product-lead (+ ux visual) | in review | – |
+| [#447](https://github.com/moranmoa/MVS/pull/447) | ui: "is typing…" on the mock (G-29) | dev-ui | tech-lead, product-lead (+ ux visual) | in review | core by dev-updater (`g29-typing-design.md`) |
+| [#433](https://github.com/moranmoa/MVS/pull/433) | voice: TURN path behind a flag (G-81) | voice-d | tech-lead, sec-lead (network) | in review | owner decision on running TURN pending |
 | [#220](https://github.com/moranmoa/MVS/pull/220) | infra: relay on a Linux host with host networking (real source IPs for DCUtR) | devops | tech-lead, sec-lead | in review | waits for the owner (relay move); live relay only from `main` |
 | [#269](https://github.com/moranmoa/MVS/pull/269) | desktop: document and test the relay's QUIC bootstrap address (#243 follow-up) | dev-voice-shell | tech-lead | in review | goes with #220 |
 | [#184](https://github.com/moranmoa/MVS/pull/184) | sync: DCUtR hole punching (design note) | dev-sync | tech-lead, sec-lead | draft | **stale**: DCUtR shipped in #219, QUIC in #243; close |
@@ -59,7 +64,7 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 - **0.4.1–0.4.5** (#346–#385): English-only notes (#346, #347), language picker (#348), unread fixes (#351, #352), repo rename (#353), own title bar (#358), profile pictures and colours (#359, #361, #362), voice rooms v2 (#369, #371, #375), relay backup mailbox (#367), T24 pacing (#366), close-hang fix (#373), hourly update checks (#377), profile save (#381, #384), relay-only follow-up (#383).
 - **0.4.6 line** (#386–#422): member relays slices 1, 2a, 2b, 3a, 3b (#387, #389, #395, #399, #400, #403, #405), **device link** (#391, #393, #394, #398, #406, #407, #408, #411, #415), keychain fixes (#388, #392), multi-relay part A (#409, #410), relay-2 interim (#404), vendored hickory 0.26 (#412), peer DNS names dropped (#416), flake fixes (#413, #417), gossipsub RUSTSEC fix (#421), notice label sanitising (#422), member-recovery design (#401), QA (#390, #402, #414, #418), CHANGELOG 0.4.6 (#420).
 
-**Merge order**: #419 (after main merge) → #425 → #423 and #424 (any order). #220 and #269 together when the owner moves the relay. **Dependabot:** crypto crates wait for T3b; ui bumps one at a time. Never rename CI jobs.
+**Merge order**: #465 any time; #458 and #463 after review; #460 after the changes; #459 and #433 on their own. #220 and #269 together when the owner moves the relay. **Dependabot:** crypto crates wait for T3b; ui bumps one at a time. Never rename CI jobs.
 
 ---
 
@@ -91,6 +96,7 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | GAP-4b-seal | Sealed bindings: AEAD under `derive_key("mvs/binding-seal/v1", server secret)` over identity ‖ signature, so non-members can't read who pulls (the binding is already tied to the peer ID, so replay is useless). Changes the pull request format: a versioned `/mvs/sync` protocol, old format kept through a compatibility window. sec-lead + tech-lead review | dev-sync | todo | – | T23 | M | open alpha |
 | GAP-6 | Clients: Kademlia client mode, filter private addresses, `/mvs/kad/1.0.0` (relay side in T4a; ship together) | dev-sync | done (identify announces only global/circuit addresses #190; relay-only #195 #274) | #190 #195 #274 | B4-sync | S | M2 |
 | GAP-6r | **Relay-only, user-facing setting**: two **blockers** for dev-sync first (sec-lead/tech-lead on #195): (1) close existing direct connections when relay-only turns on, with a test (closing trips a `libp2p-request-response` `debug_assert`); (2) in relay-only mode `GlobalIdentify` announces only circuits through our relay, never confirmed global external addresses (our public IP), with a test. Then the api (dev-identity) and the UI switch (dev-ui). **Must not ship before both blockers** | dev-sync → dev-identity → dev-ui | done (sync #195 #274, api #272, UI #273, voice follow-up #383) | #195 #272 #273 #274 #383 | R-P0 | M | M2 |
+| GAP-25 | Channel record timestamps unbounded (threat model `a8a09a5`): per-peer ingest rate for channel records + refuse records more than 10 min ahead on receive | dev-sync | todo (P1, before open alpha; after multi-relay part B) | – | MX | S | Before open alpha |
 | T19 | `Node::close_channel(server, channel)`: a deleted channel's sync log stops syncing (today it stays open until restart; TODO in #185); api calls it from `delete_channel` (one line, dev-identity) | dev-sync, then dev-identity | todo | – | #183 ✔, #185 | S | M2 |
 | T20 | Connection-type indicator: `Member.connection` direct / relay / null in the api (#196), UI next to the presence dot | dev-identity, then dev-ui | done | #187 #196 #209 | T18 | S | M2 |
 | B23 | Name sanitising in core: bidi controls, invisible chars (QA-06; QA-13 fixed in the UI by #10, core-side check still needed) | core-5 | done (strict for the closed alpha, product-lead decision; a refused name shows an error on its field: "השם מכיל תווים שאי אפשר להשתמש בהם בשם." / "The name contains characters that can't be used in names.") | #151 #152 | B4 | S | M2 |
@@ -119,7 +125,7 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | T21 | Installer firewall rule: NSIS adds Windows Defender Firewall inbound allow rules for `mvs-core.exe`, TCP and UDP (QUIC, #243), private and public profiles; removed on uninstall. Today Windows prompts on the first direct listen, and "Cancel" silently blocks direct sync | devops | in progress (the prompt is explained, #260; the NSIS firewall rule is left) | #260 | #243 | S | M2 |
 | T22 | Third-party notices file: generate `THIRD_PARTY_NOTICES` from the lockfiles (core + desktop + ui), including the ring 0.16 OpenSSL clause and CDLA-Permissive-2.0 text for webpki-roots (#256); bundle it in every installer via `release.yml` and show it in Settings → About | devops | done | #258 | #256 | S | done |
 | T3b | libp2p 0.57 + ed25519-dalek 3 / curve25519-dalek 5 migration: one crypto PR across records, identity, groupkeys, updater, api, sync; clears hickory-proto RUSTSEC-2026-0118/0119 | dev-sync | deferred (blocked on duplicate crypto crates; the bump removes the vendored `libp2p-dns` and `libp2p-gossipsub`, #412) | #412 | #256 | M | sec-lead review |
-| T3r | Relay (`infra/relay`) libp2p 0.54 → 0.56 to match core; then drop the ring 0.16 deny exception | devops | todo | – | #256 | S | live relay only from main, with the manager OK |
+| T3r | Relay (`infra/relay`) libp2p 0.54 → 0.56 to match core; then drop the ring 0.16 deny exception | devops | done (relay on libp2p 0.56, #443; dropping the ring exception follows with B10) | #443 | #256 | S | live relay only from main, with the manager OK |
 | V-C3 | `setWebRTCIPHandlingPolicy("default_public_and_private_interfaces")` on the window webContents in `desktop/src/main.js` (sec-lead ship-blocker), unless #228 already carries it | voice C (dev-voice-shell); sec-lead reviews | todo | – | #228 | S | **before calls ship in a release** |
 | V-A2 | Voice signalling fair share: the global 10/s bucket in `core/sync/src/voice.rs` can be drained by members of other servers; reserve a share for peers in my active call, or key the cap per server | dev-sync | todo | – | #238 | S | P3 |
 | V-E3 | Voice room UI: production `ROOM_ID` check accepts only 64-hex ids | dev-ui | todo | – | #239 | S | P3 |
@@ -180,20 +186,20 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | G-22 | Message context menu: reply, copy, edit, delete (B25 §2, rest of #208) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #213 | B25 | S | 0.4.0 |
 | G-06 | Tooltip with the full server name in the rail (48-character names) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo | – | – | S | 0.4.0 |
 | **0.4.x** | **In parallel, infrastructure (P0)** | | | | | | |
-| G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d (+ devops for the relay move, dev-sync) | in progress (design #333, engine TURN #337, QUIC #243, STUN #222; relay move #220 open) | #333 #337 | #220, STUN | L | 0.4.x |
-| G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; **servers come back after restore**: design note to tech-lead first) | #292 #317 #339 #340 #367 | – | L | 0.4.x |
+| G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d (+ devops for the relay move, dev-sync) | in progress (design #333, engine TURN #337, QUIC #243, STUN #222; relay move #220 open; TURN path behind a flag in review #433, voice-d, owner decision on running TURN pending; ICE restart on network change after #433, todo) | #333 #337 #433 | #220, STUN | L | 0.4.x |
+| G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; restore progress part 1 #457; phase B buddies in review #461, dev-identity (sync side "BUDDIES on" by dev-sync only after multi-relay part B); restore screen in review #458) | #292 #317 #339 #340 #367 #457 #461 #458 | – | L | 0.4.x |
 | **0.5.0** | **"Conversation" (P1)** | | | | | | |
-| G-23 | Date divider (B16, UX-12) | dev-ui | todo (dev-ui, first in 0.5.0) | – | – | S | 0.5.0 |
-| G-29 | "Is typing…" (ephemeral, not stored) | dev-typing (core, proposed session) + dev-ui | todo (core spec `g29-typing-design.md` done; dev-ui builds the UI against the mock after G-23) | – | – | M | 0.5.0 |
+| G-23 | Date divider (B16, UX-12) | dev-ui | done | #439 #449 | – | S | 0.5.0 |
+| G-29 | "Is typing…" (ephemeral, not stored) | dev-updater (core, spec `g29-typing-design.md`) + dev-ui | in progress (UI on the mock in review, #447, dev-ui; core now assigned to dev-updater) | #447 | – | M | 0.5.0 |
 | G-25 | Basic Markdown (mind direction, B17) | dev-ui | todo | – | – | M | 0.5.0 |
-| G-26 | Emoji reactions (signed record) | dev-updater (records + api) → dev-ui | in progress (design `g26-reactions-design.md` + Amendment 1, security lead OK; `reactions-v1` cap gate) | – | – | M | 0.5.0 |
+| G-26 | Emoji reactions (signed record) | dev-updater (records + api) → dev-ui | in progress (design `g26-reactions-design.md` + Amendment 1, security lead OK; core done #454; UI in review #463, dev-ui) | #454 #463 | – | M | 0.5.0 |
 | G-27 | Emoji picker | dev-ui | todo | – | – | M | 0.5.0 |
-| G-32 | ↑ to edit the last message (check `onEditLast`) | dev-ui | built, verify only (dev-ui checks `onEditLast`) | – | – | S | 0.5.0 |
-| G-33 | Jump to latest message button | dev-ui | built, verify only (dev-ui checks the button) | – | – | S | 0.5.0 |
+| G-32 | ↑ to edit the last message (check `onEditLast`) | dev-ui | done | #441 | – | S | 0.5.0 |
+| G-33 | Jump to latest message button | dev-ui | done | #441 | – | S | 0.5.0 |
 | G-30 | Link to a message | dev-ui + dev-identity | todo | – | – | M | 0.5.0 |
-| G-63 | Notification sound | dev-ui | todo | – | – | S | 0.5.0 |
-| G-62 | Taskbar unread count | dev-voice-shell | todo (dev-voice-shell) | – | G-61 ✔ | S | 0.5.0 |
-| G-113 | Screen-reader announcement of new messages (B21, UX-38) | dev-ui | todo | – | – | S | 0.5.0 |
+| G-63 | Notification sound | voice-c | todo | – | – | S | 0.5.0 |
+| G-62 | Taskbar unread count | dev-voice-shell | done | #430 #442 | G-61 ✔ | S | 0.5.0 |
+| G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | todo | – | – | S | 0.5.0 |
 | G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
 | G-53 | Removed accounts list + undo-kick UI (core ready, #110) | dev-ui | todo | – | – | S | 0.5.x |
@@ -209,13 +215,14 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 | G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | todo | – | – | S | 0.5.x |
 | **0.6.0** | **"Voice like Discord" (P1)** | | | | | | |
 | G-16 | Additional voice channels (record + core) | dev-records + dev-identity → dev-ui | built as voice rooms (join to create; dev-ui verifies against GAPS scope) | #355 #369 #371 #375 | – | L | 0.4.3 |
-| G-72 | Microphone/speaker choice and mic test | voice-c | todo (voice-c) | – | – | M | 0.6.0 |
-| G-73 | Per-person volume | voice-c | todo (voice-c) | – | – | S | 0.6.0 |
-| G-84 | Deafen | voice-c | todo (voice-c) | – | – | S | 0.6.0 |
-| G-84b | Others see my "deafened" state, not only muted (UX follow-up on #432): a `deafened` flag in the voice hello, shown in the room roster | voice-c + core voice | todo | #432 | G-84 | S | 0.6.0 |
-| G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | todo (dev-voice-shell, after G-62) | – | – | M | 0.6.0 |
-| G-64 | Join notification sound | dev-ui | todo | – | – | S | 0.6.0 |
-| G-83 | Participant count (check; `call.activity`, tech-lead decision in #224) | dev-identity → dev-ui | todo | – | – | S | 0.6.0 |
+| G-72 | Microphone/speaker choice and mic test | voice-c | done | #429 #436 #438 | – | M | 0.6.0 |
+| G-73 | Per-person volume | voice-c | done | #434 #440 | – | S | 0.6.0 |
+| G-84 | Deafen | voice-c | done | #432 | – | S | 0.6.0 |
+| G-84b | Others see my "deafened" state, not only muted (UX follow-up on #432): a `deafened` flag in the voice hello, shown in the room roster | voice-c + core voice | done | #451 | G-84 ✔ | S | 0.6.0 |
+| G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | done (shell #444, UI #450) | #444 #450 | – | M | 0.6.0 |
+| G-64 | Join/leave notification sound | dev-ui | done | #456 | – | S | 0.6.0 |
+| G-83 | Participant count on room rows (covered by the voice rooms shipped in 0.4.3) | dev-identity → dev-ui | done | #369 #371 #375 | – | S | 0.6.0 |
+| G-78 | Optional app lock (design note first) | dev-voice-shell | in review (design note #466, approved by the tech lead with one change; awaiting the security lead) | #466 | – | M | – |
 | **P2** | **P2 backlog, after the closed alpha: see [`docs/ux/GAPS.md`](ux/GAPS.md)** (G-28 files, G-31 search, G-34 link previews, G-15 pins, G-42 roles, G-43, G-44, G-45 DM, G-46, G-55, G-71, G-75, G-76, G-78, G-93, G-02, G-101–G-103, G-111, G-115) | product-lead | todo | – | – | – | – |
 | **Done** | | | | | | | |
 | G-35 | Owners delete any message (in B25) | – | done | #208 | – | – | – |
@@ -226,17 +233,17 @@ Last updated: 2026-11-17, refresh 12. `main` has every PR up to #425 except the 
 
 | ID | Title | Owner | Status | PR | Depends on | Size | MS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DL | **Device link**: approve a sign-in on your other device (QR/code, SAS on both screens, relay circuit only; spec `device-link-slice`) | dev-sync, dev-identity, dev-ui | done (UI #391 #408, core #393, sync #394 #398, fixes #406 #407 #411, notices #415, QA #402); notice slot in review | #391 #393 #394 #398 #408 #415 #425 | – | L | 0.4.6 |
-| DL-n | Notice slot `/mvs/notice/1` for holders (a device-added notice reaches the other device) | dev-sync, then dev-identity (fetch loop) | in review (#425) | #425 | DL | M | 0.4.6 |
+| DL | **Device link**: approve a sign-in on your other device (QR/code, SAS on both screens, relay circuit only; spec `device-link-slice`) | dev-sync, dev-identity, dev-ui | done (UI #391 #408, core #393, sync #394 #398, fixes #406 #407 #411, notices #415, QA #402, notice slot #425 #435) | #391 #393 #394 #398 #408 #415 #425 | – | L | 0.4.6 |
+| DL-n | Notice slot `/mvs/notice/1` for holders (a device-added notice reaches the other device) | dev-sync, then dev-identity (fetch loop) | done (slot #425, #435; device-added notice #415) | #425 #435 #415 | DL | M | 0.4.6 |
 | MR | **Member relays** (design #368): slice 1 setting + API, 2a relaying side, 2b client side (+ follow-ups), 3a off on a metered connection, 3b global off switch in a signed `flags.json` | dev-identity, dev-sync, voice-c, dev-updater | done (slice 1 #387 #389, 2a #395, 2b #399 #400, 3a #403, 3b #405); QA Linux metered check left | #387 #389 #395 #399 #400 #403 #405 #418 | – | L | 0.4.6 |
 | MR-2c | Member relay 2c: throwaway IDs (same-IP real connection links the throwaway to the real ID) | – | deferred (manager + sec-lead recommend (c): keep #368's honest copy; maybe a future opt-in mode); owner to confirm | – | – | L | – |
 | MR-3c | Member relays slice 3c (option C, email-included variant) | dev-sync | todo (later) | – | MR | M | – |
-| MRC | **Automatic member recovery** (3-of-5 shares to adult co-members, 72 h hold): design note #401 approved; build notes: constant-time Shamir + KATs, re-share ≤ 1/day, holder cap, holder storage key while locked | dev-identity (design), sec-lead review | deferred (after device link; needs the mailer) | #401 | DL, #365 mailer | L | – |
-| MX | Multi-relay: part A (relay list from CI to the core, #409 #410) done; **part B** (use the list in `node.rs`) | dev-sync | todo (after #419 and the beacon) | #409 #410 | #419 | M | 0.4.x |
-| MX-c | Multi-relay part C: relays bootstrap each other; relay-2 on the owner's PC is interim (#404, same-PC container is not resilience against the PC going down) | devops | todo | #404 | MX | M | 0.4.x |
-| RD1 | Relay-down part 1: remember members' direct addresses and redial them | dev-sync | in review (#419; needs main merged) | #419 | #417 ✔ | S | 0.4.x |
-| RD2 | Relay-down part 2: LAN beacon (derived tags, previous epoch, fixed 8 tags padded, caps, firewall check, TTL 1; sec-lead call on the open question) | dev-sync | todo (after #419) | – | RD1 | M | 0.4.x |
-| HK | Hickory advisories (RUSTSEC-2026-0118/0119): peer-learned DNS names dropped (#416), vendored `libp2p-dns` on hickory 0.26 (#412), gossipsub PRUNE fix (#421, RUSTSEC-2026-0534); open: relay keeps DNS names out of the DHT and drops `/dns*` from identify, advisory watch for the vendored crates | dev-sync, dev-updater, devops | in progress (#423, #424 in review; relay hickory bump and identify change are devops) | #412 #416 #421 #423 #424 | – | S | 0.4.x |
+| MRC | **Automatic member recovery** (3-of-5 shares to adult co-members, 72 h hold): design note #401 approved; build notes: constant-time Shamir + KATs, re-share ≤ 1/day, holder cap, holder storage key while locked | dev-identity (design), sec-lead review | in progress (design #401 approved; core merged #431; the rest is deferred, needs the mailer) | #401 #431 | DL, #365 mailer | L | – |
+| MX | Multi-relay: part A (relay list from CI to the core, #409 #410) done; **part B** (use the list in `node.rs`) | dev-sync | todo (dev-sync; after #419 ✔ and the beacon; then GAP-25 and G-91 "BUDDIES on") | #409 #410 | #419 | M | 0.4.x |
+| MX-c | Multi-relay part C: relays bootstrap each other; relay-2 on the owner's PC is interim (#404, same-PC container is not resilience against the PC going down) | devops | in progress (release side merged #448; relay `PEER_RELAYS` in review #459, devops) | #404 #448 #459 | MX | M | 0.4.x |
+| RD1 | Relay-down part 1: remember members' direct addresses and redial them | dev-sync | done | #419 | #417 ✔ | S | 0.4.x |
+| RD2 | Relay-down part 2: LAN beacon (derived tags, previous epoch, fixed 8 tags padded, caps, firewall check, TTL 1; sec-lead call on the open question) | dev-sync | in review (#460, dev-sync, changes requested) | #460 | RD1 | M | 0.4.x |
+| HK | Hickory advisories (RUSTSEC-2026-0118/0119): peer-learned DNS names dropped (#416), vendored `libp2p-dns` on hickory 0.26 (#412), gossipsub PRUNE fix (#421, RUSTSEC-2026-0534); open: relay keeps DNS names out of the DHT and drops `/dns*` from identify, advisory watch for the vendored crates | dev-sync, dev-updater, devops | in progress (#423, #424 merged; relay hickory bump and identify change are devops) | #412 #416 #421 #423 #424 | – | S | 0.4.x |
 | EP | Email + password sign-in (design #365, behind `available=false` until 2 bootstraps) | dev-identity, devops (mailer) | deferred (design only) | #365 | MR | L | – |
 
 ### Reviews, QA, security, business
@@ -350,11 +357,11 @@ Legend: green done · blue in review · yellow in progress · red blocked · gre
 
 ### Critical path to the closed alpha
 
-B9 installers, B8 in-app update, T1, T13, B1 and B4-sync are done; releases ship as pre-releases (latest v0.4.5).
+B9 installers, B8 in-app update, T1, T13, B1 and B4-sync are done; releases ship as pre-releases (latest published v0.4.5; v0.4.7 next).
 
 - **Open M2 gates:** B5 real networks (blocked on the T4 go-live) and the relay move (#220, owner). Relay-down resilience (RD1, RD2) and multi-relay (MX) make the relay less of a single point.
 - **Open M3 items:** T12 install tests (#69), T21 firewall rule, B24 About screen, UX-10 landing page, T9 go/no-go; code signing is still an owner decision (5.7, 5.8).
-- **Next release:** 0.4.6 publish (CHANGELOG merged in #420), then 0.5.0 "Conversation" (G-23, G-29, G-62 and the rest of that block).
+- **Next release:** 0.4.7 publish (replaces the unpublished 0.4.6; CHANGELOG #465, in review), then 0.5.0 "Conversation" (G-23, G-32, G-33, G-62 are on `main`; G-29 and the G-26 UI are in review).
 - **Diagram note:** the graph above is from the first board; the nodes B1, B8, B9, T1, T3 and B6 are now done.
 
 ---
@@ -365,21 +372,21 @@ What each agent picks up **after its current PR merges**, the lead who assigns i
 
 | Agent | Assigned by | Now | Next (in order) | Writes | Must not touch |
 | --- | --- | --- | --- | --- | --- |
-| **tech-lead** | manager | reviews #419, #425, #423, #424 | 1. Reviews: G-26 (dev-updater), G-91 design note (dev-identity), #419 new head. 2. 0.4.6 go/no-go. 3. G-81 scope (TURN decision, owner). | – | – |
-| **dev-sync** | tech-lead → dev-identity | #425 notice slot (in review); #419 (needs main merged) | 1. **#419** remembered addresses (merge main first, 2 nits). 2. **Relay-down part 2**: LAN beacon (RD2). 3. **Multi-relay part B** (`node.rs`, MX). 4. Slice 3c later. One writer on `node.rs`. | `core/sync/**`, `core/spike-peer/**` | `core/records`, `infra/` |
-| **dev-identity** (core sub-lead) | tech-lead | – | 1. **G-91** servers come back after restore: design note to tech-lead first. 2. **Notice fetch loop** (#415/#425 follow-up: fetch once at start/unlock). 3. Member recovery design stays deferred. 4. B7-k, B23-z2, T17, T19 call. | `core/api/**`, `core/identity/**` | `ui/**` (contract changes go to dev-ui) |
-| **dev-ui** (client sub-lead) | tech-lead | 0.5.0 "Conversation" | 1. **G-23** date divider. 2. **G-29** typing indicator (after the core spec from tech-lead). 3. G-32 and G-33: already built, **verify only**. 4. Rest of 0.5.0 (G-25, G-27, G-30, G-63, G-113, G-92). 5. B12, B20, B21, B24, pill polish. | `ui/**` (sole writer, incl. `ui/src/i18n/*.json`) | `ui/src/core/ipc.ts`, `desktop/**` |
-| **voice-d** | tech-lead | multi-relay part A merged (#409 #410) | 1. **G-81 calls across networks** (engine TURN #337 is merged; needs the relay move and STUN). | `ui/src/voice/**` | `core/sync`, `infra/` |
-| **dev-voice-shell / voice-c** | tech-lead → dev-ui | 3a metered #403 merged | 1. #269 with the relay move. 2. T8-04 `MVS_DEMO` (P2). 3. V-C3 WebRTC IP policy check. | `desktop/**`, `ui/src/core/ipc.ts` | other `ui/src/**`, `release.yml` |
-| **devops** | tech-lead | #423 (in review) | 1. **#423** relay keeps DNS names out of the DHT. 2. **Relay hickory bump**. 3. **Relay drops `/dns*` from identify**. 4. Multi-relay part C and the relay move (#220, owner; live relay only from `main` with the manager OK). 5. T21 firewall rule, T12 (#69), macOS runner (R8). | `infra/**`, `.github/workflows/release.yml`, `.github/scripts/manifest-body.mjs`, `docs/release/**`, `packaging/**` | `ci.yml` (dev-updater) |
-| **dev-updater** | tech-lead → dev-identity | #424 (in review) | 1. **G-26** reactions, records + api (design `g26-reactions-design.md`). 2. B10 advisories blocking after the 0.57 bump. Never rename CI jobs. | `core/updater/**`, `.github/workflows/ci.yml`, `.github/scripts/npm-licenses.mjs`, `.github/scripts/install-cargo-deny.sh`, `.github/dependabot.yml`, `core/deny.toml` | `release.yml`, `.github/scripts/manifest-body.mjs` |
-| **dev-voice-shell** / **voice-c** | manager | – | dev-voice-shell: G-62 taskbar badge, then G-74 push-to-talk. voice-c: G-72, G-84, G-73. | `desktop/**` (dev-voice-shell) | `ui/**` (ask dev-ui) |
-| **sec-lead** | manager | reviews #419, #423, #425 | 1. Member-recovery design review (when built). 2. LAN beacon open question (RD2). 3. 2c decision with the owner. 4. Key custody for D-sign / D23. | `docs/security/**` | crate code (findings go to owners) |
+| **tech-lead** | manager | reviews #447, #458, #459, #460, #461, #463, #433, #465 | 1. Reviews: the open PRs above. 2. 0.4.7 go/no-go (replaces 0.4.6). 3. G-81 scope (TURN decision, owner). 4. G-78 note #466: approved, one change requested; with sec-lead. | – | – |
+| **dev-sync** | tech-lead → dev-identity | #460 LAN beacon (changes requested) | 1. **#460** relay-down part 2 (RD2): address the requested changes. 2. **Multi-relay part B** (`node.rs`, MX). 3. **GAP-25** (after part B): per-peer ingest rate for channel records, refuse records more than 10 min ahead on receive (P1, before open alpha). 4. "BUDDIES on" for G-91 (after part B). 5. Slice 3c later. One writer on `node.rs`. | `core/sync/**`, `core/spike-peer/**` | `core/records`, `infra/` |
+| **dev-identity** (core sub-lead) | tech-lead | – | 1. **G-91** servers come back after restore: design note to tech-lead first. 2. **#461** phase B buddies and **#431** follow-ups; notice fetch loop (fetch once at start/unlock). 3. Member recovery design stays deferred. 4. B7-k, B23-z2, T17, T19 call. | `core/api/**`, `core/identity/**` | `ui/**` (contract changes go to dev-ui) |
+| **dev-ui** (client sub-lead) | tech-lead | 0.5.0 "Conversation" | 1. In review: **G-26** UI (#463), **G-29** UI on the mock (#447), **G-91** restore screen (#458). 2. G-23, G-32, G-33, G-64, G-74 UI are done. 4. Rest of 0.5.0 (G-25, G-27, G-30, G-92). 5. B12, B20, B21, B24, pill polish. | `ui/**` (sole writer, incl. `ui/src/i18n/*.json`) | `ui/src/core/ipc.ts`, `desktop/**` |
+| **voice-d** | tech-lead | #433 TURN path behind a flag (in review) | 1. **G-81 calls across networks** (#433; owner decision on running TURN pending). 2. **ICE restart on network change** (todo, after #433). | `ui/src/voice/**` | `core/sync`, `infra/` |
+| **dev-voice-shell / voice-c** | tech-lead → dev-ui | G-62, G-74 shell merged | 1. **G-78 optional app lock**: design note in review (#466), awaiting the security lead. 2. #269 with the relay move. 3. T8-04 `MVS_DEMO` (P2). 4. V-C3 WebRTC IP policy check. | `desktop/**`, `ui/src/core/ipc.ts` | other `ui/src/**`, `release.yml` |
+| **devops** | tech-lead | #459 `PEER_RELAYS` (in review), #443 merged | 1. **#459** relay `PEER_RELAYS`, then multi-relay part C. 2. **Relay hickory bump**. 3. **Relay drops `/dns*` from identify**. 4. Multi-relay part C and the relay move (#220, owner; live relay only from `main` with the manager OK). 5. T21 firewall rule, T12 (#69), macOS runner (R8). | `infra/**`, `.github/workflows/release.yml`, `.github/scripts/manifest-body.mjs`, `docs/release/**`, `packaging/**` | `ci.yml` (dev-updater) |
+| **dev-updater** | tech-lead → dev-identity | G-26 core merged (#454) | 1. **G-29 core** (typing, spec `g29-typing-design.md`; dev-ui has the UI on the mock, #447). 2. B10 advisories blocking after the 0.57 bump. Never rename CI jobs. | `core/updater/**`, `.github/workflows/ci.yml`, `.github/scripts/npm-licenses.mjs`, `.github/scripts/install-cargo-deny.sh`, `.github/dependabot.yml`, `core/deny.toml` | `release.yml`, `.github/scripts/manifest-body.mjs` |
+| **dev-voice-shell** / **voice-c** | manager | – | dev-voice-shell: G-78 app lock (design note in review, #466). voice-c: **G-63** notification sound, **G-113** screen-reader announcement (both todo, moved from dev-ui). G-62, G-74, G-72, G-84, G-73 are done. | `desktop/**` (dev-voice-shell) | `ui/**` (ask dev-ui) |
+| **sec-lead** | manager | reviews #459, #460, #461, #433 | 1. G-78 app lock note review (#466). 2. LAN beacon (#460) and GAP-25. 3. Member-recovery design review (when built). 3. 2c decision with the owner. 4. Key custody for D-sign / D23. | `docs/security/**` | crate code (findings go to owners) |
 | **qa** | manager | – | 1. **Linux metered check** for member relays (#403, #418). 2. **0.5.0 test pass** after the merges. 3. Linux keyring prerequisite in the testing docs (QA-20). 4. T7, T12 manual pass; B5 with dev-sync. | `qa/**` | `ui/**`, `ci.yml` (ask dev-updater) |
-| **product-lead** | manager | – | 1. Accept 0.5.0 items (G-23, G-29). 2. Review product/UX/business/QA/board PRs. 3. 0.4.6 notes. | `docs/spec.md`, `docs/reviews/po-*` | `ui/src/i18n/*` |
+| **product-lead** | manager | – | 1. Accept 0.5.0 items (G-23, G-29). 2. Review product/UX/business/QA/board PRs. 3. 0.4.7 notes (#465). | `docs/spec.md`, `docs/reviews/po-*` | `ui/src/i18n/*` |
 | **ux** | product-lead | – | 1. Typing indicator and date divider specs/visual checks. 2. Visual check of dev-ui PRs. | `docs/ux/**`, `docs/reviews/ux-*` | `ui/**` |
 | **biz** | product-lead | – | 1. Answer the owner's questions on §5. 2. Tester recruitment with product-lead. | `docs/business/**` | – |
-| **pm** | manager | this PR (refresh 12) | Batched board refreshes; flag conflicts. | `docs/BOARD.md`, `docs/TEAM.md` | everything else |
+| **pm** | manager | this PR (refresh 13) | Batched board refreshes; flag conflicts. | `docs/BOARD.md`, `docs/TEAM.md` | everything else |
 
 **Deferred (not queued):** member relay 2c (throwaway IDs, owner to confirm); libp2p 0.57 bump (T3b: removes the vendored `libp2p-dns` and `libp2p-gossipsub`; blocked on duplicate crypto crates); automatic member recovery (design note by dev-identity, security lead reviews); email + password sign-in (design #365).
 
@@ -453,6 +460,7 @@ All rows below are **awaiting owner**: the recommendations are written, and the 
 | 5.12 | Legal entity for donations | Exempt dealer (עוסק פטור) when donations start | awaiting owner | – | Before donations |
 | 5.13 | Light lawyer review before open alpha | Yes (~₪3,000–8,000) | awaiting owner | – | Before open alpha |
 | MR-2c | Member relay 2c (throwaway IDs): accept the linkability, keep the real swarm off relays, or defer. Recommendation (manager, sec-lead): defer (c) and keep #368's honest copy | tech-lead, sec-lead | awaiting owner | MR-2c | Before open alpha |
+| G-81 | Run a TURN media relay for calls with CGNAT/cellular peers (G-81)? | Pending. Recommended: 0.5 promises "at least one side on a normal home NAT" | awaiting owner | G-81 (#433) | Before 0.5.0 |
 
 (5.6 is the heading for 5.7–5.13 in the plan, not a decision.)
 | GAP-2 | `auth_deps` format: the kick names the kicker's channel heads so backdated messages are voided (technical, tech-lead + sec-lead; owner informed) | tech-lead, sec-lead | B4 | Now |

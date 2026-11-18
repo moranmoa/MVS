@@ -48,28 +48,30 @@ fn edit(seq: u64, deps: Vec<RecordId>, adult: bool) -> Record {
 #[test]
 fn the_latest_adult_edit_is_kept_through_toggles_and_dropped_on_delete() {
     let (mut records, heads) = founded(&[1]);
-    let create = rec(0, 2, heads, Action::ChannelCreate { channel: NIGHT, adult: false, name: "night".into() });
-    let on = edit(3, vec![create.id()], true);
-    let off = edit(4, vec![on.id()], false);
-    records.extend([create.clone(), on.clone(), off.clone()]);
+    // #general first: the first channel is #general, which can't be deleted.
+    let general = rec(0, 2, heads, Action::ChannelCreate { channel: ChannelId::from_bytes([5; 32]), adult: false, name: "general".into() });
+    let create = rec(0, 3, vec![general.id()], Action::ChannelCreate { channel: NIGHT, adult: false, name: "night".into() });
+    let on = edit(4, vec![create.id()], true);
+    let off = edit(5, vec![on.id()], false);
+    records.extend([general, create.clone(), on.clone(), off.clone()]);
     let state = all_orders(&records);
     assert_eq!(state.adult_edits.get(&NIGHT), Some(&on.id()), "turned plain: the entry stays");
     assert!(!state.channels[&NIGHT].adult);
 
-    let again = edit(5, vec![off.id()], true);
+    let again = edit(6, vec![off.id()], true);
     records.push(again.clone());
     let state = all_orders(&records);
     assert_eq!(state.adult_edits.get(&NIGHT), Some(&again.id()), "off → on: the latest edit");
 
     // Renaming a channel that's already 18+ doesn't move it (Security Lead
     // on #551): only plain → 18+ counts.
-    let rename = rec(0, 6, vec![again.id()], Action::ChannelEdit { channel: NIGHT, adult: true, name: "late".into() });
+    let rename = rec(0, 7, vec![again.id()], Action::ChannelEdit { channel: NIGHT, adult: true, name: "late".into() });
     records.push(rename.clone());
     let state = all_orders(&records);
     assert_eq!(state.channels[&NIGHT].name, "late");
     assert_eq!(state.adult_edits.get(&NIGHT), Some(&again.id()), "a rename keeps the transition");
 
-    let delete = rec(0, 7, vec![rename.id()], Action::ChannelDelete { channel: NIGHT });
+    let delete = rec(0, 8, vec![rename.id()], Action::ChannelDelete { channel: NIGHT });
     records.push(delete);
     let state = all_orders(&records);
     assert!(state.adult_edits.is_empty());

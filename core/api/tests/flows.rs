@@ -5061,10 +5061,13 @@ fn profile_picture_and_colour_reach_other_members() {
     assert_eq!(err(profile(Some(&small_webp(65, 0)), None)), ErrorCode::BadRequest);
     assert_eq!(err(profile(None, Some("blue"))), ErrorCode::BadRequest);
     assert_eq!(err(profile(Some(&small_webp(48, 2_600)), None)), ErrorCode::BadRequest);
-    // The largest valid profile (128 four-byte emoji, a 2,556-byte picture,
-    // a colour) fits one post and is published (the 4 KiB check guards it).
+    // A near-largest profile (116 four-byte emoji, a 2,556-byte picture, a
+    // colour) fits one post and is published (the 4 KiB check guards it).
+    // Every cap a release adds (adult-keys-v1 here, server-meta-v1 next)
+    // takes ~16 bytes of every profile post, so the name room left beside
+    // the largest picture shrinks: 128 emoji no longer fit (B7-k).
     let mut largest = profile(Some(&small_webp(48, 2_512)), Some("#ffffff"));
-    largest.display_name = "🙂".repeat(128);
+    largest.display_name = "🙂".repeat(116);
     // #378: an explicit save posts at once, up to a burst of three.
     let before = posts();
     bob.core.update_profile(largest).unwrap();

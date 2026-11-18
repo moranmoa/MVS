@@ -336,6 +336,9 @@ struct Inner {
     /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
     /// once nobody is missing.
     join_key_wait: HashMap<(ServerId, ChannelId), u64>,
+    /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
+    /// once every member posts the cap, so it comes again if it reopens.
+    adult_keys_warned: HashSet<ServerId>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -572,6 +575,7 @@ impl Core {
             typing: typing::Typing::default(),
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
+            adult_keys_warned: HashSet::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -2608,6 +2612,9 @@ impl Core {
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
                 let _ = inner.post_caps(ports, server);
+                // B7-k K2: owners and admins learn when older members would
+                // key an 18+ channel for minors too.
+                let _ = inner.adult_keys_notice(server, me, events);
                 let after = inner.view(server)?;
                 if after.is_kicked(&me) {
                     inner.join_waiting.remove(&server);
@@ -4776,6 +4783,27 @@ impl Inner {
     /// The release that adds a cap: my latest profile post in `server` lacks
     /// one of [`model::CAPS`] (posted by an older version), so post it
     /// again, once.
+    /// B7-k K2 (Security Lead on #544): to an owner or admin of a server
+    /// with an 18+ channel, `notice: adult-keys-outdated` once while some
+    /// member's latest profile post lacks `adult-keys-v1` (such a member, if
+    /// a moderator, re-keys 18+ channels for every member). Sent again only
+    /// after the list has been empty.
+    fn adult_keys_notice(&mut self, server: ServerId, me: PublicKey, events: &mut Events) -> CoreResult<()> {
+        let view = self.view(server)?;
+        let outdated = view.state.role(me) >= authority::Role::Admin
+            && view.state.channels.values().any(|c| c.adult)
+            && !view.lacking(model::ADULT_KEYS_CAP, me).is_empty();
+        if !outdated {
+            self.adult_keys_warned.remove(&server);
+        } else if self.adult_keys_warned.insert(server) {
+            events.push(Event::Notice {
+                kind: NoticeKind::AdultKeysOutdated,
+                server_id: model::hex_id(server.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());

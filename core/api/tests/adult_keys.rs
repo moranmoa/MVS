@@ -156,3 +156,89 @@ fn an_adult_channel_is_keyed_for_adults_only_and_re_keyed_when_it_turns_adult() 
     // And the minor no longer sees the channel at all (B7 §4).
     assert!(!minor.core.list_channels(&server.id).unwrap().iter().any(|c| c.id == lounge));
 }
+
+/// Security Lead nit on #544: the cipher's adults are fresh at every seal.
+/// A channel turned 18+ and written to at once, with no sync between, is
+/// re-keyed for the adults first: never sealed under the old head.
+#[test]
+fn turned_adult_and_sent_at_once_re_keys_first() {
+    let world = World::new();
+    let (owner, owner_cipher, owner_key) = person(&world, "Owner", "1990-05-01");
+    let (adult, _, adult_key) = person(&world, "Adult", "1990-05-01");
+    let (minor, minor_cipher, minor_key) = person(&world, "Minor", "2009-06-01");
+    let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
+    let den = owner.core.create_channel(&server.id, "den", false).unwrap().id;
+    for peer in [&adult, &minor] {
+        peer.core.join_server(&server.invite_link).unwrap();
+    }
+    owner.core.sync_now().unwrap();
+    let (server_key, den_key) = ids(&server, &den);
+    owner.core.send_message(&den, "for everyone", None).unwrap();
+    assert_eq!(owner_cipher.last_for(den_key), Some(BTreeSet::from([owner_key, adult_key, minor_key])));
+    minor.core.sync_now().unwrap();
+
+    owner.core.update_channel(&den, None, Some(true)).unwrap();
+    owner.core.send_message(&den, "adults now", None).unwrap();
+    assert_eq!(owner_cipher.last_for(den_key), Some(BTreeSet::from([owner_key, adult_key])));
+    minor.core.sync_now().unwrap();
+    let sent = latest_message(&world, server_key, den_key);
+    assert!(minor_cipher.decrypt(server_key, den_key, sent.author(), sent.body()).is_err());
+}
+
+/// Security Lead K2: an owner of a server with an 18+ channel learns, once,
+/// that a member runs a version without `adult-keys-v1`.
+#[test]
+fn owners_are_told_once_when_a_member_lacks_adult_keys() {
+    use records::SigningKey;
+    let world = World::new();
+    let (owner, _, _) = person(&world, "Owner", "1990-05-01");
+    let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
+    owner.core.create_channel(&server.id, "night", true).unwrap();
+    owner.core.sync_now().unwrap();
+    let (key, _) = ids(&server, &owner.core.list_channels(&server.id).unwrap()[0].id);
+    let notices = |peer: &Peer| -> Vec<NoticeKind> {
+        peer.events
+            .take()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Notice { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .collect()
+    };
+    owner.events.take();
+
+    // A member on an older version joins: its profile lacks the cap.
+    let old = SigningKey::from_bytes(&[43; 32]);
+    let invite = {
+        let link = server.invite_link.trim_start_matches("mvs://join/");
+        RecordId::from_bytes(hex::decode(link.split('/').nth(1).unwrap()).unwrap().try_into().unwrap())
+    };
+    let control = || -> Vec<RecordId> {
+        world.network.fetch(key).iter().filter(|x| x.scope() == Scope::Control).map(|x| x.id()).collect()
+    };
+    let mut deps: BTreeSet<RecordId> = control().into_iter().collect();
+    deps.insert(invite);
+    let join = authority::sign_control(&old, key, 1, deps.into_iter().collect(), 1, &authority::Action::Join { invite })
+        .unwrap();
+    world.network.publish(&join);
+    let profile = |caps: &str, seq| {
+        let text = format!(r#"{{"mvs":"mvs/profile/v1","displayName":"Old","caps":[{caps}]}}"#);
+        authority::sign_control(&old, key, seq, control(), 2, &authority::Action::Post { text }).unwrap()
+    };
+    world.network.publish(&profile(r#""server-lifecycle-v1","reactions-v1","channel-topic-v1""#, 2));
+    owner.core.sync_now().unwrap();
+    assert_eq!(notices(&owner), [NoticeKind::AdultKeysOutdated]);
+    let old_id = hex::encode(old.verifying_key().to_bytes());
+    assert_eq!(owner.core.get_update_needed(&server.id, Some("adult-keys-v1")).unwrap(), [old_id]);
+    owner.core.sync_now().unwrap();
+    assert!(notices(&owner).is_empty(), "once, not every round");
+
+    // It updates: the list empties, and no notice.
+    world
+        .network
+        .publish(&profile(r#""server-lifecycle-v1","reactions-v1","channel-topic-v1","adult-keys-v1""#, 3));
+    owner.core.sync_now().unwrap();
+    assert!(owner.core.get_update_needed(&server.id, Some("adult-keys-v1")).unwrap().is_empty());
+    assert!(!notices(&owner).contains(&NoticeKind::AdultKeysOutdated));
+}

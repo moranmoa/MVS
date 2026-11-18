@@ -173,9 +173,14 @@ pub(crate) const REACTIONS_CAP: &str = "reactions-v1";
 /// refuse an unknown kind and stall the control log behind it, so nobody
 /// sets a topic until every member posts this.
 pub(crate) const TOPIC_CAP: &str = "channel-topic-v1";
+/// B7-k (Security Lead K2): this version keys an 18+ channel for its adult
+/// members only. An older moderator still re-keys it for every member, so
+/// what's sent then is readable by minors: owners and admins are told
+/// (`notice: adult-keys-outdated`) until every member posts this.
+pub(crate) const ADULT_KEYS_CAP: &str = "adult-keys-v1";
 /// Every cap this version posts, and the only names `getUpdateNeeded`
 /// takes.
-pub(crate) const CAPS: [&str; 3] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP];
+pub(crate) const CAPS: [&str; 4] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {

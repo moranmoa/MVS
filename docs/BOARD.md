@@ -171,7 +171,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 
 **Condition on every UI PR from now on:** AA contrast (G-112, B20) and reduced motion (G-114, B21). A UI PR that breaks either is not accepted.
 
-**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-53 → G-14 → G-51 · voice-c G-48 → G-47 → G-41 · voice-d G-25 · dev-ui G-27 → G-78 UI → G-30. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
+**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-53 → G-14 → G-51 · voice-c G-48 → G-47 → G-41 · voice-d G-25 · dev-ui G-27 → G-05 → G-06 → G-78 UI → G-30. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
 
 | ID | Title | Owner | Status | PR | Depends on | Size | MS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -182,13 +182,13 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-21c | Unread count cache: `fill_unread` rebuilds the shown list per channel on each `listChannels` call; cache the count per channel, updated on message store and `markRead`. Only when profiling shows it (reviews: tech-lead) | dev-identity | todo | – | #327 | S | P3 |
 | G-PR1 | Profile post: retry only to the servers that refused it (a stored set of server IDs instead of the single pending flag). Today one refusing server makes every server get a fresh ~4 KB profile post every 10 minutes (reviews: tech-lead) | dev-identity | todo (after the 2026-11-17 reset) | – | #359 | S | – |
 | G-24 | @mentions (UI + core format, GAPS §2.5) (reviews: tech-lead, product-lead (+ ux visual), sec-lead (format)) | dev-ui + dev-identity (format) | done | #330 #331 #338 #342 | – | M | 0.4.0 |
-| G-05 | Mention badge in the rail, separate from the new-messages dot (`mentionsMe` exists) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo | – | G-24 | S | 0.4.0 |
+| G-05 | Mention badge in the rail, separate from the new-messages dot (`mentionsMe` exists) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo (dev-ui after G-27; no rail mention badge yet) | – | G-24 | S | 0.4.0 |
 | G-61 | Notifications and mute (local + shell, GAPS §2.4) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui + dev-voice-shell | done | #336 | – | M | 0.4.0 |
 | G-17 | Mute a channel (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #335 | G-61 | S | 0.4.0 |
 | G-03 | Mute a server, greyed in the rail (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #335 | G-61 | S | 0.4.0 |
 | G-04 | Mark all as read for a server, from the context menu (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #335 | G-21 | S | 0.4.0 |
 | G-22 | Message context menu: reply, copy, edit, delete (B25 §2, rest of #208) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #213 | B25 | S | 0.4.0 |
-| G-06 | Tooltip with the full server name in the rail (48-character names) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo | – | – | S | 0.4.0 |
+| G-06 | Tooltip with the full server name in the rail (48-character names) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo (dev-ui after G-05; today only a native title, not shown on keyboard focus) | – | – | S | 0.4.0 |
 | **0.4.x** | **In parallel, infrastructure (P0)** | | | | | | |
 | G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d (+ devops for the relay move, dev-sync) | in progress (design #333, engine TURN #337, QUIC #243, STUN #222; relay move #220 open; TURN path behind a flag in review #433, voice-d, owner decision on running TURN pending; ICE restart on network change after #433, todo) | #333 #337 #433 | #220, STUN | L | 0.4.x |
 | G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; restore progress part 1 #457; phase B buddies in review #461, dev-identity (sync side "BUDDIES on" by dev-sync only after multi-relay part B); restore screen in review #458) | #292 #317 #339 #340 #367 #457 #461 #458 | – | L | 0.4.x |
@@ -200,7 +200,7 @@ Last updated: 2026-11-18, refresh 13. `main` has every PR up to #457 except the 
 | G-27 | Emoji picker | dev-ui | todo (dev-ui 1st) | – | – | M | 0.5.0 |
 | G-32 | ↑ to edit the last message (check `onEditLast`) | dev-ui | done | #441 | – | S | 0.5.0 |
 | G-33 | Jump to latest message button | dev-ui | done | #441 | – | S | 0.5.0 |
-| G-30 | Link to a message | dev-ui + dev-identity | todo (dev-ui after G-27, G-78 UI) | – | – | M | 0.5.0 |
+| G-30 | Link to a message | dev-ui + dev-identity | todo (dev-ui after G-27, G-05, G-06, G-78 UI) | – | – | M | 0.5.0 |
 | G-63 | Notification sound | voice-c | done, accepted | #468 | – | S | 0.5.0 |
 | G-62 | Taskbar unread count | dev-voice-shell | done | #430 #442 | G-61 ✔ | S | 0.5.0 |
 | G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | done, accepted | #470 | – | S | 0.5.0 |

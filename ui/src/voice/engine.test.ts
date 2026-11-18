@@ -971,9 +971,11 @@ describe('voice engine', () => {
 
     mic.level = 0.2;
     await vi.advanceTimersByTimeAsync(100);
+    expect(events.at(-1)?.[A]).not.toBe(true); // not yet: 150 ms first (G-82)
+    await vi.advanceTimersByTimeAsync(200);
     expect(events.at(-1)).toEqual({ [A]: true });
     mic.level = 0;
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(200);
     expect(events.at(-1)).toEqual({ [A]: true }); // held
     await vi.advanceTimersByTimeAsync(400);
     expect(events.at(-1)).toEqual({ [A]: false });

@@ -1954,6 +1954,141 @@ fn join_re_keys_spend_a_token_bucket() {
     assert!(!bodies.iter().any(|b| b == "before anyone joined"), "{bodies:?}");
 }
 
+/// QA's lost-message P1: a member who just joined never saw a message that
+/// another member sent between the join and the join re-key reaching the
+/// sender. The sender already saw the joiner in the control log, but its
+/// key predated the join (`RotationNeed::Add` doesn't stop `encrypt`), so
+/// the message was sealed under a key the joiner never gets. Now it waits
+/// for the re-key ([`JOIN_KEY_WAIT`] at most).
+#[test]
+fn a_message_sent_while_the_join_re_key_is_in_flight_reaches_the_joiner() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Window");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "a is keyed", None).unwrap();
+
+    // B joins; A sees the join before the owner has re-keyed for B.
+    let b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "pre a", None).unwrap();
+
+    // Then everyone catches up: the owner re-keys for B, and A's held
+    // message goes out under the new key.
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+    b.core.sync_now().unwrap();
+    let bodies: Vec<String> =
+        b.core.get_messages(&channel, 0, 9).unwrap().messages.into_iter().map(|m| m.body).collect();
+    assert!(bodies.iter().any(|m| m == "pre a"), "B misses A's message: {bodies:?}");
+}
+
+/// The wait for a join re-key is bounded: with no moderator online, a
+/// message goes out under the current key after [`JOIN_KEY_WAIT`], so the
+/// members who hold it still read it (the joiner can't: the residual).
+#[test]
+fn with_no_moderator_online_the_join_key_wait_ends() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Offline");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+
+    let b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "while the owner is away", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    assert!(held.id.starts_with(api::KEY_PENDING_PREFIX));
+    // Still within the wait: still held.
+    advance(&world, JOIN_KEY_WAIT.as_millis() as u64 / 2);
+    a.core.sync_now().unwrap();
+    assert_eq!(world.network.fetch(server_key(&server)).iter().filter(|r| r.kind() == Kind::Message).count(), 0);
+    // Past it: sent under the key A and the owner hold. A later message
+    // isn't held at all (the wait is per join, not per message).
+    advance(&world, JOIN_KEY_WAIT.as_millis() as u64);
+    a.core.sync_now().unwrap();
+    let next = a.core.send_message(&channel, "and another", None).unwrap();
+    assert_ne!(next.send_state, Some(SendState::Pending), "{next:?}");
+    // The owner reads both without having re-keyed (sync only after this).
+    let bodies: Vec<String> = {
+        owner.core.sync_now().unwrap();
+        owner.core.get_messages(&channel, 0, 9).unwrap().messages.into_iter().map(|m| m.body).collect()
+    };
+    assert!(bodies.iter().any(|m| m == "while the owner is away"), "{bodies:?}");
+    assert!(bodies.iter().any(|m| m == "and another"), "{bodies:?}");
+    // The joiner never opens them (sealed before its key: the residual).
+    b.core.sync_now().unwrap();
+    let seen: Vec<String> =
+        b.core.get_messages(&channel, 0, 9).unwrap().messages.into_iter().map(|m| m.body).collect();
+    assert!(!seen.iter().any(|m| m == "while the owner is away" || m == "and another"), "{seen:?}");
+}
+
+/// SL C1: a member removed during the hold (here a leave; a kick or revoke
+/// is the same `RotationRequired`) means the held message is never sealed
+/// under the key that member still holds, not even past the wait.
+#[test]
+fn a_removal_during_the_hold_never_falls_back_to_the_old_key() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Removal");
+    let a = joiner(&world, &server, "A");
+    let c = joiner(&world, &server, "C");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+    c.core.sync_now().unwrap();
+
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "not for C", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    // C, who holds the current key, leaves while it is held; the owner
+    // (the only rotator) stays away.
+    c.core.leave_server(&server.id).unwrap();
+    advance(&world, 100);
+    a.core.sync_now().unwrap();
+    advance(&world, 2 * JOIN_KEY_WAIT.as_millis() as u64);
+    a.core.sync_now().unwrap();
+    let sent = world.network.fetch(server_key(&server)).iter().filter(|r| r.kind() == Kind::Message).count();
+    assert_eq!(sent, 0, "sealed under the key C still holds");
+}
+
+/// SL C2: a moderator's re-key on send spends the GAP-8 join token. With
+/// none left, the moderator's own message waits for the shared re-key.
+#[test]
+fn a_moderator_without_a_join_token_holds_the_message() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Mod");
+    // The burst: three joins, three re-keys.
+    for i in 0..JOIN_REKEY_BURST {
+        let _peer = joiner(&world, &server, &format!("J{i}"));
+        advance(&world, 100);
+        owner.core.sync_now().unwrap();
+    }
+    let late = joiner(&world, &server, "Late");
+    owner.core.sync_now().unwrap();
+    let before = rotations(&world, &server);
+    let held = owner.core.send_message(&channel, "for Late too", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending), "{held:?}");
+    assert_eq!(rotations(&world, &server), before, "re-keyed on send without a token");
+    // The next token re-keys, and the held message goes out under it.
+    let due = owner.core.next_rekey_in().expect("a waiting re-key");
+    advance(&world, due.as_millis() as u64 + 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(rotations(&world, &server), before + 1);
+    late.core.sync_now().unwrap();
+    let seen: Vec<String> =
+        late.core.get_messages(&channel, 0, 9).unwrap().messages.into_iter().map(|m| m.body).collect();
+    assert!(seen.iter().any(|m| m == "for Late too"), "{seen:?}");
+}
+
+fn server_key(server: &ServerSummary) -> ServerId {
+    ServerId::from_bytes(hex::decode(&server.id).unwrap().try_into().unwrap())
+}
+
 /// GAP-8 amplification: 10 joins in 5 s, with the owner syncing every
 /// 500 ms, give at most 3 rotations (the burst); the next token keys
 /// everyone else at once, and all 10 can write.

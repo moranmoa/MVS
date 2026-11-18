@@ -14,6 +14,7 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  BlockedUser,
   JoinStatus,
   Member,
   Message,
@@ -161,7 +162,15 @@ export interface CoreCommands {
   markRead(channelId: Id): Promise<void>;
 
   // Safety
+  /** A toggle; prefer setBlocked. Fires members.changed and blocks.changed. */
   blockUser(userId: Id): Promise<void>;
+  /** G-47: everyone I blocked, ordered by userId, including people who share no server with me. */
+  listBlocked(): Promise<BlockedUser[]>;
+  /**
+   * G-47: blocks or unblocks. Idempotent: no change fires nothing; otherwise
+   * blocks.changed (and members.changed). `bad-request` for my own id.
+   */
+  setBlocked(userId: Id, blocked: boolean): Promise<null>;
   kickMember(serverId: Id, userId: Id): Promise<void>;
   /** G-53: owner only (`not-allowed` for anyone else): the accounts removed from the server, in no set order. */
   listRemovedMembers(serverId: Id): Promise<RemovedMember[]>;
@@ -251,6 +260,8 @@ export interface CoreEvents {
   'channel.added': Channel;
   'channel.removed': { serverId: Id; channelId: Id; name: string };
   'members.changed': { serverId: Id; members: Member[] };
+  /** G-47: the whole list of blocked accounts, after any change. */
+  'blocks.changed': { blocked: BlockedUser[] };
   'message.added': Message;
   'message.updated': Message;
   'join.status': JoinStatus;

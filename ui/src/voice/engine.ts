@@ -36,7 +36,7 @@
 
 import type { CallSignal, CallState, Id } from '../core/types';
 import type { VoiceCore } from './adapter';
-import { cleanTurnCredentials, iceServersFor, normalizeFingerprint, soleFingerprint, type TurnCredentials } from './sdp';
+import { cleanStunUrl, cleanTurnCredentials, iceServersFor, normalizeFingerprint, soleFingerprint, type TurnCredentials } from './sdp';
 import { quiet, rms, stepSpeaking, type SpeakState } from './speaking';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'failed';
@@ -55,7 +55,45 @@ export type VoiceErrorCode =
   | 'fingerprint-mismatch'
   | 'peer-failed'
   /** The call started without a microphone; sending needs a rejoin. */
-  | 'rejoin-to-talk';
+  | 'rejoin-to-talk'
+  /**
+   * G-81: a STUN server is configured but gathering found no public address
+   * (srflx): UDP to it is blocked, or it is down. Once per call; for the
+   * diagnostics and the debug log, not a user message.
+   */
+  | 'stun-unreachable';
+
+/** ICE candidate types: the only thing diagnostics say about a candidate. */
+export type CandidateType = 'host' | 'srflx' | 'prflx' | 'relay';
+export const CANDIDATE_TYPES: readonly CandidateType[] = ['host', 'srflx', 'prflx', 'relay'];
+
+/**
+ * G-81 diagnostics for one peer: states, candidate types, counts and
+ * timings only. By construction there is no address, port or host name in
+ * here: every string is one of a fixed set.
+ */
+export interface PeerDiagnostics {
+  state: PeerConnectionState;
+  ice: RTCIceConnectionState | 'unknown';
+  /** My candidates in the last description I sent, by type; null before one. */
+  gathered: Record<CandidateType, number> | null;
+  /** The selected pair's types; null while there is none. */
+  pair: { local: CandidateType | 'unknown'; remote: CandidateType | 'unknown' } | null;
+  /** Gathering for the last description I sent, in ms. */
+  gatherMs: number | null;
+  /** From starting this connection to its first "connected", in ms. */
+  setupMs: number | null;
+}
+
+export interface VoiceDiagnostics {
+  /** A STUN server is configured (its address is never shown). */
+  stun: boolean;
+  /** Whether it answered (any srflx gathered); null before any gathering or without STUN. */
+  stunAnswered: boolean | null;
+  /** How long gathering may take before the description goes out anyway, in seconds (UX: "no answer within {s} s"). */
+  gatherWindowS: number;
+  peers: Record<Id, PeerDiagnostics>;
+}
 
 export interface VoiceError {
   code: VoiceErrorCode;
@@ -101,6 +139,8 @@ export interface VoiceEnv {
 export interface VoiceEngineOptions {
   /** The config's STUN URL (`stun:host:port`), if any. */
   stunUrl?: string | null;
+  /** Relay-only is on: the engine never starts a call (SL S1, G-81). */
+  relayOnly?: boolean;
   env?: VoiceEnv;
   /** How long to wait for ICE gathering before sending the SDP anyway. */
   gatherTimeoutMs?: number;
@@ -164,6 +204,8 @@ export interface VoiceEngine {
    * (`host`, `srflx`, `prflx`, `relay`), never the addresses. null while none.
    */
   connectionTypes(): Promise<Record<Id, { local: string; remote: string } | null>>;
+  /** G-81: what the diagnostics panel shows; never an address. */
+  diagnostics(): Promise<VoiceDiagnostics>;
 }
 
 const MAX_PEERS = 4; // 5 in a call, me included
@@ -196,6 +238,11 @@ interface Peer {
   recovery: { giveUp: ReturnType<typeof setTimeout>; resend: ReturnType<typeof setInterval> | null } | null;
   /** A short wait on `disconnected` before restarting: it often comes back by itself. */
   grace: ReturnType<typeof setTimeout> | null;
+  /** G-81 diagnostics: when this connection started, how long to connect, what I gathered. */
+  startedAt: number;
+  setupMs: number | null;
+  gathered: Record<CandidateType, number> | null;
+  gatherMs: number | null;
 }
 
 interface Meter {
@@ -204,6 +251,38 @@ interface Meter {
   buffer: Float32Array<ArrayBuffer>;
   /** G-82: the speaking state machine (speaking.ts). */
   speak: SpeakState;
+}
+
+/** My candidates in a description, counted by type (nothing else is read from them). */
+export function candidateCounts(sdp: string): Record<CandidateType, number> {
+  const out: Record<CandidateType, number> = { host: 0, srflx: 0, prflx: 0, relay: 0 };
+  for (const m of sdp.matchAll(/^a=candidate:[^\r\n]* typ (host|srflx|prflx|relay)(?=[ \r\n]|$)/gm)) out[m[1] as CandidateType]++;
+  return out;
+}
+
+const ICE_STATES: readonly string[] = ['new', 'checking', 'connected', 'completed', 'failed', 'disconnected', 'closed'];
+
+/** The selected candidate pair's types, from getStats; never the addresses. */
+async function selectedPair(pc: RTCPeerConnection): Promise<{ local: CandidateType | 'unknown'; remote: CandidateType | 'unknown' } | null> {
+  try {
+    const stats = await pc.getStats();
+    const byId = new Map<string, Record<string, unknown>>();
+    stats.forEach((r: Record<string, unknown>) => byId.set(r.id as string, r));
+    let pair: Record<string, unknown> | undefined;
+    for (const r of byId.values()) {
+      if (r.type === 'transport' && typeof r.selectedCandidatePairId === 'string') pair = byId.get(r.selectedCandidatePairId);
+    }
+    if (!pair) {
+      for (const r of byId.values()) if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r;
+    }
+    const type = (id: unknown) => {
+      const t = typeof id === 'string' ? byId.get(id)?.candidateType : undefined;
+      return typeof t === 'string' && (CANDIDATE_TYPES as readonly string[]).includes(t) ? (t as CandidateType) : 'unknown';
+    };
+    return pair ? { local: type(pair.localCandidateId), remote: type(pair.remoteCandidateId) } : null;
+  } catch {
+    return null; // no stats
+  }
 }
 
 export function browserEnv(): VoiceEnv {
@@ -262,6 +341,9 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   let turn: TurnCredentials | null = null;
   let turnRefreshAt = 0;
   let turnTimer: ReturnType<typeof setTimeout> | null = null;
+  const stunConfigured = cleanStunUrl(options.stunUrl) !== null;
+  /** The call generation stun-unreachable was last reported for. */
+  let stunWarned = -1;
   const iceServers = () => iceServersFor(options.stunUrl, turn && turn.expiresAt > Date.now() ? turn : null);
 
   const listeners: { [E in keyof VoiceEvents]: Set<(p: VoiceEvents[E]) => void> } = {
@@ -608,6 +690,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       watchdog: null,
       recovery: null,
       grace: null,
+      startedAt: Date.now(),
+      setupMs: null,
+      gathered: null,
+      gatherMs: null,
     };
     peers.set(id, peer);
     peer.watchdog = setTimeout(
@@ -641,6 +727,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       if (peer.closed) return;
       const s = pc.connectionState;
       if (s === 'connected') {
+        if (peer.setupMs === null) peer.setupMs = Date.now() - peer.startedAt;
         clearGrace(peer);
         endRecovery(peer);
         void checkCertificate(peer); // again after a restart: same certificate, or the peer goes
@@ -835,10 +922,18 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     const desc = kind === 'offer' ? await pc.createOffer() : await pc.createAnswer();
     if (peer.closed || gen !== generation) return;
     await pc.setLocalDescription(desc);
+    const gatherFrom = Date.now();
     await gathered(pc);
     if (peer.closed || gen !== generation) return;
     const sdp = pc.localDescription?.sdp;
     if (!sdp) return dropPeer(peer, 'failed');
+    peer.gatherMs = Date.now() - gatherFrom;
+    peer.gathered = candidateCounts(sdp);
+    // G-81: STUN configured, yet no public address came back: say so once per call.
+    if (stunConfigured && peer.gathered.srflx === 0 && stunWarned !== generation) {
+      stunWarned = generation;
+      emit('error', { code: 'stun-unreachable' });
+    }
     await core.sendSignal(peer.id, kind, sdp);
   }
 
@@ -1068,6 +1163,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   // ---- lifecycle -------------------------------------------------------------
   async function start(state: CallState, myId: Id) {
     if (active) stop();
+    // SL S1: relay-only means no voice. The core already refuses and ends
+    // calls; the engine adds its own stop: no microphone, no connection, no
+    // candidate gathering (offers and signals are ignored while inactive).
+    if (options.relayOnly) return;
     active = true;
     const gen = ++generation;
     me = myId;
@@ -1206,27 +1305,22 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     async connectionTypes() {
       const out: Record<Id, { local: string; remote: string } | null> = {};
+      for (const p of peers.values()) out[p.id] = await selectedPair(p.pc);
+      return out;
+    },
+    async diagnostics() {
+      const out: VoiceDiagnostics = { stun: stunConfigured, stunAnswered: null, gatherWindowS: gatherTimeoutMs / 1000, peers: {} };
       for (const p of peers.values()) {
-        out[p.id] = null;
-        try {
-          const stats = await p.pc.getStats();
-          const byId = new Map<string, Record<string, unknown>>();
-          stats.forEach((r: Record<string, unknown>) => byId.set(r.id as string, r));
-          let pair: Record<string, unknown> | undefined;
-          for (const r of byId.values()) {
-            if (r.type === 'transport' && typeof r.selectedCandidatePairId === 'string') pair = byId.get(r.selectedCandidatePairId);
-          }
-          if (!pair) {
-            for (const r of byId.values()) if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r;
-          }
-          const type = (id: unknown) => {
-            const t = typeof id === 'string' ? byId.get(id)?.candidateType : undefined;
-            return typeof t === 'string' && /^(host|srflx|prflx|relay)$/.test(t) ? t : 'unknown';
-          };
-          if (pair) out[p.id] = { local: type(pair.localCandidateId), remote: type(pair.remoteCandidateId) };
-        } catch {
-          // no stats: null
-        }
+        const ice = p.pc.iceConnectionState;
+        out.peers[p.id] = {
+          state: p.state,
+          ice: ICE_STATES.includes(ice) ? ice : 'unknown',
+          gathered: p.gathered && { ...p.gathered },
+          pair: await selectedPair(p.pc),
+          gatherMs: p.gatherMs,
+          setupMs: p.setupMs,
+        };
+        if (stunConfigured && p.gathered) out.stunAnswered = out.stunAnswered === true || p.gathered.srflx > 0;
       }
       return out;
     },

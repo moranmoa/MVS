@@ -8,6 +8,8 @@ import { MockCore } from '../core/mock';
 import { cleanLockState } from '../core/ipc';
 import { newPasscodeProblem } from './AppLockSection';
 import { formatWait, lockScreenFromUrl } from './useLock';
+import en from '../i18n/en.json';
+import he from '../i18n/he.json';
 
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
@@ -44,6 +46,17 @@ afterEach(() => {
 });
 
 const LOCKED_A = { enabled: true, locked: true, pending: false, path: 'A', inCall: false };
+
+describe('locale files', () => {
+  // UTF-8 read as Windows-1252 and written back (e.g. a PowerShell write
+  // without -Encoding utf8) turns "…" into "â€¦" and Hebrew into "×…".
+  it('hold no double-encoded text', () => {
+    for (const [name, messages] of Object.entries({ he, en } as Record<string, Record<string, string>>)) {
+      const bad = Object.entries(messages).filter(([, v]) => /×|â€|Ã|Â/.test(v));
+      expect(bad, name).toEqual([]);
+    }
+  });
+});
 
 describe('helpers', () => {
   it('reads the lock screen from the URL', () => {

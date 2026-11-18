@@ -1021,7 +1021,7 @@ export class MockCore implements CoreApi {
     if (!ch) throw err({ code: 'not-found' });
     this.ownedServer(ch.channel.serverId);
     const t = topic.trim();
-    if ([...t].length > 256 || new TextEncoder().encode(t).length > 1024 || /[ -  ]/.test(t)) {
+    if ([...t].length > 256 || new TextEncoder().encode(t).length > 1024 || /[\u0000-\u001f\u007f\u2028\u2029]/.test(t)) {
       throw err({ code: 'bad-request' });
     }
     if ((ch.channel.topic ?? '') === t) return ch.channel;

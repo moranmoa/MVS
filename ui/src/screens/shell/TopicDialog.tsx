@@ -14,7 +14,7 @@ import { Dialog } from '../../components/common';
 const COUNT_FROM = 200;
 
 /** One line: line breaks (and the Unicode line/paragraph separators) become spaces. */
-const oneLine = (s: string) => s.replace(/[\r\n  ]+/g, ' ');
+const oneLine = (s: string) => s.replace(/[\r\n\u2028\u2029]+/g, ' ');
 
 export function TopicDialog({
   channel,

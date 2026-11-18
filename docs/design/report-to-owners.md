@@ -147,3 +147,32 @@ sig        [u8; 64]   Ed25519 over "mvs/report/v1\0" ‖ all of the above
   - the security lead reviews the codec and the seal.
 - **A8. node.rs is dev-sync's:** I send them the exact hookup: the protocol, the limiter and the typing members-only check. The protocol lives in its own module.
 - **A9. One PR, core only, with CONFORMANCE.md:** `mock.ts`, the allow-list and the UI go to voice-c.
+
+## Security lead review (`sec-lead-g48-report.md`): R1–R7
+- **R1. Recipients are re-resolved for each outbox row at send time.** A row whose recipient is no longer owner or admin, or is the reported member, is dropped. The receiver's own "I'm staff" check is advisory only.
+- **R2.** A message report excludes the author of the target record from the recipients.
+- **R3. Seal:**
+  - the associated data is `"mvs/report-box/v1" ‖ ephemeral ‖ recipient ‖ server`, which supersedes A7's string;
+  - an all-zero shared secret is refused;
+  - it reuses `groupkeys`' Ed→X conversion and the existing crates.
+- **R4. Evidence:**
+  - Valid only when:
+    - its ID equals `target`;
+    - it is of the same channel and server, kind `Message`;
+    - the author's signature checks;
+    - it is within `MAX_RECORD_BYTES`.
+  - Otherwise it is marked invalid, not dropped silently.
+  - It is never fed into the log or the fold.
+  - It is shown as plain text, or as Markdown with links that aren't live.
+- **R5. Storage and lock:**
+  - the outbox stores only sealed boxes;
+  - the report commands are not in the G-78 lock allow-set;
+  - retention exception: the evidence outlives the author's delete;
+  - reports are dropped on leave.
+- **R6. Reasons 5 and 6:** the evidence is shown only behind a click, never inline or in a notification. Reason 6 points to the B24 abuse address (a Product Owner call).
+- **R7. A uniform receive path:** every frame gets the same work and the same ack, with no early return before the open attempt.
+
+## Product Owner decisions
+- For reasons 5 and 6, the evidence is never part of anything that feeds a notification or a preview. `listReports` and `report.received` carry no evidence for them, and the UI fetches it only on an explicit click, through `getReportEvidence(reportId)`.
+- The core gates by the viewer's age. Staff without an 18+ claim get `not-allowed` from `getReportEvidence` for reasons 5 and 6. `Report.evidenceWithheld: true` tells the UI why.
+- For reason 6, no API path exports or forwards the evidence: there's no copy or forward command, and it's not in any export.

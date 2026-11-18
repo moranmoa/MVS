@@ -99,6 +99,22 @@ const BIO_MAX_LINES: usize = 8;
 const AVATAR_DATA_URL_MAX: usize = 700_000;
 const AVATAR_TYPES: [&str; 4] = ["png", "jpeg", "webp", "gif"];
 
+/// B23-z2 (Tech Lead, #241): whether this core *writes* display names with
+/// an emoji ZWJ sequence ("👨‍👩‍👧"). The reader (`ServerView::display_names`)
+/// takes them from this release on; the writer switches on one release
+/// later, so a name never reaches a core that would drop it. Until then the
+/// strict rule applies to my own name.
+const WRITE_ZWJ_NAMES: bool = false;
+
+/// The rule my own display name must pass (see [`WRITE_ZWJ_NAMES`]).
+fn profile_name_ok(name: &str) -> bool {
+    if WRITE_ZWJ_NAMES {
+        authority::display_name_ok(name)
+    } else {
+        authority::display_text_ok(name)
+    }
+}
+
 /// `bad-request` unless the profile fits the caps above, and the avatar is
 /// a base64 `data:` URL of an allow-listed raster type (never SVG).
 pub(crate) fn check_profile(input: &ProfileInput) -> Result<(), ErrorCode> {
@@ -110,7 +126,7 @@ pub(crate) fn check_profile(input: &ProfileInput) -> Result<(), ErrorCode> {
     // B23: no bidi, control or zero-width characters in a name others see.
     let ok = !name.is_empty()
         && name.chars().count() <= PROFILE_NAME_MAX_CHARS
-        && authority::display_text_ok(name)
+        && profile_name_ok(name)
         && bio_ok
         && avatar_ok;
     ok.then_some(()).ok_or(ErrorCode::BadRequest)
@@ -457,7 +473,9 @@ impl<'a> ServerView<'a> {
         for id in &self.state.posts {
             let Some(record) = by_id.get(id) else { continue };
             let name = parse_profile(record).map(|p| p.display_name);
-            if let Some(name) = name.filter(|n| authority::display_text_ok(n)) {
+            // B23-z2: the reader takes the display-name rule (an emoji ZWJ
+            // sequence allowed), a release before this core writes one.
+            if let Some(name) = name.filter(|n| authority::display_name_ok(n)) {
                 // Later profile posts (a new display name) win.
                 names.insert(record.author(), name);
             }
@@ -583,6 +601,30 @@ pub(crate) fn age_on(birth_date: &str, now_ms: u64) -> Option<u32> {
         age -= 1;
     }
     u32::try_from(age).ok()
+}
+
+/// G-77: a birth date as `YYYY-MM-DD`, a real calendar day from 1900 on,
+/// not after today (UTC).
+pub(crate) fn valid_birth_date(birth_date: &str, now_ms: u64) -> bool {
+    let parts: Vec<&str> = birth_date.split('-').collect();
+    let [y, m, d] = parts.as_slice() else { return false };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 || !birth_date.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        return false;
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) else { return false };
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if y < 1900 || !(1..=days).contains(&d) {
+        return false;
+    }
+    let today = civil_from_days((now_ms / 86_400_000) as i64);
+    (y, m, d) <= today
 }
 
 /// Days since 1970-01-01 to (year, month, day). Howard Hinnant's algorithm.
@@ -915,6 +957,20 @@ mod tests {
     }
 
     #[test]
+    fn birth_dates_are_strict() {
+        let nov_3_2026 = 20_760 * 86_400_000;
+        for ok in ["2008-11-03", "2026-11-03", "1900-01-01", "2000-02-29", "1990-12-31"] {
+            assert!(valid_birth_date(ok, nov_3_2026), "{ok}");
+        }
+        for bad in [
+            "2026-11-04", "1899-12-31", "2001-02-29", "1900-02-29", "1990-13-01", "1990-00-10", "1990-04-31",
+            "1990-4-01", "90-04-01", "1990-04-01x", "+990-04-01", "1990/04/01", "", "1990-04",
+        ] {
+            assert!(!valid_birth_date(bad, nov_3_2026), "{bad}");
+        }
+    }
+
+    #[test]
     fn short_codes_look_like_the_mock() {
         let code = short_code(&PublicKey::from_bytes([7; 32]));
         assert_eq!(code.len(), 9);
@@ -1001,6 +1057,68 @@ mod tests {
         assert!(!heads.contains(&orphan.id()));
         assert!(heads.contains(&log.records.last().unwrap().id()));
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
+    }
+
+    /// B23-z2: the reader takes a display name with an emoji ZWJ sequence
+    /// (a family, "👩🏽‍💻"), still drops a stray ZWJ or a bidi control, and
+    /// keeps the last good name. The writer stays strict until
+    /// `WRITE_ZWJ_NAMES` flips; server names stay strict for good.
+    #[test]
+    fn zwj_names_are_read_but_not_yet_written() {
+        let owner = records::SigningKey::from_bytes(&[2; 32]);
+        let genesis = authority::sign_genesis(&owner, [0; 16], 1, b"{}").unwrap();
+        let server = genesis.server();
+        let mut log = Log::new(server, [genesis.clone()]);
+        let names = |log: &Log| {
+            let view = ServerView {
+                id: server,
+                genesis: GenesisBody { v: 1, name: "S".into(), age_restriction: AgeRestriction::None },
+                owner: genesis.author(),
+                state: log.resolver.state(),
+                records: &log.records,
+            };
+            view.display_names().get(&genesis.author()).cloned()
+        };
+        let post = |log: &mut Log, seq: u64, name: &str| {
+            let deps = view_deps(log, &genesis);
+            let action = profile_action_with(name, None, None);
+            log.add(authority::sign_control(&owner, server, seq, deps, seq, &action).unwrap());
+        };
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        post(&mut log, 1, family);
+        assert_eq!(names(&log).as_deref(), Some(family), "read");
+        post(&mut log, 2, "a\u{200D}b");
+        assert_eq!(names(&log).as_deref(), Some(family), "a stray ZWJ is dropped; the last good name stays");
+        post(&mut log, 3, "\u{202E}evil");
+        assert_eq!(names(&log).as_deref(), Some(family), "bidi still refused");
+        post(&mut log, 4, "Dana");
+        assert_eq!(names(&log).as_deref(), Some("Dana"));
+
+        // Not written yet (one release later, Tech Lead #241).
+        let input = |name: &str| ProfileInput {
+            display_name: name.into(),
+            bio: None,
+            avatar_data_url: None,
+            avatar_small: None,
+            color: None,
+        };
+        assert_eq!(check_profile(&input(family)).is_ok(), WRITE_ZWJ_NAMES);
+        assert!(check_profile(&input("Dana")).is_ok());
+        // A server name: never a ZWJ.
+        assert!(!authority::server_name_ok(family));
+        assert!(authority::server_name_ok("Team"));
+    }
+
+    /// The log's current heads, for a test record.
+    fn view_deps(log: &Log, genesis: &Record) -> Vec<RecordId> {
+        let view = ServerView {
+            id: log.server,
+            genesis: GenesisBody { v: 1, name: "S".into(), age_restriction: AgeRestriction::None },
+            owner: genesis.author(),
+            state: log.resolver.state(),
+            records: &log.records,
+        };
+        view.deps(None)
     }
 
     #[test]

@@ -19,7 +19,8 @@
 // Any mismatch fails the build. Errors name an entry's position, never the
 // address. <host> is /dns4|/dns6|/dns|/ip4|/ip6 followed by the name or IP.
 //
-// Output: {"relay": ..., "relays": [...], "bootstrap": [...], "stun": ...}; each key
+// Output: {"relay": ..., "relays": [...], "bootstrap": [...], "stun": ...,
+// "abuseAddress": ...} (ABUSE_ADDRESS, G-48); each key
 // only when its variable is set ({} for none). With RELAYS, "relay" is its
 // first entry. bootstrap is a direct (non-wss) route to the relays, so they
 // can observe clients' public addresses (DCUtR, #219).
@@ -58,6 +59,18 @@ function checked(name, value) {
 function stunUrl(value) {
   const m = /^stun:([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:]{2,39}\]):(\d{1,5})$/.exec(value);
   if (!m || Number(m[2]) < 1 || Number(m[2]) > 65535) fail("the STUN URL must be stun:<host>:<port>");
+  return value;
+}
+
+// G-48: where people report abuse to the app's operators (B24), shown next
+// to a report about a minor. An e-mail address or an https URL, at most 254
+// characters; nothing else. Never printed: the domain is private.
+function abuseAddress(value) {
+  const email = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,189}\.[A-Za-z]{2,63}$/;
+  const url = /^https:\/\/[A-Za-z0-9.-]{1,253}(?::\d{1,5})?(?:\/[A-Za-z0-9._~%\/-]*)?$/;
+  if (value.length > 254 || !(email.test(value) || url.test(value))) {
+    fail("the abuse-report address must be an e-mail address or an https URL");
+  }
   return value;
 }
 
@@ -118,7 +131,9 @@ if (boot.length) {
 }
 agree(config.relays || (config.relay ? [config.relay] : []), config.bootstrap || []);
 if (process.env.STUN) config.stun = stunUrl(process.env.STUN);
+if (process.env.ABUSE_ADDRESS?.trim()) config.abuseAddress = abuseAddress(process.env.ABUSE_ADDRESS.trim());
 writeFileSync(out, JSON.stringify(config));
 console.log(config.relays ? `${config.relays.length} relays configured` : config.relay ? "relay configured" : "::warning::no relay address in this build: the app will run offline");
 console.log(config.bootstrap ? `${config.bootstrap.length} bootstrap address(es) configured` : "no bootstrap address in this build");
 console.log(config.stun ? "STUN configured" : "no STUN server in this build");
+console.log(config.abuseAddress ? "abuse-report address configured" : "no abuse-report address in this build");

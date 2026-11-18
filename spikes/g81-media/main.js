@@ -17,7 +17,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const mode = process.argv.find((a) => ['codec', 'ipc', 'aec'].includes(a)) || 'codec';
+const mode = process.argv.find((a) => ['codec', 'ipc', 'aec', 'pipeline'].includes(a)) || 'codec';
 const outIdx = process.argv.indexOf('--out');
 const outFile = outIdx > 0 ? process.argv[outIdx + 1] : path.join(__dirname, `results-${mode}.json`);
 app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'mvs-g81-spike-')));

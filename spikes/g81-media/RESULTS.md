@@ -27,3 +27,7 @@ a dev-sync / dev-identity item, and a TL/SL decision.
     electron spikes/g81-media/main.js codec|ipc|aec
 
 A throwaway profile each time. `aec` plays sound out loud and asks for the microphone.
+
+## Pipeline smoke test (silent, real WebCodecs)
+
+`electron spikes/g81-media/main.js pipeline` (build first: `ui/node_modules/.bin/esbuild spikes/g81-media/pipeline.ts --bundle --format=iife --outfile=spikes/g81-media/pipeline.bundle.js`). The real `ui/src/voice/media` MediaSession, a synthetic oscillator as the mic, a loopback with 20-80 ms jitter and 2% loss, and output to a MediaStreamDestination (never the speakers). 10 s: 250 frames sent (25 fps), 0 oversize; 246 delivered, 244 played, 3 missing; the jitter target settled at 120 ms; decoded audio reached the output. It caught two bugs fixed in the module: a stereo track failed the mono encoder silently (now downmixed, and send errors show in stats).

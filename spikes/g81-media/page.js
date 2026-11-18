@@ -218,7 +218,7 @@ async function aec() {
 (async () => {
   let result;
   try {
-    result = mode === 'ipc' ? await ipc() : mode === 'aec' ? await aec() : await codec();
+    result = mode === 'ipc' ? await ipc() : mode === 'aec' ? await aec() : mode === 'pipeline' ? await globalThis.runPipeline(10) : await codec();
   } catch (e) {
     result = { error: String(e?.stack || e) };
   }

@@ -483,6 +483,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
   - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+- Blocked accounts (G-47):
+  - `listBlocked()` returns `BlockedUser[]`, `{ userId, shortCode, name? }`, ordered by `userId` (`shortCode` is the identity code, as `Member.shortCode`, so rows without a name can be told apart, G-47b): everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
+  - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.
+  - `blockUser(userId)` stays a toggle, for older shells.
+  - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
+  - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

@@ -173,6 +173,8 @@
   "join.keepTrying": "Keep looking in the background",
   "join.invalid": "That doesn't look like an invite link. Check it was copied in full.",
   "join.ageBlocked": "This server is for ages {age} and over, so you can't join it.",
+  "join.removed": "This account was removed from the server, so it can't join. You can contact the owner.",
+  "join.closed": "The owner closed this server, so it can't be joined.",
   "join.joined": "You're in",
 
   "age.none": "No age limit",

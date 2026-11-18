@@ -820,14 +820,15 @@ async fn report_boxes_go_between_members_acked_with_their_own_caps() {
     let (b, mut eb) = bound_node_events("report-b", &relay, 33, false, Arc::new(gate.clone())).await;
     voice_meet(&a, &b, voice_id(32), voice_id(33), false).await;
 
-    let mut acked = 0;
-    // The fourth is over the cap: dropped unanswered, so it times out unacked.
-    for n in 0..4u8 {
-        if a.report_send(voice_id(33), vec![n; MAX_REPORT_BLOB]).await.is_ok() {
-            acked += 1;
-        }
-    }
-    assert_eq!(acked, 3, "the burst is acked; over the cap, no ack");
+    // Five at once: the burst of 3 is acked; past it, a box is dropped
+    // unanswered and times out unacked (a token comes back only every 10 s).
+    let start = Instant::now();
+    let sends = (0..5u8).map(|n| a.report_send(voice_id(33), vec![n; MAX_REPORT_BLOB]));
+    let results = futures::future::join_all(sends).await;
+    let acked = results.iter().filter(|r| r.is_ok()).count();
+    let allowed = 3 + (start.elapsed().as_secs_f64() / 10.0).floor() as usize;
+    assert!(acked >= 3 && acked <= allowed.min(4), "{acked} acked, {allowed} allowed");
+    assert!(results.iter().all(|r| matches!(r, Ok(()) | Err(ReportError::NotAcked))), "{results:?}");
     let mut got = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
@@ -837,7 +838,7 @@ async fn report_boxes_go_between_members_acked_with_their_own_caps() {
             _ => {}
         }
     }
-    assert_eq!(got.len(), 3);
+    assert_eq!(got.len(), acked, "exactly the acked ones arrived");
     assert!(got.iter().all(|(from, bytes)| *from == voice_id(32) && bytes.len() == MAX_REPORT_BLOB));
     assert_eq!(a.report_send(voice_id(33), vec![0; MAX_REPORT_BLOB + 1]).await, Err(ReportError::TooLarge));
     assert_eq!(a.report_send(voice_id(99), b"x".to_vec()).await, Err(ReportError::NotMember));

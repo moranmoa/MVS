@@ -121,3 +121,29 @@ sig        [u8; 64]   Ed25519 over "mvs/report/v1\0" ‖ all of the above
 1. Option A (direct and private, but staff must come online) or option B (in the log, but the reporter is visible to all)? I recommend A.
 2. Should evidence be the signed record (verifiable, up to about 16 KiB), or only a reference?
 3. Should moderators receive reports too? This note says owners and admins only, as the board item asks.
+
+## Amendment 1 (Tech Lead review)
+- **The questions:**
+  - **Q1:** option A. Delivery through member relays or a holder mailbox is a later follow-up.
+  - **Q2:** the evidence is the signed record. The receiver checks:
+    - its ID equals `target`;
+    - its channel equals `channel`, a channel of `server`;
+    - its author is the reported author.
+
+    The evidence is padded to buckets (0, 2, 8, 16 KiB), so the box size doesn't follow the message's length.
+  - **Q3:** owner and admins only.
+- **A1. Who is reported:** for kind = message, the reported member is the message's author, taken from the record. They are excluded from the recipients. With nobody left, the answer is `no-recipient`, and the UI points at the B24 abuse address.
+- **A2. The outbox re-checks at every send:** a row whose recipient is no longer owner or admin is dropped. Admins added after a report don't get it in v1.
+- **A3. Losing staff status:**
+  - When I stop being owner or admin, `listReports` is `not-allowed`, and my stored reports for that server are deleted.
+  - Leaving the server, or being kicked, deletes them too.
+  - When the reporter leaves a server, their outbox rows for it are deleted.
+- **A4. Never in the account backup or the logs:** neither reports nor the outbox. Dedup IDs are kept for 31 days, matching the 30-day `ts` window.
+- **A5. Receiving a member report:** the target must be a current or removed member of the server.
+- **A6. Non-repudiation is intended:** staff hold a signed report and can prove who filed it. The UI (voice-c and UX) must say "the owner and admins will see that you reported this".
+- **A7. Crypto:**
+  - reuse `groupkeys`' Ed25519→X25519 conversion and the existing XChaCha20-Poly1305 and BLAKE3 crates, with no new or duplicate crypto crate;
+  - AEAD associated data = `"mvs/report-seal/v1" ‖ recipient ‖ server`;
+  - the security lead reviews the codec and the seal.
+- **A8. node.rs is dev-sync's:** I send them the exact hookup: the protocol, the limiter and the typing members-only check. The protocol lives in its own module.
+- **A9. One PR, core only, with CONFORMANCE.md:** `mock.ts`, the allow-list and the UI go to voice-c.

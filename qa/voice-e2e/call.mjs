@@ -428,6 +428,20 @@ try {
   }
   if (JOIN_ONLY) break scenario;
 
+  // 0.4.6: an owner sees the member-relay disclosure (modal) once a member
+  // is there; it has to be answered before anything else can be clicked.
+  if (ROLE === 'a') {
+    await check('MR.1', 'the owner sees the "Relay for your members" disclosure; OK closes it and relaying stays on', async () => {
+      const dlg = page.locator('dialog.member-relay-disclosure');
+      await dlg.waitFor({ state: 'visible', timeout: 30_000 });
+      await dlg.getByRole('button', { name: /^(OK|אישור)$/ }).click();
+      await dlg.waitFor({ state: 'hidden', timeout: 10_000 });
+      const mr = await invoke('getMemberRelay').catch(() => null);
+      if (mr && (!mr.disclosureSeen || !mr.effective)) throw new Error(JSON.stringify(mr));
+      return mr ? `disclosureSeen ${mr.disclosureSeen}, effective ${mr.effective}` : 'closed';
+    });
+  }
+
   await openServer();
   log('server open in the UI');
 

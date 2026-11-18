@@ -207,6 +207,11 @@ export interface Message {
    * member list, and a token whose id isn't here as a former member.
    */
   mentions?: string[];
+  /**
+   * G-26: at most 20 emoji (the most popular), listed in the order they first
+   * appeared; absent when there are none. `mine`: I have it on.
+   */
+  reactions?: { emoji: string; count: number; mine: boolean }[];
   /** Set by the UI when the text was too long or had too many lines to show in full. */
   clipped?: boolean;
   /**

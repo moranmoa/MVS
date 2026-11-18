@@ -168,6 +168,22 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the in-app updater (hourly check) narrows the window;
     - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
+- Channel topic (G-14; design `docs/design/channel-topic.md`):
+  - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
+  - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.
+  - **The text rule** (`authority::channel_topic_ok`): one line, trimmed, 1–256 code points and at most 1024 bytes, and the strict name rule (no bidi controls, other control characters, line breaks included, or zero-width characters).
+  - Errors, with nothing signed:
+    - `bad-request`: the topic fails the rule.
+    - `not-found`: an unknown or deleted channel.
+    - `not-allowed`: I'm not the owner or an admin.
+    - `update-needed`: a current member's latest profile post lacks `channel-topic-v1`. `getUpdateNeeded(serverId, "channel-topic-v1")` says who. Clearing a topic that isn't set signs nothing, so it isn't gated.
+  - **Record:** `Kind::ChannelTopic = 22`, control scope, at most 1057 bytes: `channel (32) ‖ history u8 (0, reserved for D30) ‖ topic UTF-8`. A body that fails the rule never parses, so it's never accepted.
+  - **Authority:** the owner or an admin, on a live channel. It's privileged, so a revoke (the only demotion) or a kick voids the author's concurrent topics. The latest accepted topic in linear order counts, per channel, and deleting the channel drops it.
+  - **Plaintext:** like channel names, topics sit unsealed in the control log, so every member can read them. An 18+ channel is listed only to members with an 18+ claim, and its topic with it; every output goes through one function (`ServerView::channels`). That hiding is display-only (GAP-22: a modified client reads it), so the UI says "visible to every member of the server".
+  - **Rendering:** plain text only: no Markdown (G-25), no HTML, and no auto-links outside the messages' link guard.
+  - **History byte:** frozen at 0 for this kind; any future use needs a new cap.
+  - **Older members:** an older core refuses kind 22 on decode and would stall on the control records after it, hence the gate. The residual is the same as for `server-lifecycle-v1`: someone who joins later on an older version can't read past a topic until they update.
+
 - New-messages divider (G-21, option A):
   - `Channel.unreadCount?: number` and `Channel.firstUnreadIndex?: number` (additive) count the messages after my read marker that aren't mine, in `getMessages` order. `firstUnreadIndex` is the `getMessages` index of the first of them, and is absent when there are none. `Channel.unread` is `unreadCount > 0`. They appear in `listChannels` and `channel.updated`.
   - `markRead(channelId)` returns `null` and moves the marker to the channel's last message. It emits `channel.updated` with `unreadCount: 0` and no `firstUnreadIndex`.
@@ -249,6 +265,19 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - So a restore (`restoreIdentity(words, input)`) can't skip the 30 days: the rejoin compares against the claim the server already holds.
   - A raise means a *changed* date. A date entered at sign-up on this computer, or one a server's **"adult"** claim already agrees with, is the one my claims come from. A "not adult" agreement proves nothing: a restored date a day short of 18 still waits. Turning 18 with it is a birthday, with no wait.
   - **Known limit,** until the encrypted backup (#291) brings the old birth date back: after a restore with a new adult date, a server I join for the first time has no earlier claim to compare, so it gets "adult" at once. Joining a fresh server first doesn't lift the wait on the old ones: only an agreeing claim or the 30 days do. The client clock, or a modified client, can also skip the wait (Security Lead, GAP-22).
+
+- Correcting the birth date (G-77, B7 §2, §9). `date` is a real `YYYY-MM-DD` from 1900 to today (UTC); anything else is `bad-request`. Each answer is `AgeCorrectionPreview { kind: 'same' | 'lower' | 'raise' | 'too-young' | 'owns-restricted-server', effectiveAt?, loses: { serverId, name, channel? }[], blockedBy?: { serverId, name }[] }`, judged by date against my current birth date (a waiting raise doesn't count yet): an earlier date is a raise, a later one a lowering, even when my age today is the same (Tech Lead on #512: an earlier birthday at the same age would otherwise skip the wait).
+  - `previewBirthDateCorrection(date)` changes nothing.
+  - `correctBirthDate(date)` applies it and fires `identity.changed`:
+    - **same** (the identical date): any waiting correction is dropped.
+    - **lower:** at once. A restore's waiting cap (at most 17) stays until its own time, for the new date; a lowering can't lift it, and cancel can't remove it. The new age claim goes to every server I'm in. An 18+ server I'm now too young for is left (one I own refuses the correction instead, below): its `Leave` goes through the leave outbox (as `leaveServer`), and `server.removed { serverId, reason: 'age', required: '18+' }` fires. Elsewhere, each 18+ channel I saw fires `channel.removed { …, reason: 'age' }`. `loses` lists them beforehand: a whole server has no `channel`.
+    - **raise:** pending for 30 days: `Identity.pendingBirthDate = { date, effectiveAt }`, and `birthDate` stays until then. A new correction replaces it; the same one again keeps its clock. When it's due, the next sync round makes it my birth date, posts the claims and fires `identity.changed`. A server left on a lowering doesn't come back by itself.
+    - **too-young** (under 16): rejected with the new error code `too-young`; nothing changes.
+    - **owns-restricted-server:** see "An owner" below.
+  - `cancelBirthDateCorrection()` drops a waiting correction (`ok` with none). A raise found after a restore isn't a correction and can't be cancelled (`not-allowed`): there's no earlier date to go back to.
+  - Same and lower never make the date "the one my claims come from": a restored date stays untrusted, so a date a day short of 18 still waits 30 days. A raise does once it settles, having waited its own 30 days (Security Lead on #512). A correction made while a restore's raise waits keeps that cap (at most 17) until its own 30 days.
+  - `channel.removed` gains `reason?: 'deleted' | 'age'`; `server.removed` gains `reason: 'age'` and `required?`.
+  - **An owner** (PO on #512): a lowering below the restriction of a server I own is refused with the new code `owns-restricted-server`, and `CoreError.servers` names those servers (the preview: `kind: 'owns-restricted-server'`, `blockedBy: { serverId, name }[]`). Nothing changes. The restriction is never lifted for me; the UI says to lower the restriction or close the server first (and, once G-43 exists, to transfer ownership). Raises and lowerings that keep me at or above every restriction I own still work.
 
 - Restore on a new computer:
   - `restoreIdentity(words, input?: { locale, country, birthDate })`. The words don't carry the country or birth date, so the UI asks them again (with the agreement) before the words and passes them here, as `createIdentity` takes them. The name follows with `updateProfile`.
@@ -449,7 +478,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - Each sync round it goes out once the rollout gate is open, and is retried until a member has it (B6 `sent`). Then the secret and subscription go too, and the others re-key.
     - If I'm kicked first, the `Leave` is dropped.
     - The leaver isn't banned, and comes back through a new invite as a plain member.
-  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). Any other cap name is `bad-request`. An empty list means the gate is open.
+  - `getUpdateNeeded(serverId, cap?)` returns the user IDs of members whose latest profile post lacks the cap, or who have none. With no cap it's `server-lifecycle-v1`: who blocks a rename or a delete. With `"reactions-v1"`: who blocks reactions (G-26). With `"channel-topic-v1"`: who blocks topics (G-14). Any other cap name is `bad-request`. An empty list means the gate is open.
   - `closeServer(serverId)` returns `null`. The owner deletes the server for good: the core syncs first, then sends the close.
     - On the owner's core, and on every member's when it reads the close, the server is closed, not purged at once. `server.closed { serverId }` fires; any call there ends; its keys and sync subscription go, and it's no longer synced. It stays in `listServers`, read-only, with `ServerSummary.closed: true` (additive).
     - 30 days (`CLOSED_RETENTION_MS`) after the close was received, the rest is purged and `server.removed { serverId, reason: 'closed' }` fires. Its genesis and close record are kept forever, so the server reads as closed, never unknown.
@@ -461,7 +490,18 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+- Display names with emoji ZWJ sequences (B23-z2, Tech Lead on #241), in two steps so a name never reaches a core that would drop it:
+  - **Now (the reader):** other people's display names from profile posts pass `authority::display_name_ok`. That's the strict rule, except that a zero-width joiner may join two emoji ("👨‍👩‍👧", "👩🏽‍💻"). A stray ZWJ, or any bidi, control or other zero-width character, is still refused: that post's name is ignored and the previous good one stays.
+  - **One release later (the writer):** `updateProfile` accepts such a name for me too (`WRITE_ZWJ_NAMES` in `model.rs` flips to true). Until then my own name keeps the strict rule (`bad-request`).
+  - Server, channel and room names keep the strict rule for good: a ZWJ is never allowed there.
+  - The UI side (dev-ui): guardCore allows a ZWJ in display names only, never in server or channel names.
+- Blocked accounts (G-47):
+  - `listBlocked()` returns `BlockedUser[]`, `{ userId, shortCode, name? }`, ordered by `userId` (`shortCode` is the identity code, as `Member.shortCode`, so rows without a name can be told apart, G-47b): everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
+  - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.
+  - `blockUser(userId)` stays a toggle, for older shells.
+  - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
+  - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

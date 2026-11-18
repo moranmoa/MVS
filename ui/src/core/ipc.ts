@@ -247,18 +247,18 @@ export async function setUnreadCount(count: number, bridge: DesktopBridge | unde
  */
 export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridge): CoreApi {
   const handlers = new Map<string, Set<(payload: never) => void>>();
-  // An mvs:// link (`link.open`) can arrive before anything listens for it:
-  // on the first launch, or during onboarding before the shell is mounted.
-  // The latest one waits for the first listener.
-  let pendingLink: unknown = null;
+  // An mvs:// link (`link.open`, or G-30's `link.message`) can arrive before
+  // anything listens for it: on the first launch, or during onboarding before
+  // the shell is mounted. The latest of each waits for its first listener.
+  const pendingLinks = new Map<string, unknown>();
   // core.status (T8-01) is a state, not a one-off: the latest one is kept and
   // given to every new listener, so a screen mounted late still knows it.
   let lastStatus: unknown = null;
   bridge.onEvent((event, payload) => {
     if (event === 'core.status') lastStatus = payload;
     const set = handlers.get(event);
-    if (event === 'link.open' && !set?.size) {
-      pendingLink = payload;
+    if ((event === 'link.open' || event === 'link.message') && !set?.size) {
+      pendingLinks.set(event, payload);
       return;
     }
     set?.forEach((h) => h(payload as never));
@@ -268,9 +268,9 @@ export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridg
     let set = handlers.get(event);
     if (!set) handlers.set(event, (set = new Set()));
     set.add(handler as (payload: never) => void);
-    if ((event as string) === 'link.open' && pendingLink !== null) {
-      const p = pendingLink;
-      pendingLink = null;
+    if (pendingLinks.has(event as string)) {
+      const p = pendingLinks.get(event as string);
+      pendingLinks.delete(event as string);
       setTimeout(() => (handler as (payload: unknown) => void)(p), 0);
     }
     if ((event as string) === 'core.status' && lastStatus !== null) {

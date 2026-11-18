@@ -170,7 +170,7 @@ button:disabled {
 
 .danger {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .primary.small,
@@ -474,7 +474,8 @@ legend {
 
 .owner-tag {
   background: var(--accent-soft);
-  color: var(--accent);
+  /* B20 (UX-13): accent on accent-soft is under AA on cards in the dark theme. */
+  color: var(--text);
 }
 
 .lookalike-tag {
@@ -990,7 +991,8 @@ legend {
   border: none;
   border-radius: var(--radius-m);
   background: var(--update);
-  color: #fff;
+  /* B20: white on the dark theme's green is 2.75:1; --accent-text is AA on both. */
+  color: var(--accent-text);
   font-size: 0.6875rem;
   font-weight: 700;
   line-height: 1.2;
@@ -1537,7 +1539,7 @@ legend {
   align-items: flex-end;
   gap: 0.25rem;
   padding: 0.375rem 0.375rem 0.375rem 0.875rem;
-  padding-inline: 0.875rem 0.375rem;
+  padding-inline: 0.375rem;
   border-radius: var(--radius-m);
   background: var(--bg-input);
 }
@@ -2441,7 +2443,7 @@ kbd {
 
 .call-leave {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .call-blocked {
@@ -3600,6 +3602,62 @@ input.switch:disabled {
   background: var(--border);
 }
 
+/* G-29: who is typing; the line keeps its height so the composer never moves. */
+.typing-line {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.25rem;
+  padding-inline: 1rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.typing-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.typing-dots {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.typing-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: typing-dot 1.2s infinite ease-in-out;
+}
+
+.typing-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.typing-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes typing-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing-dots span {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
 /* G-26: reactions under a message. */
 .reactions {
   display: flex;
@@ -3640,38 +3698,182 @@ input.switch:disabled {
   }
 }
 
-/* The emoji picker (compact; the full set and categories are G-27). */
+/* G-27: the emoji picker (docs/ux/specs/emoji-picker.md). A popover anchored
+   to its trigger (placed from code), a bottom sheet below 40rem. */
+.emoji-picker {
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  width: 22rem;
+  height: 26.25rem;
+  max-width: calc(100vw - 1rem);
+  max-height: calc(100vh - 1rem);
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.emoji-picker[open] {
+  display: flex;
+}
+
+.emoji-picker.popover::backdrop {
+  background: transparent;
+}
+
+.emoji-picker.sheet {
+  inset: auto 0 0 0;
+  width: 100%;
+  max-width: 100%;
+  height: 60vh;
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+}
+
+.emoji-picker.sheet::backdrop {
+  background: rgba(10, 12, 18, 0.55);
+}
+
 .emoji-search {
   width: 100%;
-  margin-block-end: 0.5rem;
+  flex: none;
+}
+
+.emoji-scroll {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.emoji-empty {
+  margin: 0.5rem 0.25rem;
+}
+
+.emoji-rows {
+  position: relative;
+  width: 100%;
+}
+
+.emoji-heading,
+.emoji-row {
+  position: absolute;
+  top: 0;
+  inset-inline: 0;
 }
 
 .emoji-heading {
-  margin: 0.5rem 0 0.25rem;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 0.25rem 0.25rem;
   font-size: 0.75rem;
   font-weight: 700;
   color: var(--text-muted);
 }
 
-.emoji-grid {
-  display: grid;
-  grid-template-columns: repeat(8, 2.5rem);
-  gap: 0.125rem;
+.emoji-row {
+  display: flex;
+  gap: 0;
 }
 
 .emoji-cell {
+  flex: none;
   width: 2.5rem;
   height: 2.5rem;
   padding: 0;
   border: 0;
   border-radius: var(--radius-s);
   background: none;
-  font-size: 1.375rem;
+  font-size: 1.5rem;
+  line-height: 1;
 }
 
 .emoji-cell:hover,
 .emoji-cell:focus-visible {
   background: var(--bg-hover);
+}
+
+.emoji-cell:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/* Reaction mode: one I already used (a ring, not colour alone). */
+.emoji-cell.mine {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.emoji-preview {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2rem;
+  padding-inline: 0.25rem;
+  border-block-start: 1px solid var(--border);
+  padding-block-start: 0.375rem;
+  overflow: hidden;
+}
+
+.emoji-preview-glyph {
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.emoji-preview-name {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.emoji-tabs {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  border-block-start: 1px solid var(--border);
+  padding-block-start: 0.25rem;
+}
+
+.emoji-tab {
+  flex: 1;
+  min-width: 0;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-block-end: 2px solid transparent;
+  border-radius: var(--radius-s) var(--radius-s) 0 0;
+  background: none;
+  font-size: 1.125rem;
+  line-height: 1;
+}
+
+.emoji-tab:hover {
+  background: var(--bg-hover);
+}
+
+/* The section at the top: an accent underline, not colour alone. */
+.emoji-tab[aria-selected='true'] {
+  border-block-end-color: var(--accent);
+  background: var(--bg-active);
+}
+
+.emoji-tabs.dim .emoji-tab {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.composer-row .emoji-open {
+  flex: none;
+  color: var(--text-muted);
 }
 
 /* G-91: how far my servers are from coming back after a restore. */
@@ -3692,4 +3894,9 @@ input.switch:disabled {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+}
+
+/* Voice IP notice v2: "Privacy settings" on the start side, Cancel and Got it at the end. */
+.ip-notice .ip-notice-settings {
+  margin-inline-end: auto;
 }

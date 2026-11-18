@@ -232,7 +232,11 @@ export type JoinStatus =
   | { phase: 'nobody-online'; link: string }
   | { phase: 'joined'; link: string; serverId: Id }
   | { phase: 'invalid'; link: string }
-  | { phase: 'age-blocked'; link: string; required: AgeRestriction };
+  | { phase: 'age-blocked'; link: string; required: AgeRestriction }
+  /** G-53 (core #503): this account was removed from the server and not let back. Final: no retries. */
+  | { phase: 'removed'; link: string }
+  /** #261: the server behind this invite was closed by its owner. Final. */
+  | { phase: 'closed'; link: string };
 
 export interface StorageUsage {
   usedBytes: number;
@@ -254,6 +258,28 @@ export interface AppInfo {
   updateChannel: UpdateChannel;
   /** Relay-only (GAP-6r, #272): this device is reached only through the relay; calls are off. */
   relayOnly?: boolean;
+}
+
+/**
+ * G-47 (core `listBlocked`, dev-identity #502): someone I blocked, whether
+ * or not we share a server. `name`: their name in a shared server, else the
+ * one kept from when I blocked them; absent if none was ever known.
+ */
+export interface BlockedUser {
+  userId: Id;
+  /** UX-19 (core #525): the identity short code, as on Member, so nameless rows can be told apart. */
+  shortCode?: string;
+  name?: string;
+}
+
+/** G-53 (core `listRemovedMembers`): an account the owner removed, who can't rejoin until the owner undoes it. */
+export interface RemovedMember {
+  id: Id;
+  shortCode: string;
+  /** Its last display name; '' if it never posted one. */
+  displayName: string;
+  /** When it was removed (the kick's time). */
+  removedAt: Timestamp;
 }
 
 /** An invite to a server (#214). `maxUses` 0 is unlimited; no `expiresAt` is never. */
@@ -362,6 +388,18 @@ export interface DeviceAdded {
 export interface DeviceApproval {
   sas: string;
   expiresAt: number;
+}
+
+/** G-29: who is typing in a channel now (ephemeral; at most 5). */
+export interface TypingState {
+  channelId: Id;
+  userIds: Id[];
+}
+
+/** Settings the core keeps on this device. */
+export interface CoreSettings {
+  /** G-29: "Show others when I'm typing" (default on). Off: nothing is sent; others are still shown. */
+  typingIndicator: boolean;
 }
 
 /**

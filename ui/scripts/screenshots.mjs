@@ -1147,15 +1147,26 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
+// ---- G-29 typing (440, chat-and-voice-extras.md) --------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&typing=1', 'x');
+  await p.locator('.typing-text').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '440-typing-he');
+  await p.close();
+}
+
 // ---- G-26 reactions (441-442, chat-and-voice-extras.md §2-3) -----------------------
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
   const row = p.locator('[role=article]:has(.msg:not(.skeleton))').last();
-  for (const name of ['אגודל למעלה', 'אש', 'פרצוף צוחק עם דמעות צחוק']) {
+  // G-27: the full picker renders only visible rows, so pick through search.
+  for (const name of ['אגודל למעלה', 'אש', 'פרצוף עם דמעות שמחה']) {
     await row.hover();
     await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
-    await p.getByRole('dialog').getByRole('button', { name, exact: true }).click();
-    await p.getByRole('dialog').waitFor({ state: 'detached' });
+    await p.getByRole('dialog').getByRole('searchbox').fill(name);
+    await p.getByRole('dialog').getByRole('gridcell', { name, exact: true }).click();
+    await p.getByRole('dialog').waitFor({ state: 'hidden' });
   }
   await row.locator('.reactions').waitFor();
   await p.mouse.move(1, 1);
@@ -1165,6 +1176,47 @@ for (const [query, name, opts] of [
   await p.getByRole('dialog').waitFor();
   await p.waitForTimeout(200);
   await shot(p, '442-emoji-picker-he');
+  await p.close();
+}
+
+// ---- G-27 the full emoji picker (450-453, emoji-picker.md) -------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const dialog = p.getByRole('dialog', { name: "הכנסת אמוג'י" });
+  // Two picks first, so the recent section shows.
+  for (const name of ['אש', 'לב אדום']) {
+    await p.getByRole('button', { name: "הכנסת אמוג'י" }).click();
+    await dialog.getByRole('searchbox').fill(name);
+    await dialog.getByRole('gridcell', { name, exact: true }).click();
+    await dialog.waitFor({ state: 'hidden' });
+  }
+  await p.getByRole('button', { name: "הכנסת אמוג'י" }).click();
+  await dialog.getByRole('gridcell').nth(4).hover();
+  await p.waitForTimeout(200);
+  await shot(p, '450-emoji-picker-he');
+  await dialog.getByRole('searchbox').fill('לב');
+  await p.waitForTimeout(200);
+  await shot(p, '451-emoji-picker-search-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999', 'x', { colorScheme: 'dark' });
+  const dialog = p.getByRole('dialog', { name: 'Insert emoji' });
+  await p.getByRole('button', { name: 'Insert emoji' }).click();
+  await dialog.getByRole('tab', { name: 'Flags' }).click();
+  await p.waitForTimeout(300);
+  await dialog.getByRole('gridcell').first().waitFor();
+  await shot(p, '452-emoji-picker-flags-en-dark');
+  await p.close();
+}
+{
+  const p = await page('?demo=1&still=1&lang=he&theme=light&update=999999', { width: 375, height: 812, phone: true });
+  await p.getByRole('button', { name: /^כללי/ }).click();
+  await p.getByRole('article').first().waitFor();
+  await p.getByRole('button', { name: "הכנסת אמוג'י" }).click();
+  await p.locator('.emoji-picker.sheet [role=gridcell]').first().waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '453-emoji-picker-sheet-he');
   await p.close();
 }
 
@@ -1311,6 +1363,81 @@ for (const [lang, theme, name, query] of [
   await p.close();
 }
 
+// ---- G-25 Markdown in messages (480-483, docs/ux/specs/markdown.md §6) -----------
+{
+  const send = async (p, text) => {
+    const box = p.getByRole('textbox', { name: /כתיבה ב|^Message / });
+    await box.fill(text);
+    await box.press('Enter');
+    await p.waitForTimeout(300);
+  };
+  const lastRow = (p) => p.locator('[role=article]:has(.msg:not(.skeleton))').last();
+
+  // 480: each marker in Hebrew messages.
+  {
+    const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+    await send(p, 'זה **מודגש**, זה *נטוי*, זה ~~מחוק~~ ומריצים `npm i` באמצע שורה');
+    await send(p, '> צריך לסגור את הגרסה היום\nמסכימים, אני על זה');
+    await send(p, 'הסוף של הפרק: ||הוא היה הרוח כל הזמן||');
+    await p.mouse.move(1, 1);
+    await shot(p, '480-markdown-he');
+    // 483: the spoiler after reveal.
+    await lastRow(p).locator('button.md-spoiler').click();
+    await p.mouse.move(1, 1);
+    await shot(p, '483-markdown-spoiler-revealed-he');
+    await p.close();
+  }
+
+  // 481: a long code block with the copy button, English, dark.
+  {
+    const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999', 'x', { colorScheme: 'dark' });
+    const long = 'docker compose run --rm shots && ' + 'echo "a very long line that keeps going past the edge of the message" && '.repeat(3) + 'true';
+    await send(p, 'Run this from ui/:\n```sh\n' + long + '\nnpm run screenshots\n```');
+    await lastRow(p).locator('.md-code-block').hover();
+    await shot(p, '481-markdown-code-block-en-dark');
+    await p.close();
+  }
+
+  // 482: an English quote in a Hebrew message, and code in a Hebrew line.
+  {
+    const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+    await send(p, 'תראו מה הוא כתב:\n> I think we should ship it today\nומריצים `npm run build` לפני ששולחים');
+    await p.mouse.move(1, 1);
+    await shot(p, '482-markdown-mixed-he');
+    await p.close();
+  }
+}
+
+// ---- member search (473-474, G-41) -------------------------------------------
+for (const [query, name, text, dark] of [
+  ['lang=he&theme=light', '473-member-search-he', 'ta', false],
+  ['lang=en&theme=dark', '474-member-search-none-en-dark', 'qqqq', true],
+]) {
+  const p = await chat('?demo=1&still=1&update=999999&' + query, 'x', dark ? { colorScheme: 'dark' } : undefined);
+  await p.locator('.member-search-input').fill(text);
+  await p.waitForTimeout(500);
+  await shot(p, name);
+  await p.close();
+}
+
+// ---- removed accounts (187, G-53, B11) ----------------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: 'הגדרות השרת' }).click();
+  await p.getByRole('tab', { name: 'חברים' }).click();
+  const panel = p.getByRole('tabpanel');
+  // Remove two members (each from the list, then confirm on their card).
+  for (let i = 0; i < 2; i++) {
+    await panel.getByRole('button', { name: 'הרחקה מהשרת' }).nth(1).click();
+    await p.getByRole('alertdialog').getByRole('button', { name: 'הרחקה', exact: true }).click();
+    await p.getByRole('alertdialog').waitFor({ state: 'detached' });
+  }
+  await p.getByRole('tab', { name: 'חשבונות שהורחקו' }).click();
+  await p.locator('.removed-accounts .removed-row').nth(1).waitFor();
+  await p.waitForTimeout(250);
+  await shot(p, '187-server-settings-removed-he');
+  await p.close();
+}
 
 // ---- blocked accounts (470-472, G-47) ----------------------------------------
 {

@@ -9,7 +9,7 @@ const listeners = new Set();
 // Shell events can arrive before the UI has subscribed: `link.open` (an
 // mvs:// invite, e.g. on the first launch) and `core.status` (sent at load).
 // The latest of each is kept for the first subscriber.
-const KEPT = new Set(['link.open', 'core.status']);
+const KEPT = new Set(['link.open', 'link.message', 'core.status']);
 const pending = new Map();
 
 ipcRenderer.on('core:event', (_e, name, payload) => {
@@ -20,6 +20,12 @@ ipcRenderer.on('core:event', (_e, name, payload) => {
   for (const cb of listeners) cb(name, payload);
 });
 
+// G-81: voice frames from the core, on their own channel (one listener at a time).
+let frameListener = null;
+ipcRenderer.on('voice:frame', (_e, frame) => {
+  if (frameListener) frameListener(frame);
+});
+
 // T8-04: in the checkout demo (main adds this argument only then) the page
 // gets no `invoke`, so the UI runs on its mock; main refuses core:invoke too.
 const DEMO = Array.isArray(process.argv) && process.argv.includes('--mvs-demo');
@@ -27,6 +33,28 @@ const DEMO = Array.isArray(process.argv) && process.argv.includes('--mvs-demo');
 contextBridge.exposeInMainWorld('mvs', {
   /** Resolves with { ok } or { error: { code, positions? } }. */
   ...(DEMO ? {} : { invoke: (cmd, args) => ipcRenderer.invoke('core:invoke', String(cmd), Array.isArray(args) ? args : []) }),
+  /**
+   * G-81 (design g81-p2p-calls.md §2.3): Opus frames over the P2P network.
+   * `send({ callId, seq, ts, data })` is fire-and-forget (data: base64, ≤ 400
+   * bytes decoded); main drops what is malformed, over the rate cap, or not
+   * in a call and unlocked. `onFrame(cb)` gets { callId, from, seq, ts, data }
+   * from the core; one listener (a new one replaces it). Returns an unsubscribe.
+   * Not in the demo (T8-04): no core, no calls (SL).
+   */
+  ...(DEMO
+    ? {}
+    : {
+        voice: Object.freeze({
+          send: (frame) => ipcRenderer.send('voice:frame', frame),
+          onFrame: (callback) => {
+            if (typeof callback !== 'function') return () => {};
+            frameListener = callback;
+            return () => {
+              if (frameListener === callback) frameListener = null;
+            };
+          },
+        }),
+      }),
   /**
    * Calls back with (eventName, payload) for every core event, plus
    * `link.open` { link } when the OS opens an mvs:// invite. Returns an

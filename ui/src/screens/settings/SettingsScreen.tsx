@@ -510,6 +510,41 @@ function DiagnosticsSection() {
   );
 }
 
+/** G-29: "Show others when I'm typing" (on by default; seeing others is unaffected). */
+function TypingSetting() {
+  const store = useAppStore();
+  const on = useStore(store, (s) => s.typingIndicator);
+  const [failed, setFailed] = useState(false);
+  return (
+    <div className="stack">
+      <label className="switch-row">
+        <span>
+          <FormattedMessage id="privacy.typing" />
+        </span>
+        <input
+          type="checkbox"
+          role="switch"
+          className="switch"
+          checked={on}
+          aria-describedby="typing-setting-hint"
+          onChange={(e) => {
+            setFailed(false);
+            store.setTypingIndicator(e.target.checked).catch(() => setFailed(true));
+          }}
+        />
+      </label>
+      <p id="typing-setting-hint" className="muted small">
+        <FormattedMessage id="privacy.typingHint" />
+      </p>
+      {failed && (
+        <p className="error small" role="alert">
+          <FormattedMessage id="invite.failed" />
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Relay-only (GAP-6r, #272), per device: nobody connects to me directly, so
 // members never see my IP address; calls are off while it is on.
 function PrivacySection({ focus, focusBlocked }: { focus?: number; focusBlocked?: number }) {
@@ -584,6 +619,7 @@ function PrivacySection({ focus, focusBlocked }: { focus?: number; focusBlocked?
           <FormattedMessage id="invite.failed" />
         </p>
       )}
+      <TypingSetting />
       <MemberRelaySetting />
       <AppLockSection />
       <BlockedList focus={focusBlocked} />

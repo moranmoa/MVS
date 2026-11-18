@@ -14,9 +14,10 @@ import { Avatar, Dialog, InviteBox, Name } from '../../components/common';
 import { GearIcon, HashIcon, PlusIcon } from '../../components/icons';
 import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
+import { RemovedAccounts } from './RemovedAccounts';
 
-export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'danger';
-const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'danger'];
+export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'removed' | 'danger';
+const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'removed', 'danger'];
 
 const NO_CHANNELS: Channel[] = [];
 const NO_MEMBERS: Member[] = [];
@@ -114,8 +115,9 @@ export function ServerSettings({
           </h3>
           {page === 'general' && <GeneralPage server={server} />}
           {page === 'channels' && <ChannelsPage server={server} onCreate={onCreateChannel} onEdit={onEditChannel} />}
-          {page === 'invite' && <InvitePage server={server} />}
+          {page === 'invite' && <InvitePage server={server} onOpenRemoved={() => choose('removed')} />}
           {page === 'members' && <MembersPage server={server} />}
+          {page === 'removed' && <RemovedAccounts server={server} />}
           {page === 'danger' && <ClosePanel server={server} />}
         </section>
       </div>
@@ -220,7 +222,7 @@ const MAX_USES = [0, 1, 5, 10, 25, 100];
 // Invites (#214): the current link, making a new one with an expiry and a use
 // limit, and the list of links with Revoke. The core sends server.updated after
 // a create or a revoke, and the list is read again then.
-function InvitePage({ server }: { server: ServerSummary }) {
+function InvitePage({ server, onOpenRemoved }: { server: ServerSummary; onOpenRemoved: () => void }) {
   const core = useCore();
   const intl = useIntl();
   const members = useStore(useAppStore(), (s) => s.members[server.id] ?? NO_MEMBERS);
@@ -284,6 +286,13 @@ function InvitePage({ server }: { server: ServerSummary }) {
           <FormattedMessage id="invite.none" />
         </p>
       )}
+      {/* G-53: a removed account can't come back with the link. */}
+      <p className="muted small">
+        <FormattedMessage id="invite.removedHint" />{' '}
+        <button type="button" className="link" onClick={onOpenRemoved}>
+          <FormattedMessage id="invite.removedHintLink" />
+        </button>
+      </p>
 
       <h4>
         <FormattedMessage id="invite.create" />

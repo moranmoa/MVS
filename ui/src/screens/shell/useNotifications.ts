@@ -10,6 +10,7 @@ import { loadDevices, playMessageCue } from '../../voice/devices';
 import { useSettings } from '../../app/settings';
 import { useCoreEvent, type Id, type Message } from '../../core';
 import { displayName } from './MemberList';
+import { plainText } from '../../markdown';
 
 /**
  * `viewing`: the channel on screen now (null on Home or in Settings).
@@ -45,7 +46,7 @@ export function useDesktopNotifications(viewing: Id | null, open: (serverId: Id,
         count > 1
           ? intl.formatMessage({ id: 'notify.grouped' }, { count, channel: where.channel.name })
           : prefs.preview && m.body
-            ? m.body
+            ? plainText(m.body) // G-25: no markers, spoilers masked
             : intl.formatMessage({ id: m.mentionsMe ? 'notify.hiddenMention' : 'notify.hidden' }, { channel: where.channel.name });
       void notify({
         title: count > 1 || !author ? place : `${displayName(author)} · ${place}`,

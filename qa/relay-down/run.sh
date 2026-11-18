@@ -4,9 +4,12 @@
 # Once all three exchange messages, the test relay is killed. Then:
 #   (a) do messages still flow, directly or through the owner's member relay
 #       (members fall back to it after about 60 s)?
-#   (b) a member that restarts while the relay is down: today it is expected
-#       to stay offline (no remembered addresses, no LAN discovery yet), so
-#       this is reported as XFAIL until dev-sync's fix lands.
+#   (b) a member that restarts while the relay is down: does it come back?
+#       Reported as XFAIL (still offline, a known gap) or XPASS. On main
+#       7c963b4 it came back in TOPO=split (through the owner's member
+#       relay) but not in TOPO=lan; the member-only LAN beacon (#460) is
+#       meant to close the lan case.
+# Exit code: 1 if any side printed a FAIL (XFAIL and INFO don't count).
 #
 #   CORE=<path to a Linux mvs-core> TOPO=lan   bash qa/relay-down/run.sh
 #   CORE=<path to a Linux mvs-core> TOPO=split bash qa/relay-down/run.sh
@@ -29,13 +32,20 @@ rv="$here/.build/$P"
 mkdir -p "$rv/core" "$rv/rv"
 cp "$CORE" "$rv/core/mvs-core"
 mask() {
-  sed -E -e 's#/p2p/[1-9A-HJ-NP-Za-km-z]{40,}#/p2p/<peer>#g' -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
+  # IPv6: multiaddrs, [bracketed], and bare forms with "::" or 5+ groups
+  # (so times like 12:30:45 and Rust paths like sync::debug stay).
+  sed -E -e 's#/p2p/[1-9A-HJ-NP-Za-km-z]{40,}#/p2p/<peer>#g' \
+    -e 's#/ip6/[^/ ,"]+#/ip6/<ip6>#g' -e 's#\[[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\]#[<ip6>]#g' \
+    -e 's#(^|[^0-9A-Za-z_:])([0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}#\1<ip6>#g' \
+    -e 's#(^|[^0-9A-Za-z_:])[0-9a-fA-F:]*::[0-9a-fA-F:]*[0-9a-fA-F]#\1<ip6>#g' \
+    -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
     -e 's#\b12D3KooW[1-9A-HJ-NP-Za-km-z]{40,}#<peer>#g' -e 's#\x1b\[[0-9;]*m##g'
 }
 nets() { if [ "$TOPO" = split ]; then echo na nb; else echo lan on; fi; }
 cleanup() {
   docker rm -f "$P-relay" "$P-o" "$P-a" "$P-b" >/dev/null 2>&1 || true
   for n in $(nets); do docker network rm "$P-$n" >/dev/null 2>&1 || true; done
+  rm -f "$rv"/rv/*.ready.json # the owner's invite link
 }
 trap cleanup EXIT INT TERM
 
@@ -91,3 +101,4 @@ grep -hE "^(PASS|FAIL|XFAIL|XPASS|INFO)" "$rv/o.log" "$rv/a.log" "$rv/b.log"
 for r in o a b; do
   echo "$r: member-relay log lines: $(grep -ci 'member relay' "$rv/core-$r.log" || true)"
 done
+if grep -qE "^FAIL" "$rv/o.log" "$rv/a.log" "$rv/b.log"; then exit 1; fi

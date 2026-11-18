@@ -160,6 +160,16 @@ impl GroupCipher for GroupKeysCipher {
         keys.encrypt(&members, plaintext, &mut OsRng).map_err(cipher_error)
     }
 
+    fn missing_readers(&self, server: ServerId, channel: ChannelId) -> Vec<PublicKey> {
+        let mut state = self.state();
+        let members = state.members.get(&server).cloned().unwrap_or_default();
+        let Ok(keys) = state.channel(server, channel) else { return Vec::new() };
+        match keys.rotation_need(&members) {
+            groupkeys::RotationNeed::Add { missing } => missing,
+            _ => Vec::new(),
+        }
+    }
+
     fn decrypt(
         &self,
         server: ServerId,

@@ -454,6 +454,23 @@ impl Resolver {
                 self.refresh_adult(author);
                 return Ok(());
             }
+            Action::ChannelTopic { channel, .. } => {
+                // G-14: changes no roles and no channel's status, so no other
+                // record is judged differently. Whether it counts depends on
+                // the author's role, which must be the same in every pass, and
+                // on the channel's ops before it. The latest accepted topic in
+                // linear order counts (`refresh_channel`).
+                if self.owner_unsettled || self.is_unsettled(author, at) {
+                    return Err(Fallback::Other);
+                }
+                if voided {
+                    self.excluded.insert(id);
+                } else if allowed {
+                    self.state.accepted.insert(id);
+                }
+                self.refresh_channel(channel);
+                return Ok(());
+            }
             Action::ChannelCreate { .. }
             | Action::ChannelEdit { .. }
             | Action::ChannelDelete { .. } => {
@@ -675,6 +692,7 @@ impl Resolver {
         let general = self.first_create(self.order.len());
         let mut entry: Option<Channel> = None;
         let mut deleted = false;
+        let mut topic: Option<String> = None;
         for op in self.channel_ops.get(&channel).into_iter().flatten() {
             if !self.state.accepted.contains(op) {
                 continue;
@@ -698,6 +716,10 @@ impl Resolver {
                 Some(Action::ChannelDelete { .. }) => {
                     entry = None;
                     deleted = true;
+                    topic = None;
+                }
+                Some(Action::ChannelTopic { topic: text, .. }) => {
+                    topic = (!text.is_empty()).then(|| text.clone());
                 }
                 _ => {}
             }
@@ -705,6 +727,10 @@ impl Resolver {
         match entry {
             Some(entry) => self.state.channels.insert(channel, entry),
             None => self.state.channels.remove(&channel),
+        };
+        match topic {
+            Some(topic) => self.state.topics.insert(channel, topic),
+            None => self.state.topics.remove(&channel),
         };
         if deleted {
             self.state.deleted_channels.insert(channel);
@@ -863,6 +889,15 @@ impl Resolver {
                 Action::ChannelCreate { .. }
                 | Action::ChannelEdit { .. }
                 | Action::ChannelDelete { .. } => return Err(Fallback::Other),
+                // G-14: an admin's topic counts or not as their role changed.
+                Action::ChannelTopic { channel, .. } => {
+                    if now {
+                        self.state.accepted.insert(id);
+                    } else {
+                        self.state.accepted.remove(&id);
+                    }
+                    self.refresh_channel(channel);
+                }
                 // The author's membership changed under it.
                 Action::AgeClaim { .. } => {
                     if now {

@@ -27,7 +27,7 @@ export function safeHref(url: string): string | null {
     // SL review: no IP literals or loopback names, which point inside the
     // network rather than at a named site (URL has already normalised
     // forms like 0x7f.1 to 127.0.0.1).
-    const host = u.hostname.toLowerCase();
+    const host = u.hostname.toLowerCase().replace(/\.$/, ''); // 'localhost.' is localhost
     if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.startsWith('[') || host === 'localhost' || host.endsWith('.localhost')) return null;
     return u.href;
   } catch {

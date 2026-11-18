@@ -71,7 +71,11 @@
 }
 
 /* The bar on the start side of the quote's own direction. */
+/* As wide as its text, on the interface side (the box follows the message,
+   the bar the quote): an English quote in a Hebrew chat keeps its bar next to it. */
 .md-quote {
+  width: fit-content;
+  max-width: 100%;
   margin: 2px 0;
   padding-inline-start: 10px;
   border-inline-start: 3px solid var(--text-faint);

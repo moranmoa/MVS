@@ -27,7 +27,7 @@ describe('markdown: safeHref', () => {
   });
 
   it('IP literals and loopback names are not links (SL review)', () => {
-    for (const bad of ['https://127.0.0.1/x', 'https://192.168.1.1', 'https://0x7f.1/', 'https://2130706433/', 'https://[::1]/', 'https://localhost:8443/', 'https://app.localhost/'])
+    for (const bad of ['https://127.0.0.1/x', 'https://192.168.1.1', 'https://0x7f.1/', 'https://2130706433/', 'https://[::1]/', 'https://localhost:8443/', 'https://app.localhost/', 'https://localhost./', 'https://127.0.0.1./'])
       expect(safeHref(bad), bad).toBeNull();
     expect(safeHref('https://a1.example.org')).toBe('https://a1.example.org/');
   });

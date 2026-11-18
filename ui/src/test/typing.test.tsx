@@ -41,20 +41,29 @@ describe('typing indicator (G-29)', () => {
     act(() => core.simulateTyping(channelId, [members[0].id]));
     await waitFor(() => expect(plain(line().textContent)).toBe(`${members[0].displayName} is typing…`));
     act(() => core.simulateTyping(channelId, [members[0].id, members[1].id]));
-    expect(plain(line().textContent)).toBe(`${members[0].displayName} and ${members[1].displayName} are typing…`);
+    await waitFor(() => expect(plain(line().textContent)).toBe(`${members[0].displayName} and ${members[1].displayName} are typing…`));
     act(() => core.simulateTyping(channelId, members.slice(0, 3).map((m) => m.id)));
-    expect(line().textContent).toBe('Several people are typing…');
+    await waitFor(() => expect(line().textContent).toBe('Several people are typing…'));
     act(() => core.simulateTyping(channelId, []));
-    expect(line().textContent).toBe('');
+    await waitFor(() => expect(line().textContent).toBe(''));
   });
 
   it('a typer the core stops refreshing is gone after 6 s (the backstop)', async () => {
     const { core, channelId, members } = await setup();
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    act(() => core.simulateTyping(channelId, [members[0].id]));
-    expect(line().textContent).not.toBe('');
+    // The clock and the backstop's timer are fake from here: no real waiting.
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     await act(async () => {
-      vi.advanceTimersByTime(6100);
+      core.simulateTyping(channelId, [members[0].id]);
+    });
+    expect(plain(line().textContent)).toBe(`${members[0].displayName} is typing…`);
+    // Still there just before 6 s…
+    await act(async () => {
+      vi.advanceTimersByTime(5900);
+    });
+    expect(line().textContent).not.toBe('');
+    // …and gone after.
+    await act(async () => {
+      vi.advanceTimersByTime(300);
     });
     expect(line().textContent).toBe('');
   });
@@ -69,6 +78,8 @@ describe('typing indicator (G-29)', () => {
 
   it('typing tells the core; send and clear stop it', async () => {
     const { core, box, channelId } = await setup();
+    // A fake clock: the 1 s throttle can't lapse between keys on a slow runner.
+    vi.useFakeTimers({ toFake: ['Date'] });
     const spy = vi.spyOn(core, 'setTyping');
     fireEvent.change(box, { target: { value: 'h' } });
     expect(spy).toHaveBeenLastCalledWith(channelId, true);
@@ -100,7 +111,7 @@ describe('typing indicator (G-29)', () => {
     fireEvent.change(box, { target: { value: 'quiet' } });
     expect(spy).not.toHaveBeenCalled();
     act(() => core.simulateTyping(channelId, [members[0].id]));
-    expect(line().textContent).not.toBe('');
+    await waitFor(() => expect(plain(line().textContent)).toBe(`${members[0].displayName} is typing…`));
   });
 
   it('the sanitizer: a channel and at most 5 distinct ids; settings default on', () => {

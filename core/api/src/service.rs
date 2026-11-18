@@ -1632,6 +1632,39 @@ impl Core {
         Ok(json)
     }
 
+    /// G-14 `setChannelTopic(channelId, topic)`: the owner or an admin sets
+    /// a channel's topic; an empty one (after trimming) clears it.
+    /// `bad-request` unless it is one line of at most 256 code points that
+    /// passes the strict name rule; `not-found` for an unknown or deleted
+    /// channel; `not-allowed` below admin; `update-needed` until every member
+    /// reads topics. The same topic again signs nothing. Never unread, a
+    /// mention or a notification: only `channel.updated`.
+    pub fn set_channel_topic(&self, channel_id: &str, topic: &str) -> CoreResult<Channel> {
+        let topic = authority::channel_topic(topic).ok_or(ErrorCode::BadRequest)?;
+        let topic = topic.as_str();
+        let (server, channel, _) = self.live_channel(channel_id)?;
+        let unchanged = {
+            let mut inner = self.lock();
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            let current = inner.view(server)?.state.topics.get(&channel).cloned();
+            if current.as_deref().unwrap_or("") != topic {
+                inner.cap_gate(server, model::TOPIC_CAP)?;
+            }
+            current.as_deref().unwrap_or("") == topic
+        };
+        if !unchanged {
+            let server_id = model::hex_id(server.as_bytes());
+            let action = Action::ChannelTopic { channel, topic: topic.to_owned() };
+            self.control_action(&server_id, action)?;
+        }
+        let json = self.channel_json(server, channel)?;
+        if !unchanged {
+            self.ports.events.emit(&Event::ChannelUpdated(json.clone()));
+        }
+        Ok(json)
+    }
+
     /// G-11 `moveChannel(serverId, channelId, before?, after?)`: owner and
     /// admin only (`not-allowed`). Puts the channel right before `before`,
     /// or right after `after`, or last with neither; both must agree (the
@@ -2521,6 +2554,7 @@ impl Core {
                 inner.load(server)?;
                 inner.seed_announced(&*ports.cipher, server)?;
                 let name_before = inner.view(server)?.state.server_name.clone();
+                let topics_before = inner.view(server)?.state.topics.clone();
                 let mut changed = false;
                 for record in records {
                     if record.server() == server {
@@ -2535,6 +2569,9 @@ impl Core {
                 if inner.view(server)?.state.server_name != name_before {
                     events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
+                // G-14: a topic set or cleared elsewhere. Only
+                // `channel.updated`: never unread, a mention or a notice.
+                inner.topic_events(&*ports.cipher, server, &topics_before, Some(me), events)?;
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
                 let _ = inner.post_caps(ports, server);
@@ -4610,6 +4647,34 @@ impl Inner {
         Ok(())
     }
 
+    /// G-14: `channel.updated` for each channel I can see whose topic is not
+    /// what it was in `before`.
+    fn topic_events(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+        before: &BTreeMap<ChannelId, String>,
+        me: Option<PublicKey>,
+        events: &mut Vec<Event>,
+    ) -> CoreResult<()> {
+        let view = self.view(server)?;
+        let after = &view.state.topics;
+        let changed: Vec<String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|id| before.get(*id) != after.get(*id))
+            .map(|id| model::hex_id(id.as_bytes()))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut channels = view.channels(me);
+        channels.retain(|c| changed.contains(&c.id));
+        self.fill_unread(cipher, server, &mut channels)?;
+        events.extend(channels.into_iter().map(Event::ChannelUpdated));
+        Ok(())
+    }
+
     /// `not-allowed` below `role` in loaded `server` (before the gate, so a
     /// member learns they can't, not that others must update).
     fn lifecycle_role(&self, server: ServerId, role: authority::Role) -> CoreResult<()> {
@@ -4980,6 +5045,12 @@ impl ServerView<'_> {
     /// The channels authority knows, with their names as created; a server
     /// from before #113 shows its derived #general.
     /// TODO(#116): hide 18+ channels from members without an 18+ claim.
+    ///
+    /// The one place 18+ channels, with their names and G-14 topics, are
+    /// withheld from members without an 18+ claim: `listChannels`, every
+    /// `channel.updated` (`channel_json`, `topic_events`) and anything later
+    /// that quotes a channel go through here. Display-only (GAP-22): the
+    /// control log is plaintext to every member.
     fn channels(&self, me: Option<PublicKey>) -> Vec<Channel> {
         let server_id = model::hex_id(self.id.as_bytes());
         let positions = self.channel_positions();
@@ -4994,6 +5065,7 @@ impl ServerView<'_> {
             first_unread_index: None,
             unread_count: None,
             position: positions.get(&id).cloned(),
+            topic: self.state.topics.get(&id).cloned(),
         };
         if self.state.channels.is_empty() && self.state.deleted_channels.is_empty() {
             return vec![channel(model::default_channel(self.id), model::GENERAL, false, true)];

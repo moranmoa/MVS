@@ -16,6 +16,9 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  ReportEvidence,
+  ReportSummary,
+  ReportTarget,
   JoinStatus,
   Member,
   Message,
@@ -33,6 +36,7 @@ import type {
   MemberRelay,
   Id,
 } from './types';
+import { REPORT_REASONS } from './types';
 
 export const NAME_MAX = 32;
 export const SERVER_NAME_MAX = 48;
@@ -258,6 +262,75 @@ export function cleanRemovedMember(r: RemovedMember): RemovedMember | null {
     shortCode: cleanCode(r.shortCode),
     displayName: cleanName(r.displayName),
     removedAt: when(r.removedAt) ?? 0,
+  };
+}
+
+/** G-48: the reporter's note, as the core allows it: one line, 280 characters. */
+export const REPORT_TEXT_MAX = 280;
+const reportText = (raw: unknown): string | undefined => {
+  if (typeof raw !== 'string') return undefined;
+  const t = cleanText(raw.replace(/\s+/g, ' '), REPORT_TEXT_MAX, 1).text.trim();
+  return t || undefined;
+};
+
+function cleanReportTarget(t: unknown): ReportTarget | null {
+  const x = t as Record<string, unknown> | null;
+  if (x?.kind === 'message' && typeof x.messageId === 'string' && typeof x.channelId === 'string') {
+    return { kind: 'message', messageId: id(x.messageId), channelId: id(x.channelId) };
+  }
+  if (x?.kind === 'member' && typeof x.userId === 'string') return { kind: 'member', userId: cleanHexId(x.userId) };
+  return null;
+}
+
+/** G-48: a report for staff, or null when its reason or target isn't one we know. Never evidence. */
+export function cleanReportSummary(r: ReportSummary): ReportSummary | null {
+  if (!r || typeof r !== 'object' || typeof r.id !== 'string') return null;
+  const target = cleanReportTarget(r.target);
+  const reason = REPORT_REASONS.find((x) => x === r.reason);
+  if (!target || !reason) return null;
+  const text = reportText(r.text);
+  return {
+    id: id(r.id),
+    serverId: id(r.serverId),
+    reporterId: cleanHexId(r.reporterId),
+    target,
+    reportedId: cleanHexId(r.reportedId),
+    reason,
+    ...(text ? { text } : {}),
+    ts: when(r.ts) ?? 0,
+    receivedAt: when(r.receivedAt) ?? 0,
+    dismissed: r.dismissed === true,
+    evidenceValid: r.evidenceValid === true,
+    // Withheld unless the core says otherwise: the safe default for reasons 5 and 6.
+    evidenceWithheld: r.evidenceWithheld !== false,
+  };
+}
+const cleanReports = (l: unknown): ReportSummary[] =>
+  Array.isArray(l) ? l.map(cleanReportSummary).filter((r): r is ReportSummary => r !== null) : [];
+
+/**
+ * G-48 (B24): the build's abuse-report address from getAppInfo, or '' unless
+ * it is a plain e-mail address or an https URL (short, no spaces or controls).
+ */
+export function cleanAbuseAddress(raw: unknown): string {
+  if (typeof raw !== 'string' || raw.length > 254 || /[\s\p{C}]/u.test(raw)) return '';
+  if (/^[^@/]+@[^@/]+\.[a-z]{2,}$/i.test(raw)) return raw;
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && !u.username && !u.password ? u.href : '';
+  } catch {
+    return '';
+  }
+}
+
+/** G-48: the reported message, as plain text (the UI never parses it as Markdown or HTML). */
+export function cleanReportEvidence(e: ReportEvidence): ReportEvidence {
+  const text = typeof e?.text === 'string' ? cleanText(e.text).text : undefined;
+  return {
+    authorId: cleanHexId(e?.authorId),
+    channelId: id(e?.channelId),
+    ts: when(e?.ts) ?? 0,
+    ...(text !== undefined ? { text } : {}),
   };
 }
 
@@ -596,6 +669,9 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'channel.added': cleanChannel,
   'channel.removed': (p) => ({ serverId: p.serverId, channelId: p.channelId, name: cleanName(p.name, CHANNEL_NAME_MAX) || '…' }),
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
+  // A report that doesn't clean up becomes an empty list's worth of nothing: dropped by the listener.
+  'report.received': (p) => ({ serverId: id(p?.serverId), report: cleanReportSummary(p?.report) as ReportSummary }),
+  'report.status': (p) => ({ reportId: id(p?.reportId), delivered: count(p?.delivered), pending: count(p?.pending) }),
   'message.added': cleanMessage,
   'message.updated': cleanMessage,
   // Only the kinds the UI knows; anything else is dropped.
@@ -669,6 +745,9 @@ export function guardCore(core: CoreApi): CoreApi {
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listReports: wrap(core.listReports, cleanReports),
+    getReportEvidence: wrap(core.getReportEvidence, cleanReportEvidence),
+    reportContent: wrap(core.reportContent, (r) => ({ reportId: id(r?.reportId), recipients: count(r?.recipients) })),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
       Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
     ),

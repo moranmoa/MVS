@@ -155,7 +155,7 @@ describe('context menus (B25)', () => {
     fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
 
     fireEvent.contextMenu(other);
-    expect(menuItems()).toEqual(['Profile', 'Copy identity code', 'Block', 'Remove from server']);
+    expect(menuItems()).toEqual(['Profile', 'Copy identity code', 'Block', 'Report', 'Remove from server']);
     fireEvent.click(screen.getByRole('menuitem', { name: 'Remove from server' }));
     expect(screen.getByRole('alertdialog', { name: 'Remove from server' })).toBeTruthy();
   });
@@ -256,14 +256,14 @@ describe('message menu (B25 §2)', () => {
     // server's rows can linger for a moment: retry until this server's menu shows.
     await waitFor(() => {
       fireEvent.contextMenu(others()[0]);
-      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID', 'Delete']);
+      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID', 'Report', 'Delete']);
     });
     fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
 
     await openOtherServer(channels);
     await waitFor(() => {
       fireEvent.contextMenu(others()[0]);
-      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID']);
+      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID', 'Report']);
     });
   });
 });

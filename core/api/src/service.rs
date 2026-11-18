@@ -380,7 +380,9 @@ struct Inner {
     /// Channels whose current key some members can't read, and since when
     /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
     /// once nobody is missing.
-    join_key_wait: HashMap<(ServerId, ChannelId), u64>,
+    /// Who was missing then: a new joiner (someone not in that set) starts
+    /// a wait of its own (dev-identity on #517).
+    join_key_wait: HashMap<(ServerId, ChannelId), (BTreeSet<PublicKey>, u64)>,
     /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
     /// once every member posts the cap, so it comes again if it reopens.
     adult_keys_warned: HashSet<ServerId>,
@@ -673,16 +675,28 @@ impl Core {
     /// the commands.
     pub fn lock_keys(&self) {
         let _ = self.leave_call();
+        // Messages held for a key: their text is dropped (zeroized) at lock
+        // and sign-out, never kept past them (lost-message P1, SL C3). Each
+        // one still listed turns `failed` with no text (`message.updated`),
+        // so the UI never shows it as about to be sent (dev-identity on
+        // #517). Before the cipher locks: the index needs the count.
+        let _ = self.run(|inner, ports, events| {
+            let held = std::mem::take(&mut inner.key_pending);
+            inner.join_key_wait.clear();
+            let mut before: HashMap<ChannelId, usize> = HashMap::new();
+            for mut p in held {
+                let earlier = before.entry(p.channel).or_default();
+                let index = inner.message_count(&*ports.cipher, p.server, p.channel).unwrap_or(0) + *earlier;
+                *earlier += 1;
+                p.failed = true;
+                p.body = Zeroizing::new(String::new());
+                events.push(Event::MessageUpdated(p.message(index)));
+            }
+            Ok(())
+        });
         self.ports.cipher.lock();
         self.ports.network.lock();
         self.keys_locked.store(true, Ordering::SeqCst);
-        // Messages held for a key: their text is dropped (zeroized) at lock
-        // and sign-out, never kept past them (lost-message P1, SL C3).
-        {
-            let mut inner = self.lock();
-            inner.key_pending.clear();
-            inner.join_key_wait.clear();
-        }
         // G-91 (Security Lead on #457): the server secrets a restore took
         // from the backup go too; the backup is fetched again after unlock.
         let mut restore = self.restore.lock().expect("not poisoned");
@@ -2342,7 +2356,7 @@ impl Core {
                 events.push(Event::MessageAdded(message.clone()));
                 return Ok(message);
             }
-            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
+            let sealed = match inner.seal_with(ports, server, channel, body.as_bytes(), false) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
                     let message = inner.hold_for_key(ports, server, channel, body)?;
@@ -4286,7 +4300,7 @@ impl Inner {
                     i += 1;
                     continue;
                 }
-                match self.seal(ports, server, channel, body.as_bytes()) {
+                match self.seal_with(ports, server, channel, body.as_bytes(), false) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
                         let record =
@@ -4340,16 +4354,22 @@ impl Inner {
         let cipher = &*ports.cipher;
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        let missing = cipher.missing_readers(server, channel).len();
-        if missing == 0 {
+        let missing: BTreeSet<PublicKey> = cipher.missing_readers(server, channel).into_iter().collect();
+        if missing.is_empty() {
             self.join_key_wait.remove(&(server, channel));
             return Ok(false);
         }
         let now = ports.clock.now_ms();
-        let since = *self.join_key_wait.entry((server, channel)).or_insert(now);
-        if now.saturating_sub(since) < JOIN_KEY_WAIT.as_millis() as u64 {
+        let wait = self.join_key_wait.entry((server, channel)).or_insert_with(|| (missing.clone(), now));
+        // Someone missing who wasn't before (a later joiner): its own wait,
+        // from now. The same set (or fewer) keeps counting from its start.
+        if !missing.is_subset(&wait.0) {
+            *wait = (missing.clone(), now);
+        }
+        if now.saturating_sub(wait.1) < JOIN_KEY_WAIT.as_millis() as u64 {
             return Ok(true);
         }
+        let missing = missing.len();
         tracing::info!(target: "mvs::keys", missing, "join key wait over: sending under the current key");
         Ok(false)
     }
@@ -4370,6 +4390,20 @@ impl Inner {
         channel: ChannelId,
         plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
+        self.seal_with(ports, server, channel, plaintext, true)
+    }
+
+    /// [`Self::seal`]; `sync: false` when [`Self::waits_for_join_key`] has
+    /// just given the cipher the members and rotations (dev-identity on
+    /// #517: not twice per send).
+    fn seal_with(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        channel: ChannelId,
+        plaintext: &[u8],
+        sync: bool,
+    ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
         let view = self.view(server)?;
@@ -4377,8 +4411,10 @@ impl Inner {
         let readers = channel_readers(&view, channel);
         let may_rotate = view.state.role(key) >= authority::Role::Moderator;
         let auth_deps = auth_deps(&view);
-        cipher.membership_changed(server, &members);
-        chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        if sync {
+            cipher.membership_changed(server, &members);
+            chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        }
         match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).

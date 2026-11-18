@@ -5957,3 +5957,63 @@ fn peer_key(peer: &Peer) -> PublicKey {
     let id = peer.core.get_identity().unwrap().unwrap().id;
     PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
 }
+
+/// dev-identity on #517: a joiner after an earlier join's wait ran out gets
+/// a wait of its own, so its first messages aren't sealed under a key it
+/// never gets.
+#[test]
+fn a_later_joiner_gets_its_own_join_key_wait() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Later");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+
+    // B joins with the owner away; A's wait for it runs out.
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "for B", None).unwrap();
+    advance(&world, 2 * JOIN_KEY_WAIT.as_millis() as u64);
+    a.core.sync_now().unwrap();
+    let sent = a.core.send_message(&channel, "B's wait is over", None).unwrap();
+    assert_ne!(sent.send_state, Some(SendState::Pending), "{sent:?}");
+
+    // C joins later: a new wait, so A holds again.
+    let _c = joiner(&world, &server, "C");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "for C", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending), "{held:?}");
+}
+
+/// dev-identity on #517: messages held for a key and dropped at the app
+/// lock turn `failed` with no text (`message.updated`), never left pending.
+#[test]
+fn held_messages_dropped_at_lock_turn_failed() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Lock");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "secret", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    a.events.take();
+    a.core.lock_keys();
+    let updated: Vec<Message> = a
+        .events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::MessageUpdated(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0].id, held.id);
+    assert_eq!(updated[0].send_state, Some(SendState::Failed));
+    assert_eq!(updated[0].body, "");
+    a.core.unlock_keys();
+}

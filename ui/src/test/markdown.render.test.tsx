@@ -25,6 +25,12 @@ describe('markdown: safeHref', () => {
     // Look-alike hosts come out in punycode, as the shell's prompt shows them.
     expect(safeHref('https://exаmple.org')).toMatch(/^https:\/\/xn--/);
   });
+
+  it('IP literals and loopback names are not links (SL review)', () => {
+    for (const bad of ['https://127.0.0.1/x', 'https://192.168.1.1', 'https://0x7f.1/', 'https://2130706433/', 'https://[::1]/', 'https://localhost:8443/', 'https://app.localhost/'])
+      expect(safeHref(bad), bad).toBeNull();
+    expect(safeHref('https://a1.example.org')).toBe('https://a1.example.org/');
+  });
 });
 
 const show = (text: string, opts: { locale?: 'en' | 'he'; renderText?: (t: string) => React.ReactNode; trailing?: React.ReactNode } = {}) => {
@@ -102,6 +108,21 @@ describe('markdown: rendering', () => {
     const shown = c.querySelector('span.md-spoiler.revealed')!;
     expect(shown.textContent).toBe('he was the ghost');
     expect(shown.closest('[aria-hidden]')).toBeNull();
+  });
+
+  it('a keyboard reveal keeps focus: it moves to the revealed text (UX review)', () => {
+    const c = show('||secret||');
+    const btn = c.querySelector<HTMLButtonElement>('button.md-spoiler')!;
+    btn.focus();
+    fireEvent.click(btn); // Enter / Space on a button
+    const shown = c.querySelector('span.md-spoiler.revealed')!;
+    expect(document.activeElement).toBe(shown);
+    expect(shown.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('the copy button shows without hover on touch screens (source rule)', () => {
+    const css = readFileSync(join(__dirname, '..', 'styles', 'markdown.css'), 'utf8');
+    expect(css).toMatch(/@media \(hover: none\) \{\s*\.md-copy \{\s*opacity: 1;/);
   });
 
   it('a link inside a hidden spoiler is not clickable until revealed', () => {

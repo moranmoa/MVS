@@ -22,7 +22,7 @@ import {
   SmilePlusIcon,
 } from '../../components/icons';
 import { textDir, useUiDir } from '../../app/textDir';
-import { MarkdownBody, plainText } from '../../markdown';
+import { excerptText, MarkdownBody, plainText } from '../../markdown';
 import { displayName, lookalikeIds, LookalikeTag } from './MemberList';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
@@ -550,7 +550,7 @@ const MessageRow = memo(function MessageRow({
           <ReplyIcon />
           <Name>{replyAuthor ? displayName(replyAuthor) : '…'}</Name>
           <span dir={textDir(m.replyTo.excerpt, uiDir)} className="reply-excerpt user-text">
-            {m.replyTo.excerpt ? <MentionText text={plainText(m.replyTo.excerpt)} message={m} plain /> : intl.formatMessage({ id: 'chat.deleted' })}
+            {m.replyTo.excerpt ? <MentionText text={excerptText(m.replyTo.excerpt)} message={m} plain /> : intl.formatMessage({ id: 'chat.deleted' })}
           </span>
         </button>
       )}

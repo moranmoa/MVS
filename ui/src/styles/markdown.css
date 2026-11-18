@@ -104,3 +104,19 @@
   cursor: auto;
 }
 
+
+/* No hover on touch screens: the copy button is always there. */
+@media (hover: none) {
+  .md-copy {
+    opacity: 1;
+  }
+}
+
+.md-spoiler.revealed:focus {
+  outline: none;
+}
+
+.md-spoiler.revealed:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

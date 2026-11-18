@@ -1,7 +1,8 @@
 // G-25: the Markdown parser (spec docs/ux/specs/markdown.md §1, §6).
 
 import { describe, expect, it } from 'vitest';
-import { parse, parseInline, plainText, SPOILER_MASK, type Inline } from '../markdown/parse';
+import { excerptText, parse, parseInline, plainText, SPOILER_MASK, type Inline } from '../markdown/parse';
+import { cleanExcerpt } from '../core/sanitize';
 
 const t = (v: string): Inline => ({ t: 'text', v });
 
@@ -46,6 +47,11 @@ describe('markdown: inline', () => {
   it('nothing is parsed inside code, including mentions and links', () => {
     expect(parseInline('`**x** https://a.example <@abc>`')).toEqual([{ t: 'code', v: '**x** https://a.example <@abc>' }]);
     expect(parseInline('``a ` b``')).toEqual([{ t: 'code', v: 'a ` b' }]);
+  });
+
+  it('a link stops at format characters (LRM, RLM, ZWJ): what shows is the href', () => {
+    expect(parseInline('https://example.org/a‎b')).toEqual([{ t: 'link', v: 'https://example.org/a' }, t('‎b')]);
+    expect(parseInline('https://exa‍mple.org')).toEqual([{ t: 'link', v: 'https://exa' }, t('‍mple.org')]);
   });
 
   it('links keep a ")" that closes a "(" inside them', () => {
@@ -102,6 +108,28 @@ describe('markdown: blocks', () => {
     expect(parse('>> x')).toEqual([{ t: 'quote', lines: [{ c: [t('> x')], raw: '> x' }] }]);
     expect(parse('\\> not a quote')).toEqual([{ t: 'line', c: [t('> not a quote')], raw: '\\> not a quote' }]);
     expect(parse('a > b')[0]).toEqual({ t: 'line', c: [t('a > b')], raw: 'a > b' });
+  });
+});
+
+describe('markdown: reply excerpts never leak a cut spoiler (UX review)', () => {
+  it('a spoiler cut at EXCERPT_MAX (its closing || gone) stays masked', () => {
+    const body = 'the twist: ||' + 'the butler did it and everyone knew '.repeat(6) + '|| ok';
+    const excerpt = cleanExcerpt(body);
+    expect(excerpt.endsWith('…')).toBe(true);
+    expect(plainText(excerpt)).toContain('butler'); // what the plain path would leak
+    expect(excerptText(excerpt)).toBe(`the twist: ${SPOILER_MASK}`);
+  });
+
+  it('whatever the pairing on the cut line: bold around it, a code span cut open', () => {
+    expect(excerptText('**a ||secret** more secret…')).toBe(`**a ${SPOILER_MASK}`);
+    expect(excerptText('||secret `a||b…')).toBe(SPOILER_MASK);
+    expect(excerptText('|| a ||b secret…')).toBe(SPOILER_MASK);
+  });
+
+  it('an unpaired || on an excerpt without "…" masks the rest too', () => {
+    expect(excerptText('look ||hidden part')).toBe(`look ${SPOILER_MASK}`);
+    expect(excerptText('a ||b|| c')).toBe(`a ${SPOILER_MASK} c`);
+    expect(excerptText('plain, no bars…')).toBe('plain, no bars…');
   });
 });
 
@@ -171,6 +199,16 @@ describe('markdown: hostile input', () => {
     const t0 = performance.now();
     for (let i = 0; i < runs; i++) parse(msg);
     expect((performance.now() - t0) / runs).toBeLessThan(5);
+  });
+
+  it('a link ending in thousands of ")" trims in linear time (SL review)', () => {
+    const one = 'https://a' + ')'.repeat(2039);
+    expect(parseInline(one)).toEqual([{ t: 'link', v: 'https://a' }, t(')'.repeat(2039))]);
+    const msg = one + ' ' + one;
+    parse(msg); // warm up
+    const t0 = performance.now();
+    parse(msg);
+    expect(performance.now() - t0).toBeLessThan(10);
   });
 
   it('unclosed backtick runs inside an open marker stay linear (one scan per run length)', () => {

@@ -4,7 +4,7 @@
 // which the desktop shell turns into its "Open this link in your browser?"
 // prompt (desktop/src/main.js openExternal).
 
-import { Fragment, memo, useMemo, useState, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { copyText } from '../app/clipboard';
 import { textDir, type Dir } from '../app/textDir';
@@ -24,6 +24,11 @@ export function safeHref(url: string): string | null {
   try {
     const u = new URL(url);
     if (u.protocol !== 'https:' || !u.hostname || u.username || u.password) return null;
+    // SL review: no IP literals or loopback names, which point inside the
+    // network rather than at a named site (URL has already normalised
+    // forms like 0x7f.1 to 127.0.0.1).
+    const host = u.hostname.toLowerCase();
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.startsWith('[') || host === 'localhost' || host.endsWith('.localhost')) return null;
     return u.href;
   } catch {
     return null;
@@ -36,7 +41,17 @@ export const COPIED_MS = 2000;
 function Spoiler({ nodes, renderText }: { nodes: Inline[]; renderText: RenderText }) {
   const intl = useIntl();
   const [shown, setShown] = useState(false);
-  if (shown) return <span className="md-spoiler revealed">{inline(nodes, renderText, true)}</span>;
+  // The button goes away on reveal: focus moves to the revealed text (UX review).
+  const revealed = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (shown) revealed.current?.focus();
+  }, [shown]);
+  if (shown)
+    return (
+      <span ref={revealed} tabIndex={-1} className="md-spoiler revealed">
+        {inline(nodes, renderText, true)}
+      </span>
+    );
   // Hidden: a button whose text is out of reach of screen readers, selection
   // and copy (the copied message has the mask instead, plainText()).
   return (

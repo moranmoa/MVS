@@ -25,7 +25,8 @@ const ESCAPABLE = new Set(['*', '_', '~', '`', '|', '>', '\\']);
 /** Bold inside italic inside a spoiler...: deeper nesting stays as typed. */
 const MAX_DEPTH = 5;
 /** A bare link: only https (the desktop shell opens nothing else). */
-const LINK = /^https:\/\/[^\s<>"'`]+/;
+// No format characters (LRM, RLM, ZWJ...) either: the shown link is its href.
+const LINK = /^https:\/\/[^\s<>"'`\p{Cf}]+/u;
 /** Trailing characters that end a sentence rather than the link. */
 const LINK_TRAIL = new Set([...'.,;:!?)]}\'"*_~|']);
 const MENTION = /^<@[^>\s]{1,128}>/;
@@ -67,12 +68,24 @@ function codeCloser(s: string, from: number, n: number): number {
 
 /** Trailing punctuation off a link, keeping a ")" that closes a "(" in it: Foo_(bar). */
 function trimLink(url: string): string {
-  for (;;) {
-    const last = url[url.length - 1];
-    if (last === undefined || !LINK_TRAIL.has(last)) return url;
-    if (last === ')' && url.split('(').length >= url.split(')').length) return url;
-    url = url.slice(0, -1);
+  // Counted once, then kept up to date: linear in the URL's length (SL review).
+  let open = 0;
+  let close = 0;
+  for (const ch of url) {
+    if (ch === '(') open++;
+    else if (ch === ')') close++;
   }
+  let end = url.length;
+  while (end > 0) {
+    const last = url[end - 1]!;
+    if (!LINK_TRAIL.has(last)) break;
+    if (last === ')') {
+      if (open >= close) break;
+      close--;
+    }
+    end--;
+  }
+  return url.slice(0, end);
 }
 
 /** A link at i (when it starts a word), with its trailing punctuation left out. */
@@ -275,6 +288,24 @@ export function plainText(text: string): string {
   return parse(text)
     .map((b) => (b.t === 'code' ? b.v : b.t === 'quote' ? b.lines.map((l) => inlinePlain(l.c)).join('\n') : inlinePlain(b.c)))
     .join('\n');
+}
+
+/**
+ * A reply excerpt as plain text. The excerpt is cut at EXCERPT_MAX, which can
+ * fall inside a spoiler and drop its closing "||": then the hidden text would
+ * show. So on a cut excerpt (ending in "…"), everything from the first "||"
+ * of its last line is masked, whatever the pairing. On any other excerpt, a
+ * "||" left over after parsing (an unpaired one, however it got cut) masks
+ * the rest too. Over-masking a preview is fine; leaking a spoiler is not.
+ */
+export function excerptText(excerpt: string): string {
+  if (excerpt.endsWith('…')) {
+    const bars = excerpt.indexOf('||', excerpt.lastIndexOf('\n') + 1);
+    if (bars !== -1) return plainText(excerpt.slice(0, bars)) + SPOILER_MASK;
+  }
+  const out = plainText(excerpt);
+  const left = out.indexOf('||', out.lastIndexOf('\n') + 1);
+  return left === -1 ? out : out.slice(0, left) + SPOILER_MASK;
 }
 
 /** True when the text has anything this module would format (a fast path for plain messages). */

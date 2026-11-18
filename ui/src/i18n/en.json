@@ -159,6 +159,10 @@
   "home.create.body": "Your own community, with a general channel ready to go.",
   "home.join.title": "Join with a link",
   "home.join.body": "Got an invite link? Paste it here.",
+  "home.firstRun.title": "Your account is ready. What now?",
+  "home.firstRun.subtitle": "Create a new server, or join one with a link you got.",
+  "home.join.paste": "Paste an invite link",
+  "home.join.submit": "Join",
 
   "create.title": "Create a server",
   "create.name": "Server name",

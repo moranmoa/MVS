@@ -111,11 +111,30 @@ function isInternalUrl(url) {
   }
 }
 
-/** Links that may be offered to the OS browser (after the user confirms): https only. */
+/**
+ * A host a link may never point the OS browser at: an IP literal (IPv4 in any
+ * form, which the URL parser has already turned into dotted quads: 0x7f.1,
+ * 2130706433, 127.1, …; or [IPv6]), localhost or *.localhost. Mirrors the
+ * UI's safeHref (#484). A trailing dot is ignored.
+ */
+function isBlockedHost(hostname) {
+  const h = String(hostname).toLowerCase().replace(/\.+$/, '');
+  if (!h) return true;
+  if (h.startsWith('[') || h.includes(':')) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true;
+  // Belt and braces, should a parser ever leave a numeric form alone.
+  if (/^(0x[0-9a-f]*|\d+)(\.(0x[0-9a-f]*|\d+))*$/.test(h)) return true;
+  return h === 'localhost' || h.endsWith('.localhost');
+}
+
+/**
+ * Links that may be offered to the OS browser (after the user confirms):
+ * https only, no credentials, and never an IP literal or localhost.
+ */
 function isExternalWebUrl(url) {
   try {
     const u = new URL(url);
-    return u.protocol === 'https:' && !!u.hostname && !u.username && !u.password;
+    return u.protocol === 'https:' && !!u.hostname && !u.username && !u.password && !isBlockedHost(u.hostname);
   } catch {
     return false;
   }

@@ -633,6 +633,8 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       state: s?.state === 'up' || s?.state === 'down' ? s.state : 'starting',
       detail: (['missing', 'start-failed', 'crashed', 'crash-loop', 'keyring'] as const).find((d) => d === s?.detail),
       ...(stunUrl ? { stunUrl } : {}),
+      // G-81 B: on only for an exact true.
+      ...(s?.voiceP2p === true ? { voiceP2p: true } : {}),
     };
   },
   'update.ready': (u) => ({ version: cleanName(u.version, 32), waitingForCall: u.waitingForCall === true }),

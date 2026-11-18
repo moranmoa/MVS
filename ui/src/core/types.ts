@@ -123,6 +123,8 @@ export interface CoreStatus {
   detail?: CoreDownDetail;
   /** Our STUN server for voice (#222), from the shell's config; absent without one. */
   stunUrl?: string;
+  /** G-81 B: calls over the P2P network are on in this build (off by default). */
+  voiceP2p?: boolean;
 }
 
 /** Commands reject with this shape; `code` maps to a translated message. */

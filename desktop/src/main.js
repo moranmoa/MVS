@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, voiceP2pFor } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -83,7 +83,9 @@ let coreStatus = { state: 'starting' };
  */
 const STUN_URL = stunFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
 if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
-const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
+/** G-81 B: calls over the P2P network (off by default; voiceP2pFor). */
+const VOICE_P2P = voiceP2pFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL, ...(VOICE_P2P ? { voiceP2p: true } : {}) });
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
 /**

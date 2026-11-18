@@ -323,6 +323,7 @@
   "call.rejoinToTalk": "To talk, leave and join again.",
   "call.ipNotice.title": "Before your first call",
   "call.ipNotice.body": "In a call, computers connect directly, so the people in it can see your internet address (IP). Relay-only mode turns calls off.",
+  "call.ipNotice.bodyP2p": "In a call, computers on the same network connect directly, and with a direct connection the people in the call can see your internet address (IP). With relay-only on, calls go through the MVS relay: they can't see it, but the relay sees that you're in a call.",
   "call.ipNotice.ok": "Got it",
   "call.ipNotice.settings": "Privacy settings",
   "call.peerFailed": "No voice connection",

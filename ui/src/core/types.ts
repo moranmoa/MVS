@@ -374,6 +374,18 @@ export interface DeviceApproval {
   expiresAt: number;
 }
 
+/** G-29: who is typing in a channel now (ephemeral; at most 5). */
+export interface TypingState {
+  channelId: Id;
+  userIds: Id[];
+}
+
+/** Settings the core keeps on this device. */
+export interface CoreSettings {
+  /** G-29: "Show others when I'm typing" (default on). Off: nothing is sent; others are still shown. */
+  typingIndicator: boolean;
+}
+
 /**
  * G-91: my servers coming back after a restore or a device link (#457).
  * `found`: live servers the backup lists (0 until found); `waiting`: of those, not back yet.

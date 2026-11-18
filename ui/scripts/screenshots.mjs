@@ -1147,6 +1147,15 @@ for (const [query, name, opts] of [
   await p.close();
 }
 
+// ---- G-29 typing (440, chat-and-voice-extras.md) --------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&typing=1', 'x');
+  await p.locator('.typing-text').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '440-typing-he');
+  await p.close();
+}
+
 // ---- G-26 reactions (441-442, chat-and-voice-extras.md §2-3) -----------------------
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');

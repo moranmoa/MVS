@@ -132,6 +132,10 @@ export interface StoreState {
    * voice room, and also learned from a call ended or a join refused for it.
    */
   relayOnly: boolean;
+  /** G-29: who is typing, by channel, and when the core last said so. */
+  typing: Record<Id, { userIds: Id[]; at: number }>;
+  /** G-29: "Show others when I'm typing". */
+  typingIndicator: boolean;
   /** G-74: the shell's answer to the push-to-talk settings ('unsupported' outside the desktop app). */
   pttStatus: 'ok' | 'invalid' | 'shortcut-taken' | 'unsupported' | 'pending';
   /** Member relays (slice 1, #368); null until read. */
@@ -158,6 +162,8 @@ export class Store {
     callError: null,
     voiceRooms: {},
     relayOnly: false,
+    typing: {},
+    typingIndicator: true,
     pttStatus: 'pending',
     memberRelay: null,
     flash: null,
@@ -239,6 +245,7 @@ export class Store {
         });
       }),
       on('voice.rooms', (p) => this.setRooms(p.serverId, p.rooms)),
+      on('typing', (t) => this.set({ typing: { ...this.state.typing, [t.channelId]: { userIds: t.userIds, at: Date.now() } } })),
       on('memberRelay.changed', (r) => this.setMemberRelay(r)),
       on('account.deviceAdded', (d) =>
         this.set({ deviceNotices: [...this.state.deviceNotices.filter((x) => x.at !== d.at), d].sort((a, b) => a.at - b.at) }),
@@ -259,6 +266,8 @@ export class Store {
     // Relay-only is per device and needs no identity (#272).
     const info = await this.core.getAppInfo().catch(() => null);
     if (info) this.set({ relayOnly: info.relayOnly === true });
+    const coreSettings = await this.core.getSettings().catch(() => null);
+    if (coreSettings) this.set({ typingIndicator: coreSettings.typingIndicator });
     const relay = await this.core.getMemberRelay().catch(() => null);
     if (relay) this.set({ memberRelay: relay });
     if (identity) await this.loadServers();
@@ -437,6 +446,12 @@ export class Store {
   /** Settings → Privacy (#272). The core ends a call in progress when it goes on. */
   setMemberRelay(memberRelay: MemberRelay): void {
     this.set({ memberRelay });
+  }
+
+  /** G-29: the privacy switch. */
+  async setTypingIndicator(on: boolean): Promise<void> {
+    await this.core.setTypingIndicator(on);
+    this.set({ typingIndicator: on });
   }
 
   setPttStatus(pttStatus: StoreState['pttStatus']): void {

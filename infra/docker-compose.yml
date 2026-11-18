@@ -37,6 +37,9 @@ services:
       # Reverse-proxy hop address(es) the relay sees for wss clients; they skip
       # only the per-IP rate limits (README). Set in .env, never committed.
       PROXY_IPS: ${PROXY_IPS:-}
+      # The other relay(s) sharing this DHT (RELAY2.md): pinned
+      # /ip4|ip6/.../p2p/<id> addresses, the Docker gateway only. Set in .env.
+      PEER_RELAYS: ${PEER_RELAYS:-}
     ports:
       - "4001:4001/tcp"
       - "4001:4001/udp"

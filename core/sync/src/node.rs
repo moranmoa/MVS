@@ -57,6 +57,7 @@ use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
+use crate::typing::{TypingError, TypingLimits, MAX_TYPING_BLOB};
 use crate::voice::{VoiceError, VoiceLimits, MAX_VOICE_BLOB};
 use crate::{
     log_name, log_of, valid_log_name, Append, Authorizer, ChannelId, NoStubs, Record, RecordId, Scope, ServerId, Store,
@@ -246,6 +247,10 @@ const MAX_DIRECT_CANDIDATES: usize = 8;
 pub struct NodeConfig {
     /// Bootstrap/relay node, ending in /p2p/<peer id>.
     pub relay: Multiaddr,
+    /// More relays of ours (multi-relay part B, the api's `MVS_RELAY_ADDRS`
+    /// after the first): each dialled, reserved on and announced like
+    /// `relay`; the member relay fallback starts only when all are down.
+    pub more_relays: Vec<Multiaddr>,
     /// Holds `store.db` and `node.key`.
     pub data_dir: PathBuf,
     /// Logs to sync from the start (see [`crate::log_name`]); more can be
@@ -325,6 +330,9 @@ pub enum NodeEvent {
     /// `from` is the identity its peer is bound to. Ephemeral: never stored
     /// or forwarded. See `voice`.
     VoiceSignal { from: PublicKey, bytes: Vec<u8> },
+    /// G-29: a typing signal (`/mvs/typing/1`) from a verified current
+    /// member, as [`NodeEvent::VoiceSignal`]. Ephemeral. See `typing`.
+    TypingSignal { from: PublicKey, bytes: Vec<u8> },
     /// An invite publication (`/mvs/invite-pub/1`) from a verified current
     /// member of `server`, `from` its identity. Opaque here: the api
     /// verifies it (C1) and calls [`Node::serve_invite`] if it holds.
@@ -397,6 +405,7 @@ enum Command {
     Disconnect { peer: PeerId },
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
+    TypingSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), TypingError>> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
     DropServerInvites { server: ServerId },
@@ -505,6 +514,8 @@ struct Behaviour {
     punch: crate::punch::MemberPunch,
     /// Voice signalling (`/mvs/voice/1`), with verified members only (`voice`).
     voice: crate::voice::VoiceBehaviour,
+    /// G-29 typing (`/mvs/typing/1`), with verified members only (`typing`).
+    typing: crate::typing::TypingBehaviour,
     /// Invite publications between members (`/mvs/invite-pub/1`).
     invite_pub: crate::invite::PublishBehaviour,
     /// Envelope asks, from anyone (`/mvs/invite/1`).
@@ -652,10 +663,26 @@ impl Node {
             Some(Protocol::P2p(peer)) => peer,
             _ => bail!("the relay address must end with /p2p/<relay peer ID>"),
         };
+        // Multi-relay (part B): our relays, the first one first; at most
+        // MAX_RELAYS, one per peer ID.
+        let mut relays = vec![OurRelay::new(config.relay.clone(), relay_peer)];
+        for addr in &config.more_relays {
+            let Some(Protocol::P2p(peer)) = addr.iter().last() else {
+                bail!("a relay address must end with /p2p/<relay peer ID>")
+            };
+            if relays.len() < MAX_RELAYS && relays.iter().all(|r| r.peer != peer) {
+                relays.push(OurRelay::new(addr.clone(), peer));
+            }
+        }
+        let dropped = 1 + config.more_relays.len() - relays.len();
+        if dropped > 0 {
+            debug!(dropped, kept = relays.len(), "relay addresses dropped (duplicate peer or over the cap)");
+        }
 
         let backoff: SharedBackoff =
             Arc::new(Mutex::new(DialBackoff::new(DIAL_BACKOFF_MIN, DIAL_BACKOFF_MAX, MAX_TRACKED_PEERS)));
-        let mut swarm = build_swarm(key, config.relay.clone(), backoff.clone(), config.allow_lan).await?;
+        let relay_addrs: Vec<Multiaddr> = relays.iter().map(|r| r.addr.clone()).collect();
+        let mut swarm = build_swarm(key, relay_addrs, backoff.clone(), config.allow_lan).await?;
         // Member relays: the daily count survives restarts (the Tech Lead, #395).
         swarm.behaviour_mut().member_relay.keep_budget_in(config.data_dir.join("member-relay.budget"));
         // A stable port: `listen` with TCP port 0 reuses the one saved in
@@ -697,8 +724,10 @@ impl Node {
                 let _ = swarm.dial(DialOpts::unknown_peer_id().address(addr.clone()).build());
             }
         }
-        swarm.behaviour_mut().kad.add_address(&relay_peer, config.relay.clone());
-        swarm.dial(config.relay.clone())?;
+        for relay in &relays {
+            swarm.behaviour_mut().kad.add_address(&relay.peer, relay.addr.clone());
+            let _ = swarm.dial(relay.addr.clone());
+        }
 
         let peer_id = *swarm.local_peer_id();
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -712,8 +741,7 @@ impl Node {
             store,
             reader,
             authorizer: config.authorizer,
-            relay_addr: config.relay,
-            relay_peer,
+            relays,
             logs: HashSet::new(),
             connected: HashSet::new(),
             inflight: HashMap::new(),
@@ -731,9 +759,6 @@ impl Node {
             answering: 0,
             decoded,
             events: EventSink { tx: events, dropped: 0 },
-            circuit: None,
-            relay_backoff: RELAY_BACKOFF_MIN,
-            relay_next_dial: Instant::now(),
             bootstrap: config.bootstrap.into_iter().map(|addr| (addr, None)).collect(),
             bootstrap_conns: HashMap::new(),
             allow_lan: config.allow_lan,
@@ -777,6 +802,7 @@ impl Node {
             started: Instant::now(),
             pending_stubs: HashMap::new(),
             voice_limits: VoiceLimits::new(),
+            typing_limits: TypingLimits::new(),
             invites: HashMap::new(),
             invite_limits: InviteLimits::new(),
             fetches: HashMap::new(),
@@ -1016,6 +1042,17 @@ impl Node {
         rx.await.map_err(|_| VoiceError::Stopped)?
     }
 
+    /// G-29: sends one typing signal (at most [`MAX_TYPING_BLOB`] bytes) to
+    /// the peer bound to `to`, as [`Node::voice_send`]. Best effort.
+    pub async fn typing_send(&self, to: PublicKey, bytes: Vec<u8>) -> Result<(), TypingError> {
+        if bytes.len() > MAX_TYPING_BLOB {
+            return Err(TypingError::TooLarge);
+        }
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::TypingSend { to, bytes, reply }).map_err(|_| TypingError::Stopped)?;
+        rx.await.map_err(|_| TypingError::Stopped)?
+    }
+
     /// Serves `publication` under the envelope handle `handle` for
     /// `server` (T8-02): answered to anyone who asks for exactly that
     /// handle (`/mvs/invite/1`). The api calls it only for an invite that
@@ -1190,7 +1227,7 @@ fn load_or_create_key(path: &std::path::Path) -> Result<identity::Keypair> {
 
 async fn build_swarm(
     key: identity::Keypair,
-    relay: Multiaddr,
+    relay: Vec<Multiaddr>,
     backoff: SharedBackoff,
     allow_lan: bool,
 ) -> Result<Swarm<Behaviour>> {
@@ -1278,6 +1315,7 @@ async fn build_swarm(
                 member_relay: crate::member_relay::MemberRelay::new(peer_id),
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
+                typing: crate::typing::behaviour(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
                 backup: crate::backup::behaviour(),
@@ -1374,8 +1412,6 @@ struct Task {
     /// Read-only connection used by blocking threads to answer pulls.
     reader: Arc<Mutex<Store>>,
     authorizer: Arc<dyn Authorizer>,
-    relay_addr: Multiaddr,
-    relay_peer: PeerId,
     logs: HashSet<String>,
     connected: HashSet<PeerId>,
     /// Pulls waiting for a response.
@@ -1403,12 +1439,9 @@ struct Task {
     /// Pulled pages coming back from decoding on blocking threads.
     decoded: mpsc::UnboundedSender<Decoded>,
     events: EventSink,
-    /// Our listener on the relay circuit; re-made after the relay restarts.
-    circuit: Option<ListenerId>,
-    /// Redialling the relay while it is down: the wait doubles up to
-    /// [`RELAY_BACKOFF_MAX`], and resets once connected.
-    relay_backoff: Duration,
-    relay_next_dial: Instant,
+    /// Our relays (multi-relay part B), the configured first one first:
+    /// each with its circuit listener and redial backoff.
+    relays: Vec<OurRelay>,
     /// Bootstrap addresses and the peer each one turned out to be.
     bootstrap: Vec<(Multiaddr, Option<PeerId>)>,
     /// Open connections we dialled at a bootstrap address, by address. The
@@ -1500,6 +1533,8 @@ struct Task {
     stub_gate: Arc<dyn StubGate>,
     /// Caps on accepted voice signals.
     voice_limits: VoiceLimits,
+    /// G-29: caps on accepted typing signals (their own, not voice's).
+    typing_limits: TypingLimits,
     /// T8-02: envelope handle → the server and publication we serve.
     invites: HashMap<[u8; 32], (ServerId, Vec<u8>)>,
     invite_limits: InviteLimits,
@@ -1562,6 +1597,31 @@ struct Task {
     member_relay_rest: HashMap<PeerId, Instant>,
     fallback_dialed: HashMap<(PeerId, PeerId), Instant>,
     fallback_dials: HashSet<ConnectionId>,
+}
+
+/// Our relays: at most this many (the api's list is 1 to 4).
+const MAX_RELAYS: usize = 4;
+
+/// One of our configured relays (multi-relay part B).
+struct OurRelay {
+    addr: Multiaddr,
+    peer: PeerId,
+    /// Our listener on its circuit; re-made after it restarts.
+    circuit: Option<ListenerId>,
+    /// Redialling it while it is down: the wait doubles up to
+    /// [`RELAY_BACKOFF_MAX`], and resets once connected.
+    backoff: Duration,
+    next_dial: Instant,
+}
+
+impl OurRelay {
+    fn new(addr: Multiaddr, peer: PeerId) -> Self {
+        OurRelay { addr, peer, circuit: None, backoff: RELAY_BACKOFF_MIN, next_dial: Instant::now() }
+    }
+
+    fn circuit_addr(&self) -> Multiaddr {
+        self.addr.clone().with(Protocol::P2pCircuit)
+    }
 }
 
 /// One [`Node::fetch_invite`]: answers so far, until every peer answered or
@@ -1759,6 +1819,9 @@ impl Task {
             Command::VoiceSend { to, bytes, reply } => {
                 let _ = reply.send(self.voice_send(to, bytes));
             }
+            Command::TypingSend { to, bytes, reply } => {
+                let _ = reply.send(self.typing_send(to, bytes));
+            }
             Command::ServeInvite { server, handle, publication, announce, reply } => {
                 let _ = reply.send(self.serve_invite(server, handle, publication, announce));
             }
@@ -1880,17 +1943,26 @@ impl Task {
     }
 
     fn discover(&mut self) {
-        if self.swarm.is_connected(&self.relay_peer) {
-            if self.circuit.is_none() {
-                self.listen_on_circuit();
+        let mut any = false;
+        for i in 0..self.relays.len() {
+            let peer = self.relays[i].peer;
+            if self.swarm.is_connected(&peer) {
+                any = true;
+                if self.relays[i].circuit.is_none() {
+                    self.listen_on_circuit(i);
+                }
+            } else if Instant::now() >= self.relays[i].next_dial {
+                let relay = &mut self.relays[i];
+                debug!(backoff = ?relay.backoff, relay = i, "dialling the relay");
+                let addr = relay.addr.clone();
+                relay.next_dial = Instant::now() + jittered(relay.backoff, OsRng.next_u32());
+                relay.backoff = (relay.backoff * 2).min(RELAY_BACKOFF_MAX);
+                let _ = self.swarm.dial(addr);
             }
+        }
+        if any {
             let me = *self.swarm.local_peer_id();
             self.swarm.behaviour_mut().kad.get_closest_peers(me);
-        } else if Instant::now() >= self.relay_next_dial {
-            debug!(backoff = ?self.relay_backoff, "dialling the relay");
-            let _ = self.swarm.dial(self.relay_addr.clone());
-            self.relay_next_dial = Instant::now() + jittered(self.relay_backoff, OsRng.next_u32());
-            self.relay_backoff = (self.relay_backoff * 2).min(RELAY_BACKOFF_MAX);
         }
         // Bootstrap peers are dialled directly: not while relay-only.
         for (addr, peer) in if self.relay_only { Vec::new() } else { self.bootstrap.clone() } {
@@ -1901,18 +1973,53 @@ impl Task {
         }
     }
 
-    /// [`reachable`], plus: a circuit through our own relay is always fine
-    /// (we dial that relay anyway, whatever its address).
+    /// [`reachable`], plus: a circuit through one of our relays is always
+    /// fine (we dial those relays anyway, whatever their address).
     fn reachable(&self, addr: &Multiaddr) -> bool {
         // Never LAN addresses here: these come from or go to the DHT (F2).
-        via_relay(addr, &self.relay_addr) || reachable(addr, false)
+        self.via_ours(addr) || reachable(addr, false)
     }
 
-    fn listen_on_circuit(&mut self) {
-        let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit);
-        match self.swarm.listen_on(circuit) {
-            Ok(id) => self.circuit = Some(id),
-            Err(err) => warn!(%err, "listening on relay circuit failed"),
+    /// Whether `addr` is a circuit through one of our relays, exactly as
+    /// configured ([`via_relay`]).
+    fn via_ours(&self, addr: &Multiaddr) -> bool {
+        self.relays.iter().any(|r| via_relay(addr, &r.addr))
+    }
+
+    /// Whether `peer` is one of our relays.
+    fn is_our_relay(&self, peer: &PeerId) -> bool {
+        self.relays.iter().any(|r| r.peer == *peer)
+    }
+
+    /// Our relays we are connected to now.
+    fn relays_connected(&self) -> Vec<PeerId> {
+        self.relays.iter().map(|r| r.peer).filter(|p| self.swarm.is_connected(p)).collect()
+    }
+
+    /// The relay to reach others through: the first with a reservation,
+    /// else the first connected, else the first.
+    fn live_relay(&self) -> Multiaddr {
+        let up = |r: &&OurRelay| self.swarm.is_connected(&r.peer);
+        self.relays
+            .iter()
+            .filter(up)
+            .find(|r| r.circuit.is_some())
+            .or_else(|| self.relays.iter().find(up))
+            .unwrap_or(&self.relays[0])
+            .addr
+            .clone()
+    }
+
+    /// A peer-learned circuit through one of our relays, rebuilt from that
+    /// relay's configured address ([`our_relay_circuit`], the #446 rules).
+    fn rebuilt_circuit(&self, addr: &Multiaddr, expected: &PeerId) -> Option<Multiaddr> {
+        self.relays.iter().find_map(|r| our_relay_circuit(addr, &r.addr, expected))
+    }
+
+    fn listen_on_circuit(&mut self, i: usize) {
+        match self.swarm.listen_on(self.relays[i].circuit_addr()) {
+            Ok(id) => self.relays[i].circuit = Some(id),
+            Err(err) => warn!(%err, relay = i, "listening on relay circuit failed"),
         }
     }
 
@@ -1955,6 +2062,14 @@ impl Task {
         if bytes.len() > MAX_VOICE_BLOB {
             return Err(VoiceError::TooLarge);
         }
+        let peer = self.member_peer(to).ok_or(VoiceError::NotMember)?;
+        self.swarm.behaviour_mut().voice.send_request(&peer, bytes);
+        Ok(())
+    }
+
+    /// A connected peer bound to `to` as a current member, a direct one
+    /// first (voice and typing).
+    fn member_peer(&self, to: PublicKey) -> Option<PeerId> {
         let mut peers: Vec<PeerId> = self
             .bound
             .iter()
@@ -1964,10 +2079,31 @@ impl Task {
             .collect();
         peers.sort_by_key(|peer| (!self.direct.contains_key(peer), *peer));
         peers.dedup();
-        let peer =
-            peers.into_iter().find(|peer| self.member_identity(*peer) == Some(to)).ok_or(VoiceError::NotMember)?;
-        self.swarm.behaviour_mut().voice.send_request(&peer, bytes);
+        peers.into_iter().find(|peer| self.member_identity(*peer) == Some(to))
+    }
+
+    /// G-29: as [`Self::voice_send`], over `/mvs/typing/1`.
+    fn typing_send(&mut self, to: PublicKey, bytes: Vec<u8>) -> Result<(), TypingError> {
+        if bytes.len() > MAX_TYPING_BLOB {
+            return Err(TypingError::TooLarge);
+        }
+        let peer = self.member_peer(to).ok_or(TypingError::NotMember)?;
+        self.swarm.behaviour_mut().typing.send_request(&peer, bytes);
         Ok(())
+    }
+
+    /// G-29: as [`Self::on_voice`], with typing's own caps.
+    fn on_typing(&mut self, peer: PeerId, bytes: Vec<u8>, channel: ResponseChannel<()>) {
+        let Some(from) = self.member_identity(peer) else {
+            debug!(%peer, "typing signal from a non-member dropped");
+            return;
+        };
+        if !self.typing_limits.allow(peer, Instant::now()) {
+            debug!(%peer, "typing signal over the rate cap dropped");
+            return;
+        }
+        let _ = self.swarm.behaviour_mut().typing.send_response(channel, ());
+        self.emit(NodeEvent::TypingSignal { from, bytes });
     }
 
     /// A voice signal came in: only a current member's, within its rate
@@ -2179,9 +2315,8 @@ impl Task {
         }
         self.provide_backup(tag);
         let mut holders = self.my_devices();
-        if self.swarm.is_connected(&self.relay_peer) {
-            holders.push(self.relay_peer);
-        }
+        // Every relay of ours we are connected to (its mailbox).
+        holders.extend(self.relays_connected());
         for peer in holders {
             self.swarm.behaviour_mut().backup.send_request(&peer, crate::backup::Request::Put(blob.clone()));
         }
@@ -2228,10 +2363,11 @@ impl Task {
         let answers: Vec<Vec<u8>> = self.store.backup(&tag).ok().flatten().into_iter().collect();
         let mut peers: Vec<PeerId> = self.connected.iter().copied().collect();
         peers.truncate(MAX_FETCH_PEERS);
-        let relayed = self.swarm.is_connected(&self.relay_peer);
-        if relayed {
-            peers.push(self.relay_peer);
-        }
+        // Each relay of ours we are connected to (the api keeps the newest
+        // valid version of what comes back).
+        let relays = self.relays_connected();
+        let relayed = !relays.is_empty();
+        peers.extend(relays);
         for peer in &peers {
             let request = self.swarm.behaviour_mut().backup.send_request(peer, crate::backup::Request::Get(tag));
             self.backup_fetch_of.insert(request, id);
@@ -2278,9 +2414,8 @@ impl Task {
     /// older one fails at negotiation). At most `max`.
     fn notice_holders(&self, max: usize) -> Vec<PeerId> {
         let mut holders = self.my_devices();
-        if self.swarm.is_connected(&self.relay_peer) {
-            holders.push(self.relay_peer);
-        }
+        // Every relay of ours we are connected to (its mailbox).
+        holders.extend(self.relays_connected());
         holders.truncate(max);
         holders
     }
@@ -2474,12 +2609,30 @@ impl Task {
     /// Providers found for a backup fetch's tag: each asked once, through
     /// our relay's circuit (R3), at most [`MAX_BACKUP_PROVIDERS`]. The
     /// lookup's own wait ends on its last step.
+    /// `peer`'s circuit through each relay of ours we are connected to, or
+    /// through the live relay's address when none is.
+    fn circuits_to(&self, peer: PeerId) -> Vec<Multiaddr> {
+        let mut circuits: Vec<Multiaddr> = self
+            .relays
+            .iter()
+            .filter(|r| self.swarm.is_connected(&r.peer))
+            .map(|r| r.circuit_addr().with(Protocol::P2p(peer)))
+            .collect();
+        if circuits.is_empty() {
+            circuits.push(self.live_relay().with(Protocol::P2pCircuit).with(Protocol::P2p(peer)));
+        }
+        circuits
+    }
+
     fn on_backup_providers(&mut self, query: kad::QueryId, providers: Vec<PeerId>, last: bool) {
         let Some(&(id, tag)) = self.backup_lookups.get(&query) else { return };
         let me = *self.swarm.local_peer_id();
         for peer in providers.into_iter().filter(|p| *p != me).take(MAX_BACKUP_PROVIDERS) {
-            let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer));
-            self.swarm.add_peer_address(peer, circuit);
+            // One circuit per connected relay of ours: until part C a
+            // provider reserved only on relay 2 is unreachable through relay 1.
+            for circuit in self.circuits_to(peer) {
+                self.swarm.add_peer_address(peer, circuit);
+            }
             let request = self.swarm.behaviour_mut().backup.send_request(&peer, crate::backup::Request::Get(tag));
             self.backup_fetch_of.insert(request, id);
             if let Some(fetch) = self.fetches.get_mut(&id) {
@@ -2519,7 +2672,7 @@ impl Task {
             let direct: Vec<ConnectionId> = self
                 .direct
                 .iter()
-                .filter(|(peer, _)| **peer != self.relay_peer)
+                .filter(|(peer, _)| !self.is_our_relay(peer))
                 .flat_map(|(_, conns)| conns.iter().copied())
                 .collect();
             if !direct.is_empty() {
@@ -2887,20 +3040,20 @@ impl Task {
                 // Relay-only: a direct connection to anyone but the relay
                 // (a dial or punch already under way when it was turned on)
                 // is closed as soon as it opens.
-                if self.relay_only && peer_id != self.relay_peer && !is_relayed(&endpoint) {
+                if self.relay_only && !self.is_our_relay(&peer_id) && !is_relayed(&endpoint) {
                     debug!(%peer_id, "relay only: closing a direct connection");
                     self.swarm.close_connection(connection_id);
                     return;
                 }
-                if peer_id != self.relay_peer {
+                if !self.is_our_relay(&peer_id) {
                     self.track_connection(peer_id, connection_id, &endpoint);
                     if is_relayed(&endpoint) {
                         self.try_punch(peer_id);
                         self.flush_link_waiting();
                     }
                 }
-                if peer_id == self.relay_peer {
-                    self.relay_backoff = RELAY_BACKOFF_MIN;
+                if let Some(relay) = self.relays.iter_mut().find(|r| r.peer == peer_id) {
+                    relay.backoff = RELAY_BACKOFF_MIN;
                     let me = *self.swarm.local_peer_id();
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
                 } else if self.connected.insert(peer_id) {
@@ -2943,15 +3096,19 @@ impl Task {
                 if num_established > 0 {
                     return;
                 }
-                if peer_id == self.relay_peer {
+                if let Some(i) = self.relays.iter().position(|r| r.peer == peer_id) {
                     // The reservation went with the connection (e.g. the relay
-                    // restarted): ask for a new one once we're back.
-                    info!("relay connection lost");
-                    self.relay_lost();
-                    if let Some(id) = self.circuit.take() {
+                    // restarted): ask for a new one once we're back. "Down" for
+                    // the member relay fallback only once all our relays are.
+                    info!(relay = i, "relay connection lost");
+                    if let Some(id) = self.relays[i].circuit.take() {
                         self.swarm.remove_listener(id);
                     }
-                    self.relay_next_dial = Instant::now() + jittered(self.relay_backoff, OsRng.next_u32());
+                    let relay = &mut self.relays[i];
+                    relay.next_dial = Instant::now() + jittered(relay.backoff, OsRng.next_u32());
+                    if self.relays_connected().is_empty() {
+                        self.relay_lost();
+                    }
                 }
                 if self.connected.remove(&peer_id) {
                     info!(%peer_id, "peer disconnected");
@@ -2969,11 +3126,11 @@ impl Task {
                 self.queued_pulls.remove(&peer_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                if peer_id == self.relay_peer {
+                if let Some(i) = self.relays.iter().position(|r| r.peer == peer_id) {
                     // Relay circuit as a fallback for peers that can't reach us
                     // directly (NAT). On a LAN the direct address wins.
-                    if self.circuit.is_none() {
-                        self.listen_on_circuit();
+                    if self.relays[i].circuit.is_none() {
+                        self.listen_on_circuit(i);
                     }
                 } else {
                     // Only addresses we would dial ourselves go into our DHT
@@ -2982,7 +3139,7 @@ impl Task {
                     let known: Vec<Multiaddr> = info
                         .listen_addrs
                         .iter()
-                        .filter(|a| self.reachable(a) && (via_relay(a, &self.relay_addr) || !a.iter().any(|p| p == Protocol::P2pCircuit)))
+                        .filter(|a| self.reachable(a) && (self.via_ours(a) || !a.iter().any(|p| p == Protocol::P2pCircuit)))
                         .cloned()
                         .collect();
                     for addr in known {
@@ -2997,19 +3154,19 @@ impl Task {
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. })) => {
-                if relay_peer_id != self.relay_peer {
+                let Some(i) = self.relays.iter().position(|r| r.peer == relay_peer_id) else {
                     // A member relay (slice 2): our circuit there is for members
                     // only, never announced (identify, DHT).
                     if !renewal {
                         debug!("reserved on a member relay");
                     }
                     return;
-                }
+                };
                 self.relay_back();
                 if !renewal {
                     // Reachable through the relay now: look for peers and catch
                     // up at once rather than at the next timer tick.
-                    info!("relay reservation accepted");
+                    info!(relay = i, "relay reservation accepted");
                     self.reached = true;
                     self.emit(NodeEvent::RelayReserved);
                     let me = *self.swarm.local_peer_id();
@@ -3018,7 +3175,7 @@ impl Task {
                     // an address the relay answers with its routing table's,
                     // which may not hold us. And the backups we hold are
                     // announced again (a restarted relay forgot them).
-                    self.swarm.add_external_address(self.relay_addr.clone().with(Protocol::P2pCircuit));
+                    self.swarm.add_external_address(self.relays[i].circuit_addr());
                     for tag in self.store.notice_tags().unwrap_or_default() {
                         self.provide_backup(tag);
                     }
@@ -3046,12 +3203,14 @@ impl Task {
             SwarmEvent::ListenerClosed { listener_id, .. } if self.member_listeners.contains_key(&listener_id) => {
                 self.member_listener_closed(listener_id);
             }
-            SwarmEvent::ListenerClosed { listener_id, .. } if self.circuit == Some(listener_id) => {
+            SwarmEvent::ListenerClosed { listener_id, .. } if self.relays.iter().any(|r| r.circuit == Some(listener_id)) => {
                 // Reservation refused or lost: the next discovery tick asks again.
-                self.circuit = None;
-                self.swarm.remove_external_address(&self.relay_addr.clone().with(Protocol::P2pCircuit));
+                let relay = self.relays.iter_mut().find(|r| r.circuit == Some(listener_id)).expect("just seen");
+                relay.circuit = None;
+                let circuit = relay.circuit_addr();
+                self.swarm.remove_external_address(&circuit);
             }
-            SwarmEvent::OutgoingConnectionError { connection_id, peer_id: Some(peer), error, .. } if peer != self.relay_peer => {
+            SwarmEvent::OutgoingConnectionError { connection_id, peer_id: Some(peer), error, .. } if !self.is_our_relay(&peer) => {
                 // Back off this peer, and forget circuit addresses that failed
                 // (a reservation that ended): the relay denies each such dial.
                 // A dial our own guard refused isn't a new failure.
@@ -3078,7 +3237,7 @@ impl Task {
             // serve (design #368 §1 rule 2), so it is taken out again at once.
             // A silently dead connection to our relay is closed after
             // RELAY_PING_MISSES failed pings, so the fallback clock starts.
-            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if peer == self.relay_peer => {
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { peer, connection, result })) if self.is_our_relay(&peer) => {
                 let misses = self.relay_ping_misses.entry(connection).or_insert(0);
                 if relay_ping(misses, result.is_ok()) {
                     self.relay_ping_misses.remove(&connection);
@@ -3087,13 +3246,22 @@ impl Task {
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
-                for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &self.relay_addr)) {
-                    // P0 on #416: our configured relay's own configured address
-                    // stays, DNS name or not (configured, not peer-learned):
-                    // without it the routing table is empty and nobody is found.
-                    if peer == self.relay_peer && is_configured_relay(addr, &self.relay_addr) {
-                        continue;
+                // One of our relays (any configured relay ID, Security Lead on
+                // part B): only its own configured address stays; every
+                // address learned for it from the DHT or a peer goes.
+                if let Some(relay) = self.relays.iter().find(|r| r.peer == peer) {
+                    let configured = relay.addr.clone();
+                    // Kept first: removing the last address drops the peer.
+                    if !addresses.iter().any(|a| is_configured_relay(a, &configured)) {
+                        self.swarm.behaviour_mut().kad.add_address(&peer, configured.clone());
                     }
+                    for addr in addresses.iter().filter(|a| !is_configured_relay(a, &configured)) {
+                        self.swarm.behaviour_mut().kad.remove_address(&peer, addr);
+                    }
+                    return;
+                }
+                let ours: Vec<Multiaddr> = self.relays.iter().map(|r| r.addr.clone()).collect();
+                for addr in addresses.iter().filter(|a| !crate::announce::announceable(a, &ours)) {
                     // Also any DNS name a peer gave (hickory-advisories): never
                     // stored, so never resolved or served to others.
                     if addr.iter().any(|p| p == Protocol::P2pCircuit) || has_dns(addr) {
@@ -3120,9 +3288,9 @@ impl Task {
                     // base can be a DNS name, or another port or transport).
                     let mut addrs: Vec<Multiaddr> = Vec::new();
                     for a in peer.addrs {
-                        let usable = if via_relay(&a, &self.relay_addr) {
+                        let usable = if self.via_ours(&a) {
                             Some(a)
-                        } else if let Some(rebuilt) = our_relay_circuit(&a, &self.relay_addr, &peer.peer_id) {
+                        } else if let Some(rebuilt) = self.rebuilt_circuit(&a, &peer.peer_id) {
                             Some(rebuilt)
                         } else {
                             (!self.relay_only && reachable(&a, false)).then_some(a)
@@ -3173,6 +3341,14 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::Voice(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "voice signal not delivered"),
+            SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            })) => self.on_typing(peer, request, channel),
+            SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::OutboundFailure {
+                peer, error, ..
+            })) => debug!(%peer, %error, "typing signal not delivered"),
             SwarmEvent::Behaviour(BehaviourEvent::InvitePub(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Request { request, channel, .. },
@@ -3843,13 +4019,17 @@ const MAX_LINK_PEERS: usize = 64;
 const LINK_REQUEST_WAIT: Duration = Duration::from_secs(20);
 
 impl Task {
-    /// Our relay circuit address, once the relay holds a reservation for us.
+    /// A relay circuit address of ours (the first relay holding a
+    /// reservation for us), for the QR.
     fn our_circuit(&self) -> Option<Multiaddr> {
-        let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit);
-        let reserved = self.circuit.is_some()
-            && self.swarm.is_connected(&self.relay_peer)
-            && self.swarm.external_addresses().any(|a| *a == circuit);
-        reserved.then(|| circuit.with(Protocol::P2p(*self.swarm.local_peer_id())))
+        let me = *self.swarm.local_peer_id();
+        self.relays.iter().find_map(|r| {
+            let circuit = r.circuit_addr();
+            let reserved = r.circuit.is_some()
+                && self.swarm.is_connected(&r.peer)
+                && self.swarm.external_addresses().any(|a| *a == circuit);
+            reserved.then(|| circuit.with(Protocol::P2p(me)))
+        })
     }
 
     fn link_open(&mut self, rv: [u8; 32], e_new_pub: [u8; 32]) -> Option<(PeerId, Multiaddr)> {
@@ -3918,7 +4098,7 @@ impl Task {
     }
 
     fn link_request(&mut self, peer: PeerId, request: LinkRequest, reply: LinkReply) {
-        if peer == *self.swarm.local_peer_id() || peer == self.relay_peer || self.link_waiting.len() >= MAX_LINK_WAITING {
+        if peer == *self.swarm.local_peer_id() || self.is_our_relay(&peer) || self.link_waiting.len() >= MAX_LINK_WAITING {
             let _ = reply.send(Err(LinkError::Network));
             return;
         }
@@ -3929,9 +4109,10 @@ impl Task {
         }
         self.link_waiting.push((peer, request, reply, Instant::now() + LINK_REQUEST_WAIT));
         if !self.relayed.contains_key(&peer) {
-            // Through our relay's circuit only, never an address from the DHT.
-            let circuit = self.relay_addr.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer));
-            let opts = DialOpts::peer_id(peer).addresses(vec![circuit]).condition(PeerCondition::Always).build();
+            // Through our relays' circuits only (each one we are connected
+            // to), never an address from the DHT.
+            let circuits = self.circuits_to(peer);
+            let opts = DialOpts::peer_id(peer).addresses(circuits).condition(PeerCondition::Always).build();
             if let Err(err) = self.swarm.dial(opts) {
                 debug!(%peer, ?err, "device link: dialling the circuit failed");
             }
@@ -4857,6 +5038,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let config = || NodeConfig {
             relay: format!("/ip4/127.0.0.1/tcp/9/p2p/{}", PeerId::random()).parse().unwrap(),
+            more_relays: vec![],
             data_dir: dir.clone(),
             logs: Vec::new(),
             authorizer: Arc::new(AcceptAll),
@@ -4899,6 +5081,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let config = NodeConfig {
             relay: format!("/ip4/127.0.0.1/tcp/9/p2p/{}", PeerId::random()).parse().unwrap(),
+            more_relays: vec![],
             data_dir: dir,
             logs: Vec::new(),
             authorizer: Arc::new(AcceptAll),
@@ -5201,6 +5384,7 @@ mod tests {
         let config = NodeConfig {
             // Nothing listens there: no relay in this test.
             relay: format!("/ip4/127.0.0.1/tcp/9/p2p/{}", PeerId::random()).parse().unwrap(),
+            more_relays: vec![],
             data_dir: dir,
             logs: Vec::new(),
             authorizer: Arc::new(AcceptAll),
@@ -5648,7 +5832,7 @@ mod tests {
     async fn the_relay_can_be_dialled_over_wss() {
         let mut swarm = build_swarm(
             identity::Keypair::generate_ed25519(),
-            "/ip4/1.2.3.4/tcp/1".parse().unwrap(),
+            vec!["/ip4/1.2.3.4/tcp/1".parse().unwrap()],
             Arc::new(Mutex::new(DialBackoff::new(DIAL_BACKOFF_MIN, DIAL_BACKOFF_MAX, 4))),
             false,
         ).await.unwrap();
@@ -5669,6 +5853,7 @@ mod tests {
             NodeConfig {
                 // Nothing listens there: no relay in this test.
                 relay: format!("/ip4/127.0.0.1/tcp/9/p2p/{}", PeerId::random()).parse().unwrap(),
+                more_relays: vec![],
                 data_dir: dir,
                 logs: vec![chan()],
                 authorizer: Arc::new(AcceptAll),

@@ -27,6 +27,10 @@ const { createNotifier } = require('./notify');
 const ptt = require('./ptt');
 const badge = require('./badge');
 const applock = require('./applock');
+const demo = require('./demo');
+
+/** T8-04: the mock demo (MVS_DEMO), checkout only; null otherwise. */
+const DEMO = demo.demoFor({ packaged: app.isPackaged, env: process.env });
 
 // Tests only, and only in a checkout (never a release build): a throwaway
 // profile, so a test run never shares the installed app's profile
@@ -34,6 +38,10 @@ const applock = require('./applock');
 // lock below, which lives in the profile.
 if (!app.isPackaged && process.env.MVS_TEST_USER_DATA && path.isAbsolute(process.env.MVS_TEST_USER_DATA)) {
   app.setPath('userData', process.env.MVS_TEST_USER_DATA);
+} else if (DEMO) {
+  // T8-04: the demo's mock keeps its state in its own profile, never in the
+  // checkout's real one (localStorage, logs).
+  app.setPath('userData', demo.demoProfile(app.getPath('userData')));
 }
 
 // One instance only: a second launch (e.g. an mvs:// link, B1-3) focuses this one.
@@ -133,7 +141,10 @@ function syncCall() {
  * (gated like A).
  */
 const appLock = applock.createAppLock({
-  request: (cmd, args) => (core ? core.request(cmd, args) : Promise.resolve({ error: { code: 'core-unavailable' } })),
+  // T8-04: the demo has no core and no data; its lock is off.
+  request: DEMO
+    ? async (cmd) => (cmd === 'getAppLock' ? { ok: { enabled: false } } : { error: { code: 'demo' } })
+    : (cmd, args) => (core ? core.request(cmd, args) : Promise.resolve({ error: { code: 'core-unavailable' } })),
   inCall: () => callGate.inCall,
   onChange: onLockChange,
 });
@@ -150,7 +161,7 @@ function lockPayload() {
 function pageQuery(st) {
   if (st.pending) return '?locked=pending';
   if (st.locked && st.path === 'A') return '?locked';
-  return !app.isPackaged && process.env.MVS_DEMO ? `?demo=${encodeURIComponent(process.env.MVS_DEMO)}` : '';
+  return DEMO ? `?demo=${encodeURIComponent(DEMO)}` : '';
 }
 
 function onLockChange(st) {
@@ -233,6 +244,10 @@ function sendMetered() {
 const UPDATE = update.resolveUpdate({ packaged: app.isPackaged, execPath: process.execPath, argv: process.argv });
 
 function startCore() {
+  if (DEMO) {
+    log('demo (MVS_DEMO): no core; the page runs on the mock');
+    return;
+  }
   if (!CORE_EXE || !path.isAbsolute(CORE_EXE) || !fs.existsSync(CORE_EXE)) {
     log('mvs-core not found; core commands answer core-unavailable');
     setCoreStatus({ state: 'down', detail: 'missing' });
@@ -282,6 +297,8 @@ function serveCoreIpc() {
     const frame = event.senderFrame;
     // Only our own page, top frame, may ask.
     if (!frame || frame !== event.sender.mainFrame || !sec.isInternalUrl(frame.url)) return { error: { code: 'not-allowed' } };
+    // T8-04: no core in the demo (the preload doesn't offer invoke either).
+    if (DEMO) return { error: { code: 'demo' } };
     const req = toRequest(cmd, args);
     if (req.error) return { error: { code: req.error } };
     // G-78: while locked, only what the lock screen (and a call behind it) needs.
@@ -330,7 +347,7 @@ function serveCoreIpc() {
   };
   let lastRetry = 0;
   ipcMain.handle('core:retry', (event) => {
-    if (!fromUs(event)) return false;
+    if (!fromUs(event) || DEMO) return false;
     // At most once every 5 s, whatever the page does.
     if (Date.now() - lastRetry < 5000) return false;
     lastRetry = Date.now();
@@ -615,7 +632,13 @@ function createWindow() {
     minHeight: 480,
     show: false,
     backgroundColor: '#1e1f22',
-    webPreferences: { ...sec.WEB_PREFERENCES, preload: path.join(__dirname, 'preload.js'), devTools: !app.isPackaged },
+    webPreferences: {
+      ...sec.WEB_PREFERENCES,
+      preload: path.join(__dirname, 'preload.js'),
+      devTools: !app.isPackaged,
+      // T8-04: tells the preload to leave invoke out (checkout only).
+      ...(DEMO ? { additionalArguments: [demo.DEMO_ARG] } : {}),
+    },
   });
   win.once('ready-to-show', () => win.show());
   // The title bar shows maximize or restore, and hides in fullscreen.

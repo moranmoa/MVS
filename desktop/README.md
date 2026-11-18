@@ -22,8 +22,14 @@ docker compose run --rm test
 ```
 
 On a machine with Node: `npm ci && npm start`. `MVS_CORE_PATH=<absolute path to mvs-core>`
-runs the real core (otherwise core commands answer `core-unavailable`);
-`MVS_DEMO=1` opens the mock demo.
+runs the real core (otherwise core commands answer `core-unavailable`).
+
+`MVS_DEMO=1` (or `unchecked`) opens the UI's mock demo with sample servers
+(T8-04, `src/demo.js`): no core is started, even with `MVS_CORE_PATH` set; the
+page gets no `window.mvs.invoke`, so the UI picks its mock; main refuses
+`core:invoke` and the app lock is off. Notifications, the taskbar count,
+push-to-talk and the clipboard still go through the shell. Checkout only: a
+packaged build ignores it.
 
 ## Security settings and where they are tested
 
@@ -39,7 +45,7 @@ runs the real core (otherwise core commands answer `core-unavailable`);
 | Navigation and redirects off `app://mvs` blocked; `<webview>` attachment blocked | `will-navigate`, `will-redirect`, `will-attach-webview` | e2e |
 | No permissions (microphone, notifications, devices, screen capture) | `setPermissionRequestHandler` / `CheckHandler`, `setDevicePermissionHandler`, `setDisplayMediaRequestHandler` | unit + e2e |
 | Crash reporter on with uploads off | `crashReporter.start({ uploadToServer: false })` | – |
-| No default menu and `devTools: false` in packaged builds (and no `devtools://` requests); `MVS_UI_DIR` and `MVS_DEMO` only in a checkout; the link dialog shows the parsed URL (punycode) | `main.js` | – (B1-3, packaged build) |
+| No default menu and `devTools: false` in packaged builds (and no `devtools://` requests); `MVS_UI_DIR` and `MVS_DEMO` only in a checkout; the link dialog shows the parsed URL (punycode) | `main.js`, `src/demo.js` | unit (`demoFor` ignores `MVS_DEMO` when packaged) + e2e (demo: no core, no `invoke`) |
 
 ## Core bridge (B1-2)
 

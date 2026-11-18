@@ -20,9 +20,13 @@ ipcRenderer.on('core:event', (_e, name, payload) => {
   for (const cb of listeners) cb(name, payload);
 });
 
+// T8-04: in the checkout demo (main adds this argument only then) the page
+// gets no `invoke`, so the UI runs on its mock; main refuses core:invoke too.
+const DEMO = Array.isArray(process.argv) && process.argv.includes('--mvs-demo');
+
 contextBridge.exposeInMainWorld('mvs', {
   /** Resolves with { ok } or { error: { code, positions? } }. */
-  invoke: (cmd, args) => ipcRenderer.invoke('core:invoke', String(cmd), Array.isArray(args) ? args : []),
+  ...(DEMO ? {} : { invoke: (cmd, args) => ipcRenderer.invoke('core:invoke', String(cmd), Array.isArray(args) ? args : []) }),
   /**
    * Calls back with (eventName, payload) for every core event, plus
    * `link.open` { link } when the OS opens an mvs:// invite. Returns an

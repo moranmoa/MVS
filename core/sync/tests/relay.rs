@@ -13,8 +13,8 @@ use libp2p::{
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
 use sync::{
-    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, VoiceError,
-    MAX_VOICE_BLOB,
+    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, TypingError, VoiceError,
+    MAX_TYPING_BLOB, MAX_VOICE_BLOB,
 };
 use tokio::sync::mpsc;
 
@@ -182,6 +182,7 @@ async fn node_lan(name: &str, relay: &Multiaddr, allow_lan: bool) -> (Node, mpsc
     let _ = std::fs::remove_dir_all(&dir);
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir,
         logs: vec![log_name(server, Scope::Channel(channel))],
         authorizer: Arc::new(AcceptAll),
@@ -369,6 +370,7 @@ async fn bound_node_on_events(
     let _ = std::fs::remove_dir_all(&dir);
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir,
         logs: vec![],
         authorizer: Arc::new(AcceptAll),
@@ -758,6 +760,49 @@ async fn the_voice_rate_cap_holds() {
     assert!(got.len() >= 20, "only {} arrived", got.len());
     assert!(got.len() <= allowed, "{} arrived, at most {allowed} allowed", got.len());
     assert!(got.iter().all(|(from, _)| *from == voice_id(25)));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// G-29: `/mvs/typing/1` between members through the relay, with its own
+/// caps (a burst of 3, then one every 2 s), never arriving as voice; a
+/// non-member's is dropped and none go to one; 512 bytes at most.
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_signals_go_between_members_with_their_own_caps() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    let (a, _ea) = bound_node_events("typing-a", &relay, 27, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("typing-b", &relay, 28, false, Arc::new(gate.clone())).await;
+    voice_meet(&a, &b, voice_id(27), voice_id(28), false).await;
+
+    let start = Instant::now();
+    for n in 0..10u8 {
+        a.typing_send(voice_id(28), vec![n; MAX_TYPING_BLOB]).await.unwrap();
+    }
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        match event {
+            NodeEvent::TypingSignal { from, bytes } => got.push((from, bytes)),
+            NodeEvent::VoiceSignal { .. } => panic!("typing arrived as voice"),
+            _ => {}
+        }
+    }
+    let allowed = 3 + (start.elapsed().as_secs_f64() / 2.0).ceil() as usize;
+    assert!(got.len() >= 3 && got.len() <= allowed, "{} arrived, {allowed} allowed", got.len());
+    assert!(got.iter().all(|(from, bytes)| *from == voice_id(27) && bytes.len() == MAX_TYPING_BLOB));
+    assert_eq!(a.typing_send(voice_id(28), vec![0; MAX_TYPING_BLOB + 1]).await, Err(TypingError::TooLarge));
+    assert_eq!(a.typing_send(voice_id(99), b"x".to_vec()).await, Err(TypingError::NotMember));
+
+    // Not a member to B: dropped there, and B sends it none.
+    gate.set(voice_id(27), true);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    a.typing_send(voice_id(28), b"from a non-member".to_vec()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        assert!(!matches!(event, NodeEvent::TypingSignal { .. }), "a non-member's typing arrived");
+    }
+    assert_eq!(b.typing_send(voice_id(27), b"to a non-member".to_vec()).await, Err(TypingError::NotMember));
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
@@ -1187,6 +1232,7 @@ async fn node_events(name: &str, relay: &Multiaddr) -> (Node, mpsc::Receiver<Nod
     let _ = std::fs::remove_dir_all(&dir);
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir,
         logs: vec![],
         authorizer: Arc::new(AcceptAll),
@@ -1465,6 +1511,7 @@ async fn member_in(name: &str, relay: &Multiaddr, key: u8, wipe: bool) -> (Node,
     }
     let config = NodeConfig {
         relay: relay.clone(),
+        more_relays: vec![],
         data_dir: dir.clone(),
         logs: vec![],
         authorizer: Arc::new(AcceptAll),
@@ -1689,6 +1736,82 @@ async fn members_meet_through_a_relay_named_by_dns() {
         assert!(start.elapsed() < Duration::from_secs(60), "members never met through a DNS-named relay");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    for node in [a, b] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Multi-relay part B: two members, each configured with both of our
+/// relays and relay-only (so every path is a relay circuit), meet; when the
+/// first relay goes away they meet again through the second, with no
+/// member relay involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_keep_meeting_when_one_of_two_relays_dies() {
+    let _ = tracing_subscriber::fmt().with_env_filter("sync=debug").with_test_writer().try_init();
+    let mut relays = Vec::new();
+    let mut handles = Vec::new();
+    let mut counts = Vec::new();
+    for _ in 0..2 {
+        let key = identity::Keypair::generate_ed25519();
+        let port = free_port();
+        relays.push(format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(key.public())).parse::<Multiaddr>().unwrap());
+        let circuits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        handles.push(start_relay_counting(key, port, circuits.clone(), true));
+        counts.push(circuits);
+    }
+    let member = |name: &'static str, key: u8| {
+        let relays = relays.clone();
+        async move {
+            let (server, channel) = test_server();
+            let dir = std::env::temp_dir().join(format!("sync-relay-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let config = NodeConfig {
+                relay: relays[0].clone(),
+                more_relays: relays[1..].to_vec(),
+                data_dir: dir,
+                logs: vec![],
+                authorizer: Arc::new(AcceptAll),
+                listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+                bootstrap: vec![],
+                allow_lan: false,
+                relay_only: true,
+            };
+            let access = Access {
+                binder: Some(Arc::new(SigningKey::from_bytes(&[key; 32]))),
+                read_gate: Some(Arc::new(AcceptAll)),
+                ..Access::default()
+            };
+            let (node, _events) = Node::start_with(config, access).await.unwrap();
+            node.open_server(server, ServerSecret::from_bytes([42; 32])).unwrap();
+            node.open_channel(server, channel).await.unwrap();
+            node
+        }
+    };
+    let a = member("multi-a", 81).await;
+    let b = member("multi-b", 82).await;
+    let meet = |deadline: Duration| {
+        let (a, b) = (&a, &b);
+        async move {
+            let start = Instant::now();
+            while !a.peers().await.unwrap().contains(&b.peer_id()) {
+                assert!(start.elapsed() < deadline, "the members never met");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    meet(Duration::from_secs(60)).await;
+    // The first relay goes away: they meet again through the second.
+    handles.remove(0).abort();
+    let start = Instant::now();
+    while a.peers().await.unwrap().contains(&b.peer_id()) && start.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    meet(Duration::from_secs(90)).await;
+    let ids = [a.peer_id(), b.peer_id()];
+    assert!(
+        counts[1].lock().unwrap().iter().any(|(p, ok)| *ok && ids.contains(p)),
+        "the second relay carried no circuit between them"
+    );
     for node in [a, b] {
         node.shutdown().await.unwrap();
     }

@@ -10,6 +10,8 @@ import { CloseIcon, CloudIcon, LinkIcon } from '../../components/icons';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
 import { nameSkeleton } from '../../core/sanitize';
+import { memberMatcher, SEARCH_FROM } from './memberMatch';
+import { MemberSearchField } from './MemberSearch';
 
 const NO_MEMBERS: Member[] = [];
 
@@ -100,11 +102,19 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
       : []),
   ];
 
+  // G-41: a search field from 15 members; cleared on switching server.
+  const searchable = members.length >= SEARCH_FROM;
+  const [query, setQuery] = useState('');
+  useEffect(() => setQuery(''), [server.id]);
+  const q = searchable ? query : '';
+  const listId = useId();
+
   const [online, offline] = useMemo(() => {
     const collator = new Intl.Collator(intl.locale);
-    const sorted = [...members].sort((a, b) => collator.compare(displayName(a), displayName(b)));
+    const match = memberMatcher(q);
+    const sorted = members.filter(match).sort((a, b) => collator.compare(displayName(a), displayName(b)));
     return [sorted.filter((m) => m.presence === 'online'), sorted.filter((m) => m.presence === 'offline')];
-  }, [members, intl.locale]);
+  }, [members, intl.locale, q]);
 
   const open = members.find((m) => m.id === openId);
   const flagged = useMemo(() => lookalikeIds(members), [members]);
@@ -193,8 +203,11 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
           </button>
         </header>
       )}
-      {group(online, 'members.online')}
-      {group(offline, 'members.offline')}
+      {searchable && <MemberSearchField query={query} onQuery={setQuery} results={online.length + offline.length} listId={listId} />}
+      <div id={listId}>
+        {group(online, 'members.online')}
+        {group(offline, 'members.offline')}
+      </div>
       {open && (
         <ProfileCard
           key={`${open.id}-${kickId === open.id}`}
@@ -287,7 +300,17 @@ export function ProfileCard({
         )}
         {!isMe && !member.blocked && !confirmKick && (
           <p className="muted small">
-            <FormattedMessage id="profile.blockHint" />
+            <FormattedMessage id="profile.blockHint" />{' '}
+            <button
+              type="button"
+              className="link"
+              onClick={() => {
+                onClose();
+                store.openSettings('blocked');
+              }}
+            >
+              <FormattedMessage id="profile.blockedListLink" />
+            </button>
           </p>
         )}
         {confirmKick && (

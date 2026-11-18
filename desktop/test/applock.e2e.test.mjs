@@ -40,7 +40,7 @@ const sent = () =>
 before(async () => {
   mkdirSync(CORE_DIR, { recursive: true });
   writeFileSync(join(CORE_DIR, 'fake-applock.json'), JSON.stringify({ enabled: true, idleMinutes: 5, lockOnSleep: true }));
-  app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_DEMO: '1', MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
+  app = await electron.launch({ args: ['.'], env: { ...process.env, MVS_CORE_PATH: FAKE_CORE, MVS_TEST_USER_DATA: PROFILE } });
   page = await app.firstWindow();
   await page.waitForLoadState('domcontentloaded');
 });
@@ -123,4 +123,7 @@ test('Ctrl+L locks; a call keeps the page (path B) with the mic off and only cal
   assert.ok(await until(async () => (await url()).endsWith('?locked')), await url());
   await page.waitForLoadState('domcontentloaded');
   assert.equal((await lockState()).path, 'A');
+  // V-C3: the lock's reloads keep the WebRTC IP policy (no local adapters).
+  const policy = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getWebRTCIPHandlingPolicy());
+  assert.equal(policy, 'default_public_and_private_interfaces');
 });

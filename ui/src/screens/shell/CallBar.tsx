@@ -8,6 +8,7 @@ import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { Dialog, Name } from '../../components/common';
+import { VoiceDiagnostics } from './VoiceDiagnostics';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
@@ -43,7 +44,9 @@ export function useCallEngine(myId: Id): CallEngine {
   const core = useCore();
   const call = useStore(store, (s) => s.call);
   const stunUrl = useStunUrl();
-  const view = useVoiceEngine(call, myId, { stunUrl });
+  // SL S1 (G-81): relay-only means no voice; the engine never starts a call then.
+  const relayOnly = useStore(store, (s) => s.relayOnly);
+  const view = useVoiceEngine(call, myId, { stunUrl, relayOnly });
   const sim = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('voiceSim') : null;
   const error = call && sim === 'noMic' ? 'no-device' : call && sim === 'rejoin' ? 'rejoin-to-talk' : view.error;
   const other = call?.participants.find((p) => p.identity !== myId)?.identity;
@@ -98,6 +101,7 @@ function useStunUrl(): string | null {
 }
 
 const NO_MEMBERS: Member[] = [];
+const noDiagnostics = async () => null;
 
 /** The short code the app shows for someone not (yet) in the member list. */
 export function codeOf(id: Id): string {
@@ -442,6 +446,8 @@ function VoiceSettings({
           <VolumeTicks />
         </fieldset>
       )}
+      {/* G-81: connection diagnostics (types and timings, never addresses). */}
+      <VoiceDiagnostics read={engine.diagnostics ?? noDiagnostics} names={Object.fromEntries(others.map((o) => [o.id, o.name]))} />
     </Dialog>
   );
 }

@@ -1,4 +1,4 @@
-//! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
+        Some(if self.cap_waiting(now) { age.min(17) } else { age })//! The core: `CoreCommands` from `ui/src/core/api.ts`, one method each.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -200,9 +200,35 @@ impl Profile {
     /// stands). A pending correction counts from the current date.
     fn effective_age(&self, now: u64) -> Option<u32> {
         let age = model::age_on(&self.birth_date, now)?;
-        let capped = self.raise_pending(now)
-            && self.pending_birth_date.as_ref().is_some_and(|p| !p.correction || p.capped);
-        Some(if capped { age.min(17) } else { age })
+        Some(if self.cap_waiting(now) { age.min(17) } else { age })
+    }
+
+    /// A restore's cap (at most 17) is still waiting at `now`: a restore-form
+    /// pending, or a correction made over one.
+    fn cap_waiting(&self, now: u64) -> bool {
+        self.raise_pending(now) && self.pending_birth_date.as_ref().is_some_and(|p| !p.correction || p.capped)
+    }
+
+    /// G-77: applies a correction already judged as `kind` (never
+    /// `too-young`). A raise waits until `effective_at` and keeps a waiting
+    /// restore cap. Same or lower: the date at once, but a waiting restore
+    /// cap stays until its own time, for the new date, so a lowering can't
+    /// lift it (Tech Lead on #512); cancel can't remove it (restore form).
+    fn correct(&mut self, kind: AgeCorrectionKind, date: &str, effective_at: u64, now: u64) {
+        let cap = self.cap_waiting(now);
+        if kind == AgeCorrectionKind::Raise {
+            self.pending_birth_date =
+                Some(PendingBirth { date: date.to_owned(), effective_at, correction: true, capped: cap });
+            return;
+        }
+        let until = self.pending_birth_date.as_ref().map_or(0, |p| p.effective_at);
+        self.birth_date = date.to_owned();
+        self.pending_birth_date = cap.then(|| PendingBirth {
+            date: date.to_owned(),
+            effective_at: until,
+            correction: false,
+            capped: false,
+        });
     }
 
     /// A pending raise whose 30 days are up takes effect: a correction's
@@ -2652,22 +2678,10 @@ impl Core {
             let preview = inner.age_correction(date, now)?;
             match preview.kind {
                 AgeCorrectionKind::TooYoung => return Err(ErrorCode::TooYoung.into()),
-                AgeCorrectionKind::Raise => {
-                    let effective_at = preview.effective_at.ok_or(ErrorCode::Internal)?;
-                    inner.update_profile_with(|p| {
-                        // A restore-form raise still waiting keeps its cap.
-                        let capped = p.raise_pending(now)
-                            && p.pending_birth_date.as_ref().is_some_and(|q| !q.correction || q.capped);
-                        p.pending_birth_date =
-                            Some(PendingBirth { date: date.to_owned(), effective_at, correction: true, capped });
-                    })?;
-                }
-                AgeCorrectionKind::Same | AgeCorrectionKind::Lower => {
-                    inner.update_profile_with(|p| {
-                        p.birth_date = date.to_owned();
-                        p.pending_birth_date = None;
-                    })?;
-                    if preview.kind == AgeCorrectionKind::Lower {
+                kind => {
+                    let effective_at = preview.effective_at.unwrap_or(0);
+                    inner.update_profile_with(|p| p.correct(kind, date, effective_at, now))?;
+                    if kind == AgeCorrectionKind::Lower {
                         inner.apply_lowered_age(ports, now, events)?;
                     }
                 }
@@ -3595,16 +3609,25 @@ impl Inner {
         if new < 16 {
             return Ok(plain(AgeCorrectionKind::TooYoung));
         }
-        let current = me.profile.effective_age(now).unwrap_or(0);
+        // By date, not by whole years: an earlier date that leaves my age the
+        // same today still makes me older sooner, so it's a raise and waits
+        // (Tech Lead on #512). Valid dates compare as strings.
         let key = me.key();
-        Ok(match new.cmp(&current) {
+        let waiting = me.profile.pending_birth_date.as_ref().filter(|p| p.correction && now < p.effective_at);
+        Ok(match date.cmp(me.profile.birth_date.as_str()) {
             std::cmp::Ordering::Equal => plain(AgeCorrectionKind::Same),
-            std::cmp::Ordering::Greater => AgeCorrectionPreview {
+            // The same raise again keeps its clock.
+            std::cmp::Ordering::Less if waiting.is_some_and(|p| p.date == date) => AgeCorrectionPreview {
+                kind: AgeCorrectionKind::Raise,
+                effective_at: waiting.map(|p| p.effective_at),
+                loses: Vec::new(),
+            },
+            std::cmp::Ordering::Less => AgeCorrectionPreview {
                 kind: AgeCorrectionKind::Raise,
                 effective_at: Some(now + AGE_RAISE_DELAY_MS),
                 loses: Vec::new(),
             },
-            std::cmp::Ordering::Less => AgeCorrectionPreview {
+            std::cmp::Ordering::Greater => AgeCorrectionPreview {
                 kind: AgeCorrectionKind::Lower,
                 effective_at: None,
                 loses: self.age_losses(key, new)?,
@@ -5753,6 +5776,37 @@ mod birth_date_tests {
         // An adult raising an adult age: no cap while it waits.
         let older = profile("1990-01-01", pending("1980-01-01", true, false));
         assert_eq!(older.effective_age(NOW), Some(36));
+    }
+
+    /// Tech Lead on #512: a lowering (or the same date) over a waiting
+    /// restore cap keeps the cap until its own time, for the new date; a
+    /// raise over it keeps it too. Without a cap, a lowering leaves nothing.
+    #[test]
+    fn a_restore_cap_survives_corrections() {
+        use crate::types::AgeCorrectionKind::{Lower, Raise, Same};
+        let until = NOW + AGE_RAISE_DELAY_MS;
+        // Restored as 1990 (capped at 17); "corrected" to 17 today, 18 tomorrow.
+        let mut p = profile("1990-01-01", pending("1990-01-01", false, false));
+        p.correct(Lower, "2008-11-04", 0, NOW);
+        assert_eq!(p.birth_date, "2008-11-04");
+        let kept = p.pending_birth_date.as_ref().unwrap();
+        assert_eq!((kept.effective_at, kept.correction), (until, false), "the cap stays, uncancellable");
+        assert_eq!(p.effective_age(NOW + 2 * 86_400_000), Some(17), "18 by date, still capped");
+        assert_eq!(p.effective_age(until), Some(18));
+
+        let mut same = profile("1990-01-01", pending("1990-01-01", false, false));
+        same.correct(Same, "1990-01-01", 0, NOW);
+        assert_eq!(same.effective_age(NOW), Some(17));
+
+        let mut raised = profile("1990-01-01", pending("1990-01-01", false, false));
+        raised.correct(Raise, "1980-01-01", NOW + 2 * AGE_RAISE_DELAY_MS, NOW);
+        assert!(raised.pending_birth_date.as_ref().unwrap().capped);
+        assert_eq!(raised.effective_age(NOW), Some(17));
+
+        let mut free = profile("1990-01-01", None);
+        free.correct(Lower, "2000-01-01", 0, NOW);
+        assert!(free.pending_birth_date.is_none());
+        assert_eq!(free.effective_age(NOW), Some(26));
     }
 
     /// Profiles saved before G-77 read their pending as the restore form.

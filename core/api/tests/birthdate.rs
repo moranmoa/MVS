@@ -46,9 +46,12 @@ fn same_raise_cancel_and_refusals() {
     let me = world.peer();
     sign_up(&me, "Me");
 
-    // Same age (another day of the same year): replaced at once.
-    let same = call(&me, "correctBirthDate", json!({ "date": "1990-06-01" })).unwrap();
+    // The same date: nothing to wait for. A later date (younger, even the
+    // same age today): a lowering, at once.
+    let same = call(&me, "correctBirthDate", json!({ "date": "1990-05-01" })).unwrap();
     assert_eq!(same, json!({ "kind": "same", "loses": [] }));
+    let later = call(&me, "correctBirthDate", json!({ "date": "1990-06-01" })).unwrap();
+    assert_eq!(later, json!({ "kind": "lower", "loses": [] }));
     assert_eq!(identity(&me).birth_date, "1990-06-01");
 
     // Older: a raise, pending for 30 days; the date stays until then.
@@ -62,6 +65,12 @@ fn same_raise_cancel_and_refusals() {
     let now = identity(&me);
     assert_eq!(now.birth_date, "1990-06-01");
     assert_eq!(now.pending_birth_date, Some(PendingBirthDate { date: "1980-01-01".into(), effective_at }));
+
+    // The same raise again keeps its clock.
+    *world.clock.0.lock().unwrap() += DAY_MS;
+    let again = me.core.correct_birth_date("1980-01-01").unwrap();
+    assert_eq!(again.effective_at, Some(effective_at));
+    assert_eq!(identity(&me).pending_birth_date.unwrap().effective_at, effective_at);
 
     // A new correction replaces it; cancelling drops it.
     me.core.correct_birth_date("1985-01-01").unwrap();
@@ -79,6 +88,30 @@ fn same_raise_cancel_and_refusals() {
         assert_eq!(call(&me, "correctBirthDate", json!({ "date": bad })).unwrap_err(), "bad-request", "{bad}");
     }
     assert_eq!(identity(&me).birth_date, "1990-06-01");
+}
+
+/// Tech Lead on #512: an earlier date that leaves my age the same today
+/// still makes me older sooner. It's a raise and waits 30 days, at the 18
+/// boundary as at any other.
+#[test]
+fn an_earlier_birthday_at_the_same_age_still_waits() {
+    let world = World::new();
+    let me = world.peer();
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "2009-01-01".into() };
+    let created = me.core.create_identity(input).unwrap();
+    let positions = me.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(me.core.check_recovery_words(answers).unwrap().ok);
+
+    // 17 either way today (2026-11-03); 18 on 2026-11-19 with the new date.
+    let preview = me.core.correct_birth_date("2008-11-19").unwrap();
+    assert_eq!(preview.kind, AgeCorrectionKind::Raise);
+    assert_eq!(preview.effective_at, Some(NOW_MS + 30 * DAY_MS));
+    assert_eq!(identity(&me).birth_date, "2009-01-01", "not until the 30 days");
+    // On the new 18th birthday, still 17: the wait isn't over.
+    *world.clock.0.lock().unwrap() += 17 * DAY_MS;
+    me.core.sync_now().unwrap();
+    assert_eq!(identity(&me).birth_date, "2009-01-01");
 }
 
 #[test]

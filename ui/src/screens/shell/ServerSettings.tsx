@@ -15,9 +15,10 @@ import { GearIcon, HashIcon, PlusIcon } from '../../components/icons';
 import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
 import { RemovedAccounts } from './RemovedAccounts';
+import { ReportsPage } from './Reports';
 
-export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'removed' | 'danger';
-const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'removed', 'danger'];
+export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'removed' | 'reports' | 'danger';
+const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'removed', 'reports', 'danger'];
 
 const NO_CHANNELS: Channel[] = [];
 const NO_MEMBERS: Member[] = [];
@@ -118,6 +119,7 @@ export function ServerSettings({
           {page === 'invite' && <InvitePage server={server} onOpenRemoved={() => choose('removed')} />}
           {page === 'members' && <MembersPage server={server} />}
           {page === 'removed' && <RemovedAccounts server={server} />}
+          {page === 'reports' && <ReportsPage server={server} />}
           {page === 'danger' && <ClosePanel server={server} />}
         </section>
       </div>

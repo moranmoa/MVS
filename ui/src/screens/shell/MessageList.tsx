@@ -37,6 +37,8 @@ interface Handlers {
   onEdit: (m: Message) => void;
   onDelete: (m: Message) => void;
   onRetry: (m: Message) => void;
+  /** G-48: report someone else's message to the owner and admins. */
+  onReport?: (m: Message) => void;
 }
 
 /** A calendar day in local time, to compare two messages. */
@@ -149,6 +151,9 @@ export function MessageList({
           },
           ...(m.authorId === myId ? [{ key: 'edit', label: intl.formatMessage({ id: 'chat.edit' }), onSelect: () => handlers.onEdit(m) }] : []),
           { kind: 'separator' },
+          ...(m.authorId !== myId && handlers.onReport
+            ? [{ key: 'report', label: intl.formatMessage({ id: 'report.action' }), onSelect: () => handlers.onReport?.(m) }]
+            : []),
           ...(m.authorId === myId || isOwner
             ? [{ key: 'delete', label: intl.formatMessage({ id: 'chat.delete' }), danger: true, onSelect: () => handlers.onDelete(m) }]
             : []),

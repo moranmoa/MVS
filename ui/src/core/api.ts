@@ -14,6 +14,11 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  ReportEvidence,
+  ReportReason,
+  ReportReceipt,
+  ReportSummary,
+  ReportTargetInput,
   JoinStatus,
   Member,
   Message,
@@ -164,6 +169,22 @@ export interface CoreCommands {
    * (it isn't made a member). `not-allowed` for anyone else or someone not removed.
    */
   undoKick(serverId: Id, userId: Id): Promise<void>;
+  /**
+   * G-48 (core #515): reports a message or member to the server's owner and
+   * admins, signed by me. `text`: one line, up to 280 characters. Errors:
+   * bad-request, not-found, not-allowed (myself, or not a member),
+   * rate-limited, already-reported (30 days), no-recipient. Then report.status.
+   */
+  reportContent(serverId: Id, target: ReportTargetInput, reason: ReportReason, text?: string): Promise<ReportReceipt>;
+  /** G-48: owner and admins only (not-allowed otherwise): the reports I hold, newest first. */
+  listReports(serverId: Id): Promise<ReportSummary[]>;
+  /** G-48: my own triage, on this device only. */
+  dismissReport(reportId: Id): Promise<null>;
+  /**
+   * G-48: the reported message, on an explicit click only. not-allowed for
+   * reasons 5 and 6 without an 18+ claim; bad-request when it doesn't check out.
+   */
+  getReportEvidence(reportId: Id): Promise<ReportEvidence>;
   // Device link (device-link-slice.md)
   /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
   startDeviceLink(): Promise<DeviceLinkOffer>;
@@ -245,6 +266,10 @@ export interface CoreEvents {
   'channel.added': Channel;
   'channel.removed': { serverId: Id; channelId: Id; name: string };
   'members.changed': { serverId: Id; members: Member[] };
+  /** G-48: a report reached me as staff. Never carries the evidence. */
+  'report.received': { serverId: Id; report: ReportSummary };
+  /** G-48: my report's delivery: staff who have it, and who it still waits for. */
+  'report.status': { reportId: Id; delivered: number; pending: number };
   'message.added': Message;
   'message.updated': Message;
   'join.status': JoinStatus;

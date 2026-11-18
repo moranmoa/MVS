@@ -937,9 +937,10 @@ impl Core {
                 continue;
             }
             let fetched = self.open_and_fetch(server, &secret);
-            // Without the genesis the answer can't be judged (a partial
-            // fetch): "invalid" would only mean "not yet".
-            let judged = fetched.iter().any(|r| r.kind() == Kind::Genesis && r.scope() == Scope::Control);
+            // "Invalid" is final only with evidence in the log (Security Lead
+            // on #457): a partial log could otherwise drop a server I'm in.
+            let me = self.lock().me.as_ref().map(Me::key);
+            let judged = me.is_some_and(|me| removal_shown(server, me, &fetched));
             let status = self.run(|inner, ports, events| {
                 // No invite: a member I still am needs none; anyone else is
                 // refused by authority and nothing is stored or sent.
@@ -4838,14 +4839,28 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
 /// that server for good. Only a definite answer does:
 /// - `Joined`: it's back;
 /// - `Closed`: its owner closed it;
-/// - `Invalid` with the genesis in hand: kicked, or no longer a member, so
-///   authority refuses the join.
+/// - `Invalid` with evidence ([`removal_shown`]): the log shows an accepted
+///   kick or leave of me, so authority refuses the join.
 ///
 /// Anything else waits for the next try: `NobodyOnline`, `Searching`,
 /// `AgeBlocked` (it depends on whether the log shows me as a member, which
 /// a partial log can miss: Security Lead on #457),
-/// `Invalid` without the genesis (a partial fetch), and every error
+/// `Invalid` without that evidence (a partial log), and every error
 /// (locked, network, internal). One bad round never loses a server.
+/// G-91 (Security Lead on #457): whether the fetched log shows I left this
+/// server: an accepted kick of me, or an accepted leave of mine. Only then
+/// is a restore's "invalid" final; a log missing my join (or the kick)
+/// proves nothing, and the server waits for a fuller answer.
+fn removal_shown(server: ServerId, me: PublicKey, fetched: &[Record]) -> bool {
+    let log = Log::new(server, fetched.iter().cloned());
+    let Some(view) = ServerView::build(server, &log) else { return false };
+    if view.state.is_member(me) {
+        return false;
+    }
+    view.is_kicked(&me)
+        || log.records.iter().any(|r| r.kind() == Kind::Leave && r.author() == me && log.accepted(&r.id()))
+}
+
 fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
     match status {
         Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,

@@ -32,6 +32,7 @@ pub mod sidecar;
 pub mod syncnet;
 pub mod types;
 pub mod update;
+pub mod typing;
 mod voice;
 
 pub use access::{KeyBinder, MemberReadGate, MemberStubGate, BINDING_PREFIX};
@@ -50,6 +51,7 @@ pub use service::{
     SYNC_EVERY,
 };
 pub use types::*;
+pub use typing::TypingNet;
 pub use voice::{
     VoiceNet, CLOCK_WINDOW_MS, HELLO_EVERY_MS, HELLO_TIMEOUT_MS, MAX_PARTICIPANTS, MAX_PAYLOAD,
     SIGNAL_PREFIX,

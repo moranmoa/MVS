@@ -181,6 +181,14 @@ pub struct Message {
     pub reactions: Option<Vec<ReactionCount>>,
 }
 
+/// `getSettings`: what the core keeps on this device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreSettings {
+    /// G-29: "Show others when I'm typing" (default on).
+    pub typing_indicator: bool,
+}
+
 /// G-26: one emoji under a message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -519,6 +527,10 @@ pub enum Event {
     /// while I'm a member. A hint: `listVoiceRooms` re-reads it.
     #[serde(rename = "voice.rooms", rename_all = "camelCase")]
     VoiceRooms { server_id: Id, rooms: Vec<VoiceRoom> },
+    /// G-29: who is typing in a channel now (at most 5, by key), whenever
+    /// that changes; at most one per channel per tick. Empty: nobody.
+    #[serde(rename = "typing", rename_all = "camelCase")]
+    Typing { channel_id: Id, user_ids: Vec<Id> },
     /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
     #[serde(rename = "memberRelay.changed")]
     MemberRelayChanged(MemberRelay),

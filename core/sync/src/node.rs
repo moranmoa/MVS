@@ -57,6 +57,7 @@ use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
+use crate::typing::{TypingError, TypingLimits, MAX_TYPING_BLOB};
 use crate::voice::{VoiceError, VoiceLimits, MAX_VOICE_BLOB};
 use crate::{
     log_name, log_of, valid_log_name, Append, Authorizer, ChannelId, NoStubs, Record, RecordId, Scope, ServerId, Store,
@@ -325,6 +326,9 @@ pub enum NodeEvent {
     /// `from` is the identity its peer is bound to. Ephemeral: never stored
     /// or forwarded. See `voice`.
     VoiceSignal { from: PublicKey, bytes: Vec<u8> },
+    /// G-29: a typing signal (`/mvs/typing/1`) from a verified current
+    /// member, as [`NodeEvent::VoiceSignal`]. Ephemeral. See `typing`.
+    TypingSignal { from: PublicKey, bytes: Vec<u8> },
     /// An invite publication (`/mvs/invite-pub/1`) from a verified current
     /// member of `server`, `from` its identity. Opaque here: the api
     /// verifies it (C1) and calls [`Node::serve_invite`] if it holds.
@@ -397,6 +401,7 @@ enum Command {
     Disconnect { peer: PeerId },
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
+    TypingSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), TypingError>> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
     DropServerInvites { server: ServerId },
@@ -505,6 +510,8 @@ struct Behaviour {
     punch: crate::punch::MemberPunch,
     /// Voice signalling (`/mvs/voice/1`), with verified members only (`voice`).
     voice: crate::voice::VoiceBehaviour,
+    /// G-29 typing (`/mvs/typing/1`), with verified members only (`typing`).
+    typing: crate::typing::TypingBehaviour,
     /// Invite publications between members (`/mvs/invite-pub/1`).
     invite_pub: crate::invite::PublishBehaviour,
     /// Envelope asks, from anyone (`/mvs/invite/1`).
@@ -777,6 +784,7 @@ impl Node {
             started: Instant::now(),
             pending_stubs: HashMap::new(),
             voice_limits: VoiceLimits::new(),
+            typing_limits: TypingLimits::new(),
             invites: HashMap::new(),
             invite_limits: InviteLimits::new(),
             fetches: HashMap::new(),
@@ -1014,6 +1022,17 @@ impl Node {
         let (reply, rx) = oneshot::channel();
         self.send(Command::VoiceSend { to, bytes, reply }).map_err(|_| VoiceError::Stopped)?;
         rx.await.map_err(|_| VoiceError::Stopped)?
+    }
+
+    /// G-29: sends one typing signal (at most [`MAX_TYPING_BLOB`] bytes) to
+    /// the peer bound to `to`, as [`Node::voice_send`]. Best effort.
+    pub async fn typing_send(&self, to: PublicKey, bytes: Vec<u8>) -> Result<(), TypingError> {
+        if bytes.len() > MAX_TYPING_BLOB {
+            return Err(TypingError::TooLarge);
+        }
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::TypingSend { to, bytes, reply }).map_err(|_| TypingError::Stopped)?;
+        rx.await.map_err(|_| TypingError::Stopped)?
     }
 
     /// Serves `publication` under the envelope handle `handle` for
@@ -1278,6 +1297,7 @@ async fn build_swarm(
                 member_relay: crate::member_relay::MemberRelay::new(peer_id),
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
+                typing: crate::typing::behaviour(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
                 backup: crate::backup::behaviour(),
@@ -1500,6 +1520,8 @@ struct Task {
     stub_gate: Arc<dyn StubGate>,
     /// Caps on accepted voice signals.
     voice_limits: VoiceLimits,
+    /// G-29: caps on accepted typing signals (their own, not voice's).
+    typing_limits: TypingLimits,
     /// T8-02: envelope handle → the server and publication we serve.
     invites: HashMap<[u8; 32], (ServerId, Vec<u8>)>,
     invite_limits: InviteLimits,
@@ -1759,6 +1781,9 @@ impl Task {
             Command::VoiceSend { to, bytes, reply } => {
                 let _ = reply.send(self.voice_send(to, bytes));
             }
+            Command::TypingSend { to, bytes, reply } => {
+                let _ = reply.send(self.typing_send(to, bytes));
+            }
             Command::ServeInvite { server, handle, publication, announce, reply } => {
                 let _ = reply.send(self.serve_invite(server, handle, publication, announce));
             }
@@ -1955,6 +1980,14 @@ impl Task {
         if bytes.len() > MAX_VOICE_BLOB {
             return Err(VoiceError::TooLarge);
         }
+        let peer = self.member_peer(to).ok_or(VoiceError::NotMember)?;
+        self.swarm.behaviour_mut().voice.send_request(&peer, bytes);
+        Ok(())
+    }
+
+    /// A connected peer bound to `to` as a current member, a direct one
+    /// first (voice and typing).
+    fn member_peer(&self, to: PublicKey) -> Option<PeerId> {
         let mut peers: Vec<PeerId> = self
             .bound
             .iter()
@@ -1964,10 +1997,31 @@ impl Task {
             .collect();
         peers.sort_by_key(|peer| (!self.direct.contains_key(peer), *peer));
         peers.dedup();
-        let peer =
-            peers.into_iter().find(|peer| self.member_identity(*peer) == Some(to)).ok_or(VoiceError::NotMember)?;
-        self.swarm.behaviour_mut().voice.send_request(&peer, bytes);
+        peers.into_iter().find(|peer| self.member_identity(*peer) == Some(to))
+    }
+
+    /// G-29: as [`Self::voice_send`], over `/mvs/typing/1`.
+    fn typing_send(&mut self, to: PublicKey, bytes: Vec<u8>) -> Result<(), TypingError> {
+        if bytes.len() > MAX_TYPING_BLOB {
+            return Err(TypingError::TooLarge);
+        }
+        let peer = self.member_peer(to).ok_or(TypingError::NotMember)?;
+        self.swarm.behaviour_mut().typing.send_request(&peer, bytes);
         Ok(())
+    }
+
+    /// G-29: as [`Self::on_voice`], with typing's own caps.
+    fn on_typing(&mut self, peer: PeerId, bytes: Vec<u8>, channel: ResponseChannel<()>) {
+        let Some(from) = self.member_identity(peer) else {
+            debug!(%peer, "typing signal from a non-member dropped");
+            return;
+        };
+        if !self.typing_limits.allow(peer, Instant::now()) {
+            debug!(%peer, "typing signal over the rate cap dropped");
+            return;
+        }
+        let _ = self.swarm.behaviour_mut().typing.send_response(channel, ());
+        self.emit(NodeEvent::TypingSignal { from, bytes });
     }
 
     /// A voice signal came in: only a current member's, within its rate
@@ -3173,6 +3227,14 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::Voice(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "voice signal not delivered"),
+            SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            })) => self.on_typing(peer, request, channel),
+            SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::OutboundFailure {
+                peer, error, ..
+            })) => debug!(%peer, %error, "typing signal not delivered"),
             SwarmEvent::Behaviour(BehaviourEvent::InvitePub(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Request { request, channel, .. },

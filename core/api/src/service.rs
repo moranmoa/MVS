@@ -15,6 +15,7 @@ use records::{ChannelId, Draft, Kind, PublicKey, Record, RecordId, Scope, Server
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::applock;
 use crate::avatar;
 use crate::backup;
 use crate::devicelink::{self, OneTimeKey, Target};
@@ -386,6 +387,9 @@ pub struct Core {
     /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
     /// waits, holding no server secrets.
     keys_locked: AtomicBool,
+    /// G-78: app-lock attempts run one at a time, so the counter can't be
+    /// raced past its delay.
+    app_lock_gate: Mutex<()>,
 }
 
 /// G-91: a restore's progress. The backup is fetched until found (with
@@ -592,6 +596,7 @@ impl Core {
             buddies_checked: Mutex::new(None),
             restore: Mutex::new(RestoreProgress::new(restore_state)),
             keys_locked: AtomicBool::new(false),
+            app_lock_gate: Mutex::new(()),
         })
     }
 
@@ -5141,6 +5146,185 @@ fn unlock_cipher(ports: &Ports, me: Option<&Me>) {
 }
 
 /// A join status's name for the join log (no link, no IDs).
+/// G-78: the app lock's settings and verifier, and its attempt counter.
+const KV_APP_LOCK: &str = "app-lock";
+const KV_APP_LOCK_ATTEMPTS: &str = "app-lock-attempts";
+
+/// G-78: what a passcode or words attempt checks, run outside the core lock
+/// (Argon2id takes 19 MiB and some tens of ms).
+enum LockCheck {
+    /// Against the stored verifier.
+    Passcode(Zeroizing<String>),
+    /// The 12 words against my identity (the restore check).
+    Words(Zeroizing<String>),
+}
+
+impl Core {
+    /// G-78 `getAppLock`: the settings, never the verifier or the salt.
+    pub fn get_app_lock(&self) -> CoreResult<AppLock> {
+        let now = self.ports.clock.now_ms();
+        let inner = self.lock();
+        let stored = app_lock_stored(&inner.db)?;
+        let wait = app_lock_attempts(&inner.db)?.wait_ms(now);
+        Ok(AppLock {
+            // Any record counts, readable or not: an unreadable one is a lock
+            // that no passcode opens (Security Lead on #476), never "off".
+            enabled: app_lock_present(&inner.db)?,
+            method: stored.as_ref().map_or(AppLockMethod::Passcode, |s| s.method),
+            idle_minutes: stored.as_ref().map_or(applock::DEFAULT_IDLE_MINUTES, |s| s.idle_minutes),
+            lock_on_sleep: stored.as_ref().is_none_or(|s| s.lock_on_sleep),
+            retry_after: wait.map(applock::retry_after_secs),
+        })
+    }
+
+    /// G-78 `verifyAppLock`. With no lock set there's nothing to check: `ok`.
+    pub fn verify_app_lock(&self, passcode: Zeroizing<String>) -> CoreResult<AppLockAnswer> {
+        let _gate = self.app_lock_gate.lock().expect("not poisoned");
+        if !app_lock_present(&self.lock().db)? {
+            return Ok(AppLockAnswer { result: AppLockResult::Ok, retry_after: None });
+        }
+        self.app_lock_attempt(LockCheck::Passcode(passcode))
+    }
+
+    /// G-78 `setAppLock`: a new passcode and settings. When a lock is set,
+    /// `current` must check out first (and counts as an attempt). A bad new
+    /// passcode or setting is `bad-request`, checked before anything counts.
+    pub fn set_app_lock(
+        &self,
+        current: Option<Zeroizing<String>>,
+        passcode: Zeroizing<String>,
+        method: AppLockMethod,
+        idle_minutes: u8,
+        lock_on_sleep: bool,
+    ) -> CoreResult<AppLockAnswer> {
+        if !applock::new_passcode_ok(&passcode) || !applock::IDLE_MINUTES.contains(&idle_minutes) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let _gate = self.app_lock_gate.lock().expect("not poisoned");
+        if app_lock_present(&self.lock().db)? {
+            let current = current.ok_or(ErrorCode::BadRequest)?;
+            let answer = self.app_lock_attempt(LockCheck::Passcode(current))?;
+            if answer.result != AppLockResult::Ok {
+                return Ok(answer);
+            }
+        }
+        let mut salt = [0u8; 16];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut salt);
+        let params = identity::LockParams::MIN;
+        // Argon2id outside the core lock.
+        let hash = identity::app_lock_verifier(&passcode, &salt, params).ok_or(ErrorCode::Internal)?;
+        let stored = applock::Stored {
+            v: 1,
+            salt: hex::encode(salt),
+            m_kib: params.m_kib,
+            t: params.t,
+            p: params.p,
+            hash: hex::encode(*hash),
+            method,
+            idle_minutes,
+            lock_on_sleep,
+        };
+        self.lock().db.set(KV_APP_LOCK, &serde_json::to_vec(&stored).expect("plain struct"))?;
+        Ok(AppLockAnswer { result: AppLockResult::Ok, retry_after: None })
+    }
+
+    /// G-78 `clearAppLock`: turns the lock off after `current` checks out.
+    pub fn clear_app_lock(&self, current: Zeroizing<String>) -> CoreResult<AppLockAnswer> {
+        let _gate = self.app_lock_gate.lock().expect("not poisoned");
+        if !app_lock_present(&self.lock().db)? {
+            return Ok(AppLockAnswer { result: AppLockResult::Ok, retry_after: None });
+        }
+        let answer = self.app_lock_attempt(LockCheck::Passcode(current))?;
+        if answer.result == AppLockResult::Ok {
+            self.lock().db.delete(KV_APP_LOCK)?;
+        }
+        Ok(answer)
+    }
+
+    /// G-78 `clearAppLockWithWords` ("forgot the passcode"): turns the lock
+    /// off when the 12 words are this identity's. Rate-limited by the same
+    /// counter; unknown or another identity's words are just `wrong`.
+    pub fn clear_app_lock_with_words(&self, words: Zeroizing<String>) -> CoreResult<AppLockAnswer> {
+        if words.len() > applock::MAX_WORDS_LEN {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let _gate = self.app_lock_gate.lock().expect("not poisoned");
+        if self.lock().me.is_none() {
+            return Err(ErrorCode::NotFound.into());
+        }
+        let answer = self.app_lock_attempt(LockCheck::Words(words))?;
+        if answer.result == AppLockResult::Ok {
+            self.lock().db.delete(KV_APP_LOCK)?;
+        }
+        Ok(answer)
+    }
+
+    /// One attempt against the shared counter (the gate is held): while a
+    /// delay runs, `rate-limited` without checking; otherwise the check runs
+    /// outside the core lock, and the counter is reset or advanced.
+    fn app_lock_attempt(&self, check: LockCheck) -> CoreResult<AppLockAnswer> {
+        let now = self.ports.clock.now_ms();
+        let (stored, attempts, me) = {
+            let inner = self.lock();
+            (app_lock_stored(&inner.db)?, app_lock_attempts(&inner.db)?, inner.me.as_ref().map(Me::key))
+        };
+        if let Some(wait) = attempts.wait_ms(now) {
+            let retry_after = Some(applock::retry_after_secs(wait));
+            return Ok(AppLockAnswer { result: AppLockResult::RateLimited, retry_after });
+        }
+        let right = match check {
+            LockCheck::Passcode(passcode) => stored.as_ref().is_some_and(|s| app_lock_matches(s, &passcode)),
+            LockCheck::Words(words) => me.is_some_and(|me| {
+                RecoveryPhrase::parse(&words).is_ok_and(|phrase| phrase.identity().public_key() == me)
+            }),
+        };
+        let mut attempts = attempts;
+        let answer = if right {
+            attempts = applock::Attempts::default();
+            AppLockAnswer { result: AppLockResult::Ok, retry_after: None }
+        } else {
+            attempts.fail(now);
+            let retry_after = attempts.wait_ms(now).map(applock::retry_after_secs);
+            AppLockAnswer { result: AppLockResult::Wrong, retry_after }
+        };
+        self.lock()
+            .db
+            .set(KV_APP_LOCK_ATTEMPTS, &serde_json::to_vec(&attempts).expect("plain struct"))?;
+        Ok(answer)
+    }
+}
+
+/// The stored lock, if it parses. A record that doesn't (or has another
+/// `v`) is still a lock: see [`app_lock_present`].
+fn app_lock_stored(db: &Db) -> CoreResult<Option<applock::Stored>> {
+    Ok(db.get(KV_APP_LOCK)?.and_then(|json| serde_json::from_slice(&json).ok()))
+}
+
+/// Whether any app-lock record is stored. An unreadable one still means
+/// "on": verify, set and clear then answer `wrong` (counted), and only the
+/// 12 words clear it. Fail closed (Security Lead on #476).
+fn app_lock_present(db: &Db) -> CoreResult<bool> {
+    Ok(db.get(KV_APP_LOCK)?.is_some())
+}
+
+fn app_lock_attempts(db: &Db) -> CoreResult<applock::Attempts> {
+    Ok(db.get(KV_APP_LOCK_ATTEMPTS)?.and_then(|json| serde_json::from_slice(&json).ok()).unwrap_or_default())
+}
+
+/// The passcode against the stored verifier, in constant time. A passcode
+/// outside the rules, or a stored record that doesn't parse, never matches.
+fn app_lock_matches(stored: &applock::Stored, passcode: &str) -> bool {
+    if stored.v != 1 || !applock::attempt_ok(passcode) {
+        return false;
+    }
+    let (Ok(salt), Some(want)) = (hex::decode(&stored.salt), model::parse_hex32(&stored.hash)) else {
+        return false;
+    };
+    let params = identity::LockParams { m_kib: stored.m_kib, t: stored.t, p: stored.p };
+    let Some(got) = identity::app_lock_verifier(passcode, &salt, params) else { return false };
+    got.iter().zip(want.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
 /// G-91 (Security Lead on #457): whether a restore's join answer settles
 /// that server for good. Only a definite answer does:
 /// - `Joined`: it's back;

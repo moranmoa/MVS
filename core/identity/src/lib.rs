@@ -19,7 +19,7 @@ mod store;
 mod vault;
 
 pub use derive::{backup_tag, BackupKeys, Identity, StorageKey, Subkey, BACKUP_TAG_CONTEXT};
-pub use lock::LockParams;
+pub use lock::{app_lock_verifier, LockParams};
 pub use phrase::{
     check_positions, is_word, suggest, word_list, PhraseError, RecoveryPhrase, UnknownWord,
     WORD_COUNT,

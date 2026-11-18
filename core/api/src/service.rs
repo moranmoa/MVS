@@ -2454,6 +2454,41 @@ impl Core {
         Ok(inner.message_count(&*self.ports.cipher, server, channel)? + held)
     }
 
+    /// G-30 `locateMessage(serverId, channelId, messageId)`: the message's
+    /// index in `getMessages` order, as of now (a snapshot: a message synced
+    /// later can shift it). Local and read-only: no peers, no sync.
+    ///
+    /// One answer, `not-found`, for everything I can't see, so a link never
+    /// confirms that something hidden exists (Security Lead, R1): not a
+    /// member, a server or channel I don't have or may not see (an 18+
+    /// channel hidden by B7 §4), IDs that don't agree, a message that isn't
+    /// here or doesn't open, a message still waiting to send (`pending-…`).
+    /// `bad-request` only for an ID that isn't 64 hex. A closed server
+    /// answers as its `getMessages` does (its keys go at the close).
+    pub fn locate_message(&self, server_id: &str, channel_id: &str, message_id: &str) -> CoreResult<MessageLocation> {
+        let not_found = || CoreError::from(ErrorCode::NotFound);
+        // Held messages aren't records: not-found, like any other unknown.
+        if message_id.starts_with(KEY_PENDING_PREFIX) {
+            return Err(not_found());
+        }
+        let hex = |id: &str| model::parse_hex32(id).ok_or_else(|| CoreError::from(ErrorCode::BadRequest));
+        let server = ServerId::from_bytes(hex(server_id)?);
+        let channel = ChannelId::from_bytes(hex(channel_id)?);
+        let message = RecordId::from_bytes(hex(message_id)?);
+        let mut inner = self.lock();
+        let me = inner.me.as_ref().map(Me::key).ok_or_else(not_found)?;
+        if !inner.db.has_server(server)? {
+            return Err(not_found());
+        }
+        inner.load(server)?;
+        if !inner.view(server)?.state.is_member(me) || !inner.visible(server)?.contains(&channel) {
+            return Err(not_found());
+        }
+        let shown = inner.shown(&*self.ports.cipher, server, channel)?;
+        let index = shown.iter().position(|s| s.record.id() == message).ok_or_else(not_found)?;
+        Ok(MessageLocation { index })
+    }
+
     /// Messages `start..end` (0-based, end exclusive) of the channel.
     pub fn get_messages(
         &self,

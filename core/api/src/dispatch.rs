@@ -118,6 +118,15 @@ struct EditArg {
     body: String,
 }
 
+/// G-30 `locateMessage`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocateArgs {
+    server_id: String,
+    channel_id: String,
+    message_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerUserArgs {
@@ -431,6 +440,10 @@ impl Core {
             "getMessages" => {
                 let a: RangeArg = args(raw)?;
                 ok(self.get_messages(&a.channel_id, a.start, a.end))
+            }
+            "locateMessage" => {
+                let a: LocateArgs = args(raw)?;
+                ok(self.locate_message(&a.server_id, &a.channel_id, &a.message_id))
             }
             "sendMessage" => {
                 let a: SendArg = args(raw)?;

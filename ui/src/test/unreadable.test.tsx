@@ -66,7 +66,7 @@ describe('placeholder rows (core #527)', () => {
       expect(r).not.toBeNull();
       return r!;
     });
-    expect(row.textContent).toBe("A message whose sender can't be verified, so it isn't shown.");
+    expect(row.textContent).toBe("This message can't be verified, so it isn't shown.");
     expect(row.classList.contains('untrusted')).toBe(true);
   });
 });

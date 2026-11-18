@@ -143,6 +143,7 @@ fn backup_keys_are_separate_from_the_identity() {
         *keys.enc_key(),
         keys.write_key().to_bytes(),
         id.recovery_write_key().to_bytes(),
+        *id.recovery_holder_secret(),
     ];
     for i in 0..secrets.len() {
         for j in i + 1..secrets.len() {
@@ -161,6 +162,15 @@ fn backup_keys_are_separate_from_the_identity() {
     // Debug shows the tag only.
     let shown = format!("{keys:?}");
     assert!(!shown.contains(&format!("{:?}", keys.enc_key())), "{shown}");
+}
+
+/// Pins the member-recovery keys: `w_r` and the holder's X25519 secret. A
+/// change would orphan every share held and every handle.
+#[test]
+fn member_recovery_keys_are_pinned() {
+    let id = parse(LEGAL).identity();
+    assert_eq!(hex::encode(id.recovery_write_key().verifying_key().to_bytes()), "00623f133a1476916ca3caf989ccc0f729c28153f2b9e4ba8600a3bbec68a064");
+    assert_eq!(hex::encode(*id.recovery_holder_secret()), "cc5c2ce1844ccbb6abcf2914d67929c9c58e2fe7a94ccce9413ee2b4449ccc94");
 }
 
 // --- Round trip ------------------------------------------------------------

@@ -19,10 +19,15 @@ const line = () => document.querySelector('.typing-line')!;
 async function setup() {
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
   render(<App core={core} initialSettings={en} />);
-  const box = (await screen.findByRole('textbox', { name: /^Message / })) as HTMLTextAreaElement;
+  await screen.findByRole('textbox', { name: /^Message / });
   const [server] = await core.listServers();
   const [channel] = await core.listChannels(server.id);
   const members = (await core.listMembers(server.id)).filter((m) => m.id !== (core as unknown as { identity: { id: string } }).identity.id);
+  // On a cold start the first render can come before the app settles on that
+  // channel and has its members: wait for both before the test starts.
+  await screen.findByRole('textbox', { name: (n) => n.startsWith('Message ') && n.includes(channel.name) });
+  await screen.findAllByText(members[0].displayName);
+  const box = screen.getByRole('textbox', { name: /^Message / }) as HTMLTextAreaElement;
   return { core, box, channelId: channel.id, members };
 }
 
@@ -34,7 +39,7 @@ describe('typing indicator (G-29)', () => {
     expect(line().getAttribute('aria-live')).toBe('off');
     expect(line().textContent).toBe('');
     act(() => core.simulateTyping(channelId, [members[0].id]));
-    expect(plain(line().textContent)).toBe(`${members[0].displayName} is typing…`);
+    await waitFor(() => expect(plain(line().textContent)).toBe(`${members[0].displayName} is typing…`));
     act(() => core.simulateTyping(channelId, [members[0].id, members[1].id]));
     expect(plain(line().textContent)).toBe(`${members[0].displayName} and ${members[1].displayName} are typing…`);
     act(() => core.simulateTyping(channelId, members.slice(0, 3).map((m) => m.id)));

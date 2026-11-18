@@ -247,13 +247,17 @@ export function cleanInvite(i: Invite): Invite {
   };
 }
 
-/** G-53: a removed account from the core. */
-export function cleanRemovedMember(r: RemovedMember): RemovedMember {
+/**
+ * G-53: a removed account from the core, or null when its id isn't 64
+ * lower-case hex (SL): undoKick is only ever sent a real account id.
+ */
+export function cleanRemovedMember(r: RemovedMember): RemovedMember | null {
+  if (typeof r?.id !== 'string' || !/^[0-9a-f]{64}$/.test(r.id)) return null;
   return {
-    id: cleanHexId(r?.id),
-    shortCode: cleanCode(r?.shortCode),
-    displayName: cleanName(r?.displayName),
-    removedAt: when(r?.removedAt) ?? 0,
+    id: r.id,
+    shortCode: cleanCode(r.shortCode),
+    displayName: cleanName(r.displayName),
+    removedAt: when(r.removedAt) ?? 0,
   };
 }
 
@@ -647,7 +651,9 @@ export function guardCore(core: CoreApi): CoreApi {
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
-    listRemovedMembers: wrap(core.listRemovedMembers, (l) => (Array.isArray(l) ? l.map(cleanRemovedMember) : [])),
+    listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
+      Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
+    ),
     joinServer: wrap(core.joinServer, cleanJoin),
     joinCall: wrap(core.joinCall, cleanCall),
     listVoiceRooms: (serverId: Id) =>

@@ -6,6 +6,7 @@ import { isCoreError, useCore, type Id, type Member, type Message, type ServerSu
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
 import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
 import { EmojiPicker } from '../../components/EmojiPicker';
+import { TopicDialog } from './TopicDialog';
 import { useUserTextProps } from '../../app/textDir';
 import { mentionQuery, toDisplay, toTokens } from '../../app/mentions';
 import { applyEdit, dismissHint, hintDue, insideOpenFence, shortcutMarker, wrapEdit } from '../../markdown/composer';
@@ -45,6 +46,8 @@ export function ChatView({
   const [editing, setEditing] = useState<Message | null>(null);
   const [toDelete, setToDelete] = useState<Message | null>(null);
   const [stickToken, setStickToken] = useState(0);
+  // G-14: the topic dialog (view; the owner can edit).
+  const [topicOpen, setTopicOpen] = useState(false);
 
   const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const nobodyOnline = members.length > 0 && members.every((m) => m.id === myId || m.presence === 'offline');
@@ -148,6 +151,19 @@ export function ChatView({
             18+
           </span>
         )}
+        {channel?.topic ? (
+          <button type="button" className="chat-topic" onClick={() => setTopicOpen(true)} aria-label={`${intl.formatMessage({ id: 'channel.topic.label' })}: ${channel.topic}`}>
+            <bdi>{channel.topic}</bdi>
+          </button>
+        ) : (
+          isOwner &&
+          channel &&
+          !server.closed && (
+            <button type="button" className="chat-topic add" onClick={() => setTopicOpen(true)}>
+              <FormattedMessage id="channel.topic.add" />
+            </button>
+          )
+        )}
         <span className="spacer" />
         <button
           type="button"
@@ -160,6 +176,7 @@ export function ChatView({
           <UsersIcon />
         </button>
       </header>
+      {channel && <TopicDialog channel={channel} canEdit={isOwner && !server.closed} open={topicOpen} onClose={() => setTopicOpen(false)} />}
       {nobodyOnline && (
         <div className="offline-banner" role="status">
           <WifiOffIcon />

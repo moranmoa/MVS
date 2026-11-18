@@ -92,6 +92,12 @@ export interface CoreCommands {
   /** Owner only. Same name rules as createChannel. */
   updateChannel(channelId: Id, input: { name?: string; adult?: boolean }): Promise<Channel>;
   /**
+   * G-14: set, change or clear (empty) a channel's topic; returns the channel.
+   * Errors: bad-request (over 256 code points / 1024 bytes, a line break, controls),
+   * not-allowed (not the owner or an admin), not-found, update-needed (cap gate).
+   */
+  setChannelTopic(channelId: Id, topic: string): Promise<Channel>;
+  /**
    * G-11 (#323), owner or admin: puts the channel right before `before`, right
    * after `after`, or last. Returns the server's channels in the new order.
    * Rejects not-allowed, not-found, bad-request.

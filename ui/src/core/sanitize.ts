@@ -267,8 +267,13 @@ const POSITION = /^[0-9A-Za-z]{0,31}[1-9A-Za-z]$/;
 /** A non-negative whole number below 2^31, or undefined. */
 const index = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 && (v as number) < 2 ** 31 ? (v as number) : undefined);
 
+/** G-14: at most 256 code points (the core's MAX_CHANNEL_TOPIC). */
+export const CHANNEL_TOPIC_MAX = 256;
+
 export function cleanChannel(c: Channel): Channel {
-  const { position, firstUnreadIndex, unreadCount, ...rest } = c;
+  const { position, firstUnreadIndex, unreadCount, topic: rawTopic, ...rest } = c;
+  // G-14: one line of plain text, cleaned like a name (no controls, bidi or line breaks).
+  const topic = cleanName(rawTopic, CHANNEL_TOPIC_MAX);
   const first = index(firstUnreadIndex);
   const n = index(unreadCount);
   return {
@@ -277,6 +282,7 @@ export function cleanChannel(c: Channel): Channel {
     ...(first !== undefined ? { firstUnreadIndex: first } : {}),
     ...(n !== undefined ? { unreadCount: n } : {}),
     ...(typeof position === 'string' && POSITION.test(position) ? { position } : {}),
+    ...(topic ? { topic } : {}),
     name: cleanName(c.name, CHANNEL_NAME_MAX) || '…',
     adult: c.adult === true,
     isDefault: c.isDefault === true,
@@ -663,6 +669,7 @@ export function guardCore(core: CoreApi): CoreApi {
     moveChannel: wrap(core.moveChannel, (l) => l.map(cleanChannel)),
     createChannel: wrap(core.createChannel, cleanChannel),
     updateChannel: wrap(core.updateChannel, cleanChannel),
+    setChannelTopic: wrap(core.setChannelTopic, cleanChannel),
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),

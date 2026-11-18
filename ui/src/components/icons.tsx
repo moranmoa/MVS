@@ -58,6 +58,12 @@ export const CrownIcon = (p: IconProps) => (
     <path d="M4 18h16M5 15l-1-9 5 4 3-6 3 6 5-4-1 9z" />
   </Icon>
 );
+/** G-26: add a reaction (a smiley with a plus). */
+export const SmilePlusIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M20 12a8 8 0 1 1-8-8M9 10h.01M15 10h.01M8.5 14.5a4.5 4.5 0 0 0 7 0M19 2v6M16 5h6" />
+  </Icon>
+);
 export const SpeakerIcon = (p: IconProps) => (
   <Icon {...p}>
     <path d="M4 9h4l5-4v14l-5-4H4zM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12" />

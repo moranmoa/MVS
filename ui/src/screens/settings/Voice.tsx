@@ -9,6 +9,7 @@ import { useEffect, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useSettings } from '../../app/settings';
 import { listOutputs, loadDevices, playTestSound, saveDevices, type OutputDevice } from '../../voice/devices';
+import { PushToTalkSection } from './PushToTalk';
 
 export function VoiceSection() {
   const intl = useIntl();
@@ -68,6 +69,7 @@ export function VoiceSection() {
       <p className="hint" role="note">
         <FormattedMessage id="voice.micTestInCall" />
       </p>
+      <PushToTalkSection />
       <label className="switch-row">
         <span>
           <FormattedMessage id="voice.callSounds" />

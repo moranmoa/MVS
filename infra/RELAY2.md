@@ -47,6 +47,11 @@ relay-2 .env:  PEER_RELAYS=/ip4/<infra2_default gateway>/tcp/4001/p2p/<relay-1 p
 The start-up log shows `peer relays peer_relays=1`; a bad entry is skipped
 with a warning naming its position only.
 
+**Ops rule (Security Lead):** `PEER_RELAYS` holds only the Docker network
+gateway address, **never the host's LAN IP**. The relay uses these addresses
+to dial only and removes them from its DHT once the other relay identifies
+itself, so they aren't served to clients (#459).
+
 ## Router (owner)
 
 Forward to this PC, next to relay-1's 4001 rules:

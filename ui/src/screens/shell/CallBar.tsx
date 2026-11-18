@@ -11,8 +11,11 @@ import { Dialog, Name } from '../../components/common';
 import { AlertIcon, GearIcon, HangUpIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, PhoneIcon } from '../../components/icons';
 import { useCore, type Id, type Member } from '../../core';
 import { useVoiceEngine, type PeerFailure, type VoiceEngineView } from '../../voice';
+// From its own module: tests that stub ../../voice keep push to talk working.
+import { usePushToTalk } from '../../voice/usePushToTalk';
 import { playCallCue, playTestSound } from '../../voice/devices';
 import { useSettings } from '../../app/settings';
+import { defaultVoicePrefs } from '../../app/voicePrefs';
 
 /**
  * The voice engine (piece D, ui/src/voice) as the call UI uses it. `peerFailed`
@@ -22,6 +25,10 @@ import { useSettings } from '../../app/settings';
 export interface CallEngine extends VoiceEngineView {
   /** No microphone, denied, or one picked after joining without one: listen-only. */
   noMic: boolean;
+  /** G-74: the push-to-talk key is held (the mic shows active). */
+  talking: boolean;
+  /** G-74: push to talk is on, with a key. */
+  ptt: boolean;
 }
 
 /**
@@ -58,7 +65,24 @@ export function useCallEngine(myId: Id): CallEngine {
   }, [fallback, store]);
   const simFailure: PeerFailure | null = sim === 'peerFailed' ? 'failed' : sim === 'peerRefused' ? 'refused' : null;
   const peerFailed = simFailure && other ? { ...view.peerFailed, [other]: simFailure } : view.peerFailed;
-  return { ...view, error, noMic, peerFailed };
+  // G-74: push to talk. The mute button stays a hard mute; the global key flips it.
+  const voice = useSettings().settings.voice ?? defaultVoicePrefs();
+  const { talking, status } = usePushToTalk({
+    mode: voice.mode,
+    pttKey: voice.pttKey,
+    globalMute: voice.globalMute,
+    inCall: !!call,
+    hardMuted: meMuted,
+    setMicMuted: view.setMicMuted,
+    onToggleMute: () => {
+      if (!call || noMic) return;
+      view.setMicMuted(!meMuted);
+      void core.setMuted(!meMuted).catch(() => {});
+    },
+  });
+  useEffect(() => store.setPttStatus(status), [store, status]);
+  const ptt = voice.mode === 'ptt' && !!voice.pttKey;
+  return { ...view, error, noMic, peerFailed, talking, ptt };
 }
 
 /**
@@ -236,7 +260,7 @@ export function CallBar({ myId, engine }: { myId: Id; engine: CallEngine }) {
       <div className="call-actions">
         <button
           type="button"
-          className={`icon-button call-mute ${me?.muted ? 'muted' : ''}`}
+          className={`icon-button call-mute ${me?.muted ? 'muted' : ''} ${engine.ptt && engine.talking && !me?.muted ? 'talking' : ''}`}
           aria-pressed={!!me?.muted}
           aria-disabled={noMic || undefined}
           aria-describedby={noMic ? 'call-no-mic' : undefined}

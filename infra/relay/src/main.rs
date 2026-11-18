@@ -39,6 +39,9 @@ use tracing_subscriber::EnvFilter;
 
 const PROTOCOL_VERSION: &str = "/mvs/0.1.0";
 
+/// How often a dropped PEER_RELAYS relay is dialled again.
+const PEER_REDIAL: Duration = Duration::from_secs(60);
+
 /// Our own DHT protocol, so it can never merge with the public IPFS DHT
 /// (`/ipfs/kad/1.0.0`). Clients (core/sync) must use the same name.
 const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/mvs/kad/1.0.0");
@@ -113,16 +116,29 @@ fn check_key_mode(_: &Path) -> Result<()> {
 }
 
 /// Whether an address is worth handing to other peers via the DHT: public
-/// IPs and DNS names only. Private, loopback, link-local and CGNAT addresses
-/// would leak a client's LAN layout and are useless to anyone outside it.
+/// IPs only (a circuit through one included). Private, loopback, link-local
+/// and CGNAT addresses would leak a client's LAN layout and are useless to
+/// anyone outside it.
 fn is_global(addr: &Multiaddr) -> bool {
     match addr.iter().next() {
         Some(Protocol::Ip4(ip)) => is_global_v4(ip),
         Some(Protocol::Ip6(ip)) => is_global_v6(ip),
-        Some(Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name)) => {
-            let name = name.trim_end_matches('.').to_ascii_lowercase();
-            name != "localhost" && !name.ends_with(".localhost") && !name.ends_with(".local")
-        }
+        _ => false,
+    }
+}
+
+/// Whether an address a client reports (identify) goes into the DHT, so into
+/// our FIND_NODE answers. Never a DNS name, not even with
+/// ALLOW_PRIVATE_ADDRS: clients refuse to dial names (#416), but names in
+/// the relay's answers could still steer lookups (Security Lead). Only
+/// ip4/ip6, public unless `allow_private`; circuits through such an address
+/// pass the same way.
+fn dht_addr_ok(addr: &Multiaddr, allow_private: bool) -> bool {
+    if addr.iter().any(|p| matches!(p, Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_))) {
+        return false;
+    }
+    match addr.iter().next() {
+        Some(Protocol::Ip4(_) | Protocol::Ip6(_)) => allow_private || is_global(addr),
         _ => false,
     }
 }
@@ -314,6 +330,11 @@ async fn run() -> Result<()> {
             // server's own store: no 12-hourly republish queries for up to
             // MAX_TAGS keys. Revisit with a second bootstrap (GAP-9).
             kad_config.set_provider_publication_interval(None);
+            // Nothing a client sends is stored as-is (Security Lead, #423):
+            // provider records go through store_client_provider (no client
+            // addresses), and values (PUT_VALUE) aren't stored at all, since
+            // clients use provider records only.
+            kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
             let store_config = kad::store::MemoryStoreConfig {
                 max_provided_keys: backup::MAX_TAGS + 1024,
                 ..Default::default()
@@ -365,21 +386,23 @@ async fn run() -> Result<()> {
     info!(peer_id = %swarm.local_peer_id(), "relay node started");
 
     // PEER_RELAYS: the other operator-run relays (comma-separated, each
-    // pinned by /p2p/<id>, IP addresses only: the relay has no DNS). They go
-    // into Kademlia so the relays share one DHT: a client asking one relay is
-    // pointed at the other for what only the other holds (e.g. a backup
-    // tag's provider record). From .env, never committed.
+    // pinned by /p2p/<id>, IP addresses only: the relay has no DNS), so the
+    // relays share one DHT: a client asking one relay is pointed at the other
+    // for what only the other holds (e.g. a backup tag's provider record).
+    // From .env, never committed. These addresses are often private (the
+    // Docker host's gateway), so they are used to dial only and never go into
+    // Kademlia: there the other relay is known by the public addresses its
+    // identify reports, the ones clients already have (#459).
     let peers = peer_relays(&env::var("PEER_RELAYS").unwrap_or_default(), *swarm.local_peer_id());
+    let mut peer_relay_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     for (peer, addr) in &peers {
-        swarm.behaviour_mut().kademlia.add_address(peer, addr.clone());
+        peer_relay_addrs.entry(*peer).or_default().push(addr.clone());
         if let Err(err) = swarm.dial(addr.clone()) {
             warn!(%err, "could not dial a PEER_RELAYS entry");
         }
     }
-    if !peers.is_empty() {
-        let _ = swarm.behaviour_mut().kademlia.bootstrap();
-    }
     info!(peer_relays = peers.len(), "peer relays");
+    let mut redial_timer = tokio::time::interval(PEER_REDIAL);
 
     // The backup mailbox, on the data volume (the only writable path).
     let backup_dir = env::var("BACKUP_DIR").unwrap_or_else(|_| "/data/backup".into());
@@ -406,6 +429,18 @@ async fn run() -> Result<()> {
     loop {
         let event = tokio::select! {
             event = swarm.select_next_some() => event,
+            // Reconnect a peer relay that dropped, through its PEER_RELAYS
+            // address (not hairpin NAT through the router).
+            _ = redial_timer.tick() => {
+                for (peer, addrs) in &peer_relay_addrs {
+                    if !swarm.is_connected(peer) {
+                        for addr in addrs {
+                            let _ = swarm.dial(addr.clone());
+                        }
+                    }
+                }
+                continue;
+            }
             _ = sweep_timer.tick() => {
                 for tag in mailbox.sweep(backup::unix_now()) {
                     swarm.behaviour_mut().kademlia.store_mut().remove_provider(&kad::RecordKey::new(&tag), &local_id);
@@ -442,13 +477,24 @@ async fn run() -> Result<()> {
         };
         match event {
             SwarmEvent::NewListenAddr { address, .. } => info!(%address, "listening"),
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::InboundRequest {
+                request: kad::InboundRequest::AddProvider { record: Some(record) },
+            })) => {
+                let _ = swarm.behaviour_mut().kademlia.store_mut().add_provider(client_provider(record));
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
                 ..
             })) => {
-                for addr in info.listen_addrs.into_iter().filter(|a| allow_private_addrs || is_global(a)) {
+                for addr in info.listen_addrs.into_iter().filter(|a| dht_addr_ok(a, allow_private_addrs)) {
                     swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                }
+                // Kad adds the address it dialled when the connection came up;
+                // a peer relay's PEER_RELAYS address must not stay there.
+                if let Some(addrs) = peer_relay_addrs.get(&peer_id) {
+                    forget_peer_relay_addrs(&mut swarm.behaviour_mut().kademlia, &peer_id, addrs);
+                    let _ = swarm.behaviour_mut().kademlia.bootstrap();
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => {
@@ -555,6 +601,29 @@ fn peer_relays(raw: &str, me: PeerId) -> Vec<(PeerId, Multiaddr)> {
     out
 }
 
+/// A provider record from a client, as stored: without the addresses it
+/// carried. GET_PROVIDERS answers then take the provider's addresses from the
+/// routing table, which only holds filtered ones (dht_addr_ok), so a client
+/// can't plant DNS names or LAN addresses in backup-tag answers (Security Lead).
+/// Removes a peer relay's PEER_RELAYS addresses from Kademlia, in both
+/// spellings (with and without the trailing /p2p/<id>), so closer-peers
+/// answers to clients never carry them (#459).
+fn forget_peer_relay_addrs(kad: &mut kad::Behaviour<kad::store::MemoryStore>, peer: &PeerId, addrs: &[Multiaddr]) {
+    for addr in addrs {
+        let mut bare = addr.clone();
+        if matches!(bare.iter().last(), Some(Protocol::P2p(_))) {
+            bare.pop();
+        }
+        kad.remove_address(peer, addr);
+        kad.remove_address(peer, &bare);
+    }
+}
+
+fn client_provider(mut record: kad::ProviderRecord) -> kad::ProviderRecord {
+    record.addresses.clear();
+    record
+}
+
 fn forget_circuit(swarm: &mut Swarm<Behaviour>, reserved: &mut HashSet<PeerId>, peer: &PeerId) {
     if reserved.remove(peer) {
         let relay_id = *swarm.local_peer_id();
@@ -615,7 +684,6 @@ mod tests {
         assert!(global("/ip4/8.8.8.8/tcp/4001"));
         assert!(global("/ip4/100.128.0.1/udp/4001/quic-v1"));
         assert!(global("/ip6/2a00:1450::1/tcp/4001"));
-        assert!(global("/dns4/relay.example.org/tcp/443/wss"));
         assert!(global("/ip4/8.8.8.8/tcp/4001/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc/p2p-circuit"));
     }
 
@@ -635,6 +703,7 @@ mod tests {
             "/ip6/fd00::1/tcp/4001",
             "/ip6/::ffff:192.168.1.1/tcp/4001",
             "/dns4/localhost/tcp/4001",
+            "/dns4/relay.example.org/tcp/443/wss",
             "/dns4/printer.local/tcp/4001",
             "/p2p-circuit",
         ] {
@@ -654,6 +723,76 @@ mod tests {
         assert_eq!(got.len(), 2, "the ip4 and ip6 entries for the other relay");
         assert!(got.iter().all(|(p, _)| *p == other));
         assert!(peer_relays("", me).is_empty());
+    }
+
+    #[test]
+    fn peer_relay_addresses_never_stay_in_the_dht() {
+        let me = PeerId::random();
+        let other = PeerId::random();
+        let mut kad = kad::Behaviour::new(me, kad::store::MemoryStore::new(me));
+        let private: Multiaddr = format!("/ip4/172.17.0.1/tcp/4011/p2p/{other}").parse().unwrap();
+        let mut bare = private.clone();
+        bare.pop();
+        let public: Multiaddr = "/ip4/8.8.8.8/tcp/4011".parse().unwrap();
+        // As if kad had added the dialled address, and identify the public one.
+        kad.add_address(&other, bare);
+        kad.add_address(&other, public.clone());
+        forget_peer_relay_addrs(&mut kad, &other, &[private]);
+        let kept: Vec<Multiaddr> = kad
+            .kbuckets()
+            .flat_map(|b| b.iter().map(|e| (*e.node.key.preimage(), e.node.value.clone())).collect::<Vec<_>>())
+            .filter(|(p, _)| *p == other)
+            .flat_map(|(_, a)| a.iter().cloned().collect::<Vec<_>>())
+            .collect();
+        // Kad stores addresses with the peer's /p2p/<id> appended.
+        assert_eq!(kept, vec![public.with(Protocol::P2p(other))], "only the public address is left");
+    }
+
+    #[test]
+    fn client_reported_dns_names_never_reach_the_dht() {
+        let ok = |a: &str, private: bool| dht_addr_ok(&a.parse().unwrap(), private);
+        let id = "12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc";
+        for name in [
+            "/dns4/peer.example.org/tcp/4001".to_string(),
+            "/dns6/peer.example.org/udp/4001/quic-v1".to_string(),
+            "/dns/peer.example.org/tcp/443/wss".to_string(),
+            "/dnsaddr/peer.example.org".to_string(),
+            format!("/dns4/relay.example.org/tcp/4001/p2p/{id}/p2p-circuit"),
+            // A name further in, behind an IP: still refused.
+            format!("/ip4/8.8.8.8/tcp/4001/p2p/{id}/p2p-circuit/dns4/x.example.org/tcp/1"),
+        ] {
+            assert!(!ok(&name, false), "{name}");
+            assert!(!ok(&name, true), "{name} with ALLOW_PRIVATE_ADDRS");
+        }
+        // Public IPs and circuits through them stay; private only with the flag.
+        assert!(ok("/ip4/8.8.8.8/tcp/4001", false));
+        assert!(ok("/ip6/2a00:1450::1/udp/4001/quic-v1", false));
+        assert!(ok(&format!("/ip4/8.8.8.8/tcp/4001/p2p/{id}/p2p-circuit"), false));
+        assert!(!ok("/ip4/192.168.1.10/tcp/4001", false));
+        assert!(ok("/ip4/192.168.1.10/tcp/4001", true));
+        assert!(!ok("/p2p-circuit", true));
+    }
+
+    #[test]
+    fn a_client_provider_record_keeps_no_addresses() {
+        use kad::store::RecordStore as _;
+        let client = PeerId::random();
+        let planted: Vec<Multiaddr> = vec![
+            "/dns4/evil.example.org/tcp/4001".parse().unwrap(),
+            "/ip4/192.168.1.10/tcp/4001".parse().unwrap(),
+            "/ip4/8.8.8.8/tcp/4001".parse().unwrap(),
+        ];
+        let key = kad::RecordKey::new(&[7u8; 32]);
+        let stored = client_provider(kad::ProviderRecord::new(key.clone(), client, planted));
+        assert!(stored.addresses.is_empty());
+        assert_eq!((stored.provider, stored.key.clone()), (client, key.clone()));
+        // And that is what the store then serves.
+        let relay = PeerId::random();
+        let mut store = kad::store::MemoryStore::new(relay);
+        store.add_provider(stored).unwrap();
+        let held = store.providers(&key);
+        assert_eq!(held.len(), 1);
+        assert!(held[0].addresses.is_empty());
     }
 
     #[cfg(unix)]

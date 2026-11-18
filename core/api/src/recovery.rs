@@ -32,6 +32,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
+use x25519_dalek::{PublicKey as X25519Public, SharedSecret, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::devicelink::Payload;
@@ -243,6 +244,76 @@ pub fn open_envelope(key: &[u8; 32], h: &[u8; 32], version: u64, sealed: &[u8]) 
     serde_json::from_slice(&plain).ok()
 }
 
+// -------------------------------------------- sealed to an X25519 key
+
+/// The box a holder keeps a share's `y` in, under its own holder key.
+pub const HOLDER_SEAL: &[u8] = b"mvs/member-recovery-holder-seal/v1";
+/// The box a released record travels in, to the new device's key.
+pub const RELEASE_SEAL: &[u8] = b"mvs/member-recovery-release-seal/v1";
+const SEAL_OVERHEAD: usize = 32 + 24 + 16;
+
+/// The box key: `HKDF-SHA256(X25519(e, to), info label ‖ e_pub ‖ to_pub)`.
+/// `None` for a low-order point (an all-zero shared secret).
+fn box_key(shared: &SharedSecret, label: &[u8], e_pub: &[u8; 32], to_pub: &[u8; 32]) -> Option<Zeroizing<[u8; 32]>> {
+    if !shared.was_contributory() {
+        return None;
+    }
+    let mut info = label.to_vec();
+    info.extend_from_slice(e_pub);
+    info.extend_from_slice(to_pub);
+    let mut key = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(None, shared.as_bytes()).expand(&info, key.as_mut()).expect("32 bytes is a valid length");
+    Some(key)
+}
+
+/// Seals `msg` to `to_pub` with a one-time key `e`: `e_pub (32) ‖ nonce
+/// (24) ‖ XChaCha20-Poly1305 box`, with `aad` bound. `label` keeps the
+/// holder's box and the release box apart. `None` for a low-order `to_pub`.
+pub fn seal_to(to_pub: &[u8; 32], label: &[u8], aad: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
+    let e = StaticSecret::random_from_rng(OsRng);
+    let e_pub = X25519Public::from(&e).to_bytes();
+    let key = box_key(&e.diffie_hellman(&X25519Public::from(*to_pub)), label, &e_pub, to_pub)?;
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let sealed = XChaCha20Poly1305::new(key.as_ref().into())
+        .encrypt(XNonce::from_slice(&nonce), Aad { msg, aad })
+        .expect("in-memory encryption");
+    let mut out = Vec::with_capacity(SEAL_OVERHEAD + msg.len());
+    out.extend_from_slice(&e_pub);
+    out.extend_from_slice(&nonce);
+    out.extend(sealed);
+    Some(out)
+}
+
+/// Opens what [`seal_to`] made with the matching secret, label and `aad`.
+pub fn open_from(secret: &StaticSecret, label: &[u8], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if sealed.len() < SEAL_OVERHEAD {
+        return None;
+    }
+    let (e_pub, rest) = sealed.split_at(32);
+    let (nonce, body) = rest.split_at(24);
+    let e_pub: [u8; 32] = e_pub.try_into().ok()?;
+    let to_pub = X25519Public::from(secret).to_bytes();
+    let key = box_key(&secret.diffie_hellman(&X25519Public::from(e_pub)), label, &e_pub, &to_pub)?;
+    XChaCha20Poly1305::new(key.as_ref().into())
+        .decrypt(XNonce::from_slice(nonce), Aad { msg: body, aad })
+        .ok()
+        .map(Zeroizing::new)
+}
+
+/// A released record, sealed to the new device's one-time X25519 key and
+/// bound to the handle.
+pub fn seal_release(record: &ShareRecord, device_pub: &[u8; 32]) -> Option<Vec<u8>> {
+    seal_to(device_pub, RELEASE_SEAL, &record.h, &record.to_bytes())
+}
+
+/// The new device opens a release for handle `h`. The record isn't checked
+/// here; the recovering side checks it against the bound `w_r_pub`.
+pub fn open_release(device: &StaticSecret, h: &[u8; 32], sealed: &[u8]) -> Option<ShareRecord> {
+    let plain = open_from(device, RELEASE_SEAL, h, sealed)?;
+    ShareRecord::from_bytes(&plain).filter(|r| r.h == *h)
+}
+
 // ----------------------------------------------- signed records (by `w_r`)
 
 /// What a holder stores per handle, signed by my recovery write key `w_r`
@@ -296,7 +367,49 @@ impl ShareRecord {
     pub fn share(&self) -> Share {
         Share { x: self.x, y: self.y.clone() }
     }
+
+    /// The wire form, [`RECORD_LEN`] bytes: `h ‖ version ‖ x ‖ y ‖ w_pub ‖
+    /// created ‖ sig`, integers big-endian. Holds `y`: sealed whenever it
+    /// leaves memory.
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(RECORD_LEN));
+        out.extend_from_slice(&self.h);
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.push(self.x);
+        out.extend_from_slice(self.y.as_ref());
+        out.extend_from_slice(&self.w_pub);
+        out.extend_from_slice(&self.created.to_be_bytes());
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Parses [`ShareRecord::to_bytes`]. It doesn't verify: callers do.
+    pub fn from_bytes(bytes: &[u8]) -> Option<ShareRecord> {
+        if bytes.len() != RECORD_LEN {
+            return None;
+        }
+        let (h, rest) = bytes.split_at(32);
+        let (version, rest) = rest.split_at(8);
+        let (x, rest) = rest.split_at(1);
+        let (y, rest) = rest.split_at(32);
+        let (w_pub, rest) = rest.split_at(32);
+        let (created, sig) = rest.split_at(8);
+        let mut y_out = Zeroizing::new([0u8; 32]);
+        y_out.copy_from_slice(y);
+        Some(ShareRecord {
+            h: h.try_into().ok()?,
+            version: u64::from_be_bytes(version.try_into().ok()?),
+            x: x[0],
+            y: y_out,
+            w_pub: w_pub.try_into().ok()?,
+            created: u64::from_be_bytes(created.try_into().ok()?),
+            sig: sig.try_into().ok()?,
+        })
+    }
 }
+
+/// The length of [`ShareRecord::to_bytes`].
+pub const RECORD_LEN: usize = 32 + 8 + 1 + 32 + 32 + 8 + 64;
 
 /// A later instruction from the account to its holders, signed by `w_r`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,9 +454,14 @@ impl Order {
     /// True only if `h` is the handle of the stored record's `w_r`, and the
     /// order is for that handle and signed by that key.
     pub fn verify(&self, sig: &[u8; 64], stored: &ShareRecord) -> bool {
-        let Ok(key) = VerifyingKey::from_bytes(&stored.w_pub) else { return false };
-        self.h() == stored.h
-            && self.h() == handle(&stored.w_pub)
+        self.h() == stored.h && self.verify_for(sig, &stored.w_pub)
+    }
+
+    /// True only if the order's `h` is the handle of `w_pub` and `w_pub`
+    /// signed it. (A holder keeps `w_pub` beside the sealed share.)
+    pub fn verify_for(&self, sig: &[u8; 64], w_pub: &[u8; 32]) -> bool {
+        let Ok(key) = VerifyingKey::from_bytes(w_pub) else { return false };
+        self.h() == handle(w_pub)
             && key.verify_strict(&self.message(), &Signature::from_bytes(sig)).is_ok()
     }
 
@@ -1036,6 +1154,37 @@ mod tests {
         assert!(!hold.may_release(&other, NOW + HOLD_MS), "a fresh 72 hours");
         assert!(hold.may_release(&other, NOW + DAY_MS + HOLD_MS));
         assert_eq!(hold.pending_device, Some(other));
+    }
+
+    /// Pins the sealed-box key layout (HKDF info `label ‖ e_pub ‖ to_pub`)
+    /// for both labels, with fixed scalars. A change would make every share
+    /// a holder keeps unreadable.
+    #[test]
+    fn box_keys_are_pinned() {
+        let e = StaticSecret::from([1u8; 32]);
+        let to = StaticSecret::from([2u8; 32]);
+        let (e_pub, to_pub) = (X25519Public::from(&e).to_bytes(), X25519Public::from(&to).to_bytes());
+        let shared = e.diffie_hellman(&X25519Public::from(to_pub));
+        let holder = box_key(&shared, HOLDER_SEAL, &e_pub, &to_pub).unwrap();
+        let release = box_key(&shared, RELEASE_SEAL, &e_pub, &to_pub).unwrap();
+        assert_eq!(hex::encode(*holder), "854b9993f2da92235bb85a61b68579366e46a5b644129c1ab1f9af3214706dac");
+        assert_eq!(hex::encode(*release), "7070653e61151bdcd254aeb8f85474eb41bd0493806e591ad70a933e34be13c8");
+        // The receiver gets the same key.
+        let other = to.diffie_hellman(&X25519Public::from(e_pub));
+        assert_eq!(*box_key(&other, HOLDER_SEAL, &e_pub, &to_pub).unwrap(), *holder);
+    }
+
+    #[test]
+    fn sealed_boxes_open_only_with_their_key_label_and_aad() {
+        let to = StaticSecret::from([2u8; 32]);
+        let to_pub = X25519Public::from(&to).to_bytes();
+        let sealed = seal_to(&to_pub, HOLDER_SEAL, b"aad", b"secret").unwrap();
+        assert_eq!(open_from(&to, HOLDER_SEAL, b"aad", &sealed).unwrap().as_slice(), b"secret");
+        assert!(open_from(&to, RELEASE_SEAL, b"aad", &sealed).is_none(), "another label");
+        assert!(open_from(&to, HOLDER_SEAL, b"aae", &sealed).is_none(), "another aad");
+        assert!(open_from(&StaticSecret::from([3u8; 32]), HOLDER_SEAL, b"aad", &sealed).is_none());
+        assert!(open_from(&to, HOLDER_SEAL, b"aad", &sealed[..40]).is_none());
+        assert_ne!(seal_to(&to_pub, HOLDER_SEAL, b"aad", b"secret").unwrap(), sealed, "a fresh e each time");
     }
 
     #[test]

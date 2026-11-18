@@ -66,3 +66,11 @@ T17 closes that: after a kick, the remaining members move to a new secret the ki
 - **Gate:** the first user of the `lv:N` cap scheme: `lv:1`. `SecretRotation` is sent only while every member's latest profile carries `lv:1` or higher.
 
 Next: the Security Lead reviews the sealing (the per-member box format, and who may rotate) and the serving rule (how sync enforces the frozen prefix for the old secret). The build follows as small PRs: records and authority first, then sync's serving rule (dev-sync), then core/api.
+
+## Security Lead's conditions for the build (approved at e903be4)
+- **S1, its own box:** the label and AAD are `"mvs/sync-secret-box/v1" ‖ server ‖ epoch/prev ‖ recipient`, so a channel `KeyRotation` box never opens as a `SecretRotation` box. There's a test for that cross-domain replay. The secret is a fresh 32 random bytes, and every value derived from it uses its own context.
+- **S2, recipients:** exactly the members at the record's position, minus the removed. A recipient who isn't a member means `Required`; a member missing means `Add`. A rotation that still includes the kicked member gives `Required` and a re-rotation (test).
+- **S3, the frozen prefix:** the rotation record R's **causal** past plus R, control log only, with no channel records. A linear prefix would leak concurrent post-kick records. Test: what the kicked member can fetch is exactly R's causal past plus R.
+- **S4:** nothing new is published on the old topics; the 7 days are read-only.
+- **S5:** invites are re-issued and the backup holds only the current secret. Every value derived from the secret follows the rotation: the sync topics and handles, the LAN beacon key, v0 links and short-link envelopes, and the backup.
+- **PO (#557):** rotate at once on a kick. A member on an old core sees update-needed for that server, never a silent failure, and resumes after updating. No warning to owners before a kick. Test: the kicked identity can't pull, an updated member syncs, and an old-core member sees update-needed.

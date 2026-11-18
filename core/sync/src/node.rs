@@ -2409,7 +2409,19 @@ impl Task {
             self.beacon_round = self.beacon_round.wrapping_add(crate::lan_beacon::SLOTS);
         }
         let epoch = crate::lan_beacon::epoch_of(unix_now());
-        let Some(packet) = crate::lan_beacon::encode(&keys, epoch, port, self.swarm.local_peer_id()) else { return };
+        // Our LAN addresses (sealed, so members dial only those): the ones
+        // we listen on, loopback last.
+        let mut ips: Vec<std::net::Ipv4Addr> = self
+            .swarm
+            .listeners()
+            .filter_map(|a| match a.iter().next() {
+                Some(Protocol::Ip4(ip)) if crate::lan_beacon::lan_scope(ip) => Some(ip),
+                _ => None,
+            })
+            .collect();
+        ips.sort_by_key(|ip| (ip.is_loopback(), *ip));
+        ips.dedup();
+        let Some(packet) = crate::lan_beacon::encode(&keys, epoch, port, self.swarm.local_peer_id(), &ips) else { return };
         let to = std::net::SocketAddr::from((crate::lan_beacon::GROUP, self.beacon_port));
         if let Err(err) = socket.try_send_to(&packet, to) {
             debug!(%err, "LAN beacon send failed");
@@ -2417,15 +2429,23 @@ impl Task {
     }
 
     /// A beacon heard on the LAN: if it is a co-member's (a tag of one of
-    /// our servers), dial its source IP at its port, expecting its peer ID
-    /// (Noise aborts on any other key). Never answered.
+    /// our servers) and its LAN-scope source is one of the addresses it
+    /// sealed, dial that address at its port, expecting its peer ID. A
+    /// replay from any other host is never dialled (#460). Never answered.
     fn on_beacon(&mut self, ip: std::net::IpAddr, packet: Vec<u8>) {
         let now = Instant::now();
-        if !self.beacon_on() || !self.beacon_limits.allow_read(now) {
+        let lan = matches!(ip, std::net::IpAddr::V4(v4) if crate::lan_beacon::lan_scope(v4));
+        if !lan || !self.beacon_on() || !self.beacon_limits.allow_read(now) {
             return;
         }
         let epoch = crate::lan_beacon::epoch_of(unix_now());
-        let Some((port, peer, _server)) = crate::lan_beacon::decode(&packet, &self.beacon_keys(), epoch) else { return };
+        let Some(beacon) = crate::lan_beacon::decode(&packet, &self.beacon_keys(), epoch) else { return };
+        let Some(source) = crate::lan_beacon::dial_target(ip, &beacon) else {
+            debug!("a LAN beacon from an address it didn't seal: not dialled");
+            return;
+        };
+        let (port, peer) = (beacon.port, beacon.peer);
+        let ip = std::net::IpAddr::V4(source);
         if peer == *self.swarm.local_peer_id() || self.direct.contains_key(&peer) || self.link_blocks(&peer) {
             return;
         }

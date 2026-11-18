@@ -7,21 +7,25 @@
 //! link-local ([`GROUP`], TTL 1):
 //!
 //! ```text
-//! "mvsl1" ‖ tcp port u16le ‖ SLOTS × ( tag[16] ‖ nonce[24] ‖ sealed peer ID[38 + 16] )
+//! "mvsl1" ‖ tcp port u16le ‖ SLOTS × ( tag[16] ‖ nonce[24] ‖ sealed( peer ID[38] ‖ 4 × IPv4 )[54 + 16] )
 //! ```
 //!
 //! - `k_lan = derive_key("mvs/lan-beacon/v1", server secret)`: only members
 //!   (who hold the secret) can make or read a tag.
 //! - `tag = BLAKE3-keyed(k_lan, epoch ‖ port)[..16]`, epochs of
 //!   [`EPOCH_SECS`]; the current epoch and one either side are accepted.
-//! - The peer ID is sealed with XChaCha20-Poly1305 under
+//! - The peer ID and the sender's LAN IPv4 addresses (up to [`MAX_IPS`],
+//!   zero-padded) are sealed with XChaCha20-Poly1305 under
 //!   `derive_key("mvs/lan-beacon-id/v1", k_lan ‖ epoch)` and a random nonce,
-//!   so the beacon is unlinkable and a member dials *expecting* that peer
-//!   ID: a replay from another host is dialled and aborted by Noise
-//!   (`WrongPeerId`) before our identity is sent.
+//!   so the beacon is unlinkable and keeps one size.
+//! - A member dials only a **LAN-scope** source (RFC 1918, CGNAT,
+//!   link-local, loopback) that is **one of the sealed addresses**, at that
+//!   address, expecting the sealed peer ID. A replay from any other host is
+//!   never dialled: libp2p-noise sends the dialer's identity (message 3)
+//!   before the swarm's `WrongPeerId` check, so an aborted dial would
+//!   still give our peer ID away (Tech Lead, Security Lead on #460).
 //! - Always [`SLOTS`] slots, unused ones random, so the size never shows how
 //!   many servers someone is in; with more open servers they take turns.
-//! - The dial goes to the packet's *source* IP only, at the port in it.
 //! - Passive: a beacon is never answered. Off under relay-only, with "LAN
 //!   allowed" off, and with no server open. Reads, dials and per-address
 //!   dials are capped.
@@ -29,6 +33,9 @@
 //! Residual (accepted, as GAP-4b): a kicked member keeps the old secret until
 //! rotation on kick, so on the same LAN it can tell "a member of X is
 //! here"; binding still refuses it.
+//! Residual (accepted, beside GAP-4b): a host that can spoof a sealed
+//! address on the LAN (ARP spoofing, a man in the middle) can still be
+//! dialled and learn the dialer's peer ID.
 
 use std::collections::HashMap;
 use std::io;
@@ -61,7 +68,10 @@ const TAG: usize = 16;
 const NONCE: usize = 24;
 /// An Ed25519 peer ID's bytes.
 const PEER_ID: usize = 38;
-const SEALED: usize = PEER_ID + 16;
+/// Sender addresses sealed in each slot.
+pub const MAX_IPS: usize = 4;
+const PLAIN: usize = PEER_ID + MAX_IPS * 4;
+const SEALED: usize = PLAIN + 16;
 const SLOT: usize = TAG + NONCE + SEALED;
 /// Every beacon is exactly this long.
 pub const PACKET_LEN: usize = MAGIC.len() + 2 + SLOTS * SLOT;
@@ -96,11 +106,21 @@ fn id_cipher(k_lan: &[u8; 32], epoch: u64) -> XChaCha20Poly1305 {
 }
 
 /// One beacon for `keys` (at most [`SLOTS`] are used; the rest are random),
-/// announcing `me` at TCP `port`. None if our peer ID isn't Ed25519.
-pub(crate) fn encode(keys: &[[u8; 32]], epoch: u64, port: u16, me: &PeerId) -> Option<Vec<u8>> {
+/// announcing `me` at TCP `port` on our LAN addresses `ips` (the first
+/// [`MAX_IPS`] LAN-scope ones). None if our peer ID isn't Ed25519 or we
+/// have no LAN address.
+pub(crate) fn encode(keys: &[[u8; 32]], epoch: u64, port: u16, me: &PeerId, ips: &[Ipv4Addr]) -> Option<Vec<u8>> {
     let id = me.to_bytes();
     if id.len() != PEER_ID {
         return None;
+    }
+    let ips: Vec<Ipv4Addr> = ips.iter().copied().filter(|ip| lan_scope(*ip)).take(MAX_IPS).collect();
+    if ips.is_empty() {
+        return None;
+    }
+    let mut plain = id.clone();
+    for i in 0..MAX_IPS {
+        plain.extend_from_slice(&ips.get(i).map_or([0; 4], |ip| ip.octets()));
     }
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&port.to_le_bytes());
@@ -108,7 +128,7 @@ pub(crate) fn encode(keys: &[[u8; 32]], epoch: u64, port: u16, me: &PeerId) -> O
     for k in keys.iter().take(SLOTS) {
         let mut nonce = [0; NONCE];
         OsRng.fill_bytes(&mut nonce);
-        let sealed = id_cipher(k, epoch).encrypt(XNonce::from_slice(&nonce), id.as_slice()).ok()?;
+        let sealed = id_cipher(k, epoch).encrypt(XNonce::from_slice(&nonce), plain.as_slice()).ok()?;
         slots.push([tag(k, epoch, port).as_slice(), &nonce, &sealed].concat());
     }
     while slots.len() < SLOTS {
@@ -125,9 +145,10 @@ pub(crate) fn encode(keys: &[[u8; 32]], epoch: u64, port: u16, me: &PeerId) -> O
     Some(out)
 }
 
-/// A beacon's port and peer ID, and the server it was found for, if one of
-/// its slots is a tag of `keys` in `epoch` or one either side.
-pub(crate) fn decode(packet: &[u8], keys: &[(ServerId, [u8; 32])], epoch: u64) -> Option<(u16, PeerId, ServerId)> {
+/// A beacon's port, peer ID and sealed sender addresses, and the server
+/// it was found for, if one of its slots is a tag of `keys` in `epoch` or
+/// one either side.
+pub(crate) fn decode(packet: &[u8], keys: &[(ServerId, [u8; 32])], epoch: u64) -> Option<Beacon> {
     if packet.len() != PACKET_LEN || &packet[..5] != MAGIC {
         return None;
     }
@@ -141,12 +162,42 @@ pub(crate) fn decode(packet: &[u8], keys: &[(ServerId, [u8; 32])], epoch: u64) -
                     continue;
                 }
                 let nonce = XNonce::from_slice(&slot[TAG..TAG + NONCE]);
-                let Ok(id) = id_cipher(k, e).decrypt(nonce, &slot[TAG + NONCE..]) else { continue };
-                return PeerId::from_bytes(&id).ok().map(|peer| (port, peer, *server));
+                let Ok(plain) = id_cipher(k, e).decrypt(nonce, &slot[TAG + NONCE..]) else { continue };
+                let Ok(peer) = PeerId::from_bytes(&plain[..PEER_ID]) else { continue };
+                let ips = plain[PEER_ID..]
+                    .chunks(4)
+                    .map(|o| Ipv4Addr::new(o[0], o[1], o[2], o[3]))
+                    .filter(|ip| !ip.is_unspecified())
+                    .collect();
+                return Some(Beacon { port, peer, server: *server, ips });
             }
         }
     }
     None
+}
+
+/// What a member's beacon says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Beacon {
+    pub port: u16,
+    pub peer: PeerId,
+    pub server: ServerId,
+    /// The sender's LAN addresses, as it sealed them.
+    pub ips: Vec<Ipv4Addr>,
+}
+
+/// LAN scope: RFC 1918, CGNAT (100.64/10), link-local, loopback.
+pub(crate) fn lan_scope(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    ip.is_private() || ip.is_link_local() || ip.is_loopback() || (a == 100 && (64..128).contains(&b))
+}
+
+/// Where to dial a beacon heard from `source`: only a LAN-scope source
+/// that is one of the addresses the sender sealed (a replay from any other
+/// host is never dialled).
+pub(crate) fn dial_target(source: IpAddr, beacon: &Beacon) -> Option<Ipv4Addr> {
+    let IpAddr::V4(source) = source else { return None };
+    (lan_scope(source) && beacon.ips.contains(&source)).then_some(source)
 }
 
 /// When the next beacon is due.
@@ -243,12 +294,42 @@ mod tests {
         k_lan(&ServerSecret::from_bytes([n; 32]))
     }
 
+    const LAN: [Ipv4Addr; 1] = [Ipv4Addr::new(10, 0, 0, 7)];
+
+    #[test]
+    fn a_beacon_is_dialled_only_from_a_sealed_lan_address() {
+        // #460 (Tech Lead, Security Lead): libp2p-noise sends our identity
+        // before WrongPeerId, so a replay must never be dialled at all.
+        let me = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let s = ServerId::from_bytes([1; 32]);
+        let (wifi, wired) = (Ipv4Addr::new(192, 168, 1, 5), Ipv4Addr::new(10, 1, 2, 3));
+        // Public addresses are never sealed; up to MAX_IPS LAN ones are.
+        let all = [Ipv4Addr::new(8, 8, 8, 8), wifi, wired, Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(169, 254, 1, 1), Ipv4Addr::LOCALHOST];
+        let packet = encode(&[key(1)], 5, 4001, &me, &all).unwrap();
+        assert_eq!(packet.len(), PACKET_LEN, "the same size with more addresses");
+        let beacon = decode(&packet, &[(s, key(1))], 5).unwrap();
+        assert_eq!(beacon.ips, vec![wifi, wired, Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(169, 254, 1, 1)]);
+        // A multi-homed sender is dialled from either of its addresses.
+        assert_eq!(dial_target(IpAddr::V4(wifi), &beacon), Some(wifi));
+        assert_eq!(dial_target(IpAddr::V4(wired), &beacon), Some(wired));
+        // A replay from another LAN host: no dial.
+        assert_eq!(dial_target(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66)), &beacon), None);
+        // A public source (unicast from outside), even one it sealed: no dial.
+        let public = Beacon { ips: vec![Ipv4Addr::new(8, 8, 8, 8)], ..beacon.clone() };
+        assert_eq!(dial_target(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), &public), None);
+        assert_eq!(dial_target("2001:db8::1".parse().unwrap(), &beacon), None);
+        // No LAN address of ours: no beacon.
+        assert!(encode(&[key(1)], 5, 4001, &me, &[Ipv4Addr::new(8, 8, 8, 8)]).is_none());
+    }
+
     #[test]
     fn a_member_reads_the_peer_id_and_nobody_else_does() {
         let me = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
         let (s1, s2) = (ServerId::from_bytes([1; 32]), ServerId::from_bytes([2; 32]));
-        let packet = encode(&[key(1)], 100, 4001, &me).unwrap();
-        assert_eq!(decode(&packet, &[(s1, key(1))], 100), Some((4001, me, s1)));
+        let ips = [Ipv4Addr::new(192, 168, 1, 5)];
+        let packet = encode(&[key(1)], 100, 4001, &me, &ips).unwrap();
+        let want = Beacon { port: 4001, peer: me, server: s1, ips: ips.to_vec() };
+        assert_eq!(decode(&packet, &[(s1, key(1))], 100), Some(want));
         // One epoch either side, not two.
         assert!(decode(&packet, &[(s1, key(1))], 101).is_some());
         assert!(decode(&packet, &[(s1, key(1))], 99).is_some());
@@ -260,7 +341,7 @@ mod tests {
         moved[5] ^= 1;
         assert!(decode(&moved, &[(s1, key(1))], 100).is_none());
         // Unlinkable: the same beacon twice differs.
-        assert_ne!(encode(&[key(1)], 100, 4001, &me).unwrap(), packet);
+        assert_ne!(encode(&[key(1)], 100, 4001, &me, &ips).unwrap(), packet);
     }
 
     #[test]
@@ -268,10 +349,10 @@ mod tests {
         let me = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
         let keys: Vec<[u8; 32]> = (0..12).map(key).collect();
         for n in [0, 1, 3, SLOTS, 12] {
-            assert_eq!(encode(&keys[..n], 7, 1, &me).unwrap().len(), PACKET_LEN, "{n} servers");
+            assert_eq!(encode(&keys[..n], 7, 1, &me, &LAN).unwrap().len(), PACKET_LEN, "{n} servers");
         }
         // With more than SLOTS servers, the first SLOTS are in it.
-        let packet = encode(&keys, 7, 1, &me).unwrap();
+        let packet = encode(&keys, 7, 1, &me, &LAN).unwrap();
         let s = ServerId::from_bytes([3; 32]);
         assert!(decode(&packet, &[(s, keys[SLOTS - 1])], 7).is_some());
         assert!(decode(&packet, &[(s, keys[SLOTS])], 7).is_none());

@@ -740,6 +740,50 @@ pub struct ServerRestore {
     pub waiting: u32,
 }
 
+/// G-78: how the app lock is unlocked. `os` (Touch ID, later Windows
+/// Hello) always has a passcode behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AppLockMethod {
+    Passcode,
+    Os,
+}
+
+/// G-78: `getAppLock`'s answer. It never holds the verifier or the salt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLock {
+    pub enabled: bool,
+    pub method: AppLockMethod,
+    pub idle_minutes: u8,
+    pub lock_on_sleep: bool,
+    /// Seconds until the next attempt is checked, while a delay runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+}
+
+/// G-78: the outcome of a passcode or words attempt. "Wrong" is an answer,
+/// not an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AppLockResult {
+    Ok,
+    Wrong,
+    RateLimited,
+}
+
+/// G-78: the answer of `verifyAppLock`, `setAppLock`, `clearAppLock` and
+/// `clearAppLockWithWords`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLockAnswer {
+    pub result: AppLockResult,
+    /// Seconds until the next attempt is checked, when a delay runs (always
+    /// with `rate-limited`; with `wrong` when this attempt started one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+}
+
 /// `getMemberRelay`'s answer, and `memberRelay.changed`'s payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

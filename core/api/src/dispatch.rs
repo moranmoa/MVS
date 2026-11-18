@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use crate::service::Core;
 use crate::types::*;
@@ -289,6 +290,51 @@ struct RelayOnlyArg {
     on: bool,
 }
 
+/// G-78: the app lock's arguments. Passcodes and words are wiped from
+/// memory when dropped, and never logged.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyAppLockArg {
+    #[serde(with = "crate::devicelink::secret_string")]
+    passcode: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearAppLockArg {
+    #[serde(with = "crate::devicelink::secret_string")]
+    current: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WordsAppLockArg {
+    #[serde(with = "crate::devicelink::secret_string")]
+    words: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SetAppLockArg {
+    #[serde(default, with = "optional_secret")]
+    current: Option<Zeroizing<String>>,
+    #[serde(with = "crate::devicelink::secret_string")]
+    passcode: Zeroizing<String>,
+    method: AppLockMethod,
+    idle_minutes: u8,
+    lock_on_sleep: bool,
+}
+
+/// An optional secret string, wiped when dropped.
+mod optional_secret {
+    use serde::{Deserialize, Deserializer};
+    use zeroize::Zeroizing;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Zeroizing<String>>, D::Error> {
+        Ok(Option::<String>::deserialize(d)?.map(Zeroizing::new))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MeteredArg {
@@ -437,6 +483,15 @@ impl Core {
             "setUpdateChannel" => ok(self.set_update_channel(args::<ChannelArg>(raw)?.channel)),
             "setRelayOnly" => ok(self.set_relay_only(args::<RelayOnlyArg>(raw)?.on)),
             "getServerRestore" => ok(Ok(self.get_server_restore())),
+            // G-78, the app lock (main-only except set and clear).
+            "getAppLock" => ok(self.get_app_lock()),
+            "verifyAppLock" => ok(self.verify_app_lock(args::<VerifyAppLockArg>(raw)?.passcode)),
+            "setAppLock" => {
+                let a = args::<SetAppLockArg>(raw)?;
+                ok(self.set_app_lock(a.current, a.passcode, a.method, a.idle_minutes, a.lock_on_sleep))
+            }
+            "clearAppLock" => ok(self.clear_app_lock(args::<ClearAppLockArg>(raw)?.current)),
+            "clearAppLockWithWords" => ok(self.clear_app_lock_with_words(args::<WordsAppLockArg>(raw)?.words)),
             "getMemberRelay" => ok(self.get_member_relay()),
             "setMemberRelay" => ok(self.set_member_relay(args::<MemberRelayArg>(raw)?.setting)),
             "setMemberRelayCap" => ok(self.set_member_relay_cap(args::<MemberRelayCapArg>(raw)?.mb)),

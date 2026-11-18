@@ -53,7 +53,7 @@ describe('voice diagnostics panel (G-81)', () => {
     expect(c.querySelector('.diag-stun')!.textContent).toBe('STUN server: answered (public address found).');
     const rows = [...c.querySelectorAll('tbody tr')].map((tr) => [...tr.children].map((x) => x.textContent));
     expect(rows).toEqual([
-      ['Dana', 'connected / connected', 'srflx → srflx', 'host 1 · srflx 1', '1835 ms'],
+      ['Dana', 'connected / connected', 'srflx → srflx', 'host 1 · srflx 1', '1800 ms'],
       ['Omer', 'connecting / checking', '—', '—', '—'],
     ]);
   });

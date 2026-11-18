@@ -13,7 +13,7 @@ import '../../styles/voice-diag.css';
 export const DIAG_REFRESH_MS = 1000;
 
 function ms(intl: ReturnType<typeof useIntl>, value: number | null): string {
-  return value === null ? '—' : intl.formatMessage({ id: 'diag.ms' }, { n: Math.round(value) });
+  return value === null ? '—' : intl.formatMessage({ id: 'diag.ms' }, { n: Math.round(value / 100) * 100 }) // SL Q2: to 100 ms;
 }
 
 function Gathered({ g }: { g: PeerDiagnostics['gathered'] }) {

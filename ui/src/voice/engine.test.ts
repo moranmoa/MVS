@@ -95,6 +95,9 @@ class FakePC {
   restarts = 0;
   /** Candidate types of the selected pair, for connectionTypes. */
   pairTypes: [string, string] = ['host', 'host'];
+  /** Extra fields on both candidate stats, and extra stats (G-81 fuzz: hostile values everywhere). */
+  statsExtra: Record<string, unknown> = {};
+  statsMore: Record<string, unknown>[] = [];
   /** G-81: the candidate lines this side gathers (into its SDP): a host and a srflx, as behind a NAT with STUN. */
   localCandidates: string[] = [...(nextCandidates ?? DEFAULT_CANDIDATES)];
   get iceConnectionState(): RTCIceConnectionState {
@@ -197,9 +200,10 @@ class FakePC {
     return new Map<string, Record<string, unknown>>([
       ['T1', { id: 'T1', type: 'transport', remoteCertificateId: 'CR', selectedCandidatePairId: 'P' }],
       ['P', { id: 'P', type: 'candidate-pair', localCandidateId: 'L', remoteCandidateId: 'R', state: 'succeeded', nominated: true }],
-      ['L', { id: 'L', type: 'local-candidate', candidateType: this.pairTypes[0], address: '192.0.2.10', port: 5000 }],
-      ['R', { id: 'R', type: 'remote-candidate', candidateType: this.pairTypes[1], address: '198.51.100.20', port: 6000 }],
+      ['L', { id: 'L', type: 'local-candidate', candidateType: this.pairTypes[0], address: '192.0.2.10', port: 5000, ...this.statsExtra }],
+      ['R', { id: 'R', type: 'remote-candidate', candidateType: this.pairTypes[1], address: '198.51.100.20', port: 6000, ...this.statsExtra }],
       ['CR', { id: 'CR', type: 'certificate', fingerprint: remote?.toUpperCase(), fingerprintAlgorithm: 'sha-256' }],
+      ...this.statsMore.map((r, i): [string, Record<string, unknown>] => [`X${i}`, { id: `X${i}`, ...r }]),
     ]);
   }
   close() {
@@ -1658,13 +1662,67 @@ describe('voice engine: G-81 diagnostics', () => {
         `candidate:${i} 1 ${pick(['udp', 'tcp'])} ${rnd(1e9)} ${addr()} ${rnd(65536)} typ ${pick(['host', 'srflx', 'relay', 'prflx', 'bogus', addr()])} raddr ${addr()} rport ${rnd(65536)}`,
       );
       const { hx, ex, ey } = await call();
-      hx.pcs[0]!.pairTypes = [pick(['host', 'srflx', addr()]), pick(['relay', addr(), 'prflx'])];
+      const pc = hx.pcs[0]!;
+      pc.pairTypes = [pick(['host', 'srflx', addr()]), pick(['relay', addr(), 'prflx'])];
+      // SL D2: an address in every field a candidate stat can carry, and in stats of every other kind.
+      const hostile = Object.fromEntries(
+        ['address', 'ip', 'port', 'relatedAddress', 'relatedPort', 'url', 'foundation', 'usernameFragment', 'candidate', 'protocol', 'relayProtocol', 'networkType'].map((k) => [k, addr()]),
+      );
+      pc.statsExtra = hostile;
+      pc.statsMore = [
+        { type: 'local-candidate', candidateType: addr(), ...hostile },
+        { type: 'candidate-pair', state: addr(), nominated: true, localCandidateId: 'X0', remoteCandidateId: 'L', ...hostile },
+        { type: 'transport', iceState: addr(), selectedCandidatePairId: rnd(2) ? 'P' : 'X1', ...hostile },
+      ];
       const d = await ex.diagnostics();
       for (const s of strings(d)) expect(ALLOWED.has(s), s).toBe(true);
+      expect(JSON.stringify(d)).not.toMatch(/\d+\.\d+\.\d+\.\d+|[0-9a-f]{1,4}:[0-9a-f]{0,4}:|\.local|example|<img/i);
       ex.dispose();
       ey.dispose();
       vi.useRealTimers();
       allPcs.length = 0;
     }
+  });
+
+  it('SL S1: relay-only never starts a call: no RTCPeerConnection, no microphone, offers ignored', async () => {
+    vi.useFakeTimers();
+    const h = fakeEnv();
+    const core = new FakeCore(B, [B, A]);
+    const engine = createVoiceEngine(core, { env: h.env, stunUrl: 'stun:stun.example.test:3478', relayOnly: true });
+    const errors = record<VoiceError>((cb) => engine.on('error', cb));
+    await engine.attach(core.state(), B);
+    core.emitSignal({ from: A, kind: 'offer', payload: `v=0\r\na=fingerprint:sha-256 ${newFingerprint()}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n`, fingerprintVerified: true });
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.pcs).toHaveLength(0);
+    expect(h.mics).toHaveLength(0);
+    expect(core.sent).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, peers: {} });
+    engine.dispose();
+  });
+});
+
+describe('SL S3: ICE servers only from a plain stun:host:port', () => {
+  it('accepts one host (name, IPv4 or [IPv6]) with an optional port', () => {
+    for (const ok of ['stun:stun.example.test:3478', 'stuns:stun.example.test:5349', 'STUN:stun.example.test', 'stun:198.51.100.7:3478', 'stun:[2001:db8::7]:3478'])
+      expect(iceServersFor(ok), ok).toEqual([{ urls: ok }]);
+  });
+  it('refuses TURN, credentials, ?transport, paths, lists and bad ports', () => {
+    for (const bad of [
+      'turn:turn.example.test:3478',
+      'turns:turn.example.test:5349',
+      'stun:stun.example.test:3478?transport=udp',
+      'stun:user:pass@stun.example.test:3478',
+      'stun:user@stun.example.test',
+      'stun:stun.example.test/path',
+      'stun:a.example.test:3478,stun:b.example.test:3478',
+      'stun:a.example.test:3478 stun:b.example.test:3478',
+      'stun:stun.example.test:0',
+      'stun:stun.example.test:65536',
+      'stun:stun.example.test:3478:1',
+      'stun:',
+      'stun:' + 'a'.repeat(260),
+    ])
+      expect(iceServersFor(bad), bad).toEqual([]);
   });
 });

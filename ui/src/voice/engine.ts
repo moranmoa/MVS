@@ -137,6 +137,8 @@ export interface VoiceEnv {
 export interface VoiceEngineOptions {
   /** The config's STUN URL (`stun:host:port`), if any. */
   stunUrl?: string | null;
+  /** Relay-only is on: the engine never starts a call (SL S1, G-81). */
+  relayOnly?: boolean;
   env?: VoiceEnv;
   /** How long to wait for ICE gathering before sending the SDP anyway. */
   gatherTimeoutMs?: number;
@@ -1159,6 +1161,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   // ---- lifecycle -------------------------------------------------------------
   async function start(state: CallState, myId: Id) {
     if (active) stop();
+    // SL S1: relay-only means no voice. The core already refuses and ends
+    // calls; the engine adds its own stop: no microphone, no connection, no
+    // candidate gathering (offers and signals are ignored while inactive).
+    if (options.relayOnly) return;
     active = true;
     const gen = ++generation;
     me = myId;

@@ -194,10 +194,10 @@ function onLockChange(st) {
     syncCall();
     // Path B unlock has no reload: hand over a held invite now (path A's
     // reload does it on did-finish-load).
-    if (uiReady && pendingInvite) {
-      const link = pendingInvite;
-      pendingInvite = null;
-      openInvite(link);
+    if (uiReady && pendingLink) {
+      const held = pendingLink;
+      pendingLink = null;
+      openLink(held);
     }
   }
 }
@@ -530,45 +530,53 @@ function lockDownSession(ses) {
 }
 
 /**
- * An mvs:// invite from the OS. Only a link of the exact invite format gets
- * through (deeplink.js). Main never joins by itself: a link from outside
- * must not reveal who we are to someone's server without a click. It sends
- * the UI a `link.open` event; the UI shows the join screen, pre-filled, and
- * calls joinServer only when the user presses Join.
+ * An mvs:// link from the OS. Only a link of an exact format gets through
+ * (deeplink.js); neither it nor argv is ever logged.
+ * - An invite: main never joins by itself (a link from outside must not
+ *   reveal who we are to someone's server without a click). The UI gets
+ *   `link.open { link }`, shows the join screen pre-filled, and calls
+ *   joinServer only when the user presses Join.
+ * - G-30, a message link: the UI gets `link.message { serverId, channelId,
+ *   messageId }`, the IDs main already parsed, and goes to that message.
  */
-let pendingInvite = null;
+let pendingLink = null;
 let healthReported = false;
 let uiReady = false;
+/** G-30 (SL): the window comes forward for a deep link at most once every 2 s. */
+const linkFocus = deeplink.createFocusThrottle();
 
-function openInvite(raw) {
-  const link = deeplink.parseInviteLink(raw);
-  if (!link) return;
-  const win = BrowserWindow.getAllWindows()[0];
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.focus();
-  }
-  // Held until the UI is up and unlocked (G-78: only the latest one).
-  if (!uiReady || !win || !sec.isInternalUrl(win.webContents.getURL()) || !lockOpen()) {
-    pendingInvite = link;
-    return;
-  }
-  win.webContents.send('core:event', 'link.open', { link });
+function bringForward(win) {
+  if (win.isMinimized()) win.restore();
+  win.focus();
 }
 
-function flushInvite() {
+/** `parsed`: deeplink.parseLink's answer (never a raw string). */
+function openLink(parsed) {
+  if (!parsed) return;
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && linkFocus.allow()) bringForward(win);
+  // Held until the UI is up and unlocked (G-78: one slot, either kind, only the latest).
+  if (!uiReady || !win || !sec.isInternalUrl(win.webContents.getURL()) || !lockOpen()) {
+    pendingLink = parsed;
+    return;
+  }
+  if (parsed.kind === 'invite') win.webContents.send('core:event', 'link.open', { link: parsed.link });
+  else win.webContents.send('core:event', 'link.message', { serverId: parsed.serverId, channelId: parsed.channelId, messageId: parsed.messageId });
+}
+
+function flushLink() {
   uiReady = true;
-  if (pendingInvite) {
-    const link = pendingInvite;
-    pendingInvite = null;
-    openInvite(link);
+  if (pendingLink) {
+    const held = pendingLink;
+    pendingLink = null;
+    openLink(held);
   }
 }
 
 // macOS delivers links as an event (also before ready).
 app.on('open-url', (event, url) => {
   event.preventDefault();
-  openInvite(url);
+  openLink(deeplink.parseLink(url));
 });
 
 /**
@@ -699,7 +707,7 @@ function createWindow() {
   });
   // Every load (a reload too) gets the current core status.
   win.webContents.on('did-finish-load', () => {
-    flushInvite();
+    flushLink();
     // The page may have missed earlier changes; the preload keeps this for the UI.
     if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('core:event', 'core.status', statusForPage(coreStatus));
     // Commit this version once the UI is up and the core answers (main only, once).
@@ -734,19 +742,16 @@ app.whenReady().then(async () => {
   setInterval(() => appLock.idleTick(powerMonitor.getSystemIdleTime()), 15_000).unref();
   powerMonitor.on('lock-screen', () => appLock.onSleep());
   powerMonitor.on('suspend', () => appLock.onSleep());
-  const first = deeplink.inviteFromArgv(process.argv);
-  if (first) openInvite(first);
+  openLink(deeplink.linkFromArgv(process.argv));
   app.on('activate', () => BrowserWindow.getAllWindows().length === 0 && createWindow());
 });
 
 app.on('second-instance', (_event, argv) => {
+  // A link brings the window forward itself (throttled); a plain relaunch always does.
+  const link = deeplink.linkFromArgv(argv);
+  if (link) return openLink(link);
   const win = BrowserWindow.getAllWindows()[0];
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.focus();
-  }
-  const link = deeplink.inviteFromArgv(argv);
-  if (link) openInvite(link);
+  if (win) bringForward(win);
 });
 
 app.on('will-quit', () => {

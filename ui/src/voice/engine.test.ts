@@ -1389,8 +1389,12 @@ describe('voice engine: ICE restart on a network change', () => {
     const { hx, hy, cx, cy, ex, ey, errors, errorsY, partsX } = await connectedPair();
     drop(hx.pcs[0]!);
     drop(hy.pcs[0]!);
-    expect(partsX.at(-1)).toContainEqual({ identity: B, state: 'connecting' });
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(1_900); // within the 2 s grace: nothing yet
+    expect(hx.pcs[0]!.restarts).toBe(0);
+    const before = partsX.length;
+    await vi.advanceTimersByTimeAsync(150);
+    // Shown as reconnecting while it restarted.
+    expect(partsX.slice(before).some((list) => list.some((p) => p.identity === B && p.state === 'connecting'))).toBe(true);
     // The offerer (A, the lower identity) restarted and re-offered; B answered on the same connection.
     expect(hx.pcs[0]!.restarts).toBe(1);
     expect(hy.pcs[0]!.restarts).toBe(0);
@@ -1431,13 +1435,51 @@ describe('voice engine: ICE restart on a network change', () => {
     await vi.advanceTimersByTimeAsync(3_000);
     expect(hy.pcs[0]!.restarts).toBe(0);
     expect(cy.sent.map((s) => s.kind)).toEqual(['answer']);
-    // The offerer's side notices too and restarts.
+    // The offerer's side notices too and restarts (after its 2 s grace).
     drop(hx.pcs[0]!);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(2_050);
     expect(cy.sent.map((s) => s.kind)).toEqual(['answer', 'answer']);
     expect(hy.pcs[0]!.connectionState).toBe('connected');
     await vi.advanceTimersByTimeAsync(30_000);
     expect(errorsY).toEqual([]); // the answerer's give-up timer was cleared
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a short "disconnected" that comes back within 2 s restarts nothing', async () => {
+    const { hx, hy, cx, ex, ey, errors } = await connectedPair();
+    drop(hx.pcs[0]!);
+    drop(hy.pcs[0]!);
+    await vi.advanceTimersByTimeAsync(1_000);
+    drop(hx.pcs[0]!, 'connected');
+    drop(hy.pcs[0]!, 'connected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(hx.pcs[0]!.restarts).toBe(0);
+    expect(cx.sent.map((s) => s.kind)).toEqual(['offer']);
+    expect(errors).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('a restart answer naming another certificate is refused before it is applied (pinned fingerprint)', async () => {
+    const { hx, hy, cx, cy, ex, ey, errors } = await connectedPair();
+    // B's side answers the restart with another certificate (a man in the middle).
+    const realSend = cy.sendSignal.bind(cy);
+    cy.wire = null;
+    cy.sendSignal = async (to, kind, payload) => {
+      const swapped = payload.replace(/a=fingerprint:sha-256 \S+/, `a=fingerprint:sha-256 ${newFingerprint()}`);
+      setTimeout(() => cx.emitSignal({ from: B, kind, payload: swapped, fingerprintVerified: true }), 0);
+      return realSend(to, kind, payload);
+    };
+    const offerer = hx.pcs[0]!;
+    const remoteBefore = offerer.remoteDescription;
+    drop(offerer, 'failed');
+    drop(hy.pcs[0]!, 'failed');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(offerer.restarts).toBe(1);
+    expect(errors).toEqual([{ code: 'fingerprint-mismatch', peer: B }]);
+    expect(offerer.closed).toBe(true);
+    expect(offerer.remoteDescription).toBe(remoteBefore); // never applied
     ex.dispose();
     ey.dispose();
   });
@@ -1463,14 +1505,14 @@ describe('voice engine: ICE restart on a network change', () => {
     hy.pcs[0]!.neverConnect = true;
     drop(hx.pcs[0]!);
     drop(hy.pcs[0]!);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(2_050); // the 2 s grace, then the first restart
     expect(hx.pcs[0]!.restarts).toBe(1);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(hx.pcs[0]!.restarts).toBe(2);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(hx.pcs[0]!.restarts).toBe(3);
     expect(errors).toEqual([]);
-    await vi.advanceTimersByTimeAsync(5_000); // 15 s
+    await vi.advanceTimersByTimeAsync(5_000); // 15 s after the restart began
     expect(errors).toEqual([{ code: 'peer-failed', peer: B }]);
     expect(errorsY).toEqual([{ code: 'peer-failed', peer: A }]);
     expect(hx.pcs[0]!.closed && hy.pcs[0]!.closed).toBe(true);

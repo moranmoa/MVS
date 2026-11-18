@@ -118,6 +118,8 @@ export interface VoiceEngineOptions {
   recoverTimeoutMs?: number;
   /** While recovering, the offerer sends a fresh restart offer this often. Default 5 s. */
   restartResendMs?: number;
+  /** How long `disconnected` may last before a restart (it often recovers by itself). Default 2 s. */
+  disconnectGraceMs?: number;
 }
 
 export interface VoiceEngine {
@@ -191,6 +193,8 @@ interface Peer {
   watchdog: ReturnType<typeof setTimeout> | null;
   /** A verified call that dropped: the give-up timer and the offerer's re-sends. */
   recovery: { giveUp: ReturnType<typeof setTimeout>; resend: ReturnType<typeof setInterval> | null } | null;
+  /** A short wait on `disconnected` before restarting: it often comes back by itself. */
+  grace: ReturnType<typeof setTimeout> | null;
 }
 
 interface Meter {
@@ -250,6 +254,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const connectTimeoutMs = options.connectTimeoutMs ?? 30_000;
   const recoverTimeoutMs = options.recoverTimeoutMs ?? 15_000;
   const restartResendMs = options.restartResendMs ?? 5000;
+  const disconnectGraceMs = options.disconnectGraceMs ?? 2000;
   const turnFetchTimeoutMs = options.turnFetchTimeoutMs ?? 2000;
   /** Cleaned TURN credentials, and when to refresh them (80% of the ttl). */
   let turn: TurnCredentials | null = null;
@@ -598,6 +603,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       attempt,
       watchdog: null,
       recovery: null,
+      grace: null,
     };
     peers.set(id, peer);
     peer.watchdog = setTimeout(
@@ -631,13 +637,22 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       if (peer.closed) return;
       const s = pc.connectionState;
       if (s === 'connected') {
+        clearGrace(peer);
         endRecovery(peer);
         void checkCertificate(peer); // again after a restart: same certificate, or the peer goes
       } else if (s === 'disconnected' || s === 'failed') {
-        // A call that worked: ICE restart on this connection. One that never
+        // A call that worked: ICE restart on this connection (after a short
+        // grace for `disconnected`, at once for `failed`). One that never
         // connected: the offerer's fresh-connection retries, as before.
-        if (peer.verified) recover(peer);
-        else if (s === 'failed') retryOrFail(peer);
+        if (peer.verified) {
+          if (s === 'failed' || peer.recovery) recover(peer);
+          else if (!peer.grace) {
+            peer.grace = setTimeout(() => {
+              peer.grace = null;
+              if (!peer.closed && peer.pc.connectionState !== 'connected') recover(peer);
+            }, disconnectGraceMs);
+          }
+        } else if (s === 'failed') retryOrFail(peer);
       }
     };
     emitParticipants();
@@ -655,6 +670,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
 
   function recover(peer: Peer) {
     if (peer.closed || !peer.verified) return;
+    clearGrace(peer);
     if (!peer.recovery) {
       peer.state = 'connecting';
       emitParticipants();
@@ -677,6 +693,11 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       return;
     }
     void sendDescription(peer, 'offer').catch(() => {});
+  }
+
+  function clearGrace(peer: Peer) {
+    if (peer.grace) clearTimeout(peer.grace);
+    peer.grace = null;
   }
 
   function endRecovery(peer: Peer) {
@@ -710,6 +731,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     if (peer.watchdog) clearTimeout(peer.watchdog);
     peer.watchdog = null;
     endRecovery(peer);
+    clearGrace(peer);
     peer.state = 'failed';
     try {
       peer.pc.close();
@@ -864,7 +886,9 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
 
   async function applyRemote(peer: Peer, type: 'offer' | 'answer', sdp: string): Promise<boolean> {
     const fingerprint = soleFingerprint(sdp);
-    if (!fingerprint) {
+    // Pinned: once a peer has a fingerprint, every later offer or answer (an
+    // ICE restart) must name the same one; refused before it's applied.
+    if (!fingerprint || (peer.fingerprint !== null && fingerprint !== peer.fingerprint)) {
       dropPeer(peer, 'fingerprint-mismatch');
       return false;
     }

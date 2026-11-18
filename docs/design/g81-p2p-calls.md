@@ -1,6 +1,6 @@
 # G-81: voice calls across networks over the P2P network only
 
-- **Status: approved (C2)** by the manager, TL and SL at ed3715b. This version folds in their amendments (TL A1–A8, SL B1–B6, the manager's two requirements) and dev-sync's network facts (`dev-sync-g81-network-side.md`). One open decision remains: §2.4 circuit order.
+- **Status: approved (C2)** by the manager, TL and SL at ed3715b. This version folds in their amendments (TL A1–A8, SL B1–B6, the manager's two requirements, including the §2.4 circuit order) and dev-sync's network facts (`dev-sync-g81-network-side.md`).
 - **Authors:** voice-d with dev-sync.
 - **Supersedes:** the STUN/TURN path in `voice-across-networks.md` (#333) for the release plan. #433 (TURN) closes (TL), `MVS_STUN_URL` stays unset, and the STUN code path stays dormant.
 - **Owner's decision (2026-11-18):** "all the app needs to work without server so make it work with the decentralized network." There's no project STUN or TURN and no public STUN. We use the libp2p network the app already runs: relays, member relays (#368), members-only hole punching (DCUtR, #219/#184), and the LAN beacon (#460).
@@ -94,21 +94,24 @@ Over a cap, the frame is dropped; after a sustained flood, the stream is closed.
 - **Cost per relayed 1:1 pair** (about 44 B of framing per frame, both directions summed): about 18 MB/h at 16 kbps (DTX lowers it further), about 30 MB/h at 24 kbps.
 - **Against the project relay:** both fit its 32 MiB circuit, which is refreshed before the cut anyway.
 
-### 2.4 Circuit order: open decision
+### 2.4 Circuit order (decided by the manager)
 
-The requirements disagree:
+**Order:** direct (LAN or punched) → a member relay of the same server → the project relay as last resort.
+
+- **Member relays carry media through a voice circuit class** in `member_relay.rs`, charged by the bytes actually relayed. dev-sync builds it, with SL review.
+- **Until that class lands,** member relays carry media only when no project relay is reachable, because today each 120 s circuit is charged its full 8 MiB.
+- **Relay-only users** always use our relays only (SL B5), so members never see their IP.
+
+The two rules are consistent: member relays come first for normal users, and relay-only users never use them.
+
+**Background**, for the record. The requirements differed:
 - **Manager:** prefer a member relay of the same server over the project relay, so calls keep working when our relays are down or gone. The project relay is the last resort, as for messages.
 - **dev-sync:** member relays as they stand don't fit media.
   - Each 120 s circuit is charged its full 8 MiB, so a relayed call costs about 240 MiB/h of the helper's `daily_cap_mb` (2 GB a day is about 8 call-hours), against roughly 18 MB/h actually carried.
   - Every 120 s brings a forced switch, which A3's make-before-break handles but which is constant churn.
 - **SL (non-blocking):** while relay-only is off, prefer the project relay for media, rather than reconnecting every two minutes.
 
-**Proposal:**
-1. Follow the manager's order (member relay first, project relay last).
-2. Make member relays fit for media with a **voice circuit class** in `member_relay.rs`, charged by the bytes actually relayed. That needs dev-sync and the SL. Until it lands, media uses member relays only when no project relay is reachable.
-3. Relay-only users never use member relays (SL B5), so for them it's always our relay.
-
-**Decision needed:** manager + SL.
+The decision above follows voice-d's proposal, which the manager confirmed on 2026-11-18. The SL and TL had approved C2 before §2.4 was settled.
 
 ## 3. Relay-only and the notice
 
@@ -170,7 +173,7 @@ QA's hooks (#500: G81.3, G81.4, G81.5) carry over. One more is needed: the media
 | **A: no open reflector** | A is rejected, and A0 isn't in v1. No reflector exists. |
 | **B: Noise end to end over the circuit** | Yes. A circuit is a transport with Noise between the cores, and a sync test taps the relay's bytes. |
 | **B: frame key if anyone forwards** | Nobody forwards (a full mesh, one stream per pair). A forwarder would need an SFrame-like key from the channel key with a new label, plus review. Refused for now. |
-| **B: relay budget (R11)** | Both directions summed: about 18 MB/h at 16 kbps (relayed default, less with DTX), about 30 MB/h at 24 kbps, under 32 MiB. Make-before-break before the cut, no `MAX_CIRCUIT_*` change, the mesh ≤ 8. Member-relay charging is open (§2.4). |
+| **B: relay budget (R11)** | Both directions summed: about 18 MB/h at 16 kbps (relayed default, less with DTX), about 30 MB/h at 24 kbps, under 32 MiB. Make-before-break before the cut, no `MAX_CIRCUIT_*` change, the mesh ≤ 8. Member relays carry media via a voice circuit class charged by actual bytes (§2.4). |
 | **B: frames bound to call, sender and sequence** | The frozen frame (§2.3). The sender comes from the bound stream. A wrong call, a duplicate or stale seq, or a bad length is dropped or closes the stream. Rate and size caps, jitter buffer ≤ 200 ms. |
 | **B: metadata** | Relays see two peer IDs, timing and volume, and with DTX when someone talks (§4). It goes in the threat model and notice v3. |
 | **C: a peer can't force a direct path under relay-only** | My engine decides (§2.2). Under relay-only, no RTCPeerConnection, candidates, DCUtR or member relays exist, so an offer is ignored. |

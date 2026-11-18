@@ -2,7 +2,7 @@
 //!
 //! The typing pattern (`typing`), in its own protocol with its own caps:
 //! - One request carries one opaque blob (the api's sealed box) of at most
-//!   [`MAX_REPORT_BLOB`] bytes. The answer is empty: the ack the sender's
+//!   [`MAX_REPORT_BLOB`] bytes. The answer is one ack byte, which the sender's
 //!   outbox waits for.
 //! - Never stored, gossiped or forwarded here. The api stores what it keeps.
 //! - Only between verified current members (the voice and typing check). A
@@ -34,6 +34,9 @@ pub(crate) const PER_PEER_BURST: u32 = 3;
 pub(crate) const PER_PEER_EVERY_SECS: u32 = 10;
 pub(crate) const ALL_BURST: u32 = 20;
 pub(crate) const ALL_RATE: u32 = 2;
+/// The answer to a box that passed: one byte. A box that didn't pass gets
+/// none (the stream closes empty), so the sender knows it wasn't taken.
+const ACK: u8 = 1;
 /// Per-peer buckets remembered.
 const MAX_TRACKED: usize = 1024;
 /// Boxes sent and waiting for their ack at once; past it, a send is refused
@@ -91,7 +94,7 @@ impl ReportLimits {
 }
 
 /// The wire format: the request is the box itself, up to the end of the
-/// stream; the answer is empty. Reading stops after [`MAX_REPORT_BLOB`] + 1
+/// stream; the answer is the one byte [`ACK`]. Reading stops after [`MAX_REPORT_BLOB`] + 1
 /// bytes, and a longer box fails the stream (so it goes unanswered).
 #[derive(Clone, Default)]
 pub(crate) struct ReportCodec;
@@ -127,8 +130,13 @@ impl request_response::Codec for ReportCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut rest = Vec::new();
-        io.take(1).read_to_end(&mut rest).await?;
+        // An explicit ack byte: a dropped box closes the stream with nothing
+        // in it, which must not read as an ack.
+        let mut ack = Vec::new();
+        io.take(2).read_to_end(&mut ack).await?;
+        if ack != [ACK] {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "no report ack"));
+        }
         Ok(())
     }
 
@@ -142,11 +150,11 @@ impl request_response::Codec for ReportCodec {
         io.write_all(&blob).await
     }
 
-    async fn write_response<T>(&mut self, _: &StreamProtocol, _: &mut T, _: ()) -> io::Result<()>
+    async fn write_response<T>(&mut self, _: &StreamProtocol, io: &mut T, _: ()) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        Ok(())
+        io.write_all(&[ACK]).await
     }
 }
 
@@ -168,6 +176,24 @@ mod tests {
             let mut sink = futures::io::Cursor::new(Vec::new());
             assert!(ReportCodec.write_request(&protocol, &mut sink, big).await.is_err());
             assert!(sink.into_inner().is_empty());
+        });
+    }
+
+    #[test]
+    fn only_the_ack_byte_is_an_ack() {
+        let protocol = REPORT_PROTOCOL;
+        futures::executor::block_on(async {
+            let mut sink = futures::io::Cursor::new(Vec::new());
+            ReportCodec.write_response(&protocol, &mut sink, ()).await.unwrap();
+            assert_eq!(sink.into_inner(), [ACK]);
+            let read = |bytes: Vec<u8>| async move {
+                ReportCodec.read_response(&protocol, &mut futures::io::Cursor::new(bytes)).await
+            };
+            assert!(read(vec![ACK]).await.is_ok());
+            // A dropped box: the stream closes empty. Never an ack.
+            assert!(read(vec![]).await.is_err());
+            assert!(read(vec![0]).await.is_err());
+            assert!(read(vec![ACK, ACK]).await.is_err());
         });
     }
 

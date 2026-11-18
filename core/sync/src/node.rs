@@ -801,11 +801,17 @@ impl Node {
             relay_lost_at: Some(Instant::now()),
             member_listeners: HashMap::new(),
             member_reserved: HashSet::new(),
+            remembered_dialed: HashMap::new(),
+            remembered_checked: Instant::now(),
             relay_ping_misses: HashMap::new(),
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
         };
+        // A relay-only start keeps no member addresses either (Security Lead).
+        if task.relay_only {
+            task.forget_remembered();
+        }
         for log in config.logs {
             task.open(log, None);
         }
@@ -1516,6 +1522,9 @@ struct Task {
     member_listeners: HashMap<ListenerId, PeerId>,
     /// Member relay listeners whose reservation was accepted.
     member_reserved: HashSet<ListenerId>,
+    /// Remembered members dialled lately, and when the rows were last checked.
+    remembered_dialed: HashMap<PeerId, Instant>,
+    remembered_checked: Instant,
     /// Failed pings in a row to our relay, per connection (`relay_ping`):
     /// one dead connection among several (TCP and QUIC) is closed on its own
     /// count (Security Lead, #400).
@@ -1597,6 +1606,7 @@ impl Task {
                     self.recheck_member_relay();
                     self.expire_fetches();
                     self.link_tick();
+                    self.check_remembered();
                     let gone = self.presence.expire(Instant::now());
                     self.went_offline(gone);
                 }
@@ -1612,6 +1622,7 @@ impl Task {
                 _ = discovery.tick() => {
                     self.discover();
                     self.member_relay_fallback();
+                    self.redial_remembered();
                 }
             }
         }
@@ -2357,6 +2368,8 @@ impl Task {
             // Relay-only users never relay for members (design #368 §1); the
             // core turns it on again, if it should be, once this is off.
             self.swarm.behaviour_mut().member_relay.stop();
+            // Nor keeps any member's address (Security Lead).
+            self.forget_remembered();
             for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
                 self.swarm.remove_listener(id);
             }
@@ -2474,7 +2487,7 @@ impl Task {
             debug!(%peer, lan, candidates = listen_addrs.len(), "no direct address to try");
             return;
         }
-        debug!(%peer, lan, ?addrs, "trying a direct connection");
+        debug!(%peer, lan, addrs = addrs.len(), "trying a direct connection");
         let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::Always).build();
         if let Err(err) = self.swarm.dial(opts) {
             debug!(%peer, ?err, "direct dial refused");
@@ -2754,7 +2767,7 @@ impl Task {
                     self.swarm.behaviour_mut().kad.get_closest_peers(me);
                 } else if self.connected.insert(peer_id) {
                     // Peer ID with its address only at debug level (PR checklist).
-                    debug!(%peer_id, address = %endpoint.get_remote_address(), "peer connected");
+                    debug!(%peer_id, relayed = is_relayed(&endpoint), "peer connected");
                     info!(%peer_id, "peer connected");
                     self.reached = true;
                     self.emit(NodeEvent::PeerConnected(peer_id));
@@ -3390,7 +3403,9 @@ impl Task {
                 // A member's direct addresses (F2): try a direct connection.
                 let addrs: Vec<Multiaddr> =
                     response.direct_addrs.iter().filter_map(|b| Multiaddr::try_from(b.to_vec()).ok()).collect();
-                debug!(peer = %key.0, ?addrs, relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                debug!(peer = %key.0, addrs = addrs.len(), relayed = self.relayed.contains_key(&key.0), "member offered direct addresses");
+                // Relay-down resilience: remembered, to redial after a restart.
+                self.remember_addrs(key.0, server, identity, &addrs);
                 if !addrs.is_empty() && self.relayed.contains_key(&key.0) {
                     self.direct_candidates.insert(key.0, direct_candidates_of(addrs));
                     self.try_direct(key.0);
@@ -4021,6 +4036,112 @@ impl Task {
             debug!(%relay, held, "member relay reservation ended");
             let rest = if held { MEMBER_RELAY_REST } else { MEMBER_RELAY_RETRY };
             self.member_relay_rest.insert(relay, Instant::now() + rest);
+        }
+    }
+}
+
+/// Relay-down resilience, remembered member addresses (design note and the
+/// leads' verdicts, 2026-11-17): direct addresses of verified members, kept
+/// in the store and redialled at start and while our relay is down. A dial
+/// hint only: Noise checks the peer ID, and the peer binds again before it
+/// counts as a member.
+/// Remembered members dialled per discovery round, and how often each one.
+const MAX_REMEMBERED_DIALS: usize = 16;
+const REMEMBERED_DIAL_EVERY: Duration = Duration::from_secs(30);
+/// How often remembered rows are checked against membership and expiry.
+const REMEMBERED_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+impl Task {
+    /// A bound member's direct addresses (from its pull answer): kept, if it
+    /// is a current member and we aren't relay-only. Only addresses we would
+    /// dial for a member; never logged.
+    fn remember_addrs(&mut self, peer: PeerId, server: ServerId, identity: PublicKey, addrs: &[Multiaddr]) {
+        if self.relay_only || !self.is_member(peer) {
+            return;
+        }
+        let keep: Vec<String> = direct_candidates_of(addrs.to_vec())
+            .into_iter()
+            .filter(|a| dialable(a, self.allow_lan))
+            .take(crate::store::MAX_REMEMBERED_ADDRS)
+            .map(|a| a.to_string())
+            .collect();
+        if keep.is_empty() {
+            return;
+        }
+        if let Err(err) = self.store.remember_peer(&server, &peer.to_bytes(), identity.as_bytes(), &keep, unix_now()) {
+            debug!(%err, "remembering a member failed");
+        }
+    }
+
+    /// Every discovery round while our relay doesn't hold our reservation
+    /// (at start too): dial the remembered members we aren't connected to,
+    /// directly. Never while relay-only.
+    fn redial_remembered(&mut self) {
+        // `direct_dials` off stands in for a firewall in tests: no redial either.
+        if self.relay_only || self.relay_lost_at.is_none() || !self.direct_dials {
+            return;
+        }
+        let now = Instant::now();
+        self.remembered_dialed.retain(|_, at| now.duration_since(*at) < REMEMBERED_DIAL_EVERY);
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let mut dials = 0;
+        for (_, peer, _, addrs) in rows {
+            if dials >= MAX_REMEMBERED_DIALS {
+                break;
+            }
+            let Ok(peer) = PeerId::from_bytes(&peer) else { continue };
+            if self.connected.contains(&peer) || self.remembered_dialed.contains_key(&peer) {
+                continue;
+            }
+            let addrs: Vec<Multiaddr> =
+                addrs.iter().filter_map(|a| a.parse().ok()).filter(|a| dialable(a, self.allow_lan)).collect();
+            if addrs.is_empty() {
+                continue;
+            }
+            self.remembered_dialed.insert(peer, now);
+            let opts = DialOpts::peer_id(peer).addresses(addrs).condition(PeerCondition::DisconnectedAndNotDialing).build();
+            if self.swarm.dial(opts).is_ok() {
+                dials += 1;
+            }
+        }
+        if dials > 0 {
+            debug!(dials, "redialling remembered members");
+        }
+    }
+
+    /// Every [`REMEMBERED_CHECK_EVERY`]: rows of peers that are no longer
+    /// members (kicked, left, removed by authority) go at once, and rows
+    /// past their 30 days.
+    fn check_remembered(&mut self) {
+        if self.remembered_checked.elapsed() < REMEMBERED_CHECK_EVERY {
+            return;
+        }
+        self.remembered_checked = Instant::now();
+        let _ = self.store.expire_peers(unix_now(), crate::store::REMEMBERED_TTL);
+        // No read gate: nobody can be shown to be a member, so nothing
+        // remembered stays (fail closed, Security Lead on #419).
+        let Some(gate) = self.access.read_gate.clone() else {
+            self.forget_remembered();
+            return;
+        };
+        let rows = self.store.remembered_peers(unix_now(), crate::store::REMEMBERED_TTL).unwrap_or_default();
+        let gone: Vec<(ServerId, Vec<u8>)> = rows
+            .into_iter()
+            .filter(|(server, _, identity, _)| {
+                !self.secrets.contains_key(server)
+                    || !gate.may_read(&PublicKey::from_bytes(*identity), &self.store.control_log(*server))
+            })
+            .map(|(server, peer, _, _)| (server, peer))
+            .collect();
+        for (server, peer) in gone {
+            let _ = self.store.forget_peer(&server, &peer);
+        }
+    }
+
+    /// Relay-only: every remembered address goes (Security Lead).
+    fn forget_remembered(&mut self) {
+        if let Err(err) = self.store.forget_all_peers() {
+            warn!(%err, "forgetting remembered members failed");
         }
     }
 }

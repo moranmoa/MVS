@@ -170,7 +170,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - **Order:** `listChannels` returns channels in order. Placed ones come first by key (then by ID); the rest keep today's order.
   - `Channel.position` (additive, the key) appears on placed channels, in `listChannels` and in `channel.updated`. The core emits `channel.updated` for each channel a local move repositioned. The UI uses the list order and never re-sorts by the key.
 
-- Restore servers, phase A (#291, `src/backup.rs`). No new command or event.
+- Restore servers, phase A (#291, `src/backup.rs`), and its progress (G-91).
   - **When the backup is written:** only when my server set changed since the last write, on the first sync round after start (login), or every 24 h (`BACKUP_REPUBLISH_MS`). Then my server list (server IDs and sync secrets) is merged into the newest backup the holders keep (`Network::fetch_backup`), sealed as the next version and handed to them (`Network::put_backup`). Rounds with nothing due fetch and put nothing. The fetch and the put run outside the core lock.
     - Servers this device listed and no longer has get a tombstone.
     - Merging keeps what my other devices wrote.
@@ -179,7 +179,13 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - It's padded to 4 KiB steps, at most 64 KiB.
   - **On `restoreIdentity`:** the core fetches the backup (`Network::fetch_backup`), keeps the newest valid one, and rejoins each live server as the same member (#290). It posts no new join, profile or age claim.
     - A server whose log no longer lists me isn't entered.
-    - A restore still waiting (no backup found yet, or servers nobody could be reached for) is retried with backoff: after 1 min, doubling (2, 4, 8, 16, 32) up to once an hour, and not again once it's done.
+    - A restore still waiting is tried again. While no backup is found: backoff, after 1 min, doubling (2, 4, 8, 16, 32) up to once an hour. Once it is found: only the servers still waiting, every 30 s (`REJOIN_EVERY_MS`), with no new backup fetch, so each comes back within 2 minutes of a member of it being reachable. Nothing more once it is done. After a restart mid-restore the backup is searched for again.
+    - A server leaves the restore only on a definite answer: back (`Joined`), closed, refused as no longer mine (kicked, not a member: `Invalid` with the server's genesis in hand), or age-blocked. Anything else (nobody reachable, a partial answer, any error) waits for the next try, so one bad round never loses a server (Security Lead on #457).
+    - The app lock (`Core::lock_keys`) drops the server secrets a waiting restore holds and pauses it; after `unlock_keys` the backup is fetched again. Otherwise, once found, a newer backup isn't fetched again until the next start or unlock.
+  - **Progress (G-91):** `getServerRestore()` returns `ServerRestore { state, found, waiting }`. The event `serverRestore.changed` carries the same, sent only when something in it changed.
+    - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).
+    - `found`: the live servers the backup lists (0 until found). `waiting`: of those, the ones not back yet.
+    - The UI shows "searching" and "waiting" honestly on the restore screen, with the invite-link hint (PO G-91 criterion 2). A server I left, was removed from, or that closed never comes back and isn't counted as waiting.
   - **Holders:** the ports are no-ops until dev-sync's `/mvs/backup/1` and devops' mailbox exist. `LoopbackNetwork` holds them for tests.
 
 - `signOut({ words: string[] } | { withoutWords: true })` returns `null` (both read at the top level of `args`). It removes this identity from this computer.

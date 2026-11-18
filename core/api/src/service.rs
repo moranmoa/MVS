@@ -1600,12 +1600,18 @@ impl Core {
             inner.cap_gate(server, model::SERVER_META_CAP)?;
             let now = ports.clock.now_ms();
             let key = format!("{KV_ICON_SET_PREFIX}{}", model::hex_id(server.as_bytes()));
+            // Only setting an image is limited: an admin must be able to
+            // remove an offensive or mistaken icon at once, and a clear is
+            // 2 bytes (Tech Lead on #555).
+            let setting = icon.is_some();
             let last = inner.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
-            if last.is_some_and(|last| now.saturating_sub(last) < ICON_EVERY_MS) {
+            if setting && last.is_some_and(|last| now.saturating_sub(last) < ICON_EVERY_MS) {
                 return Err(ErrorCode::RateLimited.into());
             }
             inner.publish_control(ports, server, &Action::ServerIcon { icon })?;
-            inner.db.set(&key, &now.to_le_bytes())?;
+            if setting {
+                inner.db.set(&key, &now.to_le_bytes())?;
+            }
             let summary = inner.counted_summary(&*ports.cipher, server)?;
             events.push(Event::ServerUpdated(summary.clone()));
             Ok(summary)

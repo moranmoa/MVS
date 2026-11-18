@@ -494,7 +494,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
 - Server icon and description (G-51, `docs/design/server-icon-description.md`):
   - `setServerIcon(serverId, dataUrl | null)` returns the updated `ServerSummary`.
     - `dataUrl` is `data:image/(png|webp);base64,…`, checked in this order: the prefix, a length cap on the base64 text, strict base64, then the magic bytes against the prefix's type, still (no APNG or animated WebP), at most 8 KiB and 128 px a side. Anything else is `bad-request`. `null` clears the icon.
-    - At most one change per server every 10 minutes from this device (`rate-limited`), since every icon stays in the control log.
+    - Setting an image: at most once per server every 10 minutes from this device (`rate-limited`), since every icon stays in the control log. Clearing it (`null`) is never limited, so an admin can remove an icon at once.
   - `setServerDescription(serverId, description)` returns the updated `ServerSummary`.
     - The text is trimmed; empty clears it. Otherwise up to 500 code points and 5 lines (`\n` only), with no `\r` or U+2028/2029, no blank first or last line, no two blank lines in a row, and no line ending in whitespace. Anything else is `bad-request`.
     - Shown as plain text with its line breaks (`white-space: pre-line`): never Markdown or links.

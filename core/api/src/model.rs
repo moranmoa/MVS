@@ -1040,6 +1040,17 @@ mod tests {
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
     }
 
+    /// Every cap is posted once (Tech Lead on #555): a merge that loses a
+    /// line of `CAPS`, or doubles one, fails here.
+    #[test]
+    fn every_cap_is_posted_once() {
+        let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();
+        assert_eq!(unique.len(), CAPS.len(), "a cap twice");
+        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, SERVER_META_CAP] {
+            assert!(CAPS.contains(&cap), "{cap} missing");
+        }
+    }
+
     #[test]
     fn initials_of_names() {
         assert_eq!(initials("קהילת הקוד"), "קה");

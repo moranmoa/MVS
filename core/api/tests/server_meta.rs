@@ -118,6 +118,12 @@ fn refusals_rate_limit_and_no_op() {
     *world.clock.0.lock().unwrap() += 10 * 60_000;
     owner.core.set_server_icon(&server.id, Some(&png(32, 32))).unwrap();
 
+    // Clearing is never limited (Tech Lead on #555): set, clear at once,
+    // then setting again within 10 minutes still is.
+    owner.core.set_server_icon(&server.id, None).unwrap();
+    assert_eq!(summary(&owner, &server.id).icon_data_url, None);
+    assert_eq!(owner.core.set_server_icon(&server.id, Some(&png(24, 24))).unwrap_err().code, ErrorCode::RateLimited);
+
     // The cap name is known to getUpdateNeeded; everyone here has it.
     assert!(owner.core.get_update_needed(&server.id, Some("server-meta-v1")).unwrap().is_empty());
 }

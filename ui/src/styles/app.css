@@ -3533,6 +3533,7 @@ input.switch:disabled {
 .call-actions .call-mute.talking {
   background: var(--accent);
   color: var(--accent-text);
+}
 
 /* G-72: voice settings (device choice and mic test), in a call. */
 .voice-settings .field + .field {
@@ -3671,6 +3672,7 @@ input.switch:disabled {
 .emoji-cell:hover,
 .emoji-cell:focus-visible {
   background: var(--bg-hover);
+}
 
 .key-row {
   display: flex;

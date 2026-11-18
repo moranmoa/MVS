@@ -3,7 +3,7 @@ import { FormattedMessage, useIntl } from 'react-intl';
 import { ageOn, countryOptions, detectCountry, MIN_AGE, toBirthDate } from '../../app/age';
 import { useAppStore } from '../../app/App';
 import { useSettings } from '../../app/settings';
-import { isCoreError, useCore, useCoreEvent, type Identity } from '../../core';
+import { isCoreError, useCore, useCoreEvent, type Identity, type ServerRestore } from '../../core';
 import type { CoreEvents } from '../../core/api';
 import { useUserTextProps } from '../../app/textDir';
 import { safeImageSrc } from '../../core/sanitize';
@@ -155,7 +155,7 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
               onCancel={() => setStep('language')}
             />
           )}
-          {step === 'agreement' && <AgreementStep onNext={() => (linked ? onFinished() : setStep('country'))} />}
+          {step === 'agreement' && <AgreementStep onNext={() => (linked ? setStep('restored') : setStep('country'))} />}
           {step === 'country' && <CountryStep value={country} onChange={setCountry} onNext={() => setStep('dob')} />}
           {step === 'dob' && (
             <DobStep
@@ -207,14 +207,39 @@ export function Onboarding({ onFinished: finish, initialStep }: { onFinished: ()
   );
 }
 
-/** After a restore (#290): servers don't come back by themselves yet; an invite link brings you back as the same member. */
+/**
+ * After a restore or a device link (G-91, #457): my servers come back on their own once a
+ * member of each is reachable. Says honestly how far that is, and that an invite link
+ * still works for one that doesn't appear (PO #426 G-91, criterion 2).
+ */
 function RestoredStep({ onDone }: { onDone: () => void }) {
+  const core = useCore();
+  const [progress, setProgress] = useState<ServerRestore | null>(null);
+  useEffect(() => {
+    let live = true;
+    void core.getServerRestore().then((r) => live && setProgress((p) => p ?? r)).catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [core]);
+  useCoreEvent('serverRestore.changed', (r) => setProgress(r));
+  const state = progress?.state ?? 'searching';
   return (
     <div className="stack">
       <h1>
         <FormattedMessage id="onb.restored.title" />
       </h1>
-      <p>
+      <p className="restore-progress" role="status">
+        {state !== 'done' && state !== 'none' && <span className="spinner small" aria-hidden="true" />}
+        {state === 'waiting' && progress ? (
+          <FormattedMessage id="onb.restored.waiting" values={{ found: progress.found, back: progress.found - progress.waiting }} />
+        ) : state === 'done' ? (
+          <FormattedMessage id={progress && progress.found > 0 ? 'onb.restored.done' : 'onb.restored.noneFound'} />
+        ) : state === 'searching' ? (
+          <FormattedMessage id="onb.restored.searching" />
+        ) : null}
+      </p>
+      <p className="muted">
         <FormattedMessage id="onb.restored.servers" />
       </p>
       <div className="actions">

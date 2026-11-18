@@ -46,7 +46,7 @@ describe('restore', () => {
     });
     expect((await core.getIdentity())?.displayName).toBe('מורן');
 
-    // Servers don't come back by themselves yet: say so, and how to return.
+    // G-91: how far the servers are, and that an invite link still works.
     expect(await screen.findByRole('heading', { name: 'החשבון שוחזר' })).toBeTruthy();
     expect(screen.getByText(/לינק הזמנה/).textContent).toContain('כאותו חשבון, עם אותו תפקיד');
     fireEvent.click(screen.getByRole('button', { name: 'המשך' }));

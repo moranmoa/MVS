@@ -96,6 +96,11 @@ export function playTestSound(outputId?: string): Promise<void> {
   return playNotes([660, 880], { gap: 0.25, length: 0.24, peak: 0.2 }, outputId);
 }
 
+/** G-63: a new message that would notify: one short, quiet two-note blip. */
+export function playMessageCue(outputId?: string): Promise<void> {
+  return playNotes([880, 1174.66], { gap: 0.08, length: 0.1, peak: 0.05 }, outputId);
+}
+
 /**
  * G-64: someone joined my call (rising) or left it (falling). Short and
  * quiet: two soft notes, well under the test sound's level.

@@ -174,6 +174,16 @@ fn trusted() -> bool {
 struct PendingBirth {
     date: String,
     effective_at: u64,
+    /// G-77: a correction (`correctBirthDate`) that raises my age. My
+    /// birth date stays the current one until `effective_at`, then becomes
+    /// `date`. False: the restore form, where the birth date is already
+    /// `date` and I count as at most 17 until then.
+    #[serde(default)]
+    correction: bool,
+    /// G-77: a correction made while a restore-form raise was waiting: I
+    /// still count as at most 17 until `effective_at`.
+    #[serde(default)]
+    capped: bool,
 }
 
 /// Decision 18: a raise of the age takes effect this long after it was found.
@@ -186,21 +196,30 @@ impl Profile {
     }
 
     /// My age as it counts at `now`: from the birth date, but at most 17
-    /// while a raise is pending (the earlier "not adult" claim stands).
+    /// while a restore-form raise is pending (the earlier "not adult" claim
+    /// stands). A pending correction counts from the current date.
     fn effective_age(&self, now: u64) -> Option<u32> {
         let age = model::age_on(&self.birth_date, now)?;
-        Some(if self.raise_pending(now) { age.min(17) } else { age })
+        let capped = self.raise_pending(now)
+            && self.pending_birth_date.as_ref().is_some_and(|p| !p.correction || p.capped);
+        Some(if capped { age.min(17) } else { age })
     }
 
-    /// A pending raise whose 30 days are up takes effect. True if it did.
+    /// A pending raise whose 30 days are up takes effect: a correction's
+    /// date becomes my birth date. True if it did.
     fn settle(&mut self, now: u64) -> bool {
-        match &self.pending_birth_date {
+        match self.pending_birth_date.take() {
             Some(p) if now >= p.effective_at => {
+                if p.correction {
+                    self.birth_date = p.date;
+                }
                 self.birth_date_trusted = true;
-                self.pending_birth_date = None;
                 true
             }
-            _ => false,
+            other => {
+                self.pending_birth_date = other;
+                false
+            }
         }
     }
 }
@@ -1733,6 +1752,7 @@ impl Core {
             server_id,
             channel_id: model::hex_id(channel.as_bytes()),
             name: current.name,
+            reason: Some(ChannelRemovedReason::Deleted),
         });
         Ok(())
     }
@@ -2547,6 +2567,7 @@ impl Core {
                     events.push(Event::ServerRemoved {
                         server_id: model::hex_id(server.as_bytes()),
                         reason: None,
+                        required: None,
                     });
                 } else if changed {
                     events.push(Event::MembersChanged {
@@ -2598,6 +2619,89 @@ impl Core {
                     });
                 }
             }
+            Ok(())
+        })
+    }
+
+    // ---- birth date (G-77, B7 §2) -------------------------------------------
+
+    /// `previewBirthDateCorrection(date)`: what [`Core::correct_birth_date`]
+    /// would do. Changes nothing. `bad-request` for a date that isn't a real
+    /// `YYYY-MM-DD` from 1900 to today.
+    pub fn preview_birth_date_correction(&self, date: &str) -> CoreResult<AgeCorrectionPreview> {
+        let now = self.ports.clock.now_ms();
+        self.lock().age_correction(date, now)
+    }
+
+    /// `correctBirthDate(date)`, compared with my age as it counts now:
+    /// - **same:** the date is replaced (a waiting correction is dropped);
+    /// - **lower:** at once. The new claim goes to every server I'm in; an
+    ///   18+ server I'm no longer old enough for is left (`server.removed`,
+    ///   `reason: 'age'`, `required`), unless I own it; elsewhere its 18+
+    ///   channels go (`channel.removed`, `reason: 'age'`);
+    /// - **raise:** pending for 30 days (`Identity.pendingBirthDate`); a new
+    ///   correction replaces it;
+    /// - **under 16:** `too-young`, nothing changed.
+    ///
+    /// `identity.changed` follows any change. Never promotes the date to
+    /// "the one my claims come from": a restored date stays untrusted, so
+    /// a date a day short of 18 still waits 30 days after turning 18.
+    pub fn correct_birth_date(&self, date: &str) -> CoreResult<AgeCorrectionPreview> {
+        let preview = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let preview = inner.age_correction(date, now)?;
+            match preview.kind {
+                AgeCorrectionKind::TooYoung => return Err(ErrorCode::TooYoung.into()),
+                AgeCorrectionKind::Raise => {
+                    let effective_at = preview.effective_at.ok_or(ErrorCode::Internal)?;
+                    inner.update_profile_with(|p| {
+                        // A restore-form raise still waiting keeps its cap.
+                        let capped = p.raise_pending(now)
+                            && p.pending_birth_date.as_ref().is_some_and(|q| !q.correction || q.capped);
+                        p.pending_birth_date =
+                            Some(PendingBirth { date: date.to_owned(), effective_at, correction: true, capped });
+                    })?;
+                }
+                AgeCorrectionKind::Same | AgeCorrectionKind::Lower => {
+                    inner.update_profile_with(|p| {
+                        p.birth_date = date.to_owned();
+                        p.pending_birth_date = None;
+                    })?;
+                    if preview.kind == AgeCorrectionKind::Lower {
+                        inner.apply_lowered_age(ports, now, events)?;
+                    }
+                }
+            }
+            let identity = inner.identity_json(inner.me.as_ref().ok_or(ErrorCode::NotFound)?)?;
+            events.push(Event::IdentityChanged(identity));
+            Ok(preview)
+        })?;
+        self.flush_leaves();
+        Ok(preview)
+    }
+
+    /// `cancelBirthDateCorrection()`: drops a waiting correction. A raise
+    /// found after a restore (not a correction) can't be cancelled: there's
+    /// no earlier date to go back to (`not-allowed`). Nothing waiting: `ok`.
+    pub fn cancel_birth_date_correction(&self) -> CoreResult<()> {
+        self.run(|inner, _, events| {
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            let pending = me.profile.pending_birth_date.as_ref().map(|p| (p.correction, p.capped, p.effective_at));
+            match pending {
+                None => return Ok(()),
+                Some((false, _, _)) => return Err(ErrorCode::NotAllowed.into()),
+                Some((true, true, effective_at)) => {
+                    // The restore-form wait goes on, for the date it had.
+                    inner.update_profile_with(|p| {
+                        let date = p.birth_date.clone();
+                        p.pending_birth_date =
+                            Some(PendingBirth { date, effective_at, correction: false, capped: false });
+                    })?;
+                }
+                Some(_) => inner.update_profile_with(|p| p.pending_birth_date = None)?,
+            }
+            let identity = inner.identity_json(inner.me.as_ref().ok_or(ErrorCode::NotFound)?)?;
+            events.push(Event::IdentityChanged(identity));
             Ok(())
         })
     }
@@ -3223,7 +3327,7 @@ impl Inner {
             let date = self.me.as_ref().expect("checked above").profile.birth_date.clone();
             self.update_profile_with(|p| {
                 p.pending_birth_date =
-                    Some(PendingBirth { date, effective_at: now + AGE_RAISE_DELAY_MS });
+                    Some(PendingBirth { date, effective_at: now + AGE_RAISE_DELAY_MS, correction: false, capped: false });
             })?;
             return Ok(None);
         }
@@ -3476,6 +3580,117 @@ impl Inner {
         }
         let identity = self.identity_json(self.me.as_ref().expect("checked above"))?;
         events.push(Event::IdentityChanged(identity));
+        Ok(())
+    }
+
+    /// G-77: what correcting my birth date to `date` would do at `now`,
+    /// against my age as it counts now (a waiting raise counts as not yet).
+    fn age_correction(&mut self, date: &str, now: u64) -> CoreResult<AgeCorrectionPreview> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        if !model::valid_birth_date(date, now) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let new = model::age_on(date, now).ok_or(ErrorCode::BadRequest)?;
+        let plain = |kind| AgeCorrectionPreview { kind, effective_at: None, loses: Vec::new() };
+        if new < 16 {
+            return Ok(plain(AgeCorrectionKind::TooYoung));
+        }
+        let current = me.profile.effective_age(now).unwrap_or(0);
+        let key = me.key();
+        Ok(match new.cmp(&current) {
+            std::cmp::Ordering::Equal => plain(AgeCorrectionKind::Same),
+            std::cmp::Ordering::Greater => AgeCorrectionPreview {
+                kind: AgeCorrectionKind::Raise,
+                effective_at: Some(now + AGE_RAISE_DELAY_MS),
+                loses: Vec::new(),
+            },
+            std::cmp::Ordering::Less => AgeCorrectionPreview {
+                kind: AgeCorrectionKind::Lower,
+                effective_at: None,
+                loses: self.age_losses(key, new)?,
+            },
+        })
+    }
+
+    /// G-77: what an age of `age` takes away: 18+ servers I'm a member of
+    /// but don't own (whole), else the 18+ channels I see now.
+    fn age_losses(&mut self, key: PublicKey, age: u32) -> CoreResult<Vec<AgeLoss>> {
+        let mut out = Vec::new();
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            let view = self.view(server)?;
+            if !view.state.is_member(key) {
+                continue;
+            }
+            let server_id = model::hex_id(server.as_bytes());
+            let name = view.state.server_name.clone().unwrap_or_else(|| view.genesis.name.clone());
+            let owner = view.state.role(key) == authority::Role::Owner;
+            if view.genesis.age_restriction.min_age() > age && !owner {
+                out.push(AgeLoss { server_id, name, channel: None });
+            } else if age < 18 && view.state.adults.contains(&key) {
+                let mut channels: Vec<String> =
+                    view.state.channels.values().filter(|c| c.adult).map(|c| c.name.clone()).collect();
+                channels.sort();
+                for channel in channels {
+                    out.push(AgeLoss { server_id: server_id.clone(), name: name.clone(), channel: Some(channel) });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// G-77: after a lowering. The new claim goes to every server I'm in.
+    /// An 18+ server I'm no longer old enough for, and don't own, is left:
+    /// its `Leave` goes through the leave outbox, and it leaves this device
+    /// (`server.removed`, `age`). Elsewhere, the 18+ channels I saw go
+    /// (`channel.removed`, `age`).
+    fn apply_lowered_age(&mut self, ports: &Ports, now: u64, events: &mut Events) -> CoreResult<()> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let (key, age) = (me.key(), me.profile.effective_age(now).unwrap_or(0));
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            let view = self.view(server)?;
+            if !view.state.is_member(key) {
+                continue;
+            }
+            let was_adult = view.state.adults.contains(&key);
+            let leave = view.genesis.age_restriction.min_age() > age && view.state.role(key) != authority::Role::Owner;
+            let adult_channels: Vec<(String, String)> = view
+                .state
+                .channels
+                .iter()
+                .filter(|(_, c)| c.adult)
+                .map(|(id, c)| (model::hex_id(id.as_bytes()), c.name.clone()))
+                .collect();
+            if let Some(claim) = self.age_claim(ports, server)? {
+                self.store(server, claim.clone())?;
+                ports.network.publish(&claim);
+            }
+            if leave {
+                let record = self.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
+                self.db.set_leave(server, &record)?;
+                if self.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
+                    ports.network.publish(&record);
+                }
+                self.purge_server(ports, server, RemovedReason::Age, &[], true, events)?;
+            } else if was_adult && age < 18 {
+                let server_id = model::hex_id(server.as_bytes());
+                for (channel_id, name) in adult_channels {
+                    events.push(Event::ChannelRemoved {
+                        server_id: server_id.clone(),
+                        channel_id,
+                        name,
+                        reason: Some(ChannelRemovedReason::Age),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4670,6 +4885,10 @@ impl Inner {
         leaving: bool,
         events: &mut Events,
     ) -> CoreResult<()> {
+        // G-77: an age removal says which restriction I'm now under.
+        let required = (reason == RemovedReason::Age)
+            .then(|| self.view(server).ok().map(|v| v.genesis.age_restriction))
+            .flatten();
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
         self.logs.remove(&server);
@@ -4677,6 +4896,7 @@ impl Inner {
         events.push(Event::ServerRemoved {
             server_id: model::hex_id(server.as_bytes()),
             reason: Some(reason),
+            required,
         });
         Ok(())
     }
@@ -5492,5 +5712,53 @@ mod device_notice_tests {
         let stored = super::device_notices(&db).unwrap();
         assert_eq!(stored.len(), 32);
         assert_eq!((stored[0], stored[31]), (8, 39), "the newest are kept");
+    }
+}
+
+#[cfg(test)]
+mod birth_date_tests {
+    use super::{PendingBirth, Profile, AGE_RAISE_DELAY_MS};
+
+    /// 2026-11-03.
+    const NOW: u64 = 20_760 * 86_400_000;
+
+    fn profile(birth: &str, pending: Option<PendingBirth>) -> Profile {
+        Profile { birth_date: birth.into(), pending_birth_date: pending, ..Profile::default() }
+    }
+
+    fn pending(date: &str, correction: bool, capped: bool) -> Option<PendingBirth> {
+        Some(PendingBirth { date: date.into(), effective_at: NOW + AGE_RAISE_DELAY_MS, correction, capped })
+    }
+
+    /// G-77: a correction counts from the current date until it settles,
+    /// then its date replaces it; the restore form counts at most 17; a
+    /// correction made over a waiting restore-form raise keeps the cap.
+    #[test]
+    fn corrections_count_from_the_current_date_until_they_settle() {
+        let mut fix = profile("2010-01-01", pending("1990-01-01", true, false));
+        assert_eq!(fix.effective_age(NOW), Some(16));
+        assert!(!fix.settle(NOW + AGE_RAISE_DELAY_MS - 1));
+        assert!(fix.pending_birth_date.is_some(), "not due: kept");
+        assert!(fix.settle(NOW + AGE_RAISE_DELAY_MS));
+        assert_eq!(fix.birth_date, "1990-01-01");
+        assert!(fix.pending_birth_date.is_none() && fix.birth_date_trusted);
+
+        let restored = profile("1990-01-01", pending("1990-01-01", false, false));
+        assert_eq!(restored.effective_age(NOW), Some(17));
+        let mut over = profile("1990-01-01", pending("1980-01-01", true, true));
+        assert_eq!(over.effective_age(NOW), Some(17), "the restore cap stays");
+        assert!(over.settle(NOW + AGE_RAISE_DELAY_MS));
+        assert_eq!(over.effective_age(NOW + AGE_RAISE_DELAY_MS), Some(46));
+
+        // An adult raising an adult age: no cap while it waits.
+        let older = profile("1990-01-01", pending("1980-01-01", true, false));
+        assert_eq!(older.effective_age(NOW), Some(36));
+    }
+
+    /// Profiles saved before G-77 read their pending as the restore form.
+    #[test]
+    fn an_old_pending_reads_as_the_restore_form() {
+        let old: PendingBirth = serde_json::from_str(r#"{"date":"1990-01-01","effectiveAt":5}"#).unwrap();
+        assert!(!old.correction && !old.capped);
     }
 }

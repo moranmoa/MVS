@@ -250,6 +250,18 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - A raise means a *changed* date. A date entered at sign-up on this computer, or one a server's **"adult"** claim already agrees with, is the one my claims come from. A "not adult" agreement proves nothing: a restored date a day short of 18 still waits. Turning 18 with it is a birthday, with no wait.
   - **Known limit,** until the encrypted backup (#291) brings the old birth date back: after a restore with a new adult date, a server I join for the first time has no earlier claim to compare, so it gets "adult" at once. Joining a fresh server first doesn't lift the wait on the old ones: only an agreeing claim or the 30 days do. The client clock, or a modified client, can also skip the wait (Security Lead, GAP-22).
 
+- Correcting the birth date (G-77, B7 §2, §9). `date` is a real `YYYY-MM-DD` from 1900 to today (UTC); anything else is `bad-request`. Each answer is `AgeCorrectionPreview { kind: 'same' | 'lower' | 'raise' | 'too-young', effectiveAt?, loses: { serverId, name, channel? }[] }`, judged against my age as it counts now (a waiting raise doesn't count yet).
+  - `previewBirthDateCorrection(date)` changes nothing.
+  - `correctBirthDate(date)` applies it and fires `identity.changed`:
+    - **same:** the date is replaced, and any waiting correction is dropped.
+    - **lower:** at once. The new age claim goes to every server I'm in. An 18+ server I'm now too young for is left, unless I own it: its `Leave` goes through the leave outbox (as `leaveServer`), and `server.removed { serverId, reason: 'age', required: '18+' }` fires. Elsewhere, each 18+ channel I saw fires `channel.removed { …, reason: 'age' }`. `loses` lists them beforehand: a whole server has no `channel`.
+    - **raise:** pending for 30 days: `Identity.pendingBirthDate = { date, effectiveAt }`, and `birthDate` stays until then. A new correction replaces it. When it's due, the next sync round makes it my birth date, posts the claims and fires `identity.changed`. A server left on a lowering doesn't come back by itself.
+    - **too-young** (under 16): rejected with the new error code `too-young`; nothing changes.
+  - `cancelBirthDateCorrection()` drops a waiting correction (`ok` with none). A raise found after a restore isn't a correction and can't be cancelled (`not-allowed`): there's no earlier date to go back to.
+  - A correction never makes the date "the one my claims come from": a restored date stays untrusted, so a date a day short of 18 still waits 30 days. A correction made while a restore's raise waits keeps that cap (at most 17) until its own 30 days.
+  - `channel.removed` gains `reason?: 'deleted' | 'age'`; `server.removed` gains `reason: 'age'` and `required?`.
+  - **Open (PO):** an owner who lowers below their own server's restriction keeps it (an owner can't leave); it isn't listed in `loses`.
+
 - Restore on a new computer:
   - `restoreIdentity(words, input?: { locale, country, birthDate })`. The words don't carry the country or birth date, so the UI asks them again (with the agreement) before the words and passes them here, as `createIdentity` takes them. The name follows with `updateProfile`.
   - Rejoining a server I'm still a member of (its invite link, after a restore) signs no new join. It never posts an empty display name or an age claim without a birth date: the server keeps the profile and claim it holds. With no birth date it isn't age-blocked either: my earlier claim stands. A known age below the server's minimum still blocks.

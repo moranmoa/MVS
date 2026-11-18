@@ -374,6 +374,7 @@ export function cleanJoin(j: JoinStatus): JoinStatus {
     case 'nobody-online':
     case 'invalid':
     case 'removed':
+    case 'closed':
       return { phase: j.phase, link };
     case 'joined':
       return { phase: 'joined', link, serverId: id(j.serverId) };

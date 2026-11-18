@@ -234,7 +234,9 @@ export type JoinStatus =
   | { phase: 'invalid'; link: string }
   | { phase: 'age-blocked'; link: string; required: AgeRestriction }
   /** G-53 (core #503): this account was removed from the server and not let back. Final: no retries. */
-  | { phase: 'removed'; link: string };
+  | { phase: 'removed'; link: string }
+  /** #261: the server behind this invite was closed by its owner. Final. */
+  | { phase: 'closed'; link: string };
 
 export interface StorageUsage {
   usedBytes: number;

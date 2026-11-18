@@ -223,6 +223,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - Each server stores at most 1000 reports.
   - **Storage:** only sealed boxes are on disk, both the outbox and the reports I received. Neither is in the account backup or the logs. The report commands aren't in the app lock's allow-set (G-78).
   - **Older peers** don't speak `/mvs/report/1`: the row stays in the outbox until they update or it expires.
+
 - Channel topic (G-14; design `docs/design/channel-topic.md`):
   - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
   - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.

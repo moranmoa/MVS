@@ -123,4 +123,7 @@ test('Ctrl+L locks; a call keeps the page (path B) with the mic off and only cal
   assert.ok(await until(async () => (await url()).endsWith('?locked')), await url());
   await page.waitForLoadState('domcontentloaded');
   assert.equal((await lockState()).path, 'A');
+  // V-C3: the lock's reloads keep the WebRTC IP policy (no local adapters).
+  const policy = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getWebRTCIPHandlingPolicy());
+  assert.equal(policy, 'default_public_and_private_interfaces');
 });

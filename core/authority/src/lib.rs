@@ -159,6 +159,14 @@ pub enum Action {
     ChannelDelete {
         channel: ChannelId,
     },
+    /// G-14: the owner or an admin sets a live channel's topic; an empty
+    /// topic clears it. Body: the channel ID, `history u8` (reserved for
+    /// D30, must be 0), then the topic, which follows [`channel_topic_ok`]
+    /// or is empty.
+    ChannelTopic {
+        channel: ChannelId,
+        topic: String,
+    },
     /// The owner lets a kicked key back: it may join again through an invite.
     /// It isn't made a member.
     Unban {
@@ -205,6 +213,7 @@ impl Action {
             Action::ChannelCreate { .. } => Kind::ChannelCreate,
             Action::ChannelEdit { .. } => Kind::ChannelEdit,
             Action::ChannelDelete { .. } => Kind::ChannelDelete,
+            Action::ChannelTopic { .. } => Kind::ChannelTopic,
             Action::Unban { .. } => Kind::Unban,
             Action::ServerEdit { .. } => Kind::ServerEdit,
             Action::Leave { .. } => Kind::Leave,
@@ -242,6 +251,9 @@ impl Action {
                 [channel.as_bytes().as_slice(), &[0, u8::from(*adult)], name.as_bytes()].concat()
             }
             Action::ChannelDelete { channel } => channel.as_bytes().to_vec(),
+            Action::ChannelTopic { channel, topic } => {
+                [channel.as_bytes().as_slice(), &[0], topic.as_bytes()].concat()
+            }
             Action::AgeClaim { adult } => vec![u8::from(*adult)],
             Action::Unban { target } => target.as_bytes().to_vec(),
             Action::ServerEdit { name } => {
@@ -316,6 +328,18 @@ impl Action {
             Kind::ChannelDelete => Some(Action::ChannelDelete {
                 channel: ChannelId::from_bytes(body.try_into().ok()?),
             }),
+            Kind::ChannelTopic => {
+                let (channel, rest) = body.split_first_chunk::<32>()?;
+                let [history, topic @ ..] = rest else { return None };
+                // No history mode is defined before D30.
+                if *history != 0 {
+                    return None;
+                }
+                let topic = String::from_utf8(topic.to_vec())
+                    .ok()
+                    .filter(|t| t.is_empty() || channel_topic_ok(t))?;
+                Some(Action::ChannelTopic { channel: ChannelId::from_bytes(*channel), topic })
+            }
             Kind::Unban => Some(Action::Unban { target: key(body)? }),
             Kind::ServerEdit => {
                 // No history mode is defined before D30.
@@ -353,6 +377,7 @@ impl Action {
             | Action::ChannelCreate { .. }
             | Action::ChannelEdit { .. }
             | Action::ChannelDelete { .. }
+            | Action::ChannelTopic { .. }
             | Action::AgeClaim { .. }
             | Action::ServerEdit { .. }
             | Action::Leave { .. }
@@ -374,7 +399,8 @@ impl Action {
         match self {
             Action::ChannelCreate { channel, .. }
             | Action::ChannelEdit { channel, .. }
-            | Action::ChannelDelete { channel } => Some(*channel),
+            | Action::ChannelDelete { channel }
+            | Action::ChannelTopic { channel, .. } => Some(*channel),
             _ => None,
         }
     }
@@ -397,6 +423,7 @@ impl Action {
                     | Action::ChannelCreate { .. }
                     | Action::ChannelEdit { .. }
                     | Action::ChannelDelete { .. }
+                    | Action::ChannelTopic { .. }
                     | Action::ServerEdit { .. }
                     | Action::ServerClose
             )
@@ -480,6 +507,23 @@ pub const MAX_CHANNEL_NAME: usize = 32;
 /// and [`display_text_ok`].
 pub fn channel_name_ok(name: &str) -> bool {
     (1..=MAX_CHANNEL_NAME).contains(&name.chars().count()) && display_text_ok(name)
+}
+
+/// Most Unicode code points in a channel topic (G-14). The body also caps it
+/// at `records::MAX_CHANNEL_TOPIC_BYTES` bytes.
+pub const MAX_CHANNEL_TOPIC: usize = 256;
+
+/// Whether `topic` can be a channel's topic: one line, trimmed, 1 to
+/// [`MAX_CHANNEL_TOPIC`] code points and at most
+/// `records::MAX_CHANNEL_TOPIC_BYTES` bytes, and the strict
+/// [`display_text_ok`], which also refuses line breaks. An empty topic
+/// (clearing it) is checked by the caller.
+pub fn channel_topic_ok(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic.trim() == topic
+        && topic.len() <= records::MAX_CHANNEL_TOPIC_BYTES
+        && topic.chars().count() <= MAX_CHANNEL_TOPIC
+        && display_text_ok(topic)
 }
 
 /// Most Unicode code points in a server name, the same limit as
@@ -746,6 +790,9 @@ pub struct State {
     pub adults: BTreeSet<Actor>,
     /// Created channels by ID.
     pub channels: BTreeMap<ChannelId, Channel>,
+    /// G-14: live channels' topics, the latest accepted in linear order;
+    /// a cleared or never-set topic is absent.
+    pub topics: BTreeMap<ChannelId, String>,
     /// Deleted channels: their IDs aren't created again.
     pub deleted_channels: BTreeSet<ChannelId>,
     /// The latest accepted rename in linear order; `None` keeps the genesis
@@ -931,6 +978,11 @@ fn permitted(view: &impl View, record: &Record, action: &Action) -> bool {
             author_role == Role::Owner
                 && view.channel(*channel) == ChannelStatus::Live { general: false }
         }
+        // G-14: the owner or an admin sets a live channel's topic.
+        Action::ChannelTopic { channel, .. } => {
+            author_role >= Role::Admin
+                && matches!(view.channel(*channel), ChannelStatus::Live { .. })
+        }
         // A member claims their own age.
         Action::AgeClaim { .. } => view.is_member(author),
         // Renaming is the owner's or an admin's.
@@ -1005,6 +1057,7 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
         | Action::ChannelCreate { .. }
         | Action::ChannelEdit { .. }
         | Action::ChannelDelete { .. }
+        | Action::ChannelTopic { .. }
         | Action::AgeClaim { .. }
         | Action::ServerEdit { .. }
         | Action::ServerClose => None,
@@ -1051,6 +1104,15 @@ fn apply_channel(state: &mut State, record: &Record, action: &Action) {
         Action::ChannelDelete { channel } => {
             state.channels.remove(channel);
             state.deleted_channels.insert(*channel);
+            state.topics.remove(channel);
+        }
+        // G-14: the latest accepted topic in linear order counts.
+        Action::ChannelTopic { channel, topic } => {
+            if topic.is_empty() {
+                state.topics.remove(channel);
+            } else {
+                state.topics.insert(*channel, topic.clone());
+            }
         }
         _ => {}
     }
@@ -1376,6 +1438,7 @@ impl<'a> Graph<'a> {
                 | Action::ChannelCreate { .. }
                 | Action::ChannelEdit { .. }
                 | Action::ChannelDelete { .. }
+                | Action::ChannelTopic { .. }
                 | Action::AgeClaim { .. }
                 | Action::ServerEdit { .. }
                 | Action::ServerClose => continue,

@@ -26,8 +26,8 @@ describe('the topic sanitizer', () => {
   });
 });
 
-async function setup() {
-  const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+/** Spies go on `core` before this: the app wraps the core and keeps the methods it was given. */
+async function setup(core = new MockCore({ demo: true, speed: 0, simulateActivity: false })) {
   render(<App core={core} initialSettings={en} />);
   await screen.findByRole('textbox', { name: /^Message / });
   const [server] = await core.listServers();
@@ -49,12 +49,15 @@ describe('channel topic (G-14)', () => {
   });
 
   it('the owner edits it: line breaks become spaces, it is trimmed, and the header follows', async () => {
-    const { core, channel } = await setup();
-    const set = vi.spyOn(core, 'setChannelTopic');
+    const mock = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const set = vi.spyOn(mock, 'setChannelTopic');
+    const { channel } = await setup(mock);
     fireEvent.click(screen.getByRole('button', { name: `Channel topic: ${channel.topic}` }));
     fireEvent.click(within(await screen.findByRole('dialog', { name: 'Channel topic' })).getByRole('button', { name: 'Edit topic' }));
     const field = screen.getByRole('textbox', { name: 'Channel topic' }) as HTMLInputElement;
-    fireEvent.change(field, { target: { value: '  Ranked tonight\nbring snacks  ' } });
+    fireEvent.change(field, { target: { value: '' } });
+    // A pasted line break becomes a space (a text field would just drop it).
+    fireEvent.paste(field, { clipboardData: { getData: () => '  Ranked tonight\nbring snacks  ' } });
     expect(field.value).toBe('  Ranked tonight bring snacks  ');
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -74,8 +77,9 @@ describe('channel topic (G-14)', () => {
   });
 
   it('says why when members need to update first, and stays open', async () => {
-    const { core, channel } = await setup();
-    vi.spyOn(core, 'setChannelTopic').mockRejectedValueOnce({ code: 'update-needed' });
+    const mock = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    vi.spyOn(mock, 'setChannelTopic').mockRejectedValueOnce({ code: 'update-needed' });
+    const { channel } = await setup(mock);
     fireEvent.click(screen.getByRole('button', { name: `Channel topic: ${channel.topic}` }));
     fireEvent.click(within(await screen.findByRole('dialog', { name: 'Channel topic' })).getByRole('button', { name: 'Edit topic' }));
     fireEvent.change(screen.getByRole('textbox', { name: 'Channel topic' }), { target: { value: 'New' } });

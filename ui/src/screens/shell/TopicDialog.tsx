@@ -88,6 +88,20 @@ export function TopicDialog({
             aria-invalid={tooLong || undefined}
             value={value}
             onChange={(e) => setValue(oneLine(e.target.value))}
+            // A one-line field drops pasted line breaks by itself; UX wants each one
+            // to become a space, so the paste is put in here.
+            onPaste={(e) => {
+              const pasted = e.clipboardData.getData('text');
+              if (!/[\r\n  ]/.test(pasted)) return;
+              e.preventDefault();
+              const el = e.currentTarget;
+              const from = el.selectionStart ?? value.length;
+              const to = el.selectionEnd ?? value.length;
+              const insert = oneLine(pasted);
+              setValue(value.slice(0, from) + insert + value.slice(to));
+              const at = from + insert.length;
+              requestAnimationFrame(() => el.setSelectionRange(at, at));
+            }}
           />
           <p id="topic-hint" className="muted small">
             <FormattedMessage id="channel.topic.hint" />

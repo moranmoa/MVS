@@ -12,6 +12,9 @@ import { Shell } from '../screens/shell/Shell';
 import { SettingsProvider, type Settings } from './settings';
 import { WindowFrame } from './TitleBar';
 import { Store, useStore } from './store';
+import { LockGate } from '../lock/LockGate';
+import { LockPage } from '../lock/LockPage';
+import { lockScreenFromUrl } from '../lock/useLock';
 
 const StoreContext = createContext<Store | null>(null);
 
@@ -21,7 +24,16 @@ export function useAppStore(): Store {
   return s;
 }
 
-export function App({ core: rawCore, initialSettings }: { core: CoreApi; initialSettings?: Settings }) {
+export function App({
+  core: rawCore,
+  initialSettings,
+  lockScreen = lockScreenFromUrl(),
+}: {
+  core: CoreApi;
+  initialSettings?: Settings;
+  /** G-78 path A: main reloaded us into the lock screen; nothing else loads. */
+  lockScreen?: 'locked' | 'pending' | null;
+}) {
   // T8-01: the core is down (shell status, or a command refused with
   // core-unavailable). `false` = up as far as we know.
   const [down, setDown] = useState<{ detail?: CoreDownDetail } | false>(false);
@@ -34,6 +46,7 @@ export function App({ core: rawCore, initialSettings }: { core: CoreApi; initial
   const load = useRef(() => store.init().then(() => setReady(true), () => {}));
 
   useEffect(() => {
+    if (lockScreen) return;
     const stop = store.start();
     let answered = false;
     void load.current().then(() => (answered = true));
@@ -52,7 +65,7 @@ export function App({ core: rawCore, initialSettings }: { core: CoreApi; initial
       off();
       stop();
     };
-  }, [store, core]);
+  }, [store, core, lockScreen]);
 
   // "Try again": the shell restarts the core now (its core.status then hides
   // the screen); without a shell, just try loading again.
@@ -69,7 +82,13 @@ export function App({ core: rawCore, initialSettings }: { core: CoreApi; initial
     <CoreContext.Provider value={core}>
       <StoreContext.Provider value={store}>
         <SettingsProvider initial={initialSettings}>
-          <WindowFrame>{down ? <CoreDownScreen detail={down.detail} onRetry={retry} /> : ready ? <Root /> : <Splash />}</WindowFrame>
+          <WindowFrame>
+            {lockScreen ? (
+              <LockPage pending={lockScreen === 'pending'} />
+            ) : (
+              <LockGate>{down ? <CoreDownScreen detail={down.detail} onRetry={retry} /> : ready ? <Root /> : <Splash />}</LockGate>
+            )}
+          </WindowFrame>
         </SettingsProvider>
       </StoreContext.Provider>
     </CoreContext.Provider>

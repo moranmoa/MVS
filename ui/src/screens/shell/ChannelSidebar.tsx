@@ -8,7 +8,8 @@ import { isCoreError } from '../../core';
 import type { Channel, Id, ServerSummary } from '../../core';
 import { Avatar, Badge, Code, Name } from '../../components/common';
 import { BellOffIcon, GearIcon, HashIcon, PlusIcon } from '../../components/icons';
-import { CallBar, useCallEngine } from './CallBar';
+import { CallBar, useSharedCallEngine } from './CallBar';
+import { LockNowButton } from '../../lock/AppLockSection';
 import { VoiceRooms } from './VoiceRooms';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
@@ -49,8 +50,9 @@ export function ChannelSidebar({
   // A closed server is read-only (#261): no owner controls there.
   const owner = server.ownerId === identity.id && !server.closed;
   const core = useCore();
-  // The one voice engine for my call, shared by the room entry and the call bar.
-  const engine = useCallEngine(identity.id);
+  // The one voice engine for my call, shared by the room entry and the call bar
+  // (it lives above the content: G-78 path B keeps the call while locked).
+  const engine = useSharedCallEngine();
   const { bind, menu } = useContextMenu();
   // G-61: the channel whose notification settings are open.
   const [notifyFor, setNotifyFor] = useState<NotifyTarget | null>(null);
@@ -337,6 +339,7 @@ export function ChannelSidebar({
             <Code value={identity.shortCode} />
           </span>
         </button>
+        <LockNowButton />
         <button
           type="button"
           className="icon-button"

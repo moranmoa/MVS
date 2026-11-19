@@ -518,7 +518,7 @@ export class MockCore implements CoreApi {
     const now = Date.now();
     seed.channels.forEach((c, ci) => {
       const ch: ChannelState = {
-        channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0 },
+        channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0, ...(c.topic ? { topic: c.topic } : {}) },
         baseCount: c.count,
         baseStart: now - 3_600_000 - c.count * this.gapMs,
         seedOffset: hashString(c.id),
@@ -1035,6 +1035,23 @@ export class MockCore implements CoreApi {
     const s = this.ownedServer(ch.channel.serverId);
     const name = input.name === undefined ? ch.channel.name : this.channelName(s, input.name, channelId);
     ch.channel = { ...ch.channel, name, adult: input.adult ?? ch.channel.adult };
+    this.emit('channel.updated', ch.channel);
+    return ch.channel;
+  }
+
+  /** G-14: the core's rules: owner (admins in the real core), one line, 256 code points; empty clears. */
+  async setChannelTopic(channelId: Id, topic: string): Promise<Channel> {
+    await this.wait(200);
+    const ch = this.channelIndex.get(channelId);
+    if (!ch) throw err({ code: 'not-found' });
+    this.ownedServer(ch.channel.serverId);
+    const t = topic.trim();
+    if ([...t].length > 256 || new TextEncoder().encode(t).length > 1024 || /[\u0000-\u001f\u007f\u2028\u2029]/.test(t)) {
+      throw err({ code: 'bad-request' });
+    }
+    if ((ch.channel.topic ?? '') === t) return ch.channel;
+    const { topic: _old, ...rest } = ch.channel;
+    ch.channel = t ? { ...rest, topic: t } : rest;
     this.emit('channel.updated', ch.channel);
     return ch.channel;
   }

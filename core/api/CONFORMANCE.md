@@ -490,7 +490,15 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1', 'adult-keys-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+- 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
+  - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
+  - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
+  - Someone entering it (a new 18+ claim) is like a join: re-keyed through the GAP-8 bucket.
+  - Sending: an 18+ channel isn't listed to, or found by, a member without an 18+ claim, so the send is `not-found` (B7 §4: no hint it exists). A raise counts only after its 30 days (decision 18, already in force), so a raised claim never gets the key early.
+  - The cipher's adults are fresh at every seal: a channel turned 18+ and written to at once (no sync between) is re-keyed for the adults first, never sealed under the old key.
+  - **Rollout (Security Lead K2):** profile posts carry the new cap `adult-keys-v1`, and `getUpdateNeeded(serverId, 'adult-keys-v1')` lists members whose latest post lacks it. A moderator on an older version still re-keys 18+ channels for every member, so what's sent while such a member re-keys is readable by minors (**residual**, until everyone updates). Owners and admins of a server with an 18+ channel get `notice` `{ kind: 'adult-keys-outdated', serverId }` once while that list isn't empty, and again only after it has emptied. The release carrying B7-k should be a required update for the open alpha.
+  - Not covered yet (its own PR, rule agreed by the TL and SL): receivers drop a Message, MessageEdit or Reaction in an 18+ channel whose author isn't an adult at the record's causal position, or, if its deps don't reach the latest ChannelEdit that made the channel 18+, isn't an adult now.
 - Display names with emoji ZWJ sequences (B23-z2, Tech Lead on #241), in two steps so a name never reaches a core that would drop it:
   - **Now (the reader):** other people's display names from profile posts pass `authority::display_name_ok`. That's the strict rule, except that a zero-width joiner may join two emoji ("👨‍👩‍👧", "👩🏽‍💻"). A stray ZWJ, or any bidi, control or other zero-width character, is still refused: that post's name is ignored and the previous good one stays.
   - **One release later (the writer):** `updateProfile` accepts such a name for me too (`WRITE_ZWJ_NAMES` in `model.rs` flips to true). Until then my own name keeps the strict rule (`bad-request`).
@@ -502,6 +510,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
+- 18+ channels, the receiver rule (B7-k, Tech Lead and Security Lead on #544). In a channel that is 18+ in my current fold, a Message, MessageEdit or Reaction counts only if:
+  - (a) its author is an adult at the record's causal position: their latest accepted age claim before its `auth_deps` (`Resolver::adult_at`); and
+  - (b) if its `auth_deps` don't reach the latest edit that made the channel 18+ (`State.adult_edits`, `Resolver::reaches`), its author is also an adult now.
+  - A failing record is dropped like a kicked author's: not shown, never unread, a mention or a notice. It stays in the log. A plain channel, or one turned plain, has no check. Nothing is cached per record: it's recomputed on every fold.
+  - So a minor's post with stale deps is dropped, and an adult who lowers their age keeps what they posted after the channel turned 18+. Posts from before the flip by someone who isn't an adult now are hidden: the accepted cost.
+  - **Accepted residual (Security Lead):** a former adult whose claim a modified client lowered can still post with stale deps that point at an adult moment after the edit. The claim is self-attested anyway (GAP-22).
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

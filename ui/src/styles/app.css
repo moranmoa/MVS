@@ -3920,3 +3920,49 @@ input.switch:disabled {
 .ip-notice .ip-notice-settings {
   margin-inline-end: auto;
 }
+
+/* G-14: the channel topic, after the name in the header: one muted line. */
+.chat-topic {
+  min-width: 0;
+  max-width: 40rem;
+  flex: 0 1 auto;
+  overflow: hidden;
+  margin-inline-start: 0.5rem;
+  padding: 0.125rem 0 0.125rem 0.75rem;
+  padding-inline: 0.75rem 0;
+  border: 0;
+  border-inline-start: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: start;
+}
+
+.chat-topic:hover {
+  color: var(--text);
+}
+
+.chat-topic.add {
+  color: var(--text-faint);
+}
+
+.topic-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.topic-field {
+  width: 100%;
+}
+
+/* G-14 on a phone: the channel name opens the topic. */
+.chat-title-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+}

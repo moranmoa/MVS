@@ -595,6 +595,20 @@ pub trait GroupCipher: Send + Sync {
         let _ = (server, channels);
     }
 
+    /// B7-k: the members of `server` with an accepted 18+ claim, and its
+    /// 18+ channels. An 18+ channel's readers are the members who are also
+    /// adults: its key rotates to them only, and an adult who leaves that
+    /// set is a removal (a re-key, as for a kick). Every other channel's
+    /// readers are all members, as before.
+    fn set_adults(
+        &self,
+        server: ServerId,
+        adults: &BTreeSet<PublicKey>,
+        adult_channels: &BTreeSet<records::ChannelId>,
+    ) {
+        let _ = (server, adults, adult_channels);
+    }
+
     /// At identity unlock: `MemberSecret::new(signing_key)`. Until then
     /// everything but bookkeeping is `Unavailable`. See the MUST above.
     fn unlock(&self, secret: Arc<groupkeys::MemberSecret>) {

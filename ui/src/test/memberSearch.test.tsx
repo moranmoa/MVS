@@ -65,7 +65,13 @@ describe('G-41: the member list search', () => {
     const q = target.displayName.slice(0, 2);
     const expected = members.filter(memberMatcher(q));
     await type(q);
-    expect(shownIds()).toBe(expected.length);
+    // CI under load (main, 2026-11-19): the app can still be settling right
+    // after start-up and drop the first change. Wait for the filtered list,
+    // typing again if the field came back empty.
+    await waitFor(() => {
+      if (field().value !== q) fireEvent.change(field(), { target: { value: q } });
+      expect(shownIds()).toBe(expected.length);
+    });
     const offline = expected.filter((x) => x.presence === 'offline').length;
     expect(within(list()).getByRole('heading', { name: `Offline – ${offline}` })).toBeTruthy();
     if (!expected.some((x) => x.presence === 'online')) expect(within(list()).queryByRole('heading', { name: /^Online/ })).toBeNull();

@@ -114,6 +114,7 @@ jobs:
           RELAY_TCP: ${{ vars.MVS_RELAY_TCP_ADDR }}
           RELAYS_TCP: ${{ vars.MVS_RELAY_TCP_ADDRS }}
           STUN: ${{ vars.MVS_STUN_URL }}
+          ABUSE_ADDRESS: ${{ vars.MVS_ABUSE_ADDRESS }}
         run: node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-vars.json"
 
   ui:
@@ -254,6 +255,20 @@ jobs:
           want='{"relay":"/dns4/relay.example.invalid/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc","stun":"stun:stun.relay.example.invalid:3478"}'
           got=$(cat "$RUNNER_TEMP/relay-selftest.json")
           [ "$got" = "$want" ] || { echo "::error::stun config was altered on the way: $got"; exit 1; }
+          # G-48: an abuse-report address (e-mail or https URL) reaches the
+          # config unchanged and is never printed; anything else fails.
+          for a in abuse@relay.example.invalid https://relay.example.invalid/abuse; do
+            log=$(ABUSE_ADDRESS="$a" node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>&1)
+            want="{\"relay\":\"/dns4/relay.example.invalid/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\",\"abuseAddress\":\"$a\"}"
+            got=$(cat "$RUNNER_TEMP/relay-selftest.json")
+            [ "$got" = "$want" ] || { echo "::error::abuse address config was altered on the way: $got"; exit 1; }
+            case "$log" in *relay.example.invalid*) echo "::error::the abuse address was printed"; exit 1;; esac
+          done
+          for a in http://relay.example.invalid/abuse 'abuse at relay.example.invalid' javascript:alert; do
+            if ABUSE_ADDRESS="$a" node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
+              echo "::error::accepted as an abuse address: $a"; exit 1
+            fi
+          done
           # Multi-relay (part A): a two-line list wins over RELAY; "relay" is
           # its first entry. Part C: the bootstrap list covers both relays.
           RELAYS=$'/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt\n' \
@@ -293,7 +308,7 @@ jobs:
           refused "one relay and transport twice" RELAYS="/dns4/relay.example.org/tcp/443/wss/p2p/$A" RELAYS_TCP="/dns4/relay.example.org/tcp/4001/p2p/$A,/dns4/relay.example.org/tcp/4002/p2p/$A"
           refused "five bootstrap entries" RELAYS="$R" RELAYS_TCP="/dns4/a.example.org/tcp/1/p2p/$A,/dns4/a.example.org/udp/1/quic-v1/p2p/$A,/dns4/b.example.org/tcp/1/p2p/$B,/dns4/b.example.org/udp/1/quic-v1/p2p/$B,/dns4/c.example.org/tcp/2/p2p/$B"
           refused "single bootstrap for another relay" RELAY="/dns4/relay.example.org/tcp/443/wss/p2p/$A" RELAY_TCP="/dns4/relay.example.org/tcp/4001/p2p/$B"
-          echo "ok: relay, relay list, bootstrap and stun reach the config unchanged; mismatches fail"
+          echo "ok: relay, relay list, bootstrap, stun and abuse address reach the config unchanged; mismatches fail"
       - name: Build-time config (relay)
         env:
           RELAY: ${{ github.event_name == 'push' && vars.MVS_RELAY_ADDR || '' }}
@@ -307,6 +322,9 @@ jobs:
           RELAYS_TCP: ${{ github.event_name == 'push' && vars.MVS_RELAY_TCP_ADDRS || '' }}
           # Our own STUN server for voice (stun:<host>:3478); optional.
           STUN: ${{ github.event_name == 'push' && vars.MVS_STUN_URL || '' }}
+          # G-48: where abuse is reported (an e-mail or https URL); optional.
+          # The domain is private: set only as a repo variable, never committed.
+          ABUSE_ADDRESS: ${{ github.event_name == 'push' && vars.MVS_ABUSE_ADDRESS || '' }}
           MSYS2_ENV_CONV_EXCL: RELAY
           MSYS_NO_PATHCONV: "1"
         run: |

@@ -74,6 +74,12 @@ export interface Channel {
   adult: boolean;
   /** The server's first channel (#general): it can be renamed but not deleted. */
   isDefault: boolean;
+  /**
+   * G-14: one line of plain text (at most 256 code points), set by the owner or
+   * an admin; absent when there is none. Visible to every member of the server
+   * (plaintext in the control log), even when an 18+ channel isn't listed to me.
+   */
+  topic?: string;
   unread: boolean;
   mentions: number;
   /**

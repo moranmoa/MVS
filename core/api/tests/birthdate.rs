@@ -198,7 +198,7 @@ fn a_lowering_leaves_adult_servers_and_hides_adult_channels_at_once() {
     let wire = serde_json::to_value(events.iter().find(|e| matches!(e, Event::ServerRemoved { .. })).unwrap()).unwrap();
     assert_eq!(wire["payload"], json!({ "serverId": adult_only.id, "reason": "age", "required": "18+" }));
     let servers: Vec<String> = member.core.list_servers().unwrap().into_iter().map(|s| s.id).collect();
-    assert_eq!(servers, [open.id.clone()]);
+    assert_eq!(servers, std::slice::from_ref(&open.id));
     assert!(!member.core.list_channels(&open.id).unwrap().iter().any(|c| c.id == night.id));
     assert_eq!(identity(&member).birth_date, "2009-06-01");
 

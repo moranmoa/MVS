@@ -494,6 +494,11 @@ pub enum NoticeKind {
     /// Rust addition: removed members still hold a channel key and only a
     /// moderator can renew it; the channel can't be written to until then.
     RekeyWaiting,
+    /// B7-k (to owners and admins of a server with an 18+ channel): some
+    /// members run a version that keys 18+ channels for every member, so
+    /// minors there may read what's sent. `getUpdateNeeded(serverId,
+    /// 'adult-keys-v1')` lists them. Sent once until that list is empty.
+    AdultKeysOutdated,
 }
 
 /// `CoreEvents` in api.ts, as `{ "event": name, "payload": ... }`.

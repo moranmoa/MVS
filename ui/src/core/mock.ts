@@ -23,6 +23,7 @@ import type {
   CreatedInvite,
   Invite,
   RemovedMember,
+  BlockedUser,
   CoreError,
   Id,
   Identity,
@@ -506,7 +507,7 @@ export class MockCore implements CoreApi {
     const now = Date.now();
     seed.channels.forEach((c, ci) => {
       const ch: ChannelState = {
-        channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0 },
+        channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0, ...(c.topic ? { topic: c.topic } : {}) },
         baseCount: c.count,
         baseStart: now - 3_600_000 - c.count * this.gapMs,
         seedOffset: hashString(c.id),
@@ -1013,6 +1014,23 @@ export class MockCore implements CoreApi {
     return ch.channel;
   }
 
+  /** G-14: the core's rules: owner (admins in the real core), one line, 256 code points; empty clears. */
+  async setChannelTopic(channelId: Id, topic: string): Promise<Channel> {
+    await this.wait(200);
+    const ch = this.channelIndex.get(channelId);
+    if (!ch) throw err({ code: 'not-found' });
+    this.ownedServer(ch.channel.serverId);
+    const t = topic.trim();
+    if ([...t].length > 256 || new TextEncoder().encode(t).length > 1024 || /[\u0000-\u001f\u007f\u2028\u2029]/.test(t)) {
+      throw err({ code: 'bad-request' });
+    }
+    if ((ch.channel.topic ?? '') === t) return ch.channel;
+    const { topic: _old, ...rest } = ch.channel;
+    ch.channel = t ? { ...rest, topic: t } : rest;
+    this.emit('channel.updated', ch.channel);
+    return ch.channel;
+  }
+
   async deleteChannel(channelId: Id): Promise<void> {
     await this.wait(200);
     const ch = this.channelIndex.get(channelId);
@@ -1319,12 +1337,49 @@ export class MockCore implements CoreApi {
 
   // ---- safety --------------------------------------------------------------
 
-  async blockUser(userId: Id): Promise<void> {
+  async blockUser(rawId: Id): Promise<void> {
+    const userId = this.memberIdOf(rawId);
+    const now = this.blockedIds().has(userId);
     for (const s of this.servers.values()) {
       if (!s.members.some((m) => m.id === userId)) continue;
-      s.members = s.members.map((m) => (m.id === userId ? { ...m, blocked: !m.blocked } : m));
+      s.members = s.members.map((m) => (m.id === userId ? { ...m, blocked: !now } : m));
       this.emit('members.changed', { serverId: s.summary.id, members: s.members });
     }
+    this.emit('blocks.changed', { blocked: this.blockedList() });
+  }
+
+  /** G-47: the blocked members of my servers, once each, ordered by id (like the core). */
+  private blockedIds(): Map<Id, string> {
+    const out = new Map<Id, string>();
+    for (const s of this.servers.values()) for (const m of s.members) if (m.blocked && !out.has(m.id)) out.set(m.id, m.displayName);
+    return out;
+  }
+
+  async listBlocked(): Promise<BlockedUser[]> {
+    return this.blockedList();
+  }
+
+  /** Like the core, by 64-hex account id (the sanitizer drops anything else). */
+  private blockedList(): BlockedUser[] {
+    const codes = new Map<Id, string>();
+    for (const s of this.servers.values()) for (const m of s.members) codes.set(m.id, m.shortCode);
+    return [...this.blockedIds()]
+      .map(([id, name]) => [asAccountId(id), name, codes.get(id) ?? ''] as const)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([userId, name, shortCode]) => ({ userId, shortCode, ...(name ? { name } : {}) }));
+  }
+
+  /** A demo member id, given as itself or as its 64-hex account id. */
+  private memberIdOf(id: Id): Id {
+    for (const s of this.servers.values()) for (const m of s.members) if (m.id === id || asAccountId(m.id) === id) return m.id;
+    return id;
+  }
+
+  async setBlocked(rawId: Id, blocked: boolean): Promise<null> {
+    const userId = this.memberIdOf(rawId);
+    if (userId === this.identity?.id) throw err({ code: 'bad-request' });
+    if (this.blockedIds().has(userId) !== blocked) await this.blockUser(userId);
+    return null;
   }
 
   // ---- voice rooms (0.4.3): calls only, no audio in the mock ---------------------

@@ -16,6 +16,7 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  BlockedUser,
   JoinStatus,
   Member,
   Message,
@@ -248,6 +249,20 @@ export function cleanInvite(i: Invite): Invite {
 }
 
 /**
+ * G-47: a blocked account from the core, or null when its id isn't 64
+ * lower-case hex (SL, as for removed accounts): setBlocked only ever gets a
+ * real account id.
+ */
+export function cleanBlockedUser(b: BlockedUser): BlockedUser | null {
+  if (typeof b?.userId !== 'string' || !/^[0-9a-f]{64}$/.test(b.userId)) return null;
+  const name = cleanName(b.name);
+  const shortCode = cleanCode(b.shortCode);
+  return { userId: b.userId, ...(shortCode ? { shortCode } : {}), ...(name ? { name } : {}) };
+}
+const cleanBlockedList = (l: unknown): BlockedUser[] =>
+  Array.isArray(l) ? l.map(cleanBlockedUser).filter((b): b is BlockedUser => b !== null) : [];
+
+/**
  * G-53: a removed account from the core, or null when its id isn't 64
  * lower-case hex (SL): undoKick is only ever sent a real account id.
  */
@@ -267,8 +282,13 @@ const POSITION = /^[0-9A-Za-z]{0,31}[1-9A-Za-z]$/;
 /** A non-negative whole number below 2^31, or undefined. */
 const index = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 && (v as number) < 2 ** 31 ? (v as number) : undefined);
 
+/** G-14: at most 256 code points (the core's MAX_CHANNEL_TOPIC). */
+export const CHANNEL_TOPIC_MAX = 256;
+
 export function cleanChannel(c: Channel): Channel {
-  const { position, firstUnreadIndex, unreadCount, ...rest } = c;
+  const { position, firstUnreadIndex, unreadCount, topic: rawTopic, ...rest } = c;
+  // G-14: one line of plain text, cleaned like a name (no controls, bidi or line breaks).
+  const topic = cleanName(rawTopic, CHANNEL_TOPIC_MAX);
   const first = index(firstUnreadIndex);
   const n = index(unreadCount);
   return {
@@ -277,6 +297,7 @@ export function cleanChannel(c: Channel): Channel {
     ...(first !== undefined ? { firstUnreadIndex: first } : {}),
     ...(n !== undefined ? { unreadCount: n } : {}),
     ...(typeof position === 'string' && POSITION.test(position) ? { position } : {}),
+    ...(topic ? { topic } : {}),
     name: cleanName(c.name, CHANNEL_NAME_MAX) || '…',
     adult: c.adult === true,
     isDefault: c.isDefault === true,
@@ -596,6 +617,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'channel.added': cleanChannel,
   'channel.removed': (p) => ({ serverId: p.serverId, channelId: p.channelId, name: cleanName(p.name, CHANNEL_NAME_MAX) || '…' }),
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
+  'blocks.changed': (p) => ({ blocked: cleanBlockedList(p?.blocked) }),
   'message.added': cleanMessage,
   'message.updated': cleanMessage,
   // Only the kinds the UI knows; anything else is dropped.
@@ -663,12 +685,14 @@ export function guardCore(core: CoreApi): CoreApi {
     moveChannel: wrap(core.moveChannel, (l) => l.map(cleanChannel)),
     createChannel: wrap(core.createChannel, cleanChannel),
     updateChannel: wrap(core.updateChannel, cleanChannel),
+    setChannelTopic: wrap(core.setChannelTopic, cleanChannel),
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listBlocked: wrap(core.listBlocked, cleanBlockedList),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
       Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
     ),

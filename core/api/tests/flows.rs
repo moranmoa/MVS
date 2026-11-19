@@ -570,7 +570,7 @@ fn restore_and_identity_rules() {
     let world = World::new();
     let peer = world.peer();
     let err = peer.core.restore_identity(vec!["legal".into(); 11]).unwrap_err();
-    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]) });
+    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]), servers: None });
     let words: Vec<String> = LEGAL.split(' ').map(String::from).collect();
     let restored = peer.core.restore_identity(words.clone()).unwrap();
     assert!(restored.recovery_checked);
@@ -3254,6 +3254,7 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     assert!(guest.events.take().contains(&Event::ServerRemoved {
         server_id: server.id.clone(),
         reason: Some(RemovedReason::Left),
+        required: None,
     }));
     assert!(guest.core.list_servers().unwrap().is_empty());
     assert_eq!(guest.core.get_messages(&channel, 0, 9).unwrap_err().code, ErrorCode::NotFound);
@@ -3310,7 +3311,7 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     *world.clock.0.lock().unwrap() += 20_000;
     third.core.sync_now().unwrap();
     let removed =
-        Event::ServerRemoved { server_id: server.id.clone(), reason: Some(RemovedReason::Closed) };
+        Event::ServerRemoved { server_id: server.id.clone(), reason: Some(RemovedReason::Closed), required: None };
     assert!(third.events.take().contains(&removed));
     assert!(third.core.list_servers().unwrap().is_empty());
     assert_eq!(third.core.list_channels(&server.id).unwrap_err().code, ErrorCode::NotFound);
@@ -3450,6 +3451,7 @@ fn a_leave_waits_in_the_outbox_until_the_gate_opens() {
         assert!(peer.events.take().contains(&Event::ServerRemoved {
             server_id: server.id.clone(),
             reason: Some(RemovedReason::Left),
+            required: None,
         }));
         assert!(peer.core.list_servers().unwrap().is_empty());
         assert_eq!(leaves_by(&world, server_key, id), 0, "a Leave went out past the gate");
@@ -5067,10 +5069,13 @@ fn profile_picture_and_colour_reach_other_members() {
     assert_eq!(err(profile(Some(&small_webp(65, 0)), None)), ErrorCode::BadRequest);
     assert_eq!(err(profile(None, Some("blue"))), ErrorCode::BadRequest);
     assert_eq!(err(profile(Some(&small_webp(48, 2_600)), None)), ErrorCode::BadRequest);
-    // The largest valid profile (128 four-byte emoji, a 2,556-byte picture,
-    // a colour) fits one post and is published (the 4 KiB check guards it).
+    // A near-largest profile (116 four-byte emoji, a 2,556-byte picture, a
+    // colour) fits one post and is published (the 4 KiB check guards it).
+    // Every cap a release adds (adult-keys-v1 here, server-meta-v1 next)
+    // takes ~16 bytes of every profile post, so the name room left beside
+    // the largest picture shrinks: 128 emoji no longer fit (B7-k).
     let mut largest = profile(Some(&small_webp(48, 2_512)), Some("#ffffff"));
-    largest.display_name = "🙂".repeat(128);
+    largest.display_name = "🙂".repeat(116);
     // #378: an explicit save posts at once, up to a burst of three.
     let before = posts();
     bob.core.update_profile(largest).unwrap();
@@ -5957,6 +5962,66 @@ fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
 fn peer_key(peer: &Peer) -> PublicKey {
     let id = peer.core.get_identity().unwrap().unwrap().id;
     PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
+}
+
+/// dev-identity on #517: a joiner after an earlier join's wait ran out gets
+/// a wait of its own, so its first messages aren't sealed under a key it
+/// never gets.
+#[test]
+fn a_later_joiner_gets_its_own_join_key_wait() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Later");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+
+    // B joins with the owner away; A's wait for it runs out.
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "for B", None).unwrap();
+    advance(&world, 2 * JOIN_KEY_WAIT.as_millis() as u64);
+    a.core.sync_now().unwrap();
+    let sent = a.core.send_message(&channel, "B's wait is over", None).unwrap();
+    assert_ne!(sent.send_state, Some(SendState::Pending), "{sent:?}");
+
+    // C joins later: a new wait, so A holds again.
+    let _c = joiner(&world, &server, "C");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "for C", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending), "{held:?}");
+}
+
+/// dev-identity on #517: messages held for a key and dropped at the app
+/// lock turn `failed` with no text (`message.updated`), never left pending.
+#[test]
+fn held_messages_dropped_at_lock_turn_failed() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Lock");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "secret", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    a.events.take();
+    a.core.lock_keys();
+    let updated: Vec<Message> = a
+        .events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::MessageUpdated(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0].id, held.id);
+    assert_eq!(updated[0].send_state, Some(SendState::Failed));
+    assert_eq!(updated[0].body, "");
+    a.core.unlock_keys();
 }
 
 /// TODO #21, the PO's placeholders: a message sent after my join that this

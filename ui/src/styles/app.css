@@ -1383,7 +1383,8 @@ legend {
 }
 
 .msg.deleted,
-.msg.blocked {
+.msg.blocked,
+.msg.unreadable {
   display: flex;
   align-items: center;
   gap: 0.5rem;

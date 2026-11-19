@@ -75,6 +75,8 @@ export interface MockOptions {
    * stay held (`wait`, for screenshots).
    */
   keyPending?: 'arrive' | 'fail' | 'wait';
+  /** Core #527: the first channel's two latest messages are placeholders (no-key, untrusted), for screenshots. */
+  unreadable?: boolean;
   /** B7: the identity has a correction raising its age, waiting its 30 days (#306). */
   pendingDob?: boolean;
   /** signOut is refused by the OS keychain (#304: nothing changes). */
@@ -238,6 +240,15 @@ export class MockCore implements CoreApi {
     if (options.deviceLinked !== undefined) {
       const label = options.deviceLinked;
       this.timers.push(setTimeout(() => this.simulateDeviceAdded(label, Date.now() - 2 * 60_000), 50));
+    }
+    if (options.unreadable) {
+      const [server] = this.servers.values();
+      const ch = server?.channels[0];
+      if (ch) {
+        const last = this.count(ch) - 1;
+        this.simulateUnreadable(ch.channel.id, last - 1, 'no-key');
+        this.simulateUnreadable(ch.channel.id, last, 'untrusted');
+      }
     }
     if (options.typing) {
       const n = Math.min(3, options.typing);
@@ -617,6 +628,20 @@ export class MockCore implements CoreApi {
     if (h % 17 === 0) msg.editedAt = msg.createdAt + 60_000;
     if (h % 401 === 0) msg.mentionsMe = true;
     return msg;
+  }
+
+  /** Mock only (core #527): turn a message into a placeholder, or open it again (kind null). */
+  simulateUnreadable(channelId: Id, index: number, kind: 'no-key' | 'untrusted' | null): void {
+    const ch = this.channelIndex.get(channelId);
+    if (!ch) return;
+    const m = this.generated(ch, index);
+    if (kind === null) {
+      ch.overrides.delete(index);
+      this.emit('message.updated', m);
+      return;
+    }
+    const { reactions: _r, mentions: _m, replyTo: _t, sendState: _s, ...rest } = m;
+    this.put(ch, { ...rest, body: '', unreadable: kind, ...(kind === 'untrusted' ? { authorId: '' } : {}) }, false);
   }
 
   private messageAt(ch: ChannelState, index: number): Message {

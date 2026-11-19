@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -85,6 +85,10 @@ let coreStatus = { state: 'starting' };
 const STUN_URL = stunFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
 if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
 const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
+// G-48 (B24): the build's abuse-report address, for the page's getAppInfo.
+// Text only, never opened; never logged (its domain is private).
+const ABUSE_ADDRESS = abuseAddressFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+if (abuseHost(ABUSE_ADDRESS)) fileLog.hide(abuseHost(ABUSE_ADDRESS));
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
 /**
@@ -361,7 +365,7 @@ function serveCoreIpc() {
     const res = await core.request(req.cmd, req.args);
     callGate.afterCommand(req.cmd, token, res);
     syncCall();
-    return res;
+    return req.cmd === 'getAppInfo' ? withAbuseAddress(res, ABUSE_ADDRESS) : res;
   });
   // The "core unavailable" screen (T8-01): try again now, and open the logs.
   const fromUs = (event) => {

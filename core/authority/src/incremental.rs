@@ -321,7 +321,11 @@ impl Resolver {
                 creates.insert(creates.partition_point(|other| pos[other] < at), id);
             }
         }
-        if matches!(action, Some(Action::ServerEdit { .. })) {
+        // G-51: the icon and description are server meta, like a rename.
+        if matches!(
+            action,
+            Some(Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. })
+        ) {
             let pos = &self.pos;
             let edits = &mut self.server_edits;
             edits.insert(edits.partition_point(|other| pos[other] < at), id);
@@ -425,7 +429,7 @@ impl Resolver {
                 }
                 return Ok(());
             }
-            Action::ServerEdit { .. } => {
+            Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
                 // Changes no roles; whether it counts depends on the author's
                 // role, which must be the same in every pass. The latest in
                 // linear order names the server.
@@ -755,13 +759,26 @@ impl Resolver {
 
     /// Recomputes whether `actor` counts as 18+: their latest accepted age
     /// claim in linear order.
-    /// The server's name: the latest accepted rename in linear order.
+    /// The server's name, and (G-51) its icon and description: each the
+    /// latest accepted of its kind in linear order (`server_edits` holds all
+    /// three kinds).
     fn refresh_server_name(&mut self) {
-        let latest = self.server_edits.iter().rev().find(|id| self.state.accepted.contains(*id));
-        self.state.server_name = latest.and_then(|id| match &self.actions[id] {
-            Some(Action::ServerEdit { name }) => Some(name.clone()),
-            _ => None,
-        });
+        let mut name = None;
+        let mut icon = None;
+        let mut description = None;
+        for id in self.server_edits.iter().rev().filter(|id| self.state.accepted.contains(*id)) {
+            match &self.actions[id] {
+                Some(Action::ServerEdit { name: n }) if name.is_none() => name = Some(n.clone()),
+                Some(Action::ServerIcon { icon: i }) if icon.is_none() => icon = Some(i.clone()),
+                Some(Action::ServerDescription { text }) if description.is_none() => {
+                    description = Some((!text.is_empty()).then(|| text.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.state.server_name = name;
+        self.state.server_icon = icon.flatten();
+        self.state.server_description = description.flatten();
     }
 
     /// Whether `id` is a close the reference would accept: the owner's, with
@@ -883,7 +900,7 @@ impl Resolver {
                     }
                     dirty.insert(author);
                 }
-                Action::ServerEdit { .. } => {
+                Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
                     if now {
                         self.state.accepted.insert(id);
                     } else {

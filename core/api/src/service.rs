@@ -380,7 +380,12 @@ struct Inner {
     /// Channels whose current key some members can't read, and since when
     /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
     /// once nobody is missing.
-    join_key_wait: HashMap<(ServerId, ChannelId), u64>,
+    /// Who was missing then: a new joiner (someone not in that set) starts
+    /// a wait of its own (dev-identity on #517).
+    join_key_wait: HashMap<(ServerId, ChannelId), (BTreeSet<PublicKey>, u64)>,
+    /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
+    /// once every member posts the cap, so it comes again if it reopens.
+    adult_keys_warned: HashSet<ServerId>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -617,6 +622,7 @@ impl Core {
             typing: typing::Typing::default(),
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
+            adult_keys_warned: HashSet::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -669,16 +675,28 @@ impl Core {
     /// the commands.
     pub fn lock_keys(&self) {
         let _ = self.leave_call();
+        // Messages held for a key: their text is dropped (zeroized) at lock
+        // and sign-out, never kept past them (lost-message P1, SL C3). Each
+        // one still listed turns `failed` with no text (`message.updated`),
+        // so the UI never shows it as about to be sent (dev-identity on
+        // #517). Before the cipher locks: the index needs the count.
+        let _ = self.run(|inner, ports, events| {
+            let held = std::mem::take(&mut inner.key_pending);
+            inner.join_key_wait.clear();
+            let mut before: HashMap<ChannelId, usize> = HashMap::new();
+            for mut p in held {
+                let earlier = before.entry(p.channel).or_default();
+                let index = inner.message_count(&*ports.cipher, p.server, p.channel).unwrap_or(0) + *earlier;
+                *earlier += 1;
+                p.failed = true;
+                p.body = Zeroizing::new(String::new());
+                events.push(Event::MessageUpdated(p.message(index)));
+            }
+            Ok(())
+        });
         self.ports.cipher.lock();
         self.ports.network.lock();
         self.keys_locked.store(true, Ordering::SeqCst);
-        // Messages held for a key: their text is dropped (zeroized) at lock
-        // and sign-out, never kept past them (lost-message P1, SL C3).
-        {
-            let mut inner = self.lock();
-            inner.key_pending.clear();
-            inner.join_key_wait.clear();
-        }
         // G-91 (Security Lead on #457): the server secrets a restore took
         // from the backup go too; the backup is fetched again after unlock.
         let mut restore = self.restore.lock().expect("not poisoned");
@@ -2338,7 +2356,7 @@ impl Core {
                 events.push(Event::MessageAdded(message.clone()));
                 return Ok(message);
             }
-            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
+            let sealed = match inner.seal_with(ports, server, channel, body.as_bytes(), false) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
                     let message = inner.hold_for_key(ports, server, channel, body)?;
@@ -2654,6 +2672,9 @@ impl Core {
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
                 let _ = inner.post_caps(ports, server);
+                // B7-k K2: owners and admins learn when older members would
+                // key an 18+ channel for minors too.
+                let _ = inner.adult_keys_notice(server, me, events);
                 let after = inner.view(server)?;
                 if after.is_kicked(&me) {
                     inner.join_waiting.remove(&server);
@@ -4279,7 +4300,7 @@ impl Inner {
                     i += 1;
                     continue;
                 }
-                match self.seal(ports, server, channel, body.as_bytes()) {
+                match self.seal_with(ports, server, channel, body.as_bytes(), false) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
                         let record =
@@ -4333,16 +4354,22 @@ impl Inner {
         let cipher = &*ports.cipher;
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        let missing = cipher.missing_readers(server, channel).len();
-        if missing == 0 {
+        let missing: BTreeSet<PublicKey> = cipher.missing_readers(server, channel).into_iter().collect();
+        if missing.is_empty() {
             self.join_key_wait.remove(&(server, channel));
             return Ok(false);
         }
         let now = ports.clock.now_ms();
-        let since = *self.join_key_wait.entry((server, channel)).or_insert(now);
-        if now.saturating_sub(since) < JOIN_KEY_WAIT.as_millis() as u64 {
+        let wait = self.join_key_wait.entry((server, channel)).or_insert_with(|| (missing.clone(), now));
+        // Someone missing who wasn't before (a later joiner): its own wait,
+        // from now. The same set (or fewer) keeps counting from its start.
+        if !missing.is_subset(&wait.0) {
+            *wait = (missing.clone(), now);
+        }
+        if now.saturating_sub(wait.1) < JOIN_KEY_WAIT.as_millis() as u64 {
             return Ok(true);
         }
+        let missing = missing.len();
         tracing::info!(target: "mvs::keys", missing, "join key wait over: sending under the current key");
         Ok(false)
     }
@@ -4363,18 +4390,36 @@ impl Inner {
         channel: ChannelId,
         plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
+        self.seal_with(ports, server, channel, plaintext, true)
+    }
+
+    /// [`Self::seal`]; `sync: false` when [`Self::waits_for_join_key`] has
+    /// just given the cipher the members and rotations (dev-identity on
+    /// #517: not twice per send).
+    fn seal_with(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        channel: ChannelId,
+        plaintext: &[u8],
+        sync: bool,
+    ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
         let view = self.view(server)?;
         let members = view.state.members.clone();
+        let readers = channel_readers(&view, channel);
         let may_rotate = view.state.role(key) >= authority::Role::Moderator;
         let auth_deps = auth_deps(&view);
-        cipher.membership_changed(server, &members);
-        chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        if sync {
+            cipher.membership_changed(server, &members);
+            chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        }
         match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).
-                self.rotate_channel(ports, server, channel, &members, &auth_deps)
+                // B7-k: an 18+ channel's key goes to its adult readers only.
+                self.rotate_channel(ports, server, channel, &readers, &auth_deps)
                     .map_err(|_| CoreError::from(ErrorCode::NotAllowed))?;
                 cipher.encrypt(server, channel, plaintext).map_err(cipher_error)
             }
@@ -4551,9 +4596,15 @@ impl Inner {
         let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
         let server_id = model::hex_id(server.as_bytes());
+        // B7-k: each channel's readers; an 18+ channel's are its adults.
+        let channels = self.known(server)?;
+        let view = self.view(server)?;
+        let readers: HashMap<ChannelId, BTreeSet<PublicKey>> =
+            channels.iter().map(|c| (*c, channel_readers(&view, *c))).collect();
         // Channels a join left stale: re-keyed together, for one token.
         let mut joined = Vec::new();
-        for channel in self.known(server)? {
+        for channel in channels {
+            let members = &readers[&channel];
             // A probe: an empty plaintext, never sent.
             let probe = cipher.encrypt(server, channel, b"");
             if probe != Err(CipherError::RotationRequired) {
@@ -4562,7 +4613,7 @@ impl Inner {
                 // channel for everyone now, so a joiner can write and read
                 // without waiting for a moderator to send first. A failure only
                 // leaves things as they were: the next round tries again.
-                let stale = self.keyed_for.get(&(server, channel)) != Some(&members);
+                let stale = self.keyed_for.get(&(server, channel)) != Some(members);
                 let no_key = probe == Err(CipherError::NoKey);
                 if may_rotate && (no_key || (probe.is_ok() && stale)) && members.len() > 1 {
                     joined.push(channel);
@@ -4578,7 +4629,7 @@ impl Inner {
             // one, and the channel stays blocked by `RotationRequired` until the
             // next sync or send retries.
             let renewed = may_rotate
-                && self.rotate_channel(ports, server, channel, &members, &auth_deps).is_ok();
+                && self.rotate_channel(ports, server, channel, members, &auth_deps).is_ok();
             let kind =
                 if renewed { NoticeKind::EncryptionRenewed } else { NoticeKind::RekeyWaiting };
             events.push(Event::Notice { kind, server_id: server_id.clone() });
@@ -4597,7 +4648,7 @@ impl Inner {
         for channel in joined {
             // Fail closed, as for a kick: a failed rotation is never announced
             // as one, and the UI learns the channel waits.
-            if self.rotate_channel(ports, server, channel, &members, &auth_deps).is_err() {
+            if self.rotate_channel(ports, server, channel, &readers[&channel], &auth_deps).is_err() {
                 let kind = NoticeKind::RekeyWaiting;
                 events.push(Event::Notice { kind, server_id: server_id.clone() });
             }
@@ -5023,6 +5074,27 @@ impl Inner {
     /// The release that adds a cap: my latest profile post in `server` lacks
     /// one of [`model::CAPS`] (posted by an older version), so post it
     /// again, once.
+    /// B7-k K2 (Security Lead on #544): to an owner or admin of a server
+    /// with an 18+ channel, `notice: adult-keys-outdated` once while some
+    /// member's latest profile post lacks `adult-keys-v1` (such a member, if
+    /// a moderator, re-keys 18+ channels for every member). Sent again only
+    /// after the list has been empty.
+    fn adult_keys_notice(&mut self, server: ServerId, me: PublicKey, events: &mut Events) -> CoreResult<()> {
+        let view = self.view(server)?;
+        let outdated = view.state.role(me) >= authority::Role::Admin
+            && view.state.channels.values().any(|c| c.adult)
+            && !view.lacking(model::ADULT_KEYS_CAP, me).is_empty();
+        if !outdated {
+            self.adult_keys_warned.remove(&server);
+        } else if self.adult_keys_warned.insert(server) {
+            events.push(Event::Notice {
+                kind: NoticeKind::AdultKeysOutdated,
+                server_id: model::hex_id(server.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());
@@ -5490,6 +5562,17 @@ impl ServerView<'_> {
             (None, None) => created.get(a).cmp(&created.get(b)),
         });
         ids
+    }
+}
+
+/// B7-k: who a channel's key is for, as the cipher counts it: the
+/// members, and for an 18+ channel only those with an accepted 18+ claim.
+fn channel_readers(view: &ServerView, channel: ChannelId) -> BTreeSet<PublicKey> {
+    let members = view.state.members.iter().copied();
+    if view.state.channels.get(&channel).is_some_and(|c| c.adult) {
+        members.filter(|m| view.state.adults.contains(m)).collect()
+    } else {
+        members.collect()
     }
 }
 

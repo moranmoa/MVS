@@ -4874,7 +4874,7 @@ impl Task {
             debug!(%peer, "voice media from a non-member refused");
             return;
         };
-        if !self.voice_call.as_ref().is_some_and(|c| c.participants.contains(&identity)) {
+        if self.voice_call.as_ref().is_none_or(|c| !c.participants.contains(&identity)) {
             debug!(%peer, "voice media from outside my call refused");
             return;
         }
@@ -4908,10 +4908,10 @@ impl Task {
     /// [`VOICE_SEQ_JUMP`]; nothing old or repeated, which also drops the
     /// copies a move sends twice).
     fn voice_in_frame(&mut self, identity: PublicKey, connection: ConnectionId, frame: VoiceFrame) {
-        if !self.voice_in.get(&identity).is_some_and(|r| r.readers.iter().any(|(c, _, _)| *c == connection)) {
+        if self.voice_in.get(&identity).is_none_or(|r| !r.readers.iter().any(|(c, _, _)| *c == connection)) {
             return;
         }
-        if !self.voice_call.as_ref().is_some_and(|c| c.call_id == frame.call_id && c.participants.contains(&identity)) {
+        if self.voice_call.as_ref().is_none_or(|c| c.call_id != frame.call_id || !c.participants.contains(&identity)) {
             return;
         }
         if let Some(last) = self.voice_seq.get(&identity) {
@@ -4937,7 +4937,7 @@ impl Task {
     /// during an overlap (checked per send, each copy counted against my
     /// cap: TL nit 5), under my call ID.
     fn voice_out_frame(&mut self, frame: VoiceFrame) {
-        if !self.voice_call.as_ref().is_some_and(|c| c.call_id == frame.call_id) {
+        if self.voice_call.as_ref().is_none_or(|c| c.call_id != frame.call_id) {
             return;
         }
         let Some(wire) = frame.encode() else { return };

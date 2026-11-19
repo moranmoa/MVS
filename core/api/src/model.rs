@@ -194,9 +194,15 @@ pub(crate) const TOPIC_CAP: &str = "channel-topic-v1";
 /// what's sent then is readable by minors: owners and admins are told
 /// (`notice: adult-keys-outdated`) until every member posts this.
 pub(crate) const ADULT_KEYS_CAP: &str = "adult-keys-v1";
+/// G-51: this version reads `ServerIcon` (23) and `ServerDescription` (24)
+/// records. Older cores refuse an unknown kind and stall the control log
+/// behind it, so nobody sets either until every member posts this.
+pub(crate) const SERVER_META_CAP: &str = "server-meta-v1";
 /// Every cap this version posts, and the only names `getUpdateNeeded`
-/// takes.
-pub(crate) const CAPS: [&str; 4] = [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP];
+/// takes. Frozen after server-meta-v1: later gates use one `lv:N` cap
+/// (Tech Lead on #555).
+pub(crate) const CAPS: [&str; 5] =
+    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {
@@ -1057,6 +1063,17 @@ mod tests {
         assert!(!heads.contains(&orphan.id()));
         assert!(heads.contains(&log.records.last().unwrap().id()));
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
+    }
+
+    /// Every cap is posted once (Tech Lead on #555): a merge that loses a
+    /// line of `CAPS`, or doubles one, fails here.
+    #[test]
+    fn every_cap_is_posted_once() {
+        let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();
+        assert_eq!(unique.len(), CAPS.len(), "a cap twice");
+        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP] {
+            assert!(CAPS.contains(&cap), "{cap} missing");
+        }
     }
 
     /// B23-z2: the reader takes a display name with an emoji ZWJ sequence

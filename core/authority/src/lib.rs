@@ -74,6 +74,7 @@ pub use records::{ChannelId, PublicKey, Record, RecordId, ServerId, Stub};
 use records::{Draft, Kind, RecordError, Scope, SigningKey, GENESIS_NONCE_LEN, MAX_CUT_ENTRIES};
 
 mod channel;
+pub mod image;
 mod incremental;
 pub use channel::{
     check_channel, check_channel_with, check_stub, message_text_ok, privileged_only, witness,
@@ -179,6 +180,19 @@ pub enum Action {
     ServerEdit {
         name: String,
     },
+    /// G-51: the owner or an admin sets or clears the server's icon. Body:
+    /// `history u8` (0), `type u8` (0 clears; 1 PNG, 2 WebP), then a still
+    /// image ([`image::still_size`], at most `records::MAX_SERVER_ICON_BYTES`
+    /// and [`ICON_SIDE_MAX`] px a side).
+    ServerIcon {
+        icon: Option<Icon>,
+    },
+    /// G-51: the owner or an admin sets the server's description; empty
+    /// clears it. Body: `history u8` (0), then UTF-8 following
+    /// [`server_description_ok`].
+    ServerDescription {
+        text: String,
+    },
     /// A member other than the owner leaves the server. It ends their role
     /// and membership; unlike a kick, they may join again. Body: a cut.
     Leave {
@@ -217,6 +231,8 @@ impl Action {
             Action::ChannelTopic { .. } => Kind::ChannelTopic,
             Action::Unban { .. } => Kind::Unban,
             Action::ServerEdit { .. } => Kind::ServerEdit,
+            Action::ServerIcon { .. } => Kind::ServerIcon,
+            Action::ServerDescription { .. } => Kind::ServerDescription,
             Action::Leave { .. } => Kind::Leave,
             Action::ServerClose => Kind::ServerClose,
         }
@@ -261,6 +277,9 @@ impl Action {
                 let json = serde_json::json!({ "v": 1, "name": name });
                 [vec![0], serde_json::to_vec(&json).expect("a JSON object")].concat()
             }
+            Action::ServerIcon { icon: None } => vec![0, 0],
+            Action::ServerIcon { icon: Some(icon) } => [vec![0, icon.kind.byte()], icon.bytes.clone()].concat(),
+            Action::ServerDescription { text } => [vec![0], text.as_bytes().to_vec()].concat(),
             Action::Leave { cut } => {
                 let mut body = Vec::new();
                 cut.encode(&mut body);
@@ -353,6 +372,30 @@ impl Action {
                 (edit.v == 1 && server_name_ok(&edit.name))
                     .then_some(Action::ServerEdit { name: edit.name })
             }
+            // G-51. No history mode is defined before D30.
+            Kind::ServerIcon => {
+                let [0, kind, image @ ..] = body else { return None };
+                let icon = match (*kind, image.is_empty()) {
+                    (0, true) => None,
+                    (kind, false) => {
+                        let kind = image::ImageType::from_byte(kind)?;
+                        if image.len() > records::MAX_SERVER_ICON_BYTES {
+                            return None;
+                        }
+                        image::still_size(image, kind, ICON_SIDE_MAX)?;
+                        Some(Icon { kind, bytes: image.to_vec() })
+                    }
+                    _ => return None,
+                };
+                Some(Action::ServerIcon { icon })
+            }
+            Kind::ServerDescription => {
+                let [0, text @ ..] = body else { return None };
+                let text = String::from_utf8(text.to_vec())
+                    .ok()
+                    .filter(|t| t.is_empty() || server_description_ok(t))?;
+                Some(Action::ServerDescription { text })
+            }
             Kind::Leave => Some(Action::Leave { cut: Cut::parse(body)? }),
             Kind::ServerClose => body.is_empty().then_some(Action::ServerClose),
             // Channel kinds are judged by the channel checks (B4-4).
@@ -382,6 +425,8 @@ impl Action {
             | Action::ChannelTopic { .. }
             | Action::AgeClaim { .. }
             | Action::ServerEdit { .. }
+            | Action::ServerIcon { .. }
+            | Action::ServerDescription { .. }
             | Action::Leave { .. }
             | Action::ServerClose => None,
         }
@@ -427,6 +472,8 @@ impl Action {
                     | Action::ChannelDelete { .. }
                     | Action::ChannelTopic { .. }
                     | Action::ServerEdit { .. }
+                    | Action::ServerIcon { .. }
+                    | Action::ServerDescription { .. }
                     | Action::ServerClose
             )
     }
@@ -538,6 +585,51 @@ pub fn channel_topic_ok(topic: &str) -> bool {
 pub fn channel_topic(raw: &str) -> Option<String> {
     let topic = raw.trim();
     (topic.is_empty() || channel_topic_ok(topic)).then(|| topic.to_owned())
+}
+
+/// G-51: the longest side of a server icon, in pixels.
+pub const ICON_SIDE_MAX: u32 = 128;
+
+/// G-51: a server icon, a still PNG or WebP checked by
+/// [`image::still_size`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Icon {
+    pub kind: image::ImageType,
+    pub bytes: Vec<u8>,
+}
+
+/// G-51: most Unicode code points in a server description. The body also
+/// caps it at `records::MAX_SERVER_DESCRIPTION_BYTES` bytes.
+pub const MAX_SERVER_DESCRIPTION: usize = 500;
+/// G-51: most lines in a server description.
+pub const MAX_SERVER_DESCRIPTION_LINES: usize = 5;
+
+/// G-51 (Tech Lead and Security Lead on #547): whether `text` can be a
+/// server's description, shared by the API and the parser:
+/// - 1 to [`MAX_SERVER_DESCRIPTION`] code points and at most
+///   `records::MAX_SERVER_DESCRIPTION_BYTES` bytes, trimmed;
+/// - lines split by `\n` only, at most [`MAX_SERVER_DESCRIPTION_LINES`];
+///   no `\r` or U+2028/2029 (the strict rule refuses them);
+/// - no leading or trailing blank line, and at most one empty line in a
+///   row;
+/// - every line passes the strict [`display_text_ok`], with no trailing
+///   whitespace (Tech Lead on #553: one encoding per description).
+///
+/// An empty description (clearing it) is checked by the caller.
+pub fn server_description_ok(text: &str) -> bool {
+    if text.is_empty()
+        || text.trim() != text
+        || text.len() > records::MAX_SERVER_DESCRIPTION_BYTES
+        || text.chars().count() > MAX_SERVER_DESCRIPTION
+    {
+        return false;
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    lines.len() <= MAX_SERVER_DESCRIPTION_LINES
+        && lines.windows(2).all(|w| !(w[0].is_empty() && w[1].is_empty()))
+        && lines.iter().all(|line| {
+            line.trim_end() == *line && display_text_ok(line) && !line.contains(['\u{2028}', '\u{2029}'])
+        })
 }
 
 /// Most Unicode code points in a server name, the same limit as
@@ -809,6 +901,12 @@ pub struct State {
     pub topics: BTreeMap<ChannelId, String>,
     /// Deleted channels: their IDs aren't created again.
     pub deleted_channels: BTreeSet<ChannelId>,
+    /// G-51: the latest accepted icon in linear order; `None` when cleared or
+    /// never set.
+    pub server_icon: Option<Icon>,
+    /// G-51: the latest accepted description in linear order; `None` when
+    /// cleared or never set.
+    pub server_description: Option<String>,
     /// The latest accepted rename in linear order; `None` keeps the genesis
     /// name.
     pub server_name: Option<String>,
@@ -1000,7 +1098,10 @@ fn permitted(view: &impl View, record: &Record, action: &Action) -> bool {
         // A member claims their own age.
         Action::AgeClaim { .. } => view.is_member(author),
         // Renaming is the owner's or an admin's.
-        Action::ServerEdit { .. } => author_role >= Role::Admin,
+        // G-51: the icon and description too.
+        Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+            author_role >= Role::Admin
+        }
         // A member leaves, but the owner can't (no ownership transfer in v1),
         // and a kicked key can't (refused above), so a ban survives.
         Action::Leave { .. } => view.is_member(author) && author_role != Role::Owner,
@@ -1074,6 +1175,8 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
         | Action::ChannelTopic { .. }
         | Action::AgeClaim { .. }
         | Action::ServerEdit { .. }
+        | Action::ServerIcon { .. }
+        | Action::ServerDescription { .. }
         | Action::ServerClose => None,
     }
 }
@@ -1083,6 +1186,10 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
 fn apply_server(state: &mut State, record: &Record, action: &Action) {
     match action {
         Action::ServerEdit { name } => state.server_name = Some(name.clone()),
+        Action::ServerIcon { icon } => state.server_icon = icon.clone(),
+        Action::ServerDescription { text } => {
+            state.server_description = (!text.is_empty()).then(|| text.clone());
+        }
         Action::ServerClose => state.closed = Some(record.id()),
         _ => {}
     }
@@ -1455,6 +1562,8 @@ impl<'a> Graph<'a> {
                 | Action::ChannelTopic { .. }
                 | Action::AgeClaim { .. }
                 | Action::ServerEdit { .. }
+                | Action::ServerIcon { .. }
+                | Action::ServerDescription { .. }
                 | Action::ServerClose => continue,
                 Action::RevokeInvite { invite } => {
                     pass.voided.extend(self.voids_of(i));

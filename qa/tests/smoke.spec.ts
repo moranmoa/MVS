@@ -77,7 +77,7 @@ test.describe('smoke', () => {
     await onboard(page);
     await page.getByRole('button', { name: /^הצטרפות בלינק/ }).click();
     await page.getByLabel(he.joinLink).fill('mvs://join/qa-smoke-test');
-    await page.getByRole('button', { name: he.join, exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: he.join, exact: true }).click();
     await expect(page.getByText('מחפשים חברים מהשרת…')).toBeVisible();
     await expect(page.getByRole('navigation', { name: 'שרתים' }).getByRole('button', { name: /^Valorant ישראל/ })).toBeVisible({
       timeout: 10_000,
@@ -97,7 +97,7 @@ test.describe('smoke', () => {
     await onboard(page);
     await page.getByRole('button', { name: /^הצטרפות בלינק/ }).click();
     await page.getByLabel(he.joinLink).fill('mvs://join/qa-retry');
-    await page.getByRole('button', { name: he.join, exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: he.join, exact: true }).click();
     const box = composer(page);
     await expect(box).toBeVisible({ timeout: 10_000 });
     await box.fill('זה ייכשל /fail');

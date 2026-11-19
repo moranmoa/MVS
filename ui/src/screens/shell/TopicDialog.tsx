@@ -92,7 +92,7 @@ export function TopicDialog({
             // to become a space, so the paste is put in here.
             onPaste={(e) => {
               const pasted = e.clipboardData.getData('text');
-              if (!/[\r\n  ]/.test(pasted)) return;
+              if (!/[\r\n\u2028\u2029]/.test(pasted)) return;
               e.preventDefault();
               const el = e.currentTarget;
               const from = el.selectionStart ?? value.length;

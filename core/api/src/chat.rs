@@ -92,6 +92,7 @@ impl ChannelGraph for Graph<'_> {
 /// edit replaced its record).
 fn stub_accepted(resolver: &Resolver, stub: &Stub, graph: &Graph) -> bool {
     check_stub(resolver, stub, graph) == Verdict::Accept
+        && adult_ok(resolver, stub.kind(), stub.scope(), stub.author(), stub.auth_deps())
 }
 
 /// The records of `channel`, in the order they were added.
@@ -101,6 +102,67 @@ pub(crate) fn channel_records(log: &Log, channel: ChannelId) -> Vec<Record> {
 
 fn accepted(resolver: &Resolver, record: &Record, graph: &Graph) -> bool {
     check_channel(resolver, record, graph) == Verdict::Accept
+        && adult_ok(resolver, record.kind(), record.scope(), record.author(), record.auth_deps())
+}
+
+/// B7-k, the receiver rule (Tech Lead and Security Lead on #544): in a
+/// channel that is 18+ in my current fold, a Message, MessageEdit or
+/// Reaction counts only if
+/// - (a) its author is an adult at the record's causal position
+///   (`Resolver::adult_at` its `auth_deps`), and
+/// - (b) when its `auth_deps` don't reach the latest edit that made the
+///   channel 18+ (`State.adult_edits`), its author is also an adult now.
+///
+/// A failing record is dropped like a kicked author's: not shown, never
+/// unread, a mention or a notice; it stays in the log. A plain channel (or
+/// one turned plain) has no check. Recomputed on every fold: positions shift
+/// as records land, so nothing is cached per record. Accepted residual
+/// (Security Lead): a former adult whose claim was lowered by a modified
+/// client can still post with stale deps pointing at an adult moment after
+/// the edit; the claim is self-attested anyway (GAP-22).
+fn adult_ok(resolver: &Resolver, kind: Kind, scope: Scope, author: PublicKey, auth_deps: &[RecordId]) -> bool {
+    if !matches!(kind, Kind::Message | Kind::MessageEdit | Kind::Reaction) {
+        return true;
+    }
+    let Scope::Channel(channel) = scope else { return true };
+    let state = resolver.state();
+    if !state.channels.get(&channel).is_some_and(|c| c.adult) {
+        return true;
+    }
+    if resolver.adult_at(author, auth_deps) != Ok(true) {
+        return false;
+    }
+    let reaches = state.adult_edits.get(&channel).is_some_and(|edit| reaches_cached(resolver, *edit, auth_deps));
+    reaches || state.adults.contains(&author)
+}
+
+thread_local! {
+    /// B7-k (Security Lead nit on #551): `reaches` answers by (edit,
+    /// auth_deps), so a fold doesn't walk the control DAG per record. The
+    /// answer is pure ancestry between records already joined: a record
+    /// joins only once its deps have, and `adult_ok` asks only after
+    /// `adult_at` found every dep held. So it never changes. Bounded.
+    static REACHES: std::cell::RefCell<HashMap<(RecordId, Vec<RecordId>), bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Entries the [`REACHES`] memo holds before it starts over.
+const REACHES_MAX: usize = 16_384;
+
+fn reaches_cached(resolver: &Resolver, edit: RecordId, auth_deps: &[RecordId]) -> bool {
+    let key = (edit, auth_deps.to_vec());
+    REACHES.with(|memo| {
+        if let Some(known) = memo.borrow().get(&key) {
+            return *known;
+        }
+        let answer = resolver.reaches(edit, auth_deps);
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= REACHES_MAX {
+            memo.clear();
+        }
+        memo.insert(key, answer);
+        answer
+    })
 }
 
 /// The channels authority knows for `server`: those its accepted
@@ -451,4 +513,122 @@ pub(crate) fn deps_with(log: &Log, channel: ChannelId, target: RecordId) -> Vec<
     deps.push(target);
     deps.sort();
     deps
+}
+
+#[cfg(test)]
+mod adult_rule_tests {
+    //! B7-k, the receiver rule (`adult_ok`), over a signed control log.
+    use super::*;
+    use authority::{sign_control, sign_genesis, Action};
+    use records::{Draft, SigningKey};
+
+    struct World {
+        resolver: Resolver,
+        server: ServerId,
+        keys: Vec<SigningKey>,
+        seq: Vec<u64>,
+        head: RecordId,
+    }
+
+    impl World {
+        /// The owner (0) and members 1 and 2, joined; no channels yet.
+        fn new() -> World {
+            let keys: Vec<SigningKey> = (0..3u8).map(|n| SigningKey::from_bytes(&[n + 10; 32])).collect();
+            let genesis = sign_genesis(&keys[0], [0; 16], 1, b"{}").unwrap();
+            let server = genesis.server();
+            let mut resolver = Resolver::new(server);
+            resolver.insert(genesis.clone());
+            let mut w = World { resolver, server, keys, seq: vec![1, 0, 0], head: genesis.id() };
+            let invite = w.control(0, Action::Invite { expires_ms: 0, max_uses: 0 });
+            for n in 1..3 {
+                w.control(n, Action::Join { invite });
+            }
+            w
+        }
+
+        fn key(&self, n: usize) -> PublicKey {
+            PublicKey::from_bytes(self.keys[n].verifying_key().to_bytes())
+        }
+
+        /// A control record by `n` on the current head; it becomes the head.
+        fn control(&mut self, n: usize, action: Action) -> RecordId {
+            let record = sign_control(&self.keys[n], self.server, self.seq[n], vec![self.head], 1, &action).unwrap();
+            self.seq[n] += 1;
+            self.head = record.id();
+            self.resolver.insert(record);
+            self.head
+        }
+
+        /// Would a message by `n` in `channel`, relying on `auth_deps`, count?
+        fn counts(&self, n: usize, channel: ChannelId, auth_deps: RecordId) -> bool {
+            let message = Draft {
+                server: self.server,
+                scope: Scope::Channel(channel),
+                seq: 0,
+                deps: vec![],
+                auth_deps: vec![auth_deps],
+                ts: 1,
+                kind: Kind::Message,
+                body: vec![0; 40],
+            }
+            .sign(&self.keys[n])
+            .unwrap();
+            adult_ok(&self.resolver, message.kind(), message.scope(), message.author(), message.auth_deps())
+        }
+    }
+
+    const NIGHT: ChannelId = ChannelId::from_bytes([7; 32]);
+
+    #[test]
+    fn the_receiver_rule_at_the_record_and_now() {
+        let mut w = World::new();
+        w.control(0, Action::ChannelCreate { channel: NIGHT, adult: false, name: "night".into() });
+        let adult1 = w.control(1, Action::AgeClaim { adult: true });
+        // A plain channel: no check at all.
+        assert!(w.counts(2, NIGHT, w.head), "plain: anyone");
+        let before_flip = w.head;
+        let flip = w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "night".into() });
+        let after_flip = w.head;
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip));
+
+        // (a): someone who never claimed 18+ never counts.
+        assert!(!w.counts(2, NIGHT, after_flip), "a minor after the flip");
+        assert!(!w.counts(2, NIGHT, before_flip), "a minor with stale deps");
+        // An adult counts, after the flip and (adult now) with stale deps too.
+        assert!(w.counts(1, NIGHT, after_flip));
+        assert!(w.counts(1, NIGHT, before_flip), "(b) passes: adult now");
+        assert!(w.counts(1, NIGHT, adult1));
+
+        // 1 lowers: posts made after the flip while adult still count
+        // (a holds at them, and their deps reach the flip)...
+        w.control(1, Action::AgeClaim { adult: false });
+        assert!(w.counts(1, NIGHT, after_flip), "an adult's history survives a lowering");
+        // ...stale deps from before the flip don't: (b) needs adult now.
+        assert!(!w.counts(1, NIGHT, before_flip), "pre-flip, now not adult: hidden (the accepted cost)");
+        // And deps after the lowering fail (a).
+        assert!(!w.counts(1, NIGHT, w.head));
+
+        // A rename of the 18+ channel doesn't move the transition (Security
+        // Lead on #551): 1's post after the flip still counts.
+        w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "late".into() });
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip));
+        assert!(w.counts(1, NIGHT, after_flip), "rename, then lower: the history stays");
+
+        // Off and on again: the latest flip counts for (b).
+        w.control(1, Action::AgeClaim { adult: true });
+        let adult_again = w.head;
+        w.control(0, Action::ChannelEdit { channel: NIGHT, adult: false, name: "night".into() });
+        assert!(w.counts(2, NIGHT, w.head), "turned plain: no check");
+        let flip2 = w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "night".into() });
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip2));
+        w.control(1, Action::AgeClaim { adult: false });
+        assert!(!w.counts(1, NIGHT, adult_again), "reaches the first flip only, not adult now");
+        assert!(w.counts(1, NIGHT, flip2), "reaches the latest flip while adult");
+
+        // Unknown deps: never counted (pending).
+        assert!(!w.counts(1, NIGHT, RecordId::from_bytes([9; 32])));
+        // Key rotations and deletes are never judged by it.
+        let rotation_kind = adult_ok(&w.resolver, Kind::KeyRotation, Scope::Channel(NIGHT), w.key(2), &[before_flip]);
+        assert!(rotation_kind);
+    }
 }

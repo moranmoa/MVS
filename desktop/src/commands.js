@@ -23,6 +23,8 @@ const COMMANDS = Object.freeze({
   listChannels: ['serverId'],
   createChannel: ['serverId', 'input'],
   updateChannel: ['channelId', 'input'],
+  // G-14 channel topic
+  setChannelTopic: ['channelId', 'topic'],
   deleteChannel: ['channelId'],
   listMembers: ['serverId'],
   createServer: ['input'],

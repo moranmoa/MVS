@@ -697,6 +697,8 @@ impl Resolver {
         let mut entry: Option<Channel> = None;
         let mut deleted = false;
         let mut topic: Option<String> = None;
+        // B7-k: as `apply_channel` keeps `State.adult_edits`.
+        let mut adult_edit: Option<RecordId> = None;
         for op in self.channel_ops.get(&channel).into_iter().flatten() {
             if !self.state.accepted.contains(op) {
                 continue;
@@ -710,9 +712,16 @@ impl Resolver {
                         created: *op,
                     };
                     entry = Some(created);
+                    if *adult {
+                        adult_edit = Some(*op);
+                    }
                 }
                 Some(Action::ChannelEdit { adult, name, .. }) => {
                     if let Some(entry) = entry.as_mut() {
+                        // Only plain → 18+, as `apply_channel`.
+                        if *adult && !entry.adult {
+                            adult_edit = Some(*op);
+                        }
                         entry.name = name.clone();
                         entry.adult = *adult;
                     }
@@ -721,6 +730,7 @@ impl Resolver {
                     entry = None;
                     deleted = true;
                     topic = None;
+                    adult_edit = None;
                 }
                 Some(Action::ChannelTopic { topic: text, .. }) => {
                     topic = (!text.is_empty()).then(|| text.clone());
@@ -735,6 +745,10 @@ impl Resolver {
         match topic {
             Some(topic) => self.state.topics.insert(channel, topic),
             None => self.state.topics.remove(&channel),
+        };
+        match adult_edit {
+            Some(edit) => self.state.adult_edits.insert(channel, edit),
+            None => self.state.adult_edits.remove(&channel),
         };
         if deleted {
             self.state.deleted_channels.insert(channel);
@@ -1055,6 +1069,35 @@ impl Resolver {
     /// The final pass's state just before position `at`.
     pub(crate) fn view_at(&self, at: usize) -> impl View + '_ {
         self.at(at)
+    }
+
+    /// B7-k, query only (no state changes): whether `actor` counts as 18+
+    /// just before the record whose `auth_deps` are given: their latest
+    /// *accepted* age claim placed before `position_after(auth_deps)` in
+    /// linear order says adult. `Err(missing)` while some dep isn't held,
+    /// like a `Pending` verdict. Positions can shift as records land
+    /// earlier, so callers recompute on each fold and never cache a verdict
+    /// per record.
+    pub fn adult_at(&self, actor: Actor, auth_deps: &[RecordId]) -> Result<bool, Vec<RecordId>> {
+        let at = self.position_after(auth_deps)?;
+        let latest = self.touch.get(&actor).into_iter().flatten().rev().find_map(|id| {
+            let before = self.pos.get(id).is_some_and(|pos| *pos < at);
+            if !before || self.known[id].author() != actor || !self.state.accepted.contains(id) {
+                return None;
+            }
+            match self.actions[id] {
+                Some(Action::AgeClaim { adult }) => Some(adult),
+                _ => None,
+            }
+        });
+        Ok(latest == Some(true))
+    }
+
+    /// B7-k, query only (no state changes): whether the control record
+    /// `ancestor` is among the ancestors of `of` (or one of them). The walk
+    /// stops below `ancestor`'s position in linear order, so it's cheap.
+    pub fn reaches(&self, ancestor: RecordId, of: &[RecordId]) -> bool {
+        self.is_control_ancestor(ancestor, of)
     }
 
     /// The accepted revokes and kicks of `target`, with their record IDs.

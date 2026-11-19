@@ -23,7 +23,7 @@ use authority::{
 use records::{ChannelId, Kind, PublicKey, Record, RecordId, Scope, ServerId, Stub, MAX_DEPS};
 
 use crate::model::Log;
-use crate::ports::{GroupCipher, Opened};
+use crate::ports::{CipherError, GroupCipher, Opened};
 use crate::reaction::{causal_order, Gate, Node, OnMessage, Reaction};
 
 /// The channel records of one server, as `authority` asks about them: full
@@ -222,6 +222,45 @@ pub(crate) struct Shown {
     /// G-26: the emoji shown under it and who has each on
     /// (`reaction::OnMessage::shown`); none on a deleted message.
     pub reactions: Vec<(String, Vec<PublicKey>)>,
+    /// A placeholder: the message keeps its place, but its text doesn't
+    /// open here (TODO #21, the PO's table). `text` is empty, with no
+    /// reactions.
+    pub unreadable: Option<Unreadable>,
+}
+
+/// Why a shown message has no text (the PO's placeholder rules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unreadable {
+    /// Sealed under a key this device doesn't hold, by someone who had
+    /// already seen me join (the lost-message P1 residual). Not final: a
+    /// later rotation may open it. Before my join, it stays hidden instead.
+    NoKey,
+    /// Opens only under a rotation authority doesn't accept (#21): shown
+    /// without its author, text or reactions.
+    Untrusted,
+}
+
+/// The control records from my latest `Join` on (it included): a channel
+/// record whose auth deps name one was written by someone who had seen me
+/// join. The server's creator (no `Join`, the genesis author) has them
+/// all. None when I'm unknown or neither. `log.records` is deps-first
+/// (topological), so one pass is enough; were it ever out of order, a
+/// record would only miss the set, so it errs towards hiding (SL on #527).
+pub(crate) fn after_my_join(log: &Log, me: Option<PublicKey>) -> HashSet<RecordId> {
+    let mut after = HashSet::new();
+    let Some(me) = me else { return after };
+    let join = log.records.iter().rev().find(|r| r.kind() == Kind::Join && r.author() == me);
+    let creator = log.records.first().is_some_and(|g| g.kind() == Kind::Genesis && g.author() == me);
+    if join.is_none() && !creator {
+        return after;
+    }
+    let join = join.map(Record::id);
+    for record in &log.records {
+        if join.is_none() || Some(record.id()) == join || record.deps().iter().any(|d| after.contains(d)) {
+            after.insert(record.id());
+        }
+    }
+    after
 }
 
 /// G-26: the reactions of one channel, folded in causal order
@@ -284,21 +323,29 @@ pub(crate) fn reactions(
     folded
 }
 
-/// Opens a message or edit body; `None` unless it opens under an accepted
-/// rotation (#21) as text within `message_text_ok`.
-fn open(
+/// Opens a message or edit body: its text only if it opens under an
+/// accepted rotation (#21) as text within `message_text_ok`. Otherwise
+/// why not: `Some(_)` for a placeholder's reason, `None` for what is never
+/// shown (malformed, or text over the limit).
+fn try_open(
     cipher: &dyn GroupCipher,
     server: ServerId,
     channel: ChannelId,
     author: PublicKey,
     body: &[u8],
-) -> Option<String> {
+) -> Result<String, Option<Unreadable>> {
     match cipher.decrypt(server, channel, author, body) {
         Ok(Opened { plaintext, accepted: true }) => {
-            let text = String::from_utf8(plaintext).ok()?;
-            message_text_ok(&text).then_some(text)
+            let text = String::from_utf8(plaintext).map_err(|_| None)?;
+            if message_text_ok(&text) {
+                Ok(text)
+            } else {
+                Err(None)
+            }
         }
-        _ => None,
+        Ok(Opened { accepted: false, .. }) => Err(Some(Unreadable::Untrusted)),
+        Err(CipherError::NoKey) => Err(Some(Unreadable::NoKey)),
+        Err(_) => Err(None),
     }
 }
 
@@ -316,26 +363,29 @@ pub(crate) fn messages(
     channel: ChannelId,
     log: &Log,
     now: u64,
+    me: Option<PublicKey>,
 ) -> Vec<Shown> {
     if !known_channels(server, log.resolver.state()).contains(&channel) {
         return Vec::new();
     }
     let replaced = Replaced::of(log, channel);
     let graph = Graph::new(&log.channel, &log.stubs);
+    let after = after_my_join(log, me);
+    let seen_join = |auth_deps: &[RecordId]| auth_deps.iter().any(|d| after.contains(d));
     // Full messages, and stubs of messages a delete or edit replaced.
     let full = channel_records(log, channel)
         .into_iter()
         .filter(|r| r.kind() == Kind::Message && accepted(&log.resolver, r, &graph))
-        .map(|r| (Meta::of_record(&r), Some(r)));
+        .map(|r| (Meta::of_record(&r), seen_join(r.auth_deps()), Some(r)));
     let pruned = log
         .stubs
         .values()
         .filter(|s| s.scope() == Scope::Channel(channel) && s.kind() == Kind::Message)
         .filter(|s| stub_accepted(&log.resolver, s, &graph))
-        .map(|s| (Meta::of_stub(s), None));
+        .map(|s| (Meta::of_stub(s), seen_join(s.auth_deps()), None));
     let mut shown: Vec<Shown> = full
         .chain(pruned)
-        .filter_map(|(meta, record)| {
+        .filter_map(|(meta, seen_join, record)| {
             if replaced.deleted.contains(&meta.id) {
                 return Some(Shown {
                     record: meta,
@@ -343,22 +393,59 @@ pub(crate) fn messages(
                     edited_at: None,
                     deleted: true,
                     reactions: Vec::new(),
+                    unreadable: None,
                 });
             }
+            // The PO's rules: untrusted always gets a placeholder; no key
+            // only when the author had seen me join (else hidden, as all
+            // history from before my join).
+            let placeholder =
+                |why: Option<Unreadable>| why.filter(|w| *w != Unreadable::NoKey || seen_join);
+            let mut why = None;
             if let Some(edit) = replaced.latest_edit.get(&meta.id) {
-                let text = open(cipher, server, channel, edit.author(), edit.body().get(32..)?)?;
-                return Some(Shown {
+                let opened = edit
+                    .body()
+                    .get(32..)
+                    .ok_or(None)
+                    .and_then(|body| try_open(cipher, server, channel, edit.author(), body));
+                match opened {
+                    Ok(text) => {
+                        return Some(Shown {
+                            record: meta,
+                            text,
+                            edited_at: Some(edit.ts()),
+                            deleted: false,
+                            reactions: Vec::new(),
+                            unreadable: None,
+                        })
+                    }
+                    // An edit that doesn't open: the original, if it does.
+                    Err(e) => why = e,
+                }
+            }
+            let opened = match &record {
+                Some(record) => try_open(cipher, server, channel, record.author(), record.body()),
+                // Pruned: only its edit had a text, and that didn't open.
+                None => Err(why),
+            };
+            match opened {
+                Ok(text) => Some(Shown {
                     record: meta,
                     text,
-                    edited_at: Some(edit.ts()),
+                    edited_at: None,
                     deleted: false,
                     reactions: Vec::new(),
-                });
+                    unreadable: None,
+                }),
+                Err(e) => placeholder(e).map(|why| Shown {
+                    record: meta,
+                    text: String::new(),
+                    edited_at: None,
+                    deleted: false,
+                    reactions: Vec::new(),
+                    unreadable: Some(why),
+                }),
             }
-            // Neither deleted nor edited: only a full record has a text.
-            let record = record?;
-            let text = open(cipher, server, channel, record.author(), record.body())?;
-            Some(Shown { record: meta, text, edited_at: None, deleted: false, reactions: Vec::new() })
         })
         .collect();
     shown.sort_by_key(|s| (s.record.ts(), s.record.id()));
@@ -367,8 +454,12 @@ pub(crate) fn messages(
     if !log.channel.iter().any(|r| r.kind() == Kind::Reaction && r.scope() == scope) {
         return shown;
     }
-    let live: HashSet<RecordId> =
-        shown.iter().filter(|s| !s.deleted).map(|s| s.record.id()).collect();
+    // Placeholders take no reactions.
+    let live: HashSet<RecordId> = shown
+        .iter()
+        .filter(|s| !s.deleted && s.unreadable.is_none())
+        .map(|s| s.record.id())
+        .collect();
     let folded = reactions(cipher, server, channel, log, &live, now);
     for s in &mut shown {
         if let Some(on) = folded.on.get(&s.record.id()) {

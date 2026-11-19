@@ -375,7 +375,8 @@ export function cleanMessage(m: Message): Message {
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
-  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
+  // An unknown unreadable kind is dropped: the message is shown as a message.
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, unreadable: _unknown, ...rest } = m;
   const mentions = cleanMentions(rawMentions);
   const reactions = cleanReactions(rawReactions);
   return {

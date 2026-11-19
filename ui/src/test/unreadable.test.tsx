@@ -34,9 +34,9 @@ async function setup() {
   await screen.findByRole('textbox', { name: /^Message / });
   const [server] = await core.listServers();
   const [channel] = await core.listChannels(server.id);
-  const count = await core.getMessageCount(channel.id);
   await screen.findAllByRole('article');
-  return { core, channelId: channel.id, last: count - 1 };
+  // A row near the top: jsdom renders only the first rows of the virtual list.
+  return { core, channelId: channel.id, last: 3 };
 }
 
 describe('placeholder rows (core #527)', () => {

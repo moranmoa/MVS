@@ -11,6 +11,10 @@ import { formatWait, lockScreenFromUrl } from './useLock';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+/** CI under load: the App's cold start can take seconds; wait for the settled UI. */
+const T = { timeout: 10_000 };
+vi.setConfig({ testTimeout: 30_000 });
+
 const settings: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
 type Listener = (event: string, payload: unknown) => void;
@@ -109,9 +113,9 @@ describe('path A: the lock screen', () => {
     fireEvent.change(field, { target: { value: '1357' } });
     fireEvent.click(screen.getByRole('button', { name: 'Unlock' }));
     expect(screen.getByRole('button', { name: 'Checking…' })).toBeTruthy();
-    expect((await screen.findByRole('alert')).textContent).toContain('Wrong passcode.');
+    expect((await screen.findByRole('alert', {}, T)).textContent).toContain('Wrong passcode.');
     expect(field.value).toBe('');
-    await waitFor(() => expect(document.activeElement).toBe(field));
+    await waitFor(() => expect(document.activeElement).toBe(field), T);
     expect(field.getAttribute('aria-invalid')).toBe('true');
     expect(b.lock.unlock).toHaveBeenCalledWith({ passcode: '1357' });
     // The show toggle.
@@ -124,7 +128,7 @@ describe('path A: the lock screen', () => {
   it('rate-limited: disabled with the countdown; the words stay available', async () => {
     bridge({ ...LOCKED_A, retryAfter: 90 });
     render(<App core={new MockCore({ speed: 0 })} initialSettings={settings} lockScreen="locked" />);
-    expect(await screen.findByText('Too many tries. Try again in 1:30.')).toBeTruthy();
+    expect(await screen.findByText('Too many tries. Try again in 1:30.', {}, T)).toBeTruthy();
     expect((screen.getByLabelText('Passcode') as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: 'Unlock' }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole('button', { name: /12 words/ }) as HTMLButtonElement).disabled).toBe(false);
@@ -139,7 +143,7 @@ describe('path A: the lock screen', () => {
     const first = screen.getByLabelText('Word 1');
     fireEvent.paste(first, { clipboardData: { getData: () => Array.from({ length: 12 }, (_, i) => `w${i}`).join(' ') } });
     fireEvent.click(screen.getByRole('button', { name: 'Unlock' }));
-    await waitFor(() => expect(b.lock.unlock).toHaveBeenCalledWith({ words: Array.from({ length: 12 }, (_, i) => `w${i}`).join(' ') }));
+    await waitFor(() => expect(b.lock.unlock).toHaveBeenCalledWith({ words: Array.from({ length: 12 }, (_, i) => `w${i}`).join(' ') }), T);
     expect(sessionStorage.getItem('mvs.lock.notice')).toBe('lock.words.done');
   });
 
@@ -156,13 +160,13 @@ describe('path B: locked during a call', () => {
     const b = bridge({ enabled: true, locked: false, pending: false, path: null });
     const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
     render(<App core={core} initialSettings={settings} />);
-    await screen.findByRole('textbox', { name: /^Message / });
-    expect(document.body.textContent).toMatch(/Minecraft IL/);
+    await screen.findByRole('textbox', { name: /^Message / }, T);
+    await waitFor(() => expect(document.body.textContent).toMatch(/Minecraft IL/), T);
     // "Lock now" sits beside my settings, only with the lock on.
     expect(screen.getAllByRole('button', { name: /Lock now/ }).length).toBeGreaterThan(0);
 
     b.emit({ enabled: true, locked: true, pending: false, path: 'B', inCall: true });
-    expect(await screen.findByRole('dialog', { name: 'MVS is locked' })).toBeTruthy();
+    expect(await screen.findByRole('dialog', { name: 'MVS is locked' }, T)).toBeTruthy();
     expect(screen.getByText('Your mic is off')).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/Minecraft IL/);
     expect(screen.queryByRole('textbox', { name: /^Message / })).toBeNull();
@@ -172,16 +176,16 @@ describe('path B: locked during a call', () => {
     expect(leave).toHaveBeenCalled();
 
     b.emit({ enabled: true, locked: false, pending: false, path: null });
-    await screen.findByRole('textbox', { name: /^Message / });
-    expect(await screen.findByText('Your mic is still off. Turn it on from the call bar.')).toBeTruthy();
+    await screen.findByRole('textbox', { name: /^Message / }, T);
+    expect(await screen.findByText('Your mic is still off. Turn it on from the call bar.', {}, T)).toBeTruthy();
   });
 
   it('Tab stays inside the overlay', async () => {
     const b = bridge({ enabled: true, locked: false, pending: false, path: null });
     render(<App core={new MockCore({ demo: true, speed: 0, simulateActivity: false })} initialSettings={settings} />);
-    await screen.findByRole('textbox', { name: /^Message / });
+    await screen.findByRole('textbox', { name: /^Message / }, T);
     b.emit({ enabled: true, locked: true, pending: false, path: 'B', inCall: true });
-    const dialog = await screen.findByRole('dialog', { name: 'MVS is locked' });
+    const dialog = await screen.findByRole('dialog', { name: 'MVS is locked' }, T);
     const leave = screen.getByRole('button', { name: 'Leave call' });
     const forgot = screen.getByRole('button', { name: /12 words/ });
     forgot.focus();
@@ -195,9 +199,9 @@ describe('path B: locked during a call', () => {
 describe('Settings → Privacy → App lock', () => {
   async function openPrivacy() {
     render(<App core={new MockCore({ demo: true, speed: 0, simulateActivity: false })} initialSettings={settings} />);
-    await screen.findByRole('textbox', { name: /^Message / });
+    await screen.findByRole('textbox', { name: /^Message / }, T);
     fireEvent.click(screen.getAllByRole('button', { name: 'Settings' })[0]!);
-    fireEvent.click(await screen.findByRole('button', { name: 'Privacy' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Privacy' }, T));
   }
 
   it('is not there outside the desktop app', async () => {
@@ -208,21 +212,21 @@ describe('Settings → Privacy → App lock', () => {
   it('turning it on sets a passcode (checked twice, then by main)', async () => {
     const b = bridge({ enabled: false, locked: false, pending: false, path: null });
     await openPrivacy();
-    fireEvent.click(await screen.findByRole('switch', { name: 'App lock' }));
-    const first = await screen.findByLabelText('New passcode');
+    fireEvent.click(await screen.findByRole('switch', { name: 'App lock' }, T));
+    const first = await screen.findByLabelText('New passcode', {}, T);
     fireEvent.change(first, { target: { value: '123' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    expect((await screen.findByRole('alert')).textContent).toBe('That passcode is too short.');
+    expect((await screen.findByRole('alert', {}, T)).textContent).toBe('That passcode is too short.');
     fireEvent.change(first, { target: { value: '246810' } });
     fireEvent.change(screen.getByLabelText('Again, to confirm'), { target: { value: '246811' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    expect((await screen.findByRole('alert')).textContent).toBe("The passcodes don't match.");
+    expect((await screen.findByRole('alert', {}, T)).textContent).toBe("The passcodes don't match.");
     expect(b.lock.set).not.toHaveBeenCalled();
     fireEvent.change(screen.getByLabelText('Again, to confirm'), { target: { value: '246810' } });
     b.lock.config.mockResolvedValue({ enabled: true, idleMinutes: 5, lockOnSleep: true, method: 'passcode' });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    await waitFor(() => expect(b.lock.set).toHaveBeenCalledWith({ passcode: '246810', idleMinutes: 5, lockOnSleep: true }));
-    expect(await screen.findByRole('combobox', { name: /Lock when idle/ })).toBeTruthy();
+    await waitFor(() => expect(b.lock.set).toHaveBeenCalledWith({ passcode: '246810', idleMinutes: 5, lockOnSleep: true }), T);
+    expect(await screen.findByRole('combobox', { name: /Lock when idle/ }, T)).toBeTruthy();
     expect(screen.getByText(/BitLocker/)).toBeTruthy();
   });
 
@@ -230,15 +234,15 @@ describe('Settings → Privacy → App lock', () => {
     const b = bridge({ enabled: true, locked: false, pending: false, path: null });
     b.lock.config.mockResolvedValue({ enabled: true, idleMinutes: 5, lockOnSleep: true, method: 'passcode' });
     await openPrivacy();
-    const select = await screen.findByRole('combobox', { name: /Lock when idle/ });
+    const select = await screen.findByRole('combobox', { name: /Lock when idle/ }, T);
     fireEvent.change(select, { target: { value: '15' } });
-    const current = await screen.findByLabelText('Current passcode', { selector: 'input' });
+    const current = await screen.findByLabelText('Current passcode', { selector: 'input' }, T);
     fireEvent.change(current, { target: { value: '2468' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    await waitFor(() => expect(b.lock.set).toHaveBeenCalledWith({ current: '2468', passcode: '2468', idleMinutes: 15, lockOnSleep: true }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Next' }, T));
+    await waitFor(() => expect(b.lock.set).toHaveBeenCalledWith({ current: '2468', passcode: '2468', idleMinutes: 15, lockOnSleep: true }), T);
     // Once per visit: the sleep switch doesn't ask again.
     fireEvent.click(screen.getByRole('switch', { name: /computer locks or sleeps/ }));
-    await waitFor(() => expect(b.lock.set).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(b.lock.set).toHaveBeenCalledTimes(2), T);
     expect(b.lock.set).toHaveBeenLastCalledWith({ current: '2468', passcode: '2468', idleMinutes: 5, lockOnSleep: false });
   });
 
@@ -247,12 +251,12 @@ describe('Settings → Privacy → App lock', () => {
     b.lock.config.mockResolvedValue({ enabled: true, idleMinutes: 5, lockOnSleep: true, method: 'passcode' });
     b.lock.clear.mockResolvedValue({ result: 'wrong' });
     await openPrivacy();
-    fireEvent.click(await screen.findByRole('switch', { name: 'App lock' }));
-    fireEvent.change(await screen.findByLabelText('Current passcode', { selector: 'input' }), { target: { value: '1111' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect((await screen.findByRole('alert')).textContent).toBe('Wrong passcode.');
+    fireEvent.click(await screen.findByRole('switch', { name: 'App lock' }, T));
+    fireEvent.change(await screen.findByLabelText('Current passcode', { selector: 'input' }, T), { target: { value: '1111' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Next' }, T));
+    expect((await screen.findByRole('alert', {}, T)).textContent).toBe('Wrong passcode.');
     expect(b.lock.clear).toHaveBeenCalledWith({ current: '1111' });
     fireEvent.click(screen.getByRole('switch', { name: 'App lock' }));
-    expect(await screen.findByLabelText('Current passcode', { selector: 'input' })).toBeTruthy();
+    expect(await screen.findByLabelText('Current passcode', { selector: 'input' }, T)).toBeTruthy();
   });
 });

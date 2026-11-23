@@ -432,6 +432,8 @@
   "chat.delete": "Delete",
   "chat.deleteConfirm": "Delete this message? It's removed for everyone running a normal version of the app.",
   "chat.deleted": "Message deleted",
+  "msg.unreadable.noKey": "This message can't be opened on this computer yet. It may open later.",
+  "msg.unreadable.untrusted": "This message can't be verified, so it isn't shown.",
   "chat.edited": "(edited)",
   "chat.state.pending": "Waiting – sends when someone from the server connects",
   "chat.state.pendingShort": "Waiting",

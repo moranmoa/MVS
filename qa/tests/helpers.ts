@@ -16,6 +16,8 @@ export const he = {
   displayName: 'שם תצוגה',
   done: 'סיום',
   homeTitle: 'ברוכים הבאים',
+  // G-92: the first Home after a new sign-up says the account is ready.
+  homeFirstRunTitle: 'החשבון מוכן. מה עכשיו?',
   serverName: 'שם השרת',
   create: 'יצירה',
   serverReady: 'השרת מוכן',
@@ -83,7 +85,8 @@ export async function onboard(page: Page, opts: OnboardOptions = {}): Promise<st
 
   await page.getByLabel(he.displayName).fill(displayName);
   await page.getByRole('button', { name: he.done }).click();
-  await expect(page.getByRole('heading', { name: he.homeTitle })).toBeVisible();
+  // G-92: onboard() always creates a new account, so its first Home says so.
+  await expect(page.getByRole('heading', { name: he.homeFirstRunTitle })).toBeVisible();
   return words;
 }
 
@@ -137,4 +140,9 @@ export function trackErrors(page: Page): string[] {
     if (m.type() === 'error') errors.push(m.text());
   });
   return errors;
+}
+
+/** Home's heading: the usual one, or (G-92) the first visit after sign-up. */
+export function homeHeading(page: Page) {
+  return page.getByRole('heading', { name: he.homeTitle }).or(page.getByRole('heading', { name: he.homeFirstRunTitle }));
 }

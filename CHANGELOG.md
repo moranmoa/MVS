@@ -10,6 +10,38 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
+## [0.5.0] - 2026-11-24
+
+### New
+- **Reactions and an emoji picker:** react to any message, and pick emoji from a full picker with Hebrew and English search, in messages and reactions alike.
+- **"Is typing…":** see when others are typing in the channel. You can turn off sharing your own typing in Settings → Privacy.
+- **Formatting in messages:** bold, italic, strikethrough, code, code blocks, quotes, spoilers and links, with keyboard shortcuts (Ctrl+B, Ctrl+I, Ctrl+E, Ctrl+Shift+X). Links open only after you confirm them.
+- **Optional app lock:** lock MVS with a passcode, by hand or after a set idle time (Settings → Privacy → App lock). A call keeps going while the app is locked, with your microphone muted. Forgot the passcode? Unlock with your 12 recovery words.
+- **Blocked accounts list:** Settings → Privacy lists everyone you blocked, including people who no longer share a server with you, with their identity code and an Unblock button with Undo.
+- **Removed accounts and undo kick:** server owners can see who was removed and let them back in (server settings → Removed accounts). A removed account trying to join is now told so, and an invite to a closed server says the server was closed.
+- **Member search:** on servers with 15 or more members, search the member list by name or identity code.
+- **Channel topic:** owners and admins can set a short topic line for each channel.
+- **Server name tooltips:** hover over or focus a server in the side rail to see its full name.
+- **After sign-up:** the first Home screen says what to do next, and you can paste an invite link straight into it.
+- **Message sound:** an optional sound for new messages (Settings → Notifications).
+- **Screen readers announce new messages** at the bottom of a channel.
+- **Restore progress:** after a restore, Home shows how many of your servers are back.
+- **Calls survive a network change:** switching between Wi-Fi, cable or VPN no longer drops the call.
+- **Connection details for calls:** a "Connection diagnostics" section in a call's voice settings shows how each person is connected. It never shows any address.
+- **Clearer colours:** text and badges now meet the WCAG AA contrast level in light and dark themes.
+
+### Fixed
+- A member who joined while someone was sending a message could miss that message permanently. Fixed.
+- A message that can't be opened yet now shows a short note in its place instead of being hidden, and opens in place when it becomes readable.
+- The member search box could clear what you'd just typed while MVS was still starting. Fixed.
+- 18+ channels are now encrypted for adult members only.
+- Links to an IP address or to your own computer are no longer opened from MVS.
+- The push-to-talk shortcut is active only while you're in a call and MVS is unlocked.
+
+### Known
+- Calls still work only between people on the same network. Calls across the internet without any server are being built and will come in a later version.
+- With someone's volume above 100%, you may hear some echo.
+
 ## [0.4.7] - 2026-11-18
 
 This version replaces 0.4.6, which was never published. It includes everything planned for 0.4.6 plus the changes below.

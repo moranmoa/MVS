@@ -182,6 +182,18 @@ export const WifiOffIcon = (p: IconProps) => (
     <path d="M2 2l20 20M8.5 16.5a5 5 0 0 1 7 0M5 13a10 10 0 0 1 5.2-2.8M19 13a10 10 0 0 0-2.3-1.7M2 8.8a15 15 0 0 1 4.2-2.7M22 8.8A15 15 0 0 0 10.7 5M12 20h.01" />
   </Icon>
 );
+/** Core #527: a message waiting for its key here. */
+export const LockIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3" />
+  </Icon>
+);
+/** Core #527: a message whose sender can't be verified. */
+export const ShieldAlertIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6zM12 8v5M12 16h.01" />
+  </Icon>
+);
 export const ShieldIcon = (p: IconProps) => (
   <Icon {...p}>
     <path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z" />

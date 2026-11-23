@@ -1383,7 +1383,8 @@ legend {
 }
 
 .msg.deleted,
-.msg.blocked {
+.msg.blocked,
+.msg.unreadable {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -3964,4 +3965,48 @@ input.switch:disabled {
   background: none;
   color: inherit;
   font: inherit;
+}
+
+/* G-92: the join card on Home: the card opens the dialog; the field joins in place. */
+.home-card.join-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.home-card-open {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 1.75rem 1.25rem 1rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: center;
+}
+
+.join-paste {
+  padding: 0 1.25rem 1.25rem;
+}
+
+.join-paste-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.join-paste-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.join-paste .error {
+  margin: 0.375rem 0 0;
+}
+
+/* G-92 (UX): an empty field shows its Hebrew placeholder in the UI direction;
+   once a link is typed it's LTR. */
+:root[dir='rtl'] .join-paste input:placeholder-shown {
+  direction: rtl;
 }

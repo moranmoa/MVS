@@ -111,6 +111,14 @@ pub struct ServerSummary {
     /// for 30 days after the close was received (additive).
     #[serde(default)]
     pub closed: bool,
+    /// G-51: the server's icon as a `data:image/(png|webp);base64,` URL;
+    /// absent when there is none (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_data_url: Option<String>,
+    /// G-51: the server's description, up to 5 lines of plain text; absent
+    /// when there is none (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

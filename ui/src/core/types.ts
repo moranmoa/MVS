@@ -206,6 +206,13 @@ export interface Message {
   replyTo?: { id: Id; index: number; authorId: Id; excerpt: string };
   /** Only set on messages written on this device. */
   sendState?: SendState;
+  /**
+   * TODO #21 / core #527: a message here that can't be opened. 'no-key': its
+   * channel key isn't on this computer (it may open later, as message.updated);
+   * 'untrusted': the sender can't be verified (no author). The body is empty,
+   * and it takes no reactions, replies, edits or deletes.
+   */
+  unreadable?: 'no-key' | 'untrusted';
   mentionsMe?: boolean;
   /**
    * G-24 (#330): the users this message mentions who are members now, as

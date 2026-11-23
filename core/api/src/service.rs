@@ -38,6 +38,11 @@ const KV_UPDATE_CHANNEL: &str = "update-channel";
 /// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
 /// about this computer's network.
 const KV_RELAY_ONLY: &str = "relay-only";
+/// G-51: when this device last set a server's icon, per server (u64 LE ms).
+const KV_ICON_SET_PREFIX: &str = "icon-set/";
+/// G-51: at most one icon change per server per 10 minutes from this device:
+/// every icon (up to 8 KiB) stays in the control log.
+const ICON_EVERY_MS: u64 = 10 * 60_000;
 /// Device link: "a new device was added" notices not yet acknowledged
 /// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
 /// start until acknowledged; the cross-device notice will feed it too.
@@ -1593,6 +1598,70 @@ impl Core {
         })
     }
 
+    /// G-51 `setServerIcon(serverId, dataUrl | null)`: a still PNG or WebP
+    /// of at most 8 KiB and 128 px a side (`avatar::icon_from_data_url`),
+    /// or `null` to clear. The owner or an admin; behind `server-meta-v1`;
+    /// at most one change per [`ICON_EVERY_MS`] per server from this device
+    /// (`rate-limited`), since every icon stays in the control log. The
+    /// same icon again signs nothing.
+    pub fn set_server_icon(&self, server_id: &str, data_url: Option<&str>) -> CoreResult<ServerSummary> {
+        let icon = match data_url {
+            None => None,
+            Some(url) => Some(crate::avatar::icon_from_data_url(url).ok_or(ErrorCode::BadRequest)?),
+        };
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            if inner.view(server)?.state.server_icon == icon {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            inner.cap_gate(server, model::SERVER_META_CAP)?;
+            let now = ports.clock.now_ms();
+            let key = format!("{KV_ICON_SET_PREFIX}{}", model::hex_id(server.as_bytes()));
+            // Only setting an image is limited: an admin must be able to
+            // remove an offensive or mistaken icon at once, and a clear is
+            // 2 bytes (Tech Lead on #555).
+            let setting = icon.is_some();
+            let last = inner.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
+            if setting && last.is_some_and(|last| now.saturating_sub(last) < ICON_EVERY_MS) {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            inner.publish_control(ports, server, &Action::ServerIcon { icon })?;
+            if setting {
+                inner.db.set(&key, &now.to_le_bytes())?;
+            }
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
+    /// G-51 `setServerDescription(serverId, text)`: trimmed; empty clears
+    /// it; otherwise `authority::server_description_ok` (`\n` only, at most
+    /// 5 lines, 500 code points) or `bad-request`. The owner or an admin;
+    /// behind `server-meta-v1`. The same text again signs nothing. Shown as
+    /// plain text, never Markdown or links.
+    pub fn set_server_description(&self, server_id: &str, text: &str) -> CoreResult<ServerSummary> {
+        let text = text.trim();
+        if !text.is_empty() && !authority::server_description_ok(text) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            if inner.view(server)?.state.server_description.as_deref().unwrap_or("") == text {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            inner.cap_gate(server, model::SERVER_META_CAP)?;
+            inner.publish_control(ports, server, &Action::ServerDescription { text: text.to_owned() })?;
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
     /// `leaveServer`: any member but the owner (`not-allowed`; the owner
     /// deletes instead). The `Leave` goes out, so the others re-key; then
     /// the server leaves this device (`server.removed`, `left`). A leaver
@@ -2655,6 +2724,11 @@ impl Core {
                 inner.load(server)?;
                 inner.seed_announced(&*ports.cipher, server)?;
                 let name_before = inner.view(server)?.state.server_name.clone();
+                // G-51: the icon and description change the summary too.
+                let meta_before = {
+                    let view = inner.view(server)?;
+                    (view.state.server_icon.clone(), view.state.server_description.clone())
+                };
                 let topics_before = inner.view(server)?.state.topics.clone();
                 let mut changed = false;
                 for record in records {
@@ -2667,7 +2741,12 @@ impl Core {
                     inner.close_locally(ports, server, events)?;
                     continue;
                 }
-                if inner.view(server)?.state.server_name != name_before {
+                let meta_changed = {
+                    let view = inner.view(server)?;
+                    view.state.server_name != name_before
+                        || (view.state.server_icon.clone(), view.state.server_description.clone()) != meta_before
+                };
+                if meta_changed {
                     events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
                 // G-14: a topic set or cleared elsewhere. Only
@@ -5529,6 +5608,8 @@ impl ServerView<'_> {
             unread: false,
             mentions: 0,
             closed: self.state.closed.is_some(),
+            icon_data_url: self.state.server_icon.as_ref().map(crate::avatar::icon_data_url),
+            description: self.state.server_description.clone(),
             id,
         }
     }

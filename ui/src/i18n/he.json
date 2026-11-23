@@ -159,6 +159,10 @@
   "home.create.body": "קהילה חדשה משלך, עם ערוץ כללי מוכן.",
   "home.join.title": "הצטרפות בלינק",
   "home.join.body": "קיבלתם לינק הזמנה? מדביקים אותו כאן.",
+  "home.firstRun.title": "החשבון מוכן. מה עכשיו?",
+  "home.firstRun.subtitle": "אפשר ליצור שרת חדש, או להצטרף לשרת עם קישור שקיבלת.",
+  "home.join.paste": "הדבקת קישור הזמנה",
+  "home.join.submit": "הצטרפות",
 
   "create.title": "יצירת שרת",
   "create.name": "שם השרת",

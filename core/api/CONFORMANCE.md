@@ -490,7 +490,8 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1', 'adult-keys-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1', 'adult-keys-v1', 'server-meta-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - **Caps are frozen after `server-meta-v1`** (Tech Lead on #555): released cores gate on these exact names, so they are posted for good. The next gated feature adds one cap of the form `"lv:N"`, a single level that implies every feature up to N; a gate checks `lv >= k`, older cores ignore it, and the profile post stops growing with each release.
 - 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
   - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
   - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
@@ -504,6 +505,17 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - **One release later (the writer):** `updateProfile` accepts such a name for me too (`WRITE_ZWJ_NAMES` in `model.rs` flips to true). Until then my own name keeps the strict rule (`bad-request`).
   - Server, channel and room names keep the strict rule for good: a ZWJ is never allowed there.
   - The UI side (dev-ui): guardCore allows a ZWJ in display names only, never in server or channel names.
+
+- Server icon and description (G-51, `docs/design/server-icon-description.md`):
+  - `setServerIcon(serverId, dataUrl | null)` returns the updated `ServerSummary`.
+    - `dataUrl` is `data:image/(png|webp);base64,…`, checked in this order: the prefix, a length cap on the base64 text, strict base64, then the magic bytes against the prefix's type, still (no APNG or animated WebP), at most 8 KiB and 128 px a side. Anything else is `bad-request`. `null` clears the icon.
+    - Setting an image: at most once per server every 10 minutes from this device (`rate-limited`), since every icon stays in the control log. Clearing it (`null`) is never limited, so an admin can remove an icon at once.
+  - `setServerDescription(serverId, description)` returns the updated `ServerSummary`.
+    - The text is trimmed; empty clears it. Otherwise up to 500 code points and 5 lines (`\n` only), with no `\r` or U+2028/2029, no blank first or last line, no two blank lines in a row, and no line ending in whitespace. Anything else is `bad-request`.
+    - Shown as plain text with its line breaks (`white-space: pre-line`): never Markdown or links.
+  - Both commands: the owner or an admin only (`not-allowed`), `not-found` for a server I'm not in, and `update-needed` while a member's latest profile lacks `server-meta-v1` (`getUpdateNeeded(serverId, 'server-meta-v1')` lists who). Setting what's already set signs nothing.
+  - `ServerSummary` gains `iconDataUrl?` and `description?` (additive; absent when unset). Any change, mine or read by sync, fires `server.updated`. It's never unread, a mention or a notice.
+  - Plaintext inside the server, like the name: every member, or a modified client, can read them (GAP-22).
 - Blocked accounts (G-47):
   - `listBlocked()` returns `BlockedUser[]`, `{ userId, shortCode, name? }`, ordered by `userId` (`shortCode` is the identity code, as `Member.shortCode`, so rows without a name can be told apart, G-47b): everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
   - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.

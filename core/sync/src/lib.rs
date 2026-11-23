@@ -40,6 +40,7 @@ mod invite;
 mod typing;
 mod voice;
 mod voice_media;
+mod dialback;
 #[cfg(test)]
 pub(crate) mod testutil;
 

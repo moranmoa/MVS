@@ -1056,6 +1056,97 @@ async fn a_senders_restart_mid_call_is_heard_at_once() {
     b.shutdown().await.unwrap();
 }
 
+// ---- relay in the app, R1: reachability by dial-back ----------------------
+
+/// Until `cond` holds for `node`'s reachability, within `wait`.
+async fn reachable_within(node: &Node, wait: Duration) -> Option<Multiaddr> {
+    let start = Instant::now();
+    loop {
+        if let Some(addr) = node.relay_reachable().await.unwrap() {
+            return Some(addr);
+        }
+        if start.elapsed() >= wait {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// SL RR1 and TL 4: a node a member can't dial back at a global address
+/// (here: loopback, as behind NAT) never counts as reachable, so it never
+/// offers itself as a member relay, though its relay is on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_not_publicly_reachable_never_offers_itself_as_a_relay() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-nat-a", &relay, 50, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-nat-b", &relay, 51, true, Arc::new(AcceptAll)).await;
+    // A opens the direct connection (so B observes A's address).
+    b.test_no_direct_dials().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(50), voice_id(51), true).await;
+    assert_eq!(reachable_within(&a, Duration::from_secs(5)).await, None, "loopback was taken as public");
+    assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()), "a NAT'd node offered itself");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// R1's working path (on one machine, loopback allowed for the test): a
+/// member dials A back at the address it observed, A is confirmed
+/// reachable there, and only then offers itself, with that address alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_dials_back_and_only_then_the_relay_is_offered() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-ok-a", &relay, 52, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-ok-b", &relay, 53, true, Arc::new(AcceptAll)).await;
+    b.test_no_direct_dials().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(52), voice_id(53), true).await;
+    let addr = reachable_within(&a, Duration::from_secs(20)).await.expect("never confirmed");
+    let a_ports: Vec<Multiaddr> = a.listen_addrs().await.unwrap();
+    assert!(
+        a_ports.iter().any(|l| l.iter().nth(1) == addr.iter().nth(1)),
+        "confirmed {addr} isn't one of A's listen ports {a_ports:?}"
+    );
+    let start = Instant::now();
+    while !b.test_relay_offers().await.unwrap().contains(&a.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(30), "the confirmed relay was never offered");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL 4: a dial-back is for members only. A helper that doesn't count the
+/// asker as a member declines, untried, so the asker stays unconfirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_member_is_never_dialled_back() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    gate.set(voice_id(54), true);
+    let (a, _ea) = bound_node_events("r1-gate-a", &relay, 54, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-gate-b", &relay, 55, true, Arc::new(gate.clone())).await;
+    b.test_no_direct_dials().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    // A sees B as a member, B doesn't see A as one: wait until A is online
+    // for B's peer at least (A's presence of B).
+    let start = Instant::now();
+    loop {
+        let sa = a.presence(test_server().0).await.unwrap();
+        if sa.online.contains(&voice_id(55)) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "never met");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(reachable_within(&a, Duration::from_secs(8)).await, None, "a non-member was dialled back");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 /// G-29: `/mvs/typing/1` between members through the relay, with its own
 /// caps (a burst of 3, then one every 2 s), never arriving as voice; a
 /// non-member's is dropped and none go to one; 512 bytes at most.

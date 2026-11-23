@@ -39,21 +39,32 @@ describe('G-41: the matcher', () => {
   });
 });
 
+const list = () => screen.getByRole('complementary', { name: 'Server members' });
+const field = () => within(list()).getByRole('searchbox', { name: 'Search members' }) as HTMLInputElement;
+const shownIds = () => within(list()).queryAllByRole('button', { name: /'s profile/ }).length;
+
+/**
+ * Start the app and wait until it has settled (TL on #559/#560): the member
+ * list shows every member of the open server, the field is there and enabled,
+ * and React's pending work is flushed. Tests then type once; they never retype.
+ */
 async function setup() {
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
   render(<App core={core} initialSettings={en} />);
   await screen.findByRole('textbox', { name: /^Message / });
   const server = (await core.listServers())[0]!;
   const members = await core.listMembers(server.id);
+  await waitFor(() => {
+    expect(shownIds()).toBe(members.length);
+    expect(field().disabled).toBe(false);
+  });
+  await act(async () => {});
   return { core, server, members };
 }
-const list = () => screen.getByRole('complementary', { name: 'Server members' });
-const field = () => within(list()).getByRole('searchbox', { name: 'Search members' }) as HTMLInputElement;
 const type = (value: string) =>
   act(async () => {
     fireEvent.change(field(), { target: { value } });
   });
-const shownIds = () => within(list()).queryAllByRole('button', { name: /'s profile/ }).length;
 
 describe('G-41: the member list search', () => {
   it(`is there from ${SEARCH_FROM} members; filters live, keeps the groups with filtered counts`, async () => {
@@ -65,13 +76,8 @@ describe('G-41: the member list search', () => {
     const q = target.displayName.slice(0, 2);
     const expected = members.filter(memberMatcher(q));
     await type(q);
-    // CI under load (main, 2026-11-19): the app can still be settling right
-    // after start-up and drop the first change. Wait for the filtered list,
-    // typing again if the field came back empty.
-    await waitFor(() => {
-      if (field().value !== q) fireEvent.change(field(), { target: { value: q } });
-      expect(shownIds()).toBe(expected.length);
-    });
+    expect(field().value).toBe(q);
+    expect(shownIds()).toBe(expected.length);
     const offline = expected.filter((x) => x.presence === 'offline').length;
     expect(within(list()).getByRole('heading', { name: `Offline – ${offline}` })).toBeTruthy();
     if (!expected.some((x) => x.presence === 'online')) expect(within(list()).queryByRole('heading', { name: /^Online/ })).toBeNull();
@@ -84,6 +90,7 @@ describe('G-41: the member list search', () => {
   it('no match: says so, with "Clear search"; the ✕ clears too', async () => {
     const { members } = await setup();
     await type('qqqqqq');
+    expect(field().value).toBe('qqqqqq');
     expect(shownIds()).toBe(0);
     expect(within(list()).getByText(/No members match\./)).toBeTruthy();
     const clears = within(list()).getAllByRole('button', { name: 'Clear search' });

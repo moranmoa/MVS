@@ -20,7 +20,7 @@ Never put the relay domain or any IP address here.
 - **Blocked accounts list:** Settings → Privacy lists everyone you blocked, including people who no longer share a server with you, with their identity code and an Unblock button with Undo.
 - **Removed accounts and undo kick:** server owners can see who was removed and let them back in (server settings → Removed accounts). A removed account trying to join is now told so, and an invite to a closed server says the server was closed.
 - **Member search:** on servers with 15 or more members, search the member list by name or identity code.
-- **Channel topic:** owners and admins can set a short topic line for each channel.
+- **Channel topic:** server owners can set a short topic line for each channel.
 - **Server name tooltips:** hover over or focus a server in the side rail to see its full name.
 - **After sign-up:** the first Home screen says what to do next, and you can paste an invite link straight into it.
 - **Message sound:** an optional sound for new messages (Settings → Notifications).
@@ -39,7 +39,7 @@ Never put the relay domain or any IP address here.
 - The push-to-talk shortcut is active only while you're in a call and MVS is unlocked.
 
 ### Known
-- Calls still work only between people on the same network. Calls across the internet without any server are being built and will come in a later version.
+- Calls still work only between people on the same network. Calls across the internet without any server are being built.
 - With someone's volume above 100%, you may hear some echo.
 
 ## [0.4.7] - 2026-11-18

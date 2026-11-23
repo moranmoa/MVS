@@ -97,42 +97,22 @@ const callGate = sec.createCallGate();
  */
 const pushToTalk = ptt.createPtt({ emit: (name) => toPages(name, {}), active: () => callGate.inCall });
 /**
- * G-74: the optional global "toggle mute" accelerator the page chose (checked),
- * or null. It is registered with the OS only during a call.
+ * G-74: the optional global "toggle mute" accelerator the page chose. G-78:
+ * registered with the OS only while in a call AND unlocked, and a press
+ * reaches the page only then (ptt.js createGlobalMute).
  */
-let globalMute = null;
-/** What ptt:set answered for it: 'ok' or 'shortcut-taken'. */
-let globalMuteStatus = 'ok';
-/** The accelerator registered with the OS right now, or null. */
-let globalMuteRegistered = null;
+const globalMute = ptt.createGlobalMute({
+  register: (accel, onPress) => globalShortcut.register(accel, onPress),
+  unregister: (accel) => globalShortcut.unregister(accel),
+  allowed: () => callGate.inCall && lockOpen(),
+  onPress: () => toPages('ptt.toggleMute', {}),
+});
 
-function registerGlobalMute() {
-  if (!globalMute || globalMuteRegistered) return !!globalMuteRegistered;
-  let ok = false;
-  try {
-    // The page hears only that it was pressed, and only during a call.
-    ok = globalShortcut.register(globalMute, () => callGate.inCall && toPages('ptt.toggleMute', {}));
-  } catch {
-    ok = false;
-  }
-  if (ok) globalMuteRegistered = globalMute;
-  return ok;
-}
-
-function unregisterGlobalMute() {
-  if (globalMuteRegistered) globalShortcut.unregister(globalMuteRegistered);
-  globalMuteRegistered = null;
-}
-
-/** After any change to the call: push-to-talk lets go, and the global shortcut follows the call. */
+/** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
 function syncCall() {
   if (!callGate.inCall) appLock.callEnded();
-  if (!callGate.inCall || !lockOpen()) {
-    pushToTalk.reset();
-    unregisterGlobalMute();
-  } else if (globalMute) {
-    registerGlobalMute();
-  }
+  if (!callGate.inCall || !lockOpen()) pushToTalk.reset();
+  globalMute.sync();
 }
 /**
  * G-62: the unread count on the taskbar (Windows: our overlay icon) or the
@@ -176,7 +156,7 @@ function onLockChange(st) {
     // Nothing that shows activity or listens: badge, push-to-talk, global mute.
     unread.set(0);
     pushToTalk.reset();
-    unregisterGlobalMute();
+    globalMute.sync(); // locked: not allowed, so off
     // Path B: the call goes on with my mic off, in the core (and the page
     // turns its track off on lock.state).
     if (st.locked && st.path === 'B' && !(prev && prev.locked && prev.path === 'B')) {
@@ -350,6 +330,9 @@ function serveCoreIpc() {
         clearStorage: async () => {
           // G-62: signed out (the core said ok): no unread count left on the taskbar.
           unread.set(0);
+          // G-74/G-78: no push-to-talk key or global shortcut left behind either.
+          pushToTalk.setKey(null);
+          globalMute.clear();
           await event.sender.session.clearStorageData({
             origin: sec.ORIGIN,
             storages: ['localstorage', 'indexdb', 'cachestorage', 'serviceworkers', 'cookies', 'websql', 'shadercache'],
@@ -435,17 +418,8 @@ function serveCoreIpc() {
     const accel = ptt.cleanAccelerator(settings.globalMute ?? null);
     if (key === undefined || accel === undefined) return 'invalid';
     pushToTalk.setKey(key);
-    // The same shortcut again: nothing to do.
-    if (accel === globalMute) return globalMuteStatus;
-    unregisterGlobalMute();
-    globalMute = accel;
-    globalMuteStatus = 'ok';
-    if (!accel) return 'ok';
-    // Try it now so the page can say "taken"; it then stays registered only
-    // during a call (syncCall).
-    if (!registerGlobalMute()) globalMuteStatus = 'shortcut-taken';
-    syncCall();
-    return globalMuteStatus;
+    // Tried now so the page can say "taken"; registered only in a call and unlocked.
+    return globalMute.set(accel);
   });
   // G-78: the lock screen's three calls. The passcode or words go straight
   // to the core (applock.js shapes them); nothing here logs them.
@@ -455,6 +429,20 @@ function serveCoreIpc() {
     return appLock.unlock(input);
   });
   ipcMain.handle('lock:now', (event) => (fromUs(event) ? appLock.lock() : false));
+  // The settings (Settings → Privacy): our own top frame, unlocked only.
+  // setAppLock / clearAppLock are not on the core:invoke allow-list; only
+  // these reach them, one at a time, then main re-reads its config.
+  ipcMain.handle('lock:config', (event) => (fromUs(event) && lockOpen() ? appLock.config() : null));
+  ipcMain.handle('lock:set', async (event, input) => {
+    if (!fromUs(event)) return { result: 'invalid' };
+    if (!lockOpen()) return { result: 'locked' };
+    return appLock.set(input);
+  });
+  ipcMain.handle('lock:clear', async (event, input) => {
+    if (!fromUs(event)) return { result: 'invalid' };
+    if (!lockOpen()) return { result: 'locked' };
+    return appLock.clear(input);
+  });
   ipcMain.handle('badge:set', (event, count) => {
     if (!fromUs(event) || !lockOpen()) return false;
     return unread.set(count);

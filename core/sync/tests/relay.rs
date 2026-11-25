@@ -1098,7 +1098,7 @@ async fn a_member_dials_back_and_only_then_the_relay_is_offered() {
     let (relay, _relay) = voice_relay();
     let (a, _ea) = bound_node_events("r1-ok-a", &relay, 52, true, Arc::new(AcceptAll)).await;
     let (b, _eb) = bound_node_events("r1-ok-b", &relay, 53, true, Arc::new(AcceptAll)).await;
-    b.test_no_direct_dials().unwrap();
+    a.test_no_direct_dials().unwrap();
     a.test_local_dialback().unwrap();
     b.test_local_dialback().unwrap();
     a.set_member_relay(true, 1024, true).unwrap();
@@ -1748,6 +1748,11 @@ async fn a_member_relay_serves_bound_members_only() {
     let (stranger, _) = node_events("mr-stranger", &relay).await;
     let a_direct = direct_addr(&a).await;
     let via_a = a_direct.clone().with(Protocol::P2pCircuit);
+    // R1: A serves only once a member dialled it back (loopback allowed
+    // for this test only).
+    for node in [&a, &b, &c] {
+        node.test_local_dialback().unwrap();
+    }
     for node in [&b, &c, &stranger] {
         node.test_dial(a_direct.clone());
     }
@@ -1769,6 +1774,7 @@ async fn a_member_relay_serves_bound_members_only() {
 
     // On: a member reserves (retrying while the gate opens), a stranger never.
     a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB, true).unwrap();
+    reachable_within(&a, Duration::from_secs(60)).await.expect("A was never dialled back");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !reserved_via(&b, &via_a).await {
         assert!(Instant::now() < deadline, "a member never reserved on the member relay");
@@ -1832,8 +1838,12 @@ async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
         node.test_no_hole_punch().unwrap();
     }
     let (d, _) = bound_node_on_events("fb-d", &relay, 34, true, Arc::new(AcceptAll), listen(), vec![], true).await;
+    // R1: A offers itself only once a member dialled it back (loopback is
+    // allowed for this test only).
+    for node in [&a, &b, &c, &d] {
+        node.test_local_dialback().unwrap();
+    }
     a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB, true).unwrap();
-    let via_a = direct_addr(&a).await.with(Protocol::P2pCircuit);
 
     // Everyone meets through our relay and binds; A's offer reaches them.
     let deadline = Instant::now() + Duration::from_secs(40);
@@ -1845,6 +1855,9 @@ async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
         assert!(Instant::now() < deadline, "the members never met: B sees {sb:?}, C sees {sc:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // A is confirmed reachable, and offers that address.
+    let confirmed = reachable_within(&a, Duration::from_secs(90)).await.expect("A was never dialled back");
+    let via_a = confirmed.with(Protocol::P2p(a.peer_id())).with(Protocol::P2pCircuit);
     // Our relay is up: nobody reserves on the member relay.
     tokio::time::sleep(Duration::from_secs(5)).await;
     for node in [&b, &c, &d] {

@@ -24,7 +24,7 @@
 //! rate per peer and in total, concurrent answers, gossip message size and
 //! topics, connections, and the pending-record buffer.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -145,8 +145,9 @@ const MAX_CONNECTIONS: u32 = 384;
 const MAX_PENDING_INCOMING: u32 = 64;
 /// A direct and a relayed connection to the same peer coexist until the
 /// relayed one ends (see `track_connection`), and two simultaneous dials can
-/// add one more for a moment.
-const MAX_CONNECTIONS_PER_PEER: u32 = 3;
+/// add one more for a moment. One more for a moment: R1's dial-back probe,
+/// which the helper closes as soon as it has answered.
+const MAX_CONNECTIONS_PER_PEER: u32 = 4;
 /// Direct incoming connections from one IP address (IPv6: one /64). PeerIds are free to
 /// make, so the per-peer cap alone doesn't stop one machine taking every
 /// incoming slot. Relayed connections all come from the relay and aren't counted.
@@ -875,6 +876,12 @@ impl Node {
             reachable: None,
             dialback_asked: None,
             dialback_local: false,
+            observed_self: VecDeque::new(),
+            recent_inbound: HashMap::new(),
+            member_relay_want: (false, 0, false),
+            dialback_wait: crate::dialback::FIRST_RETRY,
+            pending_reached: None,
+            dialback_probes: Vec::new(),
             invites: HashMap::new(),
             invite_limits: InviteLimits::new(),
             fetches: HashMap::new(),
@@ -1667,7 +1674,7 @@ struct Task {
     /// way, by the test connection; the caps; my confirmed public address;
     /// when I last asked.
     inbound_direct: HashMap<ConnectionId, (PeerId, Multiaddr)>,
-    outbound_direct: HashMap<ConnectionId, PeerId>,
+    outbound_direct: HashMap<ConnectionId, (PeerId, Multiaddr)>,
     dialbacks: HashMap<ConnectionId, (ResponseChannel<crate::dialback::Answer>, Multiaddr, Instant)>,
     dialback_per_asker: RateLimiter<PeerId>,
     dialback_all: RateLimiter<()>,
@@ -1675,6 +1682,25 @@ struct Task {
     dialback_asked: Option<Instant>,
     /// Tests on one machine: loopback and LAN addresses may be dialled back.
     dialback_local: bool,
+    /// Addresses peers observed for us (identify), the newest last, at most
+    /// 16: what a helper's reported address must match (SL on #565).
+    observed_self: VecDeque<Multiaddr>,
+    /// When a direct inbound connection from each peer last arrived: a
+    /// helper's "reached" counts only with one (TL on #565).
+    recent_inbound: HashMap<PeerId, Instant>,
+    /// What the core asked of the member relay (on, daily cap, preferred):
+    /// it serves only while confirmed reachable (TL on #565).
+    member_relay_want: (bool, u32, bool),
+    /// The wait before asking again after a round that confirmed nothing:
+    /// 15 s, doubling to [`crate::dialback::PER_ASKER_EVERY`] (a helper may
+    /// not have bound me yet; a decline costs it nothing).
+    dialback_wait: Duration,
+    /// A helper's "reached" for an address of mine whose inbound connection
+    /// hasn't shown up yet (its answer can overtake it): confirmed if that
+    /// inbound arrives within 10 s.
+    pending_reached: Option<(PeerId, Multiaddr, Instant)>,
+    /// Dial-back probes that reached their asker, closed after a few seconds.
+    dialback_probes: Vec<(ConnectionId, Instant)>,
     /// T8-02: envelope handle → the server and publication we serve.
     invites: HashMap<[u8; 32], (ServerId, Vec<u8>)>,
     invite_limits: InviteLimits,
@@ -2004,10 +2030,8 @@ impl Task {
             Command::NoDirectDials => self.direct_dials = false,
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
             Command::MemberRelay { on, daily_cap_mb, preferred } => {
-                // Relay-only users never relay (design §1), whatever the core says.
-                let on = on && !self.relay_only;
-                self.swarm.behaviour_mut().member_relay.set(on, daily_cap_mb, preferred);
-                self.recheck_member_relay();
+                self.member_relay_want = (on, daily_cap_mb, preferred);
+                self.apply_member_relay();
             }
             Command::ListenAddrs { reply } => {
                 let _ = reply.send(self.swarm.listeners().cloned().collect());
@@ -3194,15 +3218,27 @@ impl Task {
                     match endpoint {
                         ConnectedPoint::Listener { send_back_addr, .. } => {
                             self.inbound_direct.insert(*connection_id, (*peer_id, send_back_addr.clone()));
+                            self.recent_inbound.insert(*peer_id, Instant::now());
+                            let waiting = self.pending_reached.take();
+                            match waiting {
+                                Some((helper, addr, at)) if helper == *peer_id && at.elapsed() < Duration::from_secs(10) => {
+                                    self.confirm_reachable(addr);
+                                }
+                                other => self.pending_reached = other,
+                            }
                         }
-                        ConnectedPoint::Dialer { .. } => {
-                            self.outbound_direct.insert(*connection_id, *peer_id);
+                        ConnectedPoint::Dialer { address, .. } => {
+                            self.outbound_direct.insert(*connection_id, (*peer_id, address.clone()));
                         }
                     }
                 }
                 // A dial-back reached its asker.
                 if let Some((channel, addr, _)) = self.dialbacks.remove(connection_id) {
                     let _ = self.swarm.behaviour_mut().dialback.send_response(channel, crate::dialback::Answer::Reached(addr));
+                    // The probe has done its job; it closes in a few seconds,
+                    // once the asker has surely seen it (closing at once
+                    // fails the asker's side of the upgrade).
+                    self.dialback_probes.push((*connection_id, Instant::now()));
                 }
             }
             SwarmEvent::ConnectionClosed { connection_id, .. } => {
@@ -3217,7 +3253,30 @@ impl Task {
                 }
             }
             // R1: a confirmation is for the addresses we had then.
-            SwarmEvent::NewListenAddr { .. } | SwarmEvent::ExpiredListenAddr { .. } => self.reachable = None,
+            SwarmEvent::NewListenAddr { .. } | SwarmEvent::ExpiredListenAddr { .. } => {
+                if self.reachable.take().is_some() {
+                    self.apply_member_relay();
+                }
+            }
+            SwarmEvent::NewExternalAddrCandidate { address } => {
+                // A new public IP (DHCP renew, another network): the
+                // confirmation was for the old one (TL on #565).
+                let confirmed_ip = self.reachable.as_ref().and_then(|(a, _)| crate::dialback::ip_of(a));
+                let seen_ip = crate::dialback::ip_of(address);
+                if confirmed_ip.is_some()
+                    && seen_ip != confirmed_ip
+                    && crate::dialback::dialable(address, self.dialback_local)
+                {
+                    self.reachable = None;
+                    self.apply_member_relay();
+                }
+                if !self.observed_self.contains(address) {
+                    if self.observed_self.len() >= 16 {
+                        self.observed_self.pop_front();
+                    }
+                    self.observed_self.push_back(address.clone());
+                }
+            }
             _ => {}
         }
         match event {
@@ -3541,9 +3600,9 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::VoiceMedia(event)) => self.on_voice_media(event),
             SwarmEvent::Behaviour(BehaviourEvent::Dialback(request_response::Event::Message {
                 peer,
-                message: request_response::Message::Request { channel, .. },
+                message: request_response::Message::Request { request, channel, .. },
                 ..
-            })) => self.on_dialback_request(peer, channel),
+            })) => self.on_dialback_request(peer, request, channel),
             SwarmEvent::Behaviour(BehaviourEvent::Dialback(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Response { response, .. },
@@ -5079,10 +5138,23 @@ impl Task {
             .map(|(addr, _)| addr.clone())
     }
 
+    /// The member relay serves only what the core asked for, never while
+    /// relay-only (design #368 §1), and only while a member's dial-back
+    /// confirms we're publicly reachable (TL on #565: not merely offered).
+    fn apply_member_relay(&mut self) {
+        let (wanted, cap, preferred) = self.member_relay_want;
+        let on = wanted && !self.relay_only && self.confirmed_public().is_some();
+        if on != self.swarm.behaviour().member_relay.enabled() || on {
+            self.swarm.behaviour_mut().member_relay.set(on, cap, preferred);
+            self.recheck_member_relay();
+        }
+    }
+
     /// Every second: a dial-back that took too long answers "not
-    /// reached"; and while my member relay is on (and I'm not relay-only)
-    /// but not confirmed, I ask up to [`crate::dialback::HELPERS`] members
-    /// I opened a direct connection to, at most once per
+    /// reached"; a confirmation that ran out stops the relay; and while
+    /// the core wants a member relay (not relay-only) but I'm not
+    /// confirmed, I ask up to [`crate::dialback::HELPERS`] members I hold a
+    /// direct connection with, at most once per
     /// [`crate::dialback::PER_ASKER_EVERY`].
     fn dialback_tick(&mut self) {
         let now = Instant::now();
@@ -5093,17 +5165,31 @@ impl Task {
                 let _ = self.swarm.behaviour_mut().dialback.send_response(channel, crate::dialback::Answer::NotReached);
             }
         }
+        self.recent_inbound.retain(|_, at| now.duration_since(*at) < Duration::from_secs(60));
+        let (done, keep): (Vec<_>, Vec<_>) =
+            self.dialback_probes.drain(..).partition(|(_, at)| now.duration_since(*at) >= Duration::from_secs(5));
+        self.dialback_probes = keep;
+        for (id, _) in done {
+            self.swarm.close_connection(id);
+        }
+        if self.swarm.behaviour().member_relay.enabled() && self.confirmed_public().is_none() {
+            self.apply_member_relay();
+        }
         let wanted = !self.relay_only
-            && self.swarm.behaviour().member_relay.enabled()
+            && self.member_relay_want.0
             && self.confirmed_public().is_none()
-            && self.dialback_asked.is_none_or(|at| now.duration_since(at) >= crate::dialback::PER_ASKER_EVERY);
+            && self.dialback_asked.is_none_or(|at| now.duration_since(at) >= self.dialback_wait);
         if !wanted {
             return;
         }
+        let listening: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
+        let Some(ask) = crate::dialback::ask_for(&listening) else { return };
+        // Members I hold a direct connection with, either way round.
         let mut helpers: Vec<PeerId> = self
             .outbound_direct
             .values()
-            .copied()
+            .map(|(peer, _)| *peer)
+            .chain(self.inbound_direct.values().map(|(peer, _)| *peer))
             .filter(|peer| self.member_identity(*peer).is_some())
             .collect();
         helpers.sort();
@@ -5111,36 +5197,57 @@ impl Task {
         if helpers.is_empty() {
             return;
         }
+        debug!(helpers = helpers.len(), "dial-back: asking");
+        // The next round, if this one confirms nothing, waits twice as long.
+        if self.dialback_asked.is_some() {
+            self.dialback_wait = (self.dialback_wait * 2).min(crate::dialback::PER_ASKER_EVERY);
+        }
         self.dialback_asked = Some(now);
         for peer in helpers.into_iter().take(crate::dialback::HELPERS) {
-            self.swarm.behaviour_mut().dialback.send_request(&peer, ());
+            self.swarm.behaviour_mut().dialback.send_request(&peer, ask);
         }
     }
 
-    /// A member asks to be dialled back (SL RR1, TL 4): only for a bound
-    /// current member, not while I'm relay-only, at the address I observe
-    /// on the direct connection it opened to me (never one it names), that
-    /// address global, expecting its peer ID; within the per-asker and
-    /// overall caps. Anything else is declined, untried.
-    fn on_dialback_request(&mut self, peer: PeerId, channel: ResponseChannel<crate::dialback::Answer>) {
+    /// A member asks to be dialled back (SL RR1, TL 4 and on #565): only for
+    /// a bound current member, not while I'm relay-only, within the
+    /// per-asker and overall caps. I dial one address: the IP of my own
+    /// direct connection with it (authenticated as its peer by Noise, never
+    /// an IP it names) with the port it says it listens on, global only,
+    /// expecting its peer ID, from a new source port. Anything else is
+    /// declined, untried.
+    fn on_dialback_request(
+        &mut self,
+        peer: PeerId,
+        ask: crate::dialback::Ask,
+        channel: ResponseChannel<crate::dialback::Answer>,
+    ) {
         use crate::dialback::Answer;
         let now = Instant::now();
-        let observed = self
-            .inbound_direct
-            .values()
-            .find(|(p, _)| *p == peer)
-            .map(|(_, addr)| crate::dialback::observed(addr))
-            .filter(|addr| crate::dialback::dialable(addr, self.dialback_local));
-        let allowed = self.member_identity(peer).is_some() && !self.relay_only && self.direct_dials;
-        let Some(addr) = observed.filter(|_| allowed) else {
-            let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Declined);
-            return;
-        };
-        if !self.dialback_per_asker.allow(peer, now) || !self.dialback_all.allow((), now) {
+        let allowed = self.member_identity(peer).is_some() && !self.relay_only;
+        if !allowed || !self.dialback_per_asker.allow(peer, now) || !self.dialback_all.allow((), now) {
+            debug!(allowed, "dial-back declined");
             let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Declined);
             return;
         }
-        let opts = DialOpts::peer_id(peer).addresses(vec![addr.clone()]).condition(PeerCondition::Always).build();
+        let local = self.dialback_local;
+        let target = self
+            .inbound_direct
+            .values()
+            .chain(self.outbound_direct.values())
+            .filter(|(p, _)| *p == peer)
+            .filter_map(|(_, addr)| crate::dialback::ip_of(addr))
+            .map(|ip| crate::dialback::target(ip, ask))
+            .find(|addr| crate::dialback::dialable(addr, local));
+        let Some(addr) = target else {
+            debug!("dial-back: no global address for the asker");
+            let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Declined);
+            return;
+        };
+        let opts = DialOpts::peer_id(peer)
+            .addresses(vec![addr.clone()])
+            .condition(PeerCondition::Always)
+            .allocate_new_port()
+            .build();
         let id = opts.connection_id();
         match self.swarm.dial(opts) {
             Ok(()) => {
@@ -5152,17 +5259,38 @@ impl Task {
         }
     }
 
-    /// A member dialled me back at `addr`: I'm publicly reachable there.
+    /// A member says it reached me at `addr`. Believed only if `addr` is
+    /// mine (an IP peers observed for me, a port I listen on) and an
+    /// inbound connection from that member actually arrived just now (SL
+    /// and TL on #565): a member can't make me advertise someone else.
     fn on_dialback_answer(&mut self, peer: PeerId, answer: crate::dialback::Answer) {
-        if self.member_identity(peer).is_none() {
+        let crate::dialback::Answer::Reached(addr) = answer else { return };
+        if self.member_identity(peer).is_none() || !crate::dialback::dialable(&addr, self.dialback_local) {
             return;
         }
-        if let crate::dialback::Answer::Reached(addr) = answer {
-            if crate::dialback::dialable(&addr, self.dialback_local) {
-                info!("relay: confirmed publicly reachable");
-                self.reachable = Some((addr, Instant::now()));
-            }
+        let observed: Vec<Multiaddr> = self.observed_self.iter().cloned().collect();
+        let listening: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
+        let mine = crate::dialback::own_candidate(&addr, &observed, &listening);
+        if !mine {
+            debug!("dial-back answer not believed: not an address of mine");
+            return;
         }
+        let arrived = self.recent_inbound.get(&peer).is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+        if !arrived {
+            // Its answer may have overtaken the dial-back connection itself.
+            self.pending_reached = Some((peer, addr, Instant::now()));
+            return;
+        }
+        self.confirm_reachable(addr);
+    }
+
+    /// R1: a believed dial-back. The relay may now serve and be offered.
+    fn confirm_reachable(&mut self, addr: Multiaddr) {
+        info!("relay: confirmed publicly reachable");
+        self.reachable = Some((addr, Instant::now()));
+        self.pending_reached = None;
+        self.dialback_wait = crate::dialback::FIRST_RETRY;
+        self.apply_member_relay();
     }
 }
 

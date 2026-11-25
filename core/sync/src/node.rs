@@ -5346,6 +5346,8 @@ impl Task {
             .filter(|(_, (_, at))| at.elapsed() >= PROBE_SETTLE)
             // Any punch with this helper lately: never its probe (TL on #565).
             .filter(|(peer, _)| self.punch_events.get(peer).is_none_or(|at| at.elapsed() > Duration::from_secs(30)))
+            // Fail closed: a full map may have missed this helper's punch.
+            .filter(|_| self.punch_events.len() < 1024)
             .filter(|(peer, (addr, _))| {
                 self.recent_inbound.get(peer).is_some_and(|(at, local, conn)| {
                     asked.is_some_and(|asked| *at >= asked)

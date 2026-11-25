@@ -220,7 +220,7 @@ Last updated: 2026-11-25, pm batch. **0.5.0 is being tagged.** Since the 2026-11
 | G-14 | Channel topic (signed record) | dev-updater | done | – | – | S | 0.5.x |
 | G-18 | Write-only-for-owners channel (signed record, channel permissions) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
 | G-47 | Blocked list with unblock (local) | voice-c | done (core #502) | #502 | – | S | 0.5.x |
-| G-47b | G-47 follow-up: `listBlocked` returns `shortCode` (derived from the user id), and the UI shows the identity code next to each blocked row (UX-19), so two "unknown account" rows can be told apart | dev-identity (core) → voice-c (UI) | todo | – | G-47 | S | P2 |
+| G-47b | G-47 follow-up: `listBlocked` returns `shortCode` (derived from the user id), and the UI shows the identity code next to each blocked row (UX-19), so two "unknown account" rows can be told apart | dev-identity (core) → voice-c (UI) | done (core #525; the UI shows the code in `Blocked.tsx`) | #525 | G-47 | S | P2 |
 | G-48 | Report to the owners (signed record) | dev-updater (core) → voice-c (UI) | todo (dev-updater 1st: design note → sec-lead → core; then voice-c UI, 3rd) | – | – | M | 0.5.x |
 | G-41 | Search members (30+ member servers) | voice-c | done | – | – | S | 0.5.x |
 | G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | in progress (core done; UI next) | – | – | S | 0.5.x |

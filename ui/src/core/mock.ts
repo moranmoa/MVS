@@ -110,12 +110,16 @@ export interface MockOptions {
   restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
+  /** B24 (?abuse=1): the build carries an abuse-report address (a placeholder, never a real one). */
+  abuseAddress?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
   outdatedMembers?: boolean;
   /** The demo server "Minecraft IL" starts closed by its owner (read-only). */
   closedServer?: boolean;
   /** As the desktop shell would: a STUN URL on core.status (#222), given to every listener. */
   stunUrl?: string;
+  /** G-81 B on, as the shell's core.status would say (`?voiceP2p`). */
+  voiceP2p?: boolean;
   /** Add members and messages written the way an attacker would (see SECURITY.md). */
   hostile?: boolean;
   /** `getRecoveryWords()` fails, to show the load error state. */
@@ -307,8 +311,10 @@ export class MockCore implements CoreApi {
     set.add(handler as (p: unknown) => void);
     // Like the shell's core.status, which every listener gets, also late ones.
     const stunUrl = this.options.stunUrl;
-    if (event === 'core.status' && stunUrl !== undefined) {
-      this.timers.push(setTimeout(() => set!.has(handler as (p: unknown) => void) && (handler as (p: unknown) => void)({ state: 'up', stunUrl }), 0));
+    const voiceP2p = this.options.voiceP2p;
+    if (event === 'core.status' && (stunUrl !== undefined || voiceP2p)) {
+      const status = { state: 'up', ...(stunUrl !== undefined ? { stunUrl } : {}), ...(voiceP2p ? { voiceP2p: true } : {}) };
+      this.timers.push(setTimeout(() => set!.has(handler as (p: unknown) => void) && (handler as (p: unknown) => void)(status), 0));
     }
     return () => set!.delete(handler as (p: unknown) => void);
   }
@@ -891,6 +897,26 @@ export class MockCore implements CoreApi {
     if (!this.approval) throw err({ code: 'bad-request' });
     this.approval = null;
     return null;
+  }
+
+  // ---- G-30: links to a message -------------------------------------------------
+
+  async locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }> {
+    // One answer for all I can't see (SL R1): not a member, a hidden or missing channel, a mismatch.
+    if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
+    const ch = this.channelIndex.get(channelId);
+    if (!ch || ch.channel.serverId !== serverId) throw err({ code: 'not-found' });
+    const at = messageId.lastIndexOf('#');
+    const index = Number(messageId.slice(at + 1));
+    if (at < 0 || messageId.slice(0, at) !== channelId || !Number.isInteger(index) || index < 0 || index >= this.count(ch)) {
+      throw err({ code: 'not-found' });
+    }
+    return { index };
+  }
+
+  /** Mock only: as if the OS opened an mvs://m/… link. */
+  simulateMessageLink(serverId: Id, channelId: Id, messageId: Id): void {
+    this.emit('link.message', { serverId, channelId, messageId });
   }
 
   // ---- G-91: servers coming back after a restore ---------------------------------
@@ -1838,7 +1864,12 @@ export class MockCore implements CoreApi {
   }
 
   async getAppInfo(): Promise<AppInfo> {
-    return { version: '0.1.0-alpha', updateChannel: this.releaseChannel, relayOnly: this.relayOnly };
+    return {
+      version: '0.1.0-alpha',
+      updateChannel: this.releaseChannel,
+      relayOnly: this.relayOnly,
+      ...(this.options.abuseAddress ? { abuseAddress: 'abuse@example.org' } : {}),
+    };
   }
 
   /** Relay-only (#272): on ends my call; every room then says so (the core: at the next sync round). */

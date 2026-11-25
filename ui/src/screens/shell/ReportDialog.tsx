@@ -6,7 +6,8 @@ import { useEffect, useId, useState, type FormEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useCore, useCoreEvent, type CoreError, type Id, type ReportReason, type ReportTargetInput } from '../../core';
 import { REPORT_REASONS } from '../../core/types';
-import { cleanAbuseAddress, REPORT_TEXT_MAX } from '../../core/sanitize';
+import { REPORT_TEXT_MAX } from '../../core/sanitize';
+import { cleanAbuseAddress } from '../../app/abuseAddress';
 import { Dialog, Name } from '../../components/common';
 import './report.css';
 

@@ -323,21 +323,6 @@ export function cleanReportSummary(r: ReportSummary): ReportSummary | null {
 const cleanReports = (l: unknown): ReportSummary[] =>
   Array.isArray(l) ? l.map(cleanReportSummary).filter((r): r is ReportSummary => r !== null) : [];
 
-/**
- * G-48 (B24): the build's abuse-report address from getAppInfo, or '' unless
- * it is a plain e-mail address or an https URL (short, no spaces or controls).
- */
-export function cleanAbuseAddress(raw: unknown): string {
-  if (typeof raw !== 'string' || raw.length > 254 || /[\s\p{C}]/u.test(raw)) return '';
-  if (/^[^@/]+@[^@/]+\.[a-z]{2,}$/i.test(raw)) return raw;
-  try {
-    const u = new URL(raw);
-    return u.protocol === 'https:' && !u.username && !u.password ? u.href : '';
-  } catch {
-    return '';
-  }
-}
-
 /** G-48: the reported message, as plain text (the UI never parses it as Markdown or HTML). */
 export function cleanReportEvidence(e: ReportEvidence): ReportEvidence {
   const text = typeof e?.text === 'string' ? cleanText(e.text).text : undefined;
@@ -502,6 +487,9 @@ const cleanRange = (r: MessageRange): MessageRange => ({ ...r, messages: r.messa
  * bearer credential: the link is never logged, only shown, copied and passed
  * to joinServer.
  */
+/** G-30: a core id (64 lower-case hex), or the demo core's short ids (letters, digits, - and #). */
+const isLinkId = (v: unknown): v is string => typeof v === 'string' && (/^[0-9a-f]{64}$/.test(v) || /^[a-z0-9][a-z0-9#-]{0,63}$/.test(v));
+
 const INVITE_LINK = /^mvs:\/\/join\/([0-9a-f]{64})\/([0-9a-f]{64})\/([0-9a-f]{64})\/?$/;
 
 /** The canonical invite link, or '' when it is not exactly that format. */
@@ -718,6 +706,13 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       : null,
   'join.status': cleanJoin,
   'link.open': (p) => ({ link: cleanInviteLink(p?.link) }),
+  // G-30: three ids, like notify.click; a missing one drops the event.
+  // G-30: three ids or nothing. Main sends only what deeplink.js parsed as
+  // 64 lower-case hex (SL); the demo core's short ids are the one other shape.
+  'link.message': (p) =>
+    isLinkId(p?.serverId) && isLinkId(p.channelId) && isLinkId(p.messageId)
+      ? { serverId: p.serverId, channelId: p.channelId, messageId: p.messageId }
+      : null,
   'window.state': (p) => ({ maximized: p?.maximized === true, fullScreen: p?.fullScreen === true }),
   'window.closeRequest': () => ({}),
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
@@ -746,6 +741,8 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       state: s?.state === 'up' || s?.state === 'down' ? s.state : 'starting',
       detail: (['missing', 'start-failed', 'crashed', 'crash-loop', 'keyring'] as const).find((d) => d === s?.detail),
       ...(stunUrl ? { stunUrl } : {}),
+      // G-81 B: on only for an exact true.
+      ...(s?.voiceP2p === true ? { voiceP2p: true } : {}),
     };
   },
   'update.ready': (u) => ({ version: cleanName(u.version, 32), waitingForCall: u.waitingForCall === true }),
@@ -800,6 +797,13 @@ export function guardCore(core: CoreApi): CoreApi {
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
     getSettings: () => core.getSettings().then(cleanCoreSettings),
+    // G-30: an index, nothing else; anything malformed is the core's error.
+    locateMessage: (serverId: Id, channelId: Id, messageId: Id) =>
+      core.locateMessage(serverId, channelId, messageId).then((r) => {
+        const index = r?.index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) throw { code: 'internal' };
+        return { index };
+      }),
     getServerRestore: () =>
       core.getServerRestore().then((r) => {
         const clean = cleanServerRestore(r);

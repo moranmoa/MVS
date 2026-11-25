@@ -142,6 +142,8 @@ export interface StoreState {
   memberRelay: MemberRelay | null;
   /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
   settingsRequest: { section: string; at: number } | null;
+  /** G-30: scroll to this message and highlight it (a link was opened). */
+  messageTarget: { channelId: Id; index: number; at: number } | null;
   /** A short confirmation toast (an i18n id), e.g. "Copied" after a menu copy. */
   flash: { id: string; values?: Record<string, string>; at: number } | null;
   /** Bumped when any message window changes, so readers re-render. */
@@ -168,6 +170,7 @@ export class Store {
     memberRelay: null,
     flash: null,
     settingsRequest: null,
+    messageTarget: null,
     serverGone: null,
     mutes: loadMutes(),
     messagesVersion: 0,
@@ -392,6 +395,15 @@ export class Store {
 
   showFlash(id: string, values?: Record<string, string>): void {
     this.set({ flash: { id, values, at: Date.now() } });
+  }
+
+  /** G-30: the message list of that channel scrolls there and highlights it. */
+  goToMessage(channelId: Id, index: number): void {
+    this.set({ messageTarget: { channelId, index, at: Date.now() } });
+  }
+
+  clearMessageTarget(): void {
+    if (this.state.messageTarget) this.set({ messageTarget: null });
   }
 
   openSettings(section: string): void {

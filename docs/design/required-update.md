@@ -26,17 +26,21 @@
 
 ### Desktop (voice-shell)
 
-- **Main is the gate, not the page** (as with the G-78 lock, path A). When `updateRequired` is set at start or arrives as `update.required`, main:
-  1. **reloads the page into `?update-required`**, which mounts no store, shows no content and starts no sync;
-  2. **narrows `core:invoke`** to `getAppInfo`, `checkForUpdate`, `restartToUpdate` and `exportDiagnostics`. Everything else answers `{ error: { code: 'update-required' } }`, including joins, sends and calls. Notifications, the badge, push-to-talk and links are held, as under the lock;
-  3. keeps this for the rest of the process. A new page or a reload can't leave it; only a restart into a non-revoked version clears it.
+- **Main is the gate, not the page.** When `updateRequired` is set at start or arrives as `update.required`, the app goes **local read-only plus update** (TL amendment 1: never lock people out of their own data when the update can't be fetched yet):
+  1. **Allowed:** reading what's on this computer, meaning servers, channels, members, `getMessages`, search, profile and settings reads, `exportDiagnostics` and any data export, the G-78 lock commands, and the update commands (`getAppInfo`, `checkForUpdate`, `restartToUpdate`).
+  2. **Refused** with `{ error: { code: 'update-required' } }`: everything that writes to or talks to the network. That's sending, editing, deleting and reacting, joining and leaving, creating, invites, calls (`joinCall`, voice frames), signed actions (roles, kicks, server settings), device linking, and settings that sign or publish.
+  3. **The list is an allow-list** (`commands.js` gains a `readOnly` flag per command, reviewed by the SL), so a new command is refused until someone marks it read-only.
+  4. **The core stops sync** while required (no dial, no gossip, no relay), so the network side matches the gate. Asking for a manifest is the only outbound traffic.
+  5. Notifications, the badge, push-to-talk and links are held.
+  6. It holds for the rest of the process. A reload can't leave it; only a restart into a non-revoked version clears it.
 - **During a call:** the block waits for the call to end (as G-78 path B waits). Until then, the call bar shows a one-line notice ("An update is required. It will install when the call ends."). Leaving the call, or the call ending, reloads into the screen.
 - **The app lock comes first:** a locked app shows the lock screen; after unlock, the required screen.
 - **Never bypassable:** the page can't send anything but the four commands, and has no route out of the screen. The window can still close, which quits the app. There's no "later" and no dismiss.
 
-### The screen (`?update-required`, dev-ui or voice-shell)
+### What people see (dev-ui or voice-shell)
 
-- The logo and **"An update is required"**, plus one line: **"This version of MVS can no longer be used. Update to keep using it."**
+- **The app stays open on its content, read-only.** A banner that can't be closed sits above everything, and the composer, call buttons and every action are disabled, with the reason on hover or focus. The banner reads **"An update is required"** plus one line: **"Until you update, you can read what's on this computer, but not send or connect."**
+- **The banner carries the states below, with Update and Retry,** instead of a separate screen. There's no "later" and no dismiss.
 - **Update** (primary): it's ready once downloaded; while downloading, it shows progress or "Downloading…". It calls `restartToUpdate`, which relaunches through the launcher (existing B8 flow).
 - **Quit:** closes the app.
 - **States:**
@@ -45,7 +49,19 @@
   - **offline:** "Can't reach the update server" plus Try again;
   - **check your clock** (`check-clock`);
   - **not available yet:** revoked, but no newer artifact for this platform. The screen says so, keeps checking every 15 min, and Quit stays.
-- **Nothing personal** on it (as the lock screen): no servers, names or counts. The version and "What's new" (signed notes) can show.
+- The version and "What's new" (signed notes) can show in the banner's details.
+
+### A bad required release (TL amendment 2)
+
+- **`revoked` only grows** on every client (`ClientPolicy`), so a later manifest can't take a revocation back. **The way out of a bad required release is a newer good one:** publish N+2 (fixed). Every client, required or not, updates to it, and `updateRequired` clears because N+2 isn't revoked.
+- **No restart loop:**
+  - If N+1 fails its trial, the launcher rolls back. It can't roll back into a revoked version, so it starts the revoked version only to fetch a fix (`RecoveryRequired`, existing).
+  - The core then **doesn't re-stage the same failed N+1**: the launcher's trial-failure record marks N+1 as failed, and the core skips a failed version until a newer one is offered.
+  - The user stays read-only with "Update not available yet" until N+2 is out. The app is never stuck restarting.
+- **Runbook** (`docs/release/`, dev-updater): how to publish a required release (`--require-from`), and if it's bad, how to ship N+2 at once. "Removing the revocation" isn't a fix, and the runbook says why.
+- **Tests:**
+  - a required install whose trial fails ends on the revoked version, read-only, with no second attempt at the same version;
+  - offering N+2 then clears `updateRequired` after one restart.
 
 ## 3. Versions that predate this feature
 
@@ -62,7 +78,7 @@
   - a stolen update key could already push any release;
   - revoking everything **without** offering a newer artifact strands users on "not available yet". That's a signed act, and the screen says what happened, which is better than a silent failure. GAP-12's root rotation caps apply unchanged.
 - **Replay:** `revoked` only grows (`ClientPolicy`), and an expired manifest is refused. Replaying an old manifest can't un-require.
-- **The gate is in main,** with a narrowed allow-list. The renderer can't reach sync, sends or joins while required.
+- **The gate is in main,** with a read-only allow-list (`commands.js` `readOnly`, default refused). The renderer can't send, join, call or sign while required, and the core's sync is stopped too.
 - **Rollback:** the launcher never rolls back into a revoked version (existing); if the new version fails its trial, the user stays on "required" with a fresh download.
 - **Diagnostics stay** (`exportDiagnostics`), so a stuck user can still send a report.
 
@@ -70,13 +86,13 @@
 
 - **updater:** `is_revoked(installed)` → required after a check and after a restart, and a revoked range from `--require-from`.
 - **api:** `getAppInfo.updateRequired`, `update.required` once, an immediate download.
-- **desktop unit:** the narrowed allow-list (the four allowed, a sample of others refused), and the lock-then-required and in-call-then-required orders.
+- **desktop unit:** every command in `commands.js` is classified, and a test fails on an unclassified one. Under required, the read-only ones pass and the rest are refused. The lock-then-required and in-call-then-required orders.
 - **desktop e2e** (fake core):
-  - a revoked start reloads into `?update-required`;
-  - `listServers` and `sendMessage` are refused;
+  - a revoked start keeps reads working (`listServers`, `getMessages`);
+  - writes and the network are refused (`sendMessage`, `joinServer`, `joinCall`, a voice frame);
   - Update calls `restartToUpdate`;
-  - a reload stays on the screen;
-  - in a call, the block waits for leaveCall.
+  - a reload stays read-only;
+  - in a call, the gate waits for leaveCall.
 - **UI:** the screen's states and strings in he and en, and AA contrast.
 
 ## 6. Order and size

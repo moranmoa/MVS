@@ -1099,6 +1099,10 @@ async fn a_member_dials_back_and_only_then_the_relay_is_offered() {
     let (a, _ea) = bound_node_events("r1-ok-a", &relay, 52, true, Arc::new(AcceptAll)).await;
     let (b, _eb) = bound_node_events("r1-ok-b", &relay, 53, true, Arc::new(AcceptAll)).await;
     a.test_no_direct_dials().unwrap();
+    // Not about punching (the forged-answer test is): a recent punch
+    // would hold the answer back 30 s.
+    a.test_no_hole_punch().unwrap();
+    b.test_no_hole_punch().unwrap();
     a.test_local_dialback().unwrap();
     b.test_local_dialback().unwrap();
     a.set_member_relay(true, 1024, true).unwrap();
@@ -1164,12 +1168,15 @@ async fn a_forged_dial_back_answer_is_never_believed() {
     // B claims to have reached A at A's own listen address, or at a victim's.
     let own = a.listen_addrs().await.unwrap().into_iter().find(|l| l.to_string().contains("/tcp/") && !l.to_string().contains("p2p-circuit")).unwrap();
     b.test_dialback_lie(own).unwrap();
-    // No hole punch either: a punched connection is excluded by the node,
-    // but this test is about an answer with no connection behind it.
-    a.test_no_hole_punch().unwrap();
-    b.test_no_hole_punch().unwrap();
     a.set_member_relay(true, 1024, true).unwrap();
     voice_meet(&a, &b, voice_id(56), voice_id(57), true).await;
+    // While A's ask to B is pending, A punches nothing with B (SL on #565),
+    // so no punched connection can pass for B's probe.
+    let start = Instant::now();
+    while a.test_punch_open(b.peer_id()).await.unwrap() || a.relay_reachable().await.unwrap().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(20), "A kept punching with the helper it asked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(reachable_within(&a, Duration::from_secs(20)).await, None, "a forged answer was believed");
     assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()));
     a.shutdown().await.unwrap();
@@ -1798,6 +1805,7 @@ async fn a_member_relay_serves_bound_members_only() {
     // for this test only).
     for node in [&a, &b, &c] {
         node.test_local_dialback().unwrap();
+        node.test_no_hole_punch().unwrap();
     }
     for node in [&b, &c, &stranger] {
         node.test_dial(a_direct.clone());

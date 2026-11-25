@@ -420,6 +420,7 @@ enum Command {
     RelayReachable { reply: oneshot::Sender<Option<Multiaddr>> },
     TestLocalDialback,
     TestDialbackLie { addr: Multiaddr },
+    TestPunchOpen { peer: PeerId, reply: oneshot::Sender<bool> },
     TestRelayOffers { reply: oneshot::Sender<Vec<PeerId>> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
@@ -884,6 +885,8 @@ impl Node {
             observed_by: HashMap::new(),
             recent_inbound: HashMap::new(),
             punched: HashSet::new(),
+            dialback_waiting: HashMap::new(),
+            punch_events: HashMap::new(),
             member_relay_want: (false, 0, false),
             dialback_wait: crate::dialback::FIRST_RETRY,
             pending_reached: HashMap::new(),
@@ -1332,6 +1335,14 @@ impl Node {
         self.send(Command::TestDialbackLie { addr })
     }
 
+    /// Tests only: whether hole punching with `peer` is allowed now.
+    #[doc(hidden)]
+    pub async fn test_punch_open(&self, peer: PeerId) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::TestPunchOpen { peer, reply })?;
+        Ok(rx.await?)
+    }
+
     /// Tests only: the members whose relay offers this node holds.
     #[doc(hidden)]
     pub async fn test_relay_offers(&self) -> Result<Vec<PeerId>> {
@@ -1707,6 +1718,13 @@ struct Task {
     recent_inbound: HashMap<PeerId, (Instant, Multiaddr, ConnectionId)>,
     /// Connections a DCUtR hole punch made: never a dial-back probe.
     punched: HashSet<ConnectionId>,
+    /// Helpers asked for a dial-back, and when: no hole punching with them
+    /// until they answer or 10 s pass.
+    dialback_waiting: HashMap<PeerId, Instant>,
+    /// The last DCUtR event (success or failure) with each peer: a helper
+    /// with one within 30 s of its answer is never believed (TL on #565: a
+    /// punch the helper dialled lands on our listener with no id of ours).
+    punch_events: HashMap<PeerId, Instant>,
     /// What the core asked of the member relay (on, daily cap, preferred):
     /// it serves only while confirmed reachable (TL on #565).
     member_relay_want: (bool, u32, bool),
@@ -2020,6 +2038,9 @@ impl Task {
             }
             Command::TestLocalDialback => self.dialback_local = true,
             Command::TestDialbackLie { addr } => self.dialback_lie = Some(addr),
+            Command::TestPunchOpen { peer, reply } => {
+                let _ = reply.send(self.swarm.behaviour().punch.open_peers().contains(&peer));
+            }
             Command::TestRelayOffers { reply } => {
                 let _ = reply.send(self.relay_offers.keys().copied().collect());
             }
@@ -2904,6 +2925,9 @@ impl Task {
             || !self.relayed.contains_key(&peer)
             || self.link_blocks(&peer)
             || !self.is_member(peer)
+            // R1: no punch with a helper while its dial-back ask is pending
+            // (SL on #565): no punched connection can pass for its probe.
+            || self.dialback_waiting.contains_key(&peer)
         {
             return;
         }
@@ -3727,6 +3751,9 @@ impl Task {
                 self.on_backup_providers(id, providers, step.last);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Punch(libp2p::dcutr::Event { remote_peer_id, result })) => {
+                if self.punch_events.len() < 1024 || self.punch_events.contains_key(&remote_peer_id) {
+                    self.punch_events.insert(remote_peer_id, Instant::now());
+                }
                 // A success shows up as a direct connection: `track_connection`
                 // flips the link to direct and parks the relayed one (#206).
                 // A failure leaves the relayed connection as it is.
@@ -5173,6 +5200,8 @@ impl Task {
         self.recent_inbound.retain(|_, (at, _, _)| now.duration_since(*at) < Duration::from_secs(60));
         self.settle_dialback_answers();
         self.pending_reached.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(15));
+        self.dialback_waiting.retain(|_, at| now.duration_since(*at) < Duration::from_secs(10));
+        self.punch_events.retain(|_, at| now.duration_since(*at) < Duration::from_secs(60));
         let (done, keep): (Vec<_>, Vec<_>) =
             self.dialback_probes.drain(..).partition(|(_, at)| now.duration_since(*at) >= Duration::from_secs(5));
         self.dialback_probes = keep;
@@ -5211,6 +5240,8 @@ impl Task {
         }
         self.dialback_asked = Some(now);
         for peer in helpers.into_iter().take(crate::dialback::HELPERS) {
+            self.dialback_waiting.insert(peer, now);
+            self.swarm.behaviour_mut().punch.close(peer);
             self.swarm.behaviour_mut().dialback.send_request(&peer, ask);
         }
     }
@@ -5313,11 +5344,15 @@ impl Task {
             .pending_reached
             .iter()
             .filter(|(_, (_, at))| at.elapsed() >= PROBE_SETTLE)
+            // Any punch with this helper lately: never its probe (TL on #565).
+            .filter(|(peer, _)| self.punch_events.get(peer).is_none_or(|at| at.elapsed() > Duration::from_secs(30)))
             .filter(|(peer, (addr, _))| {
                 self.recent_inbound.get(peer).is_some_and(|(at, local, conn)| {
                     asked.is_some_and(|asked| *at >= asked)
                         && crate::dialback::same_port(addr, local)
                         && !self.punched.contains(conn)
+                        // Fail closed: a full set could have missed one.
+                        && self.punched.len() < 1024
                         && at.elapsed() >= PROBE_SETTLE
                 })
             })

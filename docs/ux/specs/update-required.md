@@ -1,80 +1,82 @@
-# "Update required" screen
+# "Update required": the read-only banner
 
-- **Owner:** voice-shell, with the screen built in the UI. **Screenshots:** 560–569.
-- **When:** the signed update manifest says this version is below the minimum the network needs, for example a release like B7-k (K2) that the owner marks as required (BOARD K2-req). This isn't the per-action `update-needed` message, where *other* members are on old versions (`server.updateNeeded`); this screen is about *my* version.
-- **Open owner question:** whether a required update blocks the whole app, or only sending and syncing. This spec covers the blocking screen, plus the in-call exception, which is the conservative reading. If the owner chooses "read-only until updated", only §1's buttons change.
-- **SL RU1 (core rule, whatever the owner decides):** while a required update is pending, the core stops all background signing: no messages, reactions, edits, profile or server records, relay offers or receipts. So even a "read-only" mode signs nothing. In read-only mode the composer and every action that would sign are disabled, with the reason `update.required.readOnly` "צריך לעדכן את MVS כדי לשלוח ולשנות דברים." / "Update MVS to send messages or make changes."
+- **Owner:** dev-ui (the banner and the disabled states), with voice-shell for main's gate. **Screenshots:** 560–569.
+- **Follows the approved design note** `docs/design/required-update.md` (#577, TL and SL). The UI only reacts to the core's `getAppInfo().updateRequired` and the `update.required { version }` event. The trigger is "my running version is revoked by a signed manifest", never a new manifest field.
+- **It isn't a full block (TL amendment 1).** The app stays open on its own content, read-only, so nobody is locked out of their data while an update can't be fetched yet. Everything that writes or connects is disabled.
+- **RU1 (SL):** while an update is required, the core signs nothing and stops sync. Update checks and downloads are its only network traffic. The UI never offers anything that would sign.
 
-## 1. The screen
+## 1. The banner
 
-A full window that replaces the app, like the lock screen. It shows no server, channel or message content, and no names.
+A full-width bar at the top of the app, under the title bar and above everything else. It has no close button and no "later".
 
 ```
- ┌─────────────────────────────── MVS ───────────────────────────┐
- │                         [MVS logo 64]                         │
- │                    צריך לעדכן את MVS                           │
- │   הגרסה הזו כבר לא יכולה להתחבר לשרתים. העדכון שומר על          │
- │   החשבון, השרתים וההודעות שלך.                                 │
- │                                                               │
- │   מורידים את העדכון…  ███████░░░  64%                          │
- │                                                               │
- │            [ הפעלה מחדש ועדכון ]   (once it's downloaded)      │
- │                    מה חדש · הורדה ידנית                        │
- │                                                   0.4.9 → 0.5.1│
- └───────────────────────────────────────────────────────────────┘
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │ ⟳  צריך לעדכן את MVS                                [עדכון] [יציאה]   │
+ │    עד העדכון אפשר לקרוא את מה שבמחשב הזה, אבל לא לשלוח או להתחבר.     │
+ │    מורידים את העדכון… ███████░░░ 64%                 מה חדש · פרטים   │
+ └───────────────────────────────────────────────────────────────────────┘
 ```
 
-- **The title:** `update.required.title` "צריך לעדכן את MVS" / "MVS needs an update".
-- **The body:** `update.required.body` "הגרסה הזו כבר לא יכולה להתחבר לשרתים. העדכון שומר על החשבון, השרתים וההודעות שלך." / "This version can no longer connect to your servers. Updating keeps your account, servers and messages."
-- **Progress:** "מורידים את העדכון…" / "Downloading the update…", with a `role="progressbar"` (`aria-valuenow`) and the percentage. It starts on its own; no button is needed to begin.
-- **Once it's downloaded:** the primary button `update.required.restart` "הפעלה מחדש ועדכון" / "Restart and update". It has focus.
+- **Colours:** `--warning-bg` with `--warning-text` (the B20 tokens, AA). It's a `role="region"` labelled by its title, and its first line is a `role="status"`.
+- **Title:** `update.required.title` "צריך לעדכן את MVS" / "An update is required".
+- **Line:** `update.required.body` "עד העדכון אפשר לקרוא את מה שבמחשב הזה, אבל לא לשלוח או להתחבר." / "Until you update, you can read what's on this computer, but not send or connect."
+- **Buttons:**
+  - `update.required.update` "עדכון" / "Update", the primary button. It's enabled once the download is ready, and it calls `restartToUpdate`. While downloading, it's disabled, and the progress shows instead.
+  - `update.required.quit` "יציאה" / "Quit". It closes the app.
 - **Links:**
-  - `update.whatsNew` "מה חדש" (existing) opens the release notes in the app;
-  - `update.required.manual` "הורדה ידנית" / "Download manually" opens the project's releases page through the existing "open in browser?" prompt. It's the way out if the in-app update fails.
-- **Versions** at the bottom end, small and LTR: `⁦{running} → {required}⁩`.
+  - `update.whatsNew` "מה חדש" (existing), for the signed notes;
+  - "פרטים" / "Details", which expands the versions, `⁦{running} → {version}⁩`, LTR;
+  - `update.required.manual` "הורדה ידנית" / "Download manually", through the open-in-browser prompt. It shows in the failed and not-available states.
+- On a phone-width window, the buttons wrap under the text. The banner never covers the composer area.
 
-## 2. States
+## 2. States in the banner (the third line)
 
-| State | What shows |
-| --- | --- |
-| downloading | progress, as above |
-| ready | `update.required.restart` |
-| offline | `update.required.offline` "אין חיבור לאינטרנט. העדכון יתחיל כשהחיבור יחזור." / "No internet connection. The update starts when you're back online." It retries on its own; there's also "לנסות שוב" |
-| failed (download or signature) | `update.required.failed` "העדכון לא הצליח. אפשר לנסות שוב, או להוריד את הגרסה החדשה ידנית." / "The update didn't work. Try again, or download the new version manually." Buttons: "לנסות שוב", plus the manual link, shown more prominently |
-| in a call | §3 |
+| State | Hebrew | English | Buttons |
+| --- | --- | --- | --- |
+| downloading | `מורידים את העדכון…` plus the percentage (`role="progressbar"`) | `Downloading the update…` | Update (disabled), Quit |
+| ready | `העדכון מוכן.` | `The update is ready.` | **Update**, Quit |
+| offline | `אי אפשר להגיע לעדכונים כרגע. כדאי לבדוק את החיבור לאינטרנט.` | `Can't reach updates right now. Check your internet connection.` | "לנסות שוב" / "Try again", Quit, manual |
+| check-clock | `השעון במחשב לא מכוון, ולכן אי אפשר לאמת את העדכון. כדאי לתקן את השעה ולנסות שוב.` | `Your computer's clock is off, so the update can't be verified. Fix the time and try again.` | Try again, Quit |
+| not available yet | `עדיין אין גרסה חדשה למחשב הזה. ממשיכים לבדוק כל רבע שעה.` | `There's no new version for this computer yet. We keep checking every 15 minutes.` | Quit, manual |
+| failed | `העדכון לא הצליח. אפשר לנסות שוב, או להוריד ידנית.` | `The update didn't work. Try again, or download it manually.` | Try again, Quit, manual |
 
-There are no error codes or URLs on the screen. Diagnostics stay in the log.
+No error codes or URLs appear; details stay in the log.
 
-## 3. In a call
+## 3. Disabled actions
 
-A required update never cuts off a call that's already going.
+Everything main refuses with `update-required` is disabled in the UI, not hidden, so people see what's paused:
+- **Disabled:** the composer, sending, editing, deleting, emoji reactions, join and leave, creating, invites, call buttons, and settings that sign (profile, server settings, roles).
+- **Each control** keeps its place, with `aria-disabled="true"` and the reason on hover and focus (`aria-describedby`): `update.required.disabled` "צריך לעדכן את MVS כדי לעשות את זה." / "Update MVS to do this."
+- **The composer** shows the same text as its placeholder, and it can't be typed in.
+- **Still available:** reading, scrolling, search, copying text, local settings (theme, language, notifications), the app lock, and diagnostics.
 
-- While in a call, the app stays as it is, with a persistent bar above the call bar: `update.required.inCall` "צריך לעדכן את MVS. העדכון יותקן כשהשיחה תסתיים." / "MVS needs an update. It will install when the call ends." It reuses the update-pill colours (`--update`), has no close button, and is a `role="status"`.
-- When the call ends, the full screen (§1) appears.
-- Joining a new call isn't possible once the requirement is known. The join button shows the same text as its reason.
+## 4. During a call (SL: at most 30 minutes)
 
-## 4. Lock and start
+- The call goes on, and only its own media keeps flowing. RU1 applies at once.
+- **The call bar** shows a one-line notice: `update.required.inCall` "צריך לעדכן את MVS. העדכון ייכנס לתוקף כשהשיחה תסתיים." / "An update is required. It applies when the call ends."
+- **After 25 minutes:** `update.required.inCallSoon` "צריך לעדכן את MVS. השיחה תסתיים בעוד 5 דקות." / "An update is required. The call ends in 5 minutes." It's announced once (`role="status"`).
+- **At 30 minutes** the call ends, and the banner (§1) applies. The end-of-call toast says why: `update.required.callEnded` "השיחה הסתיימה כי צריך לעדכן את MVS." / "The call ended because MVS needs an update."
+- New calls can't start (§3).
 
-- **App lock (G-78):** the lock comes first. After unlock, this screen shows, never before it, so a locked app shows nothing about the update.
-- **At start:** if the requirement is already known, the screen shows right after "טוענים…", with no flash of the app.
+## 5. Lock and start
 
-## 5. Accessibility
+- **App lock (G-78):** the lock screen comes first. The banner appears only after unlock, and the lock screen shows nothing about the update.
+- **At start:** if `updateRequired` is already set, the app opens straight into the read-only state, with the banner, with no flash of enabled controls.
+- **A reload can't leave it.** Only a restart into a version that isn't revoked clears it.
 
-- The page is one `main` landmark with the title as `h1`. Focus starts on the primary button when there is one, otherwise on the title (`tabIndex=-1`).
-- Progress is announced at most every 25% (`aria-live="polite"` on a separate line), not on every percent.
-- Reduced motion: the progress bar fills without animation.
+## 6. Accessibility
 
-## 6. Strings (new)
-
-`update.required.title`, `.body`, `.downloading`, `.restart`, `.manual`, `.offline`, `.failed`, `.inCall`, as above. `.downloading` is "מורידים את העדכון…" / "Downloading the update…".
+- When the banner appears, focus doesn't jump. It's announced once through its status line.
+- The progress is announced at most every 25%. Reduced motion means no animated fill.
+- The banner's buttons are 24px minimum (44px on touch), and they come first in Tab order after the title bar.
 
 ## 7. Acceptance criteria
 
-1. With a manifest minimum above the running version, the screen replaces the app, and no server or message text is in the DOM.
-2. The download starts on its own. "הפעלה מחדש ועדכון" shows once it's ready, and it restarts into the new version.
-3. Offline shows the offline line, and it recovers by itself when the connection returns.
-4. A failed signature shows the failed state, with no technical detail on screen.
-5. During a call, the call goes on with the bar showing. When the call ends, the full screen shows.
-6. When locked, the lock screen comes first, and this screen comes only after unlock.
+1. With `updateRequired` set, the app shows its content read-only, with the banner. There's no close and no "later".
+2. Sending, reacting, joining, calls and signing settings are disabled, with the reason on hover and focus. Reading, search and local settings still work.
+3. Downloading leads to ready, and "Update" restarts into the new version. Offline, check-clock, not-available and failed each show their line and buttons.
+4. In a call: the call-bar notice shows, then "…in 5 minutes" at 25 minutes. At 30 minutes the call ends, with its toast.
+5. When locked, the lock screen comes first, and the banner shows only after unlock.
+6. Reloading the page keeps the read-only state.
 
-**Screenshots:** 560 `560-update-required-downloading-he`, 561 `561-update-required-ready-he`, 562 `562-update-required-failed-en-dark`, 563 `563-update-required-in-call-he`.
+**Screenshots:** 560 `560-update-required-downloading-he`, 561 `561-update-required-ready-he`, 562 `562-update-required-offline-en-dark`, 563 `563-update-required-not-available-he`, 564 `564-update-required-in-call-soon-he`, 565 `565-update-required-composer-disabled-he`.

@@ -419,6 +419,8 @@ impl Meta {
 
 /// My call.
 struct Mine {
+    /// G-81: this call's ID (`CallState.callId`), new on every join.
+    call_id: [u8; 16],
     server: ServerId,
     channel: ChannelId,
     muted: bool,
@@ -475,6 +477,11 @@ pub(crate) struct Calls {
     /// advertised the `deafen` cap, and when we received it. Bounded by
     /// [`MAX_CAPS_ENTRIES`].
     caps: HashMap<PublicKey, u64>,
+    /// G-81: how my frames reach each call peer (the node's `VoicePath`),
+    /// and the peers the UI has on LAN WebRTC (`setCallWebrtcPeers`):
+    /// both reset with each new call.
+    paths: HashMap<PublicKey, VoicePathKind>,
+    webrtc: HashSet<PublicKey>,
 }
 
 impl Calls {
@@ -699,7 +706,7 @@ impl Calls {
         channel: ChannelId,
         joined_at: u64,
     ) -> CoreResult<CallState> {
-        self.mine = Some(Mine { server, channel, muted: false, deafened: false, joined_at, since: ctx.now });
+        self.mine = Some(Mine { server, channel, muted: false, deafened: false, joined_at, since: ctx.now, call_id: { let mut id = [0u8; 16]; OsRng.fill_bytes(&mut id); id } });
         self.dirty.insert(server);
         self.hello(ctx, members, None);
         let state = self.state(ctx.me()).expect("in a call");
@@ -722,6 +729,7 @@ impl Calls {
             participants: Vec::new(),
             full: false,
             relay_only: self.relay_only(),
+            call_id: None,
         }));
     }
 
@@ -949,6 +957,7 @@ impl Calls {
                     participants: Vec::new(),
                     full: true,
                     relay_only: self.relay_only(),
+                    call_id: None,
                 }));
             }
             WireKind::Edit => {
@@ -1267,6 +1276,7 @@ impl Calls {
             identity: model::hex_id(me.as_bytes()),
             muted: mine.muted,
             deafened: mine.deafened && mine.muted,
+            path: None,
         }];
         let mut limit = MAX_PARTICIPANTS;
         if let Some(room) = self.rooms.get(&mine.channel) {
@@ -1275,6 +1285,7 @@ impl Calls {
                 identity: model::hex_id(key.as_bytes()),
                 muted: peer.muted,
                 deafened: peer.deafened,
+                path: self.paths.get(key).copied(),
             }));
         }
         let full = participants.len() >= limit;
@@ -1283,6 +1294,7 @@ impl Calls {
             participants,
             full,
             relay_only: self.relay_only(),
+            call_id: Some(hex::encode(mine.call_id)),
         })
     }
 

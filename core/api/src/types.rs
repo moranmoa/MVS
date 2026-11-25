@@ -710,6 +710,10 @@ pub struct CallState {
     /// with this set ended because relay-only went on.
     #[serde(default)]
     pub relay_only: bool,
+    /// G-81: my current call's ID (32 lowercase hex), opaque, new on every
+    /// join; `voiceFrame`s carry it. Absent with no call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,6 +725,21 @@ pub struct CallParticipant {
     /// G-84b: hears no one (only with `muted`; false from cores before 0.6.0).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deafened: bool,
+    /// G-81: how my voice frames reach this peer over libp2p; only for
+    /// peers I send to that way (not on LAN WebRTC), absent for me.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<VoicePathKind>,
+}
+
+/// G-81 `CallParticipant.path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoicePathKind {
+    Lan,
+    Direct,
+    Circuit,
+    MemberCircuit,
+    None,
 }
 
 /// Why `server.removed` fired (server lifecycle).

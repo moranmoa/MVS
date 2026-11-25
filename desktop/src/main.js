@@ -127,6 +127,11 @@ const requiredGate = required.createRequiredGate({
   onChange: (st) => toPages('update.gate', st),
 });
 
+/** The page's Retry (update:check): main asks the core, rate-limited. */
+const updateCheck = required.createCheckThrottle({
+  run: () => (core ? core.request('checkForUpdate', {}) : Promise.resolve({ error: { code: 'core-unavailable' } })),
+});
+
 /** Asks the core whether this version must update (at every core start). */
 function checkRequired() {
   if (!core) return;
@@ -460,6 +465,9 @@ function serveCoreIpc() {
   ipcMain.handle('lock:state', (event) => (fromUs(event) ? lockPayload() : null));
   // Required updates (#577): the gate's state, for a page that asks (TL).
   ipcMain.handle('update:gate', (event) => (fromUs(event) ? requiredGate.state : null));
+  // The banner's Retry: main runs the core's update check itself (checkForUpdate
+  // stays main/core only, B8 A2), at most once every 30 s; only a code goes back.
+  ipcMain.handle('update:check', (event) => (fromUs(event) ? updateCheck() : 'invalid'));
   ipcMain.handle('lock:unlock', async (event, input) => {
     if (!fromUs(event)) return 'invalid';
     return appLock.unlock(input);

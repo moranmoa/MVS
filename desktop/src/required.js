@@ -51,16 +51,19 @@ const READ_ONLY = Object.freeze(
     // A local wipe, applied before any network (SL): someone stuck on an old
     // version must still be able to remove their data from this computer.
     'signOut',
+    // G-48: the reports this computer holds (read only).
+    'listReports',
   ]),
 );
 
 /**
- * The update itself. `checkForUpdate` (the banner's Retry) is dev-updater's
- * coming core command: allowed here already, reachable once commands.js lists it.
+ * The update itself. The banner's Retry is not here: `checkForUpdate` stays
+ * main/core only (B8 A2), and the page asks main through `update:check`,
+ * which main rate-limits and runs itself.
  */
-const UPDATE = Object.freeze(new Set(['getAppInfo', 'restartToUpdate', 'checkForUpdate']));
-/** Update commands the core doesn't have yet (the classification test allows these). */
-const PENDING_CORE = Object.freeze(new Set(['checkForUpdate']));
+const UPDATE = Object.freeze(new Set(['getAppInfo', 'restartToUpdate']));
+/** How often main runs a check the page asked for (Retry). */
+const CHECK_EVERY_MS = 30_000;
 
 /**
  * While a required update waits for a call to end (TL): only the call's own
@@ -111,6 +114,11 @@ const NOT_READ_ONLY = Object.freeze(
     'sendSignal',
     'setMemberRelay',
     'setMemberRelayCap',
+    // G-48 reports: a report is a signed record; dismissing one and the
+    // evidence fetch are kept off until confirmed local-only (SL to check).
+    'reportContent',
+    'dismissReport',
+    'getReportEvidence',
   ]),
 );
 
@@ -202,4 +210,28 @@ function createRequiredGate({ inCall, endCall, onChange = () => {}, now = Date.n
   };
 }
 
-module.exports = { READ_ONLY, UPDATE, PENDING_CORE, CALL, NOT_READ_ONLY, CALL_CAP_MS, cleanRequired, createRequiredGate };
+/**
+ * The page's Retry: at most one core check per CHECK_EVERY_MS; in between it
+ * answers 'too-soon'. `run()` asks the core (checkForUpdate) and resolves its
+ * answer. Only a code goes back to the page: 'ok' or the core's error code.
+ */
+function createCheckThrottle({ run, now = Date.now, every = CHECK_EVERY_MS }) {
+  let last = -Infinity;
+  let busy = false;
+  return async () => {
+    if (busy || now() - last < every) return 'too-soon';
+    busy = true;
+    last = now();
+    try {
+      const res = await run();
+      if (res && res.error) return typeof res.error.code === 'string' ? res.error.code : 'internal';
+      return 'ok';
+    } catch {
+      return 'internal';
+    } finally {
+      busy = false;
+    }
+  };
+}
+
+module.exports = { READ_ONLY, UPDATE, CALL, NOT_READ_ONLY, CALL_CAP_MS, CHECK_EVERY_MS, cleanRequired, createRequiredGate, createCheckThrottle };

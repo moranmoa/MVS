@@ -127,6 +127,11 @@ contextBridge.exposeInMainWorld('mvs', {
    * phase: 'none'|'call'|'gated', callEndsAt } (also the `update.gate` event).
    */
   updateGate: () => ipcRenderer.invoke('update:gate'),
+  /**
+   * The banner's Retry: main checks for an update now (at most every 30 s).
+   * Resolves 'ok' | 'too-soon' | the core's error code ('offline', …).
+   */
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

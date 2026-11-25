@@ -4,7 +4,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { COMMANDS } = require('../src/commands');
-const { READ_ONLY, UPDATE, PENDING_CORE, CALL, NOT_READ_ONLY, CALL_CAP_MS, cleanRequired, createRequiredGate } = require('../src/required');
+const { READ_ONLY, UPDATE, CALL, NOT_READ_ONLY, CALL_CAP_MS, CHECK_EVERY_MS, cleanRequired, createRequiredGate, createCheckThrottle } = require('../src/required');
 
 test('every command in commands.js is classified exactly once', () => {
   const all = Object.keys(COMMANDS);
@@ -14,10 +14,10 @@ test('every command in commands.js is classified exactly once', () => {
     const n = [READ_ONLY, UPDATE, NOT_READ_ONLY].filter((s) => s.has(c)).length;
     assert.equal(n, 1, c);
   }
-  // Nothing stale: every classified name is a real command (or a known coming one).
-  for (const c of [...READ_ONLY, ...UPDATE, ...NOT_READ_ONLY]) assert.ok(Object.hasOwn(COMMANDS, c) || PENDING_CORE.has(c), c);
-  // A pending one that has arrived must leave PENDING_CORE.
-  for (const c of PENDING_CORE) assert.equal(Object.hasOwn(COMMANDS, c), false, `${c} is in commands.js now: drop it from PENDING_CORE`);
+  // Nothing stale: every classified name is a real command.
+  for (const c of [...READ_ONLY, ...UPDATE, ...NOT_READ_ONLY]) assert.ok(Object.hasOwn(COMMANDS, c), c);
+  // checkForUpdate stays main/core only (B8 A2): the page reaches it through update:check.
+  assert.equal(Object.hasOwn(COMMANDS, 'checkForUpdate'), false);
 });
 
 test('the read-only side never writes to or talks to the network', () => {
@@ -86,7 +86,7 @@ test('in a call: only reads, the update and the call itself pass until the call 
   gate.set({ version: '0.6.0' });
   assert.equal(gate.state.phase, 'call');
   assert.equal(gate.state.active, false);
-  for (const c of [...CALL, 'getMessages', 'listServers', 'getAppInfo', 'restartToUpdate', 'checkForUpdate']) assert.equal(gate.allows(c), true, c);
+  for (const c of [...CALL, 'getMessages', 'listServers', 'getAppInfo', 'restartToUpdate']) assert.equal(gate.allows(c), true, c);
   for (const c of ['sendMessage', 'joinServer', 'kickMember', 'createInvite', 'updateProfile', 'joinCall']) assert.equal(gate.allows(c), false, c);
   st.inCall = false;
   gate.callChanged();
@@ -94,7 +94,32 @@ test('in a call: only reads, the update and the call itself pass until the call 
   assert.equal(gate.state.active, true);
   for (const c of ['sendSignal', 'setMuted', 'setDeafened']) assert.equal(gate.allows(c), false, c);
   assert.equal(gate.allows('leaveCall'), true);
-  assert.equal(gate.allows('checkForUpdate'), true, 'Retry');
+  assert.equal(gate.allows('checkForUpdate'), false, 'Retry goes through main, not core:invoke');
+});
+
+test('Retry (update:check): main runs the check at most every 30 s; only a code goes back', async () => {
+  let t = 0;
+  const runs = [];
+  let answer = { ok: { status: 'upToDate', secret: 'x' } };
+  const check = createCheckThrottle({ run: async () => (runs.push(t), answer), now: () => t });
+  assert.equal(await check(), 'ok');
+  t = CHECK_EVERY_MS - 1;
+  assert.equal(await check(), 'too-soon');
+  t = CHECK_EVERY_MS;
+  answer = { error: { code: 'offline', detail: 'x' } };
+  assert.equal(await check(), 'offline');
+  assert.deepEqual(runs, [0, CHECK_EVERY_MS]);
+  // Two at once: the second waits its turn.
+  t = 10 * CHECK_EVERY_MS;
+  let release;
+  const slow = createCheckThrottle({ run: () => new Promise((r) => (release = () => r({ ok: null }))), now: () => t });
+  const first = slow();
+  assert.equal(await slow(), 'too-soon');
+  release();
+  assert.equal(await first, 'ok');
+  // A throw is 'internal', never an exception to the page.
+  const bad = createCheckThrottle({ run: async () => { throw new Error('no'); } });
+  assert.equal(await bad(), 'internal');
 });
 
 test('the state for a page that asks: phase and version, never cleared', () => {

@@ -71,7 +71,7 @@ test('required: reads and update pass; writes and the network are refused; it ne
   const { gate, states } = harness();
   assert.equal(gate.set({ version: '0.6.0' }), true);
   assert.equal(gate.state.active, true);
-  for (const c of ['listServers', 'getMessages', 'exportDiagnostics', 'getAppInfo', 'restartToUpdate', 'leaveCall']) assert.equal(gate.allows(c), true, c);
+  for (const c of ['listServers', 'getMessages', 'exportDiagnostics', 'getAppInfo', 'restartToUpdate', 'leaveCall', 'signOut']) assert.equal(gate.allows(c), true, c);
   for (const c of ['sendMessage', 'joinServer', 'joinCall', 'sendSignal', 'updateProfile']) assert.equal(gate.allows(c), false, c);
   assert.equal(gate.allows('somethingNew'), false, 'unknown: refused');
   assert.equal(gate.set(null), false);

@@ -48,6 +48,9 @@ const READ_ONLY = Object.freeze(
     'markMemberRelayDisclosureSeen',
     // Leaving a call is always allowed (the gate waits for the call to end anyway).
     'leaveCall',
+    // A local wipe, applied before any network (SL): someone stuck on an old
+    // version must still be able to remove their data from this computer.
+    'signOut',
   ]),
 );
 
@@ -64,7 +67,6 @@ const NOT_READ_ONLY = Object.freeze(
     'checkRecoveryWords',
     'restoreIdentity',
     'updateProfile',
-    'signOut',
     'createChannel',
     'updateChannel',
     'setChannelTopic',

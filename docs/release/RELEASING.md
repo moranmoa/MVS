@@ -411,7 +411,7 @@ The design is in `docs/design/required-update.md`. Use a required release when o
   - Versions older than N update through the normal banner, and nothing forces them.
 - **To publish one:**
   1. Build and sign as usual (steps 1–4).
-  2. Build the body with `--require-from <version>`. That fills `revoked` with every published version below `<version>`. The option is in `manifest-body.mjs` (devops); check the body's `revoked` list before signing.
+  2. Publish it as required with **`.\.github\scripts\publish-release.ps1 -Tag vN -RequireFrom N`**. It runs `manifest-body.mjs --require-from N` on each channel's body, filling `revoked` with every published (non-draft) version below N, and the summary lists what is revoked before you sign. Check that list.
   3. The release's own version is never revoked, and it must have an artifact for every platform. A revoked client with no artifact for its platform is stranded on "not available yet".
 - **If a required release is bad,** don't try to "un-require" it:
   - `revoked` only ever grows on clients (a later manifest can't take a revocation back), and a replayed older manifest can't either.

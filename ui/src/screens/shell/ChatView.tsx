@@ -56,6 +56,8 @@ export function ChatView({
   const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const nobodyOnline = members.length > 0 && members.every((m) => m.id === myId || m.presence === 'offline');
   const isOwner = server.ownerId === myId;
+  // #589: an update ready to install (the rail pill's state), for the update-needed line.
+  const staged = useStore(store, (s) => s.update);
 
   // G-21: where the new messages started when I opened the channel. Kept until
   // I leave it, even after it's all read, so the divider stays put.
@@ -197,6 +199,17 @@ export function ChatView({
           <span>
             <FormattedMessage id="server.syncUpdateNeeded" />
           </span>
+          {/* Only once an update is staged; until then the rail pill shows the download (UX). */}
+          {staged && (
+            <button
+              type="button"
+              className="secondary small"
+              onClick={() => core.restartToUpdate().catch((e) => isCoreError(e) && store.updateRefused(e.code))}
+              disabled={staged.waitingForCall}
+            >
+              <FormattedMessage id="server.syncUpdateNeeded.restart" />
+            </button>
+          )}
         </div>
       )}
       {nobodyOnline && (

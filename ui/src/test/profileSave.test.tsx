@@ -120,7 +120,7 @@ describe('profile-too-large (#594)', () => {
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
     });
-    expect(within(dialog).getByRole('alert').textContent).toBe('The name is too long for this picture. Shorten the name or choose a smaller picture.');
+    expect(within(dialog).getByRole('alert').textContent).toBe('Your profile is too large. Choose a different picture or shorten the name.');
     expect(within(dialog).getByRole('radio', { name: 'Pink' }).getAttribute('aria-checked')).toBe('true');
   });
 });

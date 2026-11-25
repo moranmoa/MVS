@@ -125,9 +125,11 @@ export interface VoiceEnv {
   /** A connection to another person in the call. Only this one takes ICE servers; the engine never calls it under relay-only. */
   createPeerConnection(config: RTCConfiguration): RTCPeerConnection;
   /**
-   * G-81 B playout (TL L1-L3, SL): one end of the in-renderer loopback pair
-   * that plays B's audio as WebRTC (so echo cancellation sees it). No
-   * arguments: always `iceServers: []`; it reaches no one, so relay-only allows it.
+   * One end of the in-renderer loopback pair that plays audio as WebRTC, so
+   * echo cancellation sees it (spike AEC run 2: 27.3 dB; plain Web Audio
+   * playout couldn't be shown to be cancelled): boosted peers (>100%) and,
+   * with G-81 B, B's audio. No arguments: always `iceServers: []`, never
+   * signalled; it reaches no one, so relay-only allows it (TL L1-L3, SL).
    */
   createLoopbackPeerConnection?(): RTCPeerConnection;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
@@ -429,8 +431,6 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   let session: MediaSession | null = null;
   let sessionCall: string | null = null;
   const bGains = new Map<Id, GainNode>();
-  /** One shared loopback playout per call (TL L4), made on the first B peer. */
-  let playout: LoopbackPlayout | null = null;
   const bSpeak = new Map<Id, SpeakState>();
   /** What setCallWebrtcPeers last said, to send only changes. */
   let webrtcSent = '';
@@ -459,14 +459,20 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const volumes = new Map<Id, number>();
   /**
    * G-73 playback path. Web Audio: each verified peer's source → its gain →
-   * a shared limiter → the speakers (the <audio> element stays, muted: Chromium
-   * feeds remote WebRTC audio to Web Audio only while an element plays it).
+   * a shared limiter → the loopback pair → an <audio> element on the chosen
+   * output, so the boosted audio is WebRTC playout that echo cancellation
+   * sees (the 0.5.0 "echo above 100%" issue). Without a loopback factory, the
+   * limiter goes to the context's destination as before. The peer's own
+   * <audio> element stays, muted: Chromium feeds remote WebRTC audio to Web
+   * Audio only while an element plays it.
    * Falls back to the element path (volume ≤ 1) where Web Audio or the
    * context's setSinkId is missing or fails. Decided per call.
    */
   let elementOnly = false;
   let limiter: DynamicsCompressorNode | null = null;
   let sinkSet: string | undefined;
+  /** The shared loopback playout behind the limiter: one per call, made with the limiter, closed with the call. */
+  let playout: LoopbackPlayout | null = null;
 
   /** The context for Web Audio playback, or null on the element path. */
   function playbackContext(): AudioContext | null {
@@ -485,15 +491,31 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
         limiter.ratio.value = 20;
         limiter.attack.value = 0.002;
         limiter.release.value = 0.1;
-        limiter.connect(c.destination);
+        playout = makePlayout(c);
+        limiter.connect(playout ? playout.input : c.destination);
       } catch {
         elementOnly = true;
         limiter = null;
         return null;
       }
     }
-    if (outputId !== sinkSet) applyContextSink(c);
+    if (outputId !== sinkSet) {
+      if (playout) {
+        sinkSet = outputId;
+        playout.setSink(outputId);
+      } else applyContextSink(c);
+    }
     return c;
+  }
+
+  /** The loopback playout, or null where this env or context can't make one (then the speakers directly). */
+  function makePlayout(c: AudioContext): LoopbackPlayout | null {
+    if (!env.createLoopbackPeerConnection || typeof c.createMediaStreamDestination !== 'function') return null;
+    try {
+      return loopbackPlayout(c, () => env.createLoopbackPeerConnection!(), () => env.createAudioElement());
+    } catch {
+      return null;
+    }
   }
 
   /** The chosen speaker for the whole context; without setSinkId, back to the element path. */
@@ -1280,30 +1302,14 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       const c = playbackContext();
       if (!c || !limiter) return null;
       g = c.createGain();
-      g.connect(bPlayoutInput(c) ?? limiter);
+      g.connect(limiter); // → the shared loopback playout (WebRTC playout: AEC), closed with the call in stop()
       bGains.set(id, g);
     }
     g.gain.value = deafened ? 0 : volumes.get(id) ?? 1;
     return g;
   }
 
-  /** The shared loopback playout's input (AEC run 2: 27.3 dB); null without a loopback factory. */
-  function bPlayoutInput(c: AudioContext): AudioNode | null {
-    if (!playout && env.createLoopbackPeerConnection && typeof c.createMediaStreamDestination === 'function') {
-      try {
-        playout = loopbackPlayout(c, () => env.createLoopbackPeerConnection!(), () => env.createAudioElement());
-        playout.setSink(outputId);
-      } catch {
-        playout = null;
-      }
-    }
-    return playout?.input ?? null;
-  }
-
   function stopB() {
-    // The loopback goes with the call (L6: leave, lock path A, sign-out, the flag off all end it here).
-    playout?.close();
-    playout = null;
     session?.stop();
     session = null;
     sessionCall = null;
@@ -1439,6 +1445,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     timer = null;
     if (turnTimer) clearTimeout(turnTimer); // the cache stays; no refreshing outside a call
     turnTimer = null;
+    playout?.close();
+    playout = null;
     void ctx?.close?.().catch(() => {});
     ctx = null;
     limiter = null;
@@ -1493,8 +1501,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     async setOutputDevice(deviceId) {
       outputId = deviceId || undefined;
-      playout?.setSink(outputId);
-      if (ctx && !elementOnly && limiter) applyContextSink(ctx);
+      if (playout) {
+        sinkSet = outputId;
+        playout.setSink(outputId);
+      } else if (ctx && !elementOnly && limiter) applyContextSink(ctx);
       if (monitor && 'setSinkId' in monitor) void monitor.setSinkId(deviceId).catch(() => {});
       await Promise.all(
         [...peers.values()].map((p) =>

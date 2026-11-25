@@ -233,7 +233,7 @@ class FakeAnalyser {
   }
 }
 
-/** G-81 B playout: one end of the in-renderer loopback pair. Records what it was asked to do. */
+/** One end of the in-renderer loopback pair. Records what it was asked to do. */
 class FakeLoopbackPC {
   static made: FakeLoopbackPC[] = [];
   calls: string[] = [];
@@ -312,7 +312,7 @@ class FakeWebAudioContext {
     this.limiters.push(c);
     return c;
   }
-  /** G-81 B playout: the loopback's stream source. */
+  /** The loopback's stream source. */
   destinations: (FakeNode & { stream: { getAudioTracks(): { stop(): void }[]; getTracks(): { stop(): void; stopped?: boolean }[] } })[] = [];
   createMediaStreamDestination() {
     const track = { stopped: false, stop() { this.stopped = true; } };
@@ -373,7 +373,7 @@ interface Harness {
   changeNetwork: () => void;
 }
 
-function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } } = {}): Harness {
+function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean; loopback?: boolean } } = {}): Harness {
   let onChange: (() => void) | null = null;
   let onNet: (() => void) | null = null;
   const h: Harness = {
@@ -429,7 +429,7 @@ function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } }
       h.contexts.push(c);
       return c as unknown as AudioContext;
     },
-    createLoopbackPeerConnection: (...args: unknown[]) => new FakeLoopbackPC(args) as unknown as RTCPeerConnection,
+    ...(opts.webAudio?.loopback ? { createLoopbackPeerConnection: (...args: unknown[]) => new FakeLoopbackPC(args) as unknown as RTCPeerConnection } : {}),
     createAudioElement: () => {
       const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, sinks: [] as string[], setSinkId: async (id: string) => void a.sinks.push(id), play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
       h.audios.push(a);
@@ -727,6 +727,77 @@ describe('voice engine', () => {
     expect(hx.audios[0]!.volume).toBe(0.4);
     ex.setDeafened(true);
     expect(hx.audios[0]!.muted).toBe(true);
+  });
+
+  it('boosted audio plays through the loopback (WebRTC playout, AEC sees it): gain → limiter → loopback bus, never the speakers directly', async () => {
+    FakeLoopbackPC.made = [];
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    ex.setPeerVolume(B, 1.8);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    const [limiter] = ctx.limiters;
+    const bus = ctx.gains.find((g) => g.out[0] === ctx.destinations[0]);
+    expect(bus).toBeTruthy();
+    expect(limiter!.out).toEqual([bus]); // the limiter before the bus (no clipping at 200%)
+    expect(ctx.gains.some((g) => g !== bus && g.out[0] === limiter && g.gain.value === 1.8)).toBe(true);
+    expect(limiter!.out).not.toContain(ctx.destination);
+    expect(FakeLoopbackPC.made).toHaveLength(2);
+    expect(FakeLoopbackPC.made.every((pc) => pc.args.length === 0)).toBe(true); // no config to put ICE servers in
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('the loopback pair negotiates only with itself: nothing of it reaches core.sendSignal', async () => {
+    FakeLoopbackPC.made = [];
+    const { cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const before = cx.sent.length;
+    ex.setPeerVolume(B, 1.5);
+    await flush();
+    await flush();
+    const [a, z] = FakeLoopbackPC.made;
+    expect(a!.calls).toEqual(expect.arrayContaining(['addTrack', 'local:offer', 'remote:answer', 'ice']));
+    expect(z!.calls).toEqual(expect.arrayContaining(['remote:offer', 'local:answer', 'ice']));
+    expect(cx.sent.length).toBe(before); // the boost added no signalling
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('one pair per call, whoever is boosted; the chosen output reaches its element; leaving closes it', async () => {
+    FakeLoopbackPC.made = [];
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    ex.setPeerVolume(B, 1.5);
+    ex.setPeerVolume(B, 0.8);
+    ex.setPeerVolume(B, 1.9);
+    expect(FakeLoopbackPC.made).toHaveLength(2);
+    await ex.setOutputDevice('spk1');
+    const el = hx.audios.at(-1) as unknown as { sinks: string[] };
+    expect(el.sinks.at(-1)).toBe('spk1');
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.sinks).toEqual([]); // the context's own output is not used
+    ex.detach();
+    expect(FakeLoopbackPC.made.every((pc) => pc.closed)).toBe(true);
+    expect(ctx.destinations[0]!.stream.getTracks()[0]!.stopped).toBe(true);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('nobody above 100%: no loopback pair at all', async () => {
+    FakeLoopbackPC.made = [];
+    const { cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(FakeLoopbackPC.made).toHaveLength(0);
+    ex.dispose();
+    ey.dispose();
   });
 
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {
@@ -1994,7 +2065,7 @@ describe('voice engine: G-81 B playout through the loopback pair', () => {
   async function bCall(o: { relayOnly?: boolean } = {}) {
     vi.useFakeTimers();
     FakeLoopbackPC.made = [];
-    const hx = fakeEnv({ webAudio: {} });
+    const hx = fakeEnv({ webAudio: { loopback: true } });
     const cx = new FakeCore(A, [A, B]);
     cx.callId = CALL_ID;
     cx.paths[B] = 'circuit';
@@ -2025,8 +2096,9 @@ describe('voice engine: G-81 B playout through the loopback pair', () => {
     // The peer's gain feeds the loopback bus, not the speakers directly.
     const bus = ctx.gains.find((g) => g.out[0] === ctx.destinations[0]);
     expect(bus).toBeTruthy();
-    expect(ctx.gains.some((g) => g.out[0] === bus)).toBe(true); // B's gain → the bus → the loopback's stream
-    expect(ctx.gains.some((g) => g !== bus && g.out[0] === ctx.limiters[0])).toBe(false); // never straight to the speakers
+    const [limiter] = ctx.limiters;
+    expect(limiter!.out).toEqual([bus]); // the shared limiter → the bus → the loopback's stream, never the speakers
+    expect(ctx.gains.some((g) => g !== bus && g.out[0] === limiter)).toBe(true); // B's gain → the limiter (#585: boosted peers share it)
     ex.dispose();
   });
 

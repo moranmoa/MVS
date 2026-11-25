@@ -68,6 +68,8 @@ const COMMANDS = Object.freeze({
   setTypingIndicator: ['on'],
   // G-91: servers coming back after a restore
   getServerRestore: [],
+  // G-30: where a linked message is (read-only, local)
+  locateMessage: ['serverId', 'channelId', 'messageId'],
   // Voice (#223); voice rooms (0.4.3)
   listVoiceRooms: ['serverId'],
   createVoiceRoom: ['serverId'],

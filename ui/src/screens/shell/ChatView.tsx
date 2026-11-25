@@ -197,6 +197,7 @@ export function ChatView({
       <MemberNames.Provider value={memberMap}>
       <MessageList
         key={channelId}
+        serverId={server.id}
         unread={unread}
         onMarkRead={markRead}
         win={win}

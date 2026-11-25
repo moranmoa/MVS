@@ -71,10 +71,14 @@ describe('the link format', () => {
   });
 });
 
-async function setup() {
-  const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+/** Spies go on `core` before this: the app wraps the core and keeps the methods it was given. */
+async function setup(core = new MockCore({ demo: true, speed: 0, simulateActivity: false })) {
   render(<App core={core} initialSettings={en} />);
   await screen.findByRole('textbox', { name: /^Message / });
+  // The composer can be in the DOM before Shell's effects ran, and Shell
+  // subscribes to `link.message` in an effect: a link emitted in that gap had
+  // no listener and was dropped (the flake under load). Flush them first.
+  await act(async () => {});
   const servers = await core.listServers();
   return { core, servers };
 }
@@ -128,19 +132,28 @@ describe('Copy message link and opening a link (G-30)', () => {
   });
 
   it('the index is a snapshot: if the id there moved, it locates again', async () => {
-    const { core, servers } = await setup();
-    const [channel] = await core.listChannels(servers[0].id);
-    const real = core.locateMessage.bind(core);
-    const locate = vi.spyOn(core, 'locateMessage').mockImplementationOnce(async () => ({ index: 2 }));
+    // Spied before render (see setup), so the app really calls these.
+    const mock = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const real = mock.locateMessage.bind(mock);
+    // The first answer is stale (the message moved); the second is right.
+    const locate = vi.spyOn(mock, 'locateMessage').mockImplementationOnce(async () => ({ index: 2 }));
     locate.mockImplementation(real);
-    act(() => core.simulateMessageLink(servers[0].id, channel.id, `${channel.id}#7`));
-    await waitFor(() => expect(document.querySelector('.row.target')).not.toBeNull());
-    expect(locate).toHaveBeenCalledTimes(2);
+    const { core, servers } = await setup(mock);
+    // A channel that isn't open yet, so it opens fresh near the linked row
+    // (an open channel sits at its bottom, far from row 5 in jsdom's virtual list).
+    const server = servers[1];
+    const channels = await core.listChannels(server.id);
+    const channel = channels[1] ?? channels[0];
+    act(() => core.simulateMessageLink(server.id, channel.id, `${channel.id}#5`));
+    await screen.findByRole('textbox', { name: (n) => n.startsWith('Message ') && n.includes(channel.name) });
+    await waitFor(() => expect(locate).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(document.querySelector('[data-index="5"].row.target')).not.toBeNull());
   });
 
   it('a link into a server I am not in: one dialog, no ids shown, nothing opened', async () => {
-    const { core } = await setup();
-    const locate = vi.spyOn(core, 'locateMessage');
+    const mock = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const locate = vi.spyOn(mock, 'locateMessage');
+    const { core } = await setup(mock);
     act(() => core.simulateMessageLink(hex('a'), hex('b'), hex('c')));
     const dialog = await screen.findByRole('dialog', { name: 'A message in another server' });
     expect(dialog.textContent).not.toContain(hex('a'));

@@ -37,7 +37,14 @@ import type {
   ServerSummary,
   StorageUsage,
   UpdateChannel,
+  ReportEvidence,
+  ReportReason,
+  ReportReceipt,
+  ReportSummary,
+  ReportTarget,
+  ReportTargetInput,
 } from './types';
+import { REPORT_REASONS } from './types';
 import {
   AVATAR_COLORS,
   BODIES,
@@ -103,6 +110,8 @@ export interface MockOptions {
   restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
+  /** B24 (?abuse=1): the build carries an abuse-report address (a placeholder, never a real one). */
+  abuseAddress?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
   outdatedMembers?: boolean;
   /** The demo server "Minecraft IL" starts closed by its owner (read-only). */
@@ -1686,6 +1695,125 @@ export class MockCore implements CoreApi {
     this.emit('notice', { kind: 'encryption-renewed', serverId });
   }
 
+  // ---- G-48: report to the owners (as core #515) -------------------------------
+
+  /** Reports I hold as owner, per server (evidence kept beside, never in the summary). */
+  private reports = new Map<Id, { summary: ReportSummary; evidence?: ReportEvidence }[]>();
+  /** What I reported, for already-reported. */
+  private reported = new Set<string>();
+  private reportSeq = 0;
+
+  async reportContent(serverId: Id, target: ReportTargetInput, reason: ReportReason, text?: string): Promise<ReportReceipt> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (!REPORT_REASONS.includes(reason) || (text !== undefined && [...text].length > 280)) throw err({ code: 'bad-request' });
+    const me = this.identity?.id;
+    let reportedId: Id;
+    if (target.kind === 'message') {
+      const { ch, index } = this.parseId(target.messageId);
+      if (this.serverOf(ch) !== s) throw err({ code: 'not-found' });
+      reportedId = this.messageAt(ch, index).authorId;
+    } else {
+      if (!s.members.some((m) => m.id === target.userId)) throw err({ code: 'not-found' });
+      reportedId = target.userId;
+    }
+    if (reportedId === me) throw err({ code: 'not-allowed' });
+    const key = `${serverId}|${target.kind === 'message' ? target.messageId : target.userId}`;
+    if (this.reported.has(key)) throw err({ code: 'already-reported' });
+    // The owner, unless they're the one reported (the mock has no admins).
+    if (reportedId === s.summary.ownerId) throw err({ code: 'no-recipient' });
+    this.reported.add(key);
+    const reportId = `r-${++this.reportSeq}`;
+    this.emit('report.status', { reportId, delivered: 0, pending: 1 });
+    setTimeout(() => this.emit('report.status', { reportId, delivered: 1, pending: 0 }), 1500 * this.speed);
+    return { reportId, recipients: 1 };
+  }
+
+  /** Demo reports in a server I own: a spam message, a member, and a reason-5 message. */
+  private reportsOf(s: ServerState): { summary: ReportSummary; evidence?: ReportEvidence }[] {
+    let list = this.reports.get(s.summary.id);
+    if (list) return list;
+    list = [];
+    const others = s.members.filter((m) => m.id !== this.identity?.id);
+    const ch = s.channels[0];
+    if (this.persisted?.demo && ch && others.length >= 3) {
+      const now = Date.now();
+      const msg = (back: number) => {
+        const index = this.count(ch) - back;
+        const m = this.messageAt(ch, index);
+        return { id: this.messageId(ch.channel.id, index), m };
+      };
+      const adult = this.ageOf(this.identity!.birthDate) >= 18;
+      const a = msg(3);
+      const c = msg(6);
+      const make = (n: number, reporter: Member, target: ReportTarget, reportedId: Id, reason: ReportReason, text: string | undefined, evidence?: ReportEvidence) => ({
+        summary: {
+          id: `demo-report-${n}`,
+          serverId: s.summary.id,
+          reporterId: reporter.id,
+          target,
+          reportedId,
+          reason,
+          ...(text ? { text } : {}),
+          ts: now - n * 3_600_000,
+          receivedAt: now - n * 3_600_000 + 2000,
+          dismissed: false,
+          evidenceValid: target.kind === 'message',
+          evidenceWithheld: (reason === 'sexual' || reason === 'minor') && !adult,
+        },
+        evidence,
+      });
+      list.push(
+        make(1, others[0]!, { kind: 'message', messageId: a.id, channelId: ch.channel.id }, a.m.authorId, 'spam', 'Posting the same link in every channel', {
+          authorId: a.m.authorId,
+          channelId: ch.channel.id,
+          ts: a.m.createdAt,
+          text: a.m.body,
+        }),
+        make(2, others[1]!, { kind: 'member', userId: others[2]!.id }, others[2]!.id, 'impersonation', undefined),
+        make(3, others[2]!, { kind: 'message', messageId: c.id, channelId: ch.channel.id }, c.m.authorId, 'sexual', undefined, {
+          authorId: c.m.authorId,
+          channelId: ch.channel.id,
+          ts: c.m.createdAt,
+          text: c.m.body,
+        }),
+      );
+    }
+    this.reports.set(s.summary.id, list);
+    return list;
+  }
+
+  async listReports(serverId: Id): Promise<ReportSummary[]> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
+    return this.reportsOf(s)
+      .map((r) => ({ ...r.summary }))
+      .sort((a, b) => b.receivedAt - a.receivedAt);
+  }
+
+  async dismissReport(reportId: Id): Promise<null> {
+    for (const list of this.reports.values()) {
+      const r = list.find((x) => x.summary.id === reportId);
+      if (r) {
+        r.summary = { ...r.summary, dismissed: true };
+        return null;
+      }
+    }
+    throw err({ code: 'not-found' });
+  }
+
+  async getReportEvidence(reportId: Id): Promise<ReportEvidence> {
+    for (const list of this.reports.values()) {
+      const r = list.find((x) => x.summary.id === reportId);
+      if (!r) continue;
+      if (r.summary.evidenceWithheld) throw err({ code: 'not-allowed' });
+      if (!r.evidence || !r.summary.evidenceValid) throw err({ code: 'bad-request' });
+      return { ...r.evidence };
+    }
+    throw err({ code: 'not-found' });
+  }
+
   async listRemovedMembers(serverId: Id): Promise<RemovedMember[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
@@ -1736,7 +1864,12 @@ export class MockCore implements CoreApi {
   }
 
   async getAppInfo(): Promise<AppInfo> {
-    return { version: '0.1.0-alpha', updateChannel: this.releaseChannel, relayOnly: this.relayOnly };
+    return {
+      version: '0.1.0-alpha',
+      updateChannel: this.releaseChannel,
+      relayOnly: this.relayOnly,
+      ...(this.options.abuseAddress ? { abuseAddress: 'abuse@example.org' } : {}),
+    };
   }
 
   /** Relay-only (#272): on ends my call; every room then says so (the core: at the next sync round). */

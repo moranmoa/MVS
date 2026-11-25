@@ -220,6 +220,11 @@ pub enum Kind {
     /// (reserved for D30, written as 0), then the description, UTF-8, at most
     /// [`MAX_SERVER_DESCRIPTION_BYTES`]; empty clears it.
     ServerDescription = 24,
+    /// One part of a server secret rotation (T17): the new sync secret sealed
+    /// to each remaining member. Body: a [header](ROTATION_HEADER_LEN), as a
+    /// `KeyRotation` part's, then what `groupkeys` puts there under its own
+    /// box label (`mvs/sync-secret-box/v1`). Control scope.
+    SecretRotation = 25,
 }
 
 /// Largest server icon image, in bytes (G-51).
@@ -255,7 +260,7 @@ pub const MAX_ROTATION_PARTS: u8 = 32;
 pub const ROTATION_HEADER_LEN: usize = ID_LEN + 2;
 
 impl Kind {
-    const ALL: [Kind; 24] = [
+    const ALL: [Kind; 25] = [
         Kind::Genesis,
         Kind::Grant,
         Kind::Revoke,
@@ -280,6 +285,7 @@ impl Kind {
         Kind::ChannelTopic,
         Kind::ServerIcon,
         Kind::ServerDescription,
+        Kind::SecretRotation,
     ];
 
     const LARGEST_BODY: usize = 16 * 1024;
@@ -311,7 +317,9 @@ impl Kind {
             // Channel ID, history byte, flags and a name.
             Kind::ChannelCreate | Kind::ChannelEdit => 512,
             Kind::Post => 4 * 1024,
-            Kind::Message | Kind::MessageEdit | Kind::KeyRotation => Kind::LARGEST_BODY,
+            Kind::Message | Kind::MessageEdit | Kind::KeyRotation | Kind::SecretRotation => {
+                Kind::LARGEST_BODY
+            }
             // A sealed 64-byte plaintext (121 bytes today), with room to spare.
             Kind::Reaction => 256,
             // Channel ID, history byte and the topic.
@@ -479,7 +487,7 @@ impl Fields {
                 return Err(RecordError::GenesisServerMismatch);
             }
         }
-        if self.kind == Kind::KeyRotation {
+        if matches!(self.kind, Kind::KeyRotation | Kind::SecretRotation) {
             let header = self.body.get(ID_LEN..ROTATION_HEADER_LEN);
             let valid =
                 header.is_some_and(|h| (1..=MAX_ROTATION_PARTS).contains(&h[1]) && h[0] < h[1]);
@@ -496,21 +504,10 @@ impl Fields {
         if !self.kind.allowed_in(self.scope) {
             return Err(RecordError::KindNotAllowedInScope(self.kind));
         }
-        if self.scope == Scope::Control && !self.auth_deps.is_empty() {
-            return Err(RecordError::AuthDepsInControlScope);
-        }
         if self.kind == Kind::Genesis && !self.deps.is_empty() {
             return Err(RecordError::GenesisWithDeps);
         }
-        if self.deps.len() > MAX_DEPS {
-            return Err(RecordError::TooManyDeps(self.deps.len()));
-        }
-        if self.auth_deps.len() > MAX_AUTH_DEPS {
-            return Err(RecordError::TooManyAuthDeps(self.auth_deps.len()));
-        }
-        if !strictly_ascending(&self.deps) || !strictly_ascending(&self.auth_deps) {
-            return Err(RecordError::NotCanonical);
-        }
+        self.header().validate()?;
         let max = self.kind.max_body();
         if body_len > max {
             return Err(RecordError::BodyTooLarge { kind: self.kind, len: body_len, max });
@@ -525,15 +522,69 @@ impl Fields {
     }
 
     fn signing_message_for(&self, body_len: usize, hash: &[u8; 32]) -> Vec<u8> {
+        self.header().signing_message(body_len, hash)
+    }
+
+    /// The wire envelope from `ver` up to `kind`.
+    fn encode_header(&self, out: &mut Vec<u8>) {
+        self.header().encode(out);
+    }
+
+    fn header(&self) -> Header<'_> {
+        Header {
+            server: self.server,
+            scope: self.scope,
+            author: self.author,
+            seq: self.seq,
+            deps: &self.deps,
+            auth_deps: &self.auth_deps,
+            ts: self.ts,
+            code: self.kind.code(),
+        }
+    }
+}
+
+/// The envelope from `ver` up to the kind code, with the code kept raw so
+/// a record of a kind this build doesn't know shares the same encoding and
+/// checks as a known one (`Record::peek_unknown`).
+struct Header<'a> {
+    server: ServerId,
+    scope: Scope,
+    author: PublicKey,
+    seq: u64,
+    deps: &'a [RecordId],
+    auth_deps: &'a [RecordId],
+    ts: u64,
+    code: u16,
+}
+
+impl Header<'_> {
+    /// The format rules that hold for every kind.
+    fn validate(&self) -> Result<(), RecordError> {
+        if self.scope == Scope::Control && !self.auth_deps.is_empty() {
+            return Err(RecordError::AuthDepsInControlScope);
+        }
+        if self.deps.len() > MAX_DEPS {
+            return Err(RecordError::TooManyDeps(self.deps.len()));
+        }
+        if self.auth_deps.len() > MAX_AUTH_DEPS {
+            return Err(RecordError::TooManyAuthDeps(self.auth_deps.len()));
+        }
+        if !strictly_ascending(self.deps) || !strictly_ascending(self.auth_deps) {
+            return Err(RecordError::NotCanonical);
+        }
+        Ok(())
+    }
+
+    fn signing_message(&self, body_len: usize, hash: &[u8; 32]) -> Vec<u8> {
         let mut out = SIGNING_CONTEXT.to_vec();
-        self.encode_header(&mut out);
+        self.encode(&mut out);
         out.extend_from_slice(&(body_len as u32).to_le_bytes());
         out.extend_from_slice(hash);
         out
     }
 
-    /// The wire envelope from `ver` up to `kind`.
-    fn encode_header(&self, out: &mut Vec<u8>) {
+    fn encode(&self, out: &mut Vec<u8>) {
         out.reserve(128 + (self.deps.len() + self.auth_deps.len()) * ID_LEN);
         out.push(VERSION);
         out.extend_from_slice(&self.server.0);
@@ -546,19 +597,30 @@ impl Fields {
         }
         out.extend_from_slice(&self.author.0);
         out.extend_from_slice(&self.seq.to_le_bytes());
-        for list in [&self.deps, &self.auth_deps] {
+        for list in [self.deps, self.auth_deps] {
             out.extend_from_slice(&(list.len() as u16).to_le_bytes());
             for id in list {
                 out.extend_from_slice(&id.0);
             }
         }
         out.extend_from_slice(&self.ts.to_le_bytes());
-        out.extend_from_slice(&self.kind.code().to_le_bytes());
+        out.extend_from_slice(&self.code.to_le_bytes());
     }
 }
 
 fn strictly_ascending(ids: &[RecordId]) -> bool {
     ids.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+/// A validly signed record of a kind this build doesn't know: a sign that
+/// its author runs a newer version (`Record::peek_unknown`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownRecord {
+    pub server: ServerId,
+    pub scope: Scope,
+    pub author: PublicKey,
+    /// The kind code.
+    pub code: u16,
 }
 
 /// A signed record. Holding one means its signature has been verified.
@@ -641,6 +703,36 @@ impl Record {
         verify(&fields.author, &message, &sig)?;
         let id = RecordId(*blake3::hash(&message).as_bytes());
         Ok(Record { fields, sig, id })
+    }
+
+    /// Whether `bytes` are a validly signed record of a kind this build
+    /// doesn't know, and if so who wrote it where. It runs the same size,
+    /// canonical-form and signature checks as `decode` (the body bounded by
+    /// the largest any kind allows), and skips only the kind's own rules.
+    /// `None` for a known kind, an unknown scope or anything `decode` would
+    /// reject for another reason. It only reports: the record is still
+    /// rejected and never stored.
+    pub fn peek_unknown(bytes: &[u8]) -> Option<UnknownRecord> {
+        let (envelope, mut reader) = read_envelope(bytes).ok()?;
+        if Kind::from_code(envelope.code).is_some() {
+            return None;
+        }
+        let body_len = reader.u32().ok()? as usize;
+        if body_len > Kind::LARGEST_BODY {
+            return None;
+        }
+        let body = reader.take(body_len).ok()?;
+        let sig = read_sig(&mut reader).ok()?;
+        let header = envelope.header();
+        header.validate().ok()?;
+        let message = header.signing_message(body_len, &body_hash(body));
+        verify(&envelope.author, &message, &sig).ok()?;
+        Some(UnknownRecord {
+            server: envelope.server,
+            scope: envelope.scope,
+            author: envelope.author,
+            code: envelope.code,
+        })
     }
 
     /// The hash the signature and the ID cover in place of the body.
@@ -770,6 +862,43 @@ impl Stub {
 /// Reads the envelope from `ver` up to `kind`, after the size check. The
 /// returned fields have an empty body.
 fn read_header(bytes: &[u8]) -> Result<(Fields, Reader<'_>), RecordError> {
+    let (envelope, reader) = read_envelope(bytes)?;
+    let Envelope { server, scope, author, seq, deps, auth_deps, ts, code } = envelope;
+    let kind = Kind::from_code(code).ok_or(RecordError::UnknownKind(code))?;
+    let fields = Fields { server, scope, author, seq, deps, auth_deps, ts, kind, body: Vec::new() };
+    Ok((fields, reader))
+}
+
+/// `Header`, owned, as read off the wire.
+struct Envelope {
+    server: ServerId,
+    scope: Scope,
+    author: PublicKey,
+    seq: u64,
+    deps: Vec<RecordId>,
+    auth_deps: Vec<RecordId>,
+    ts: u64,
+    code: u16,
+}
+
+impl Envelope {
+    fn header(&self) -> Header<'_> {
+        Header {
+            server: self.server,
+            scope: self.scope,
+            author: self.author,
+            seq: self.seq,
+            deps: &self.deps,
+            auth_deps: &self.auth_deps,
+            ts: self.ts,
+            code: self.code,
+        }
+    }
+}
+
+/// Reads the envelope from `ver` up to the kind code, after the size check,
+/// without interpreting the code.
+fn read_envelope(bytes: &[u8]) -> Result<(Envelope, Reader<'_>), RecordError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(RecordError::TooLarge { len: bytes.len() });
     }
@@ -790,9 +919,7 @@ fn read_header(bytes: &[u8]) -> Result<(Fields, Reader<'_>), RecordError> {
     let auth_deps = reader.ids(MAX_AUTH_DEPS, RecordError::TooManyAuthDeps)?;
     let ts = reader.u64()?;
     let code = reader.u16()?;
-    let kind = Kind::from_code(code).ok_or(RecordError::UnknownKind(code))?;
-    let fields = Fields { server, scope, author, seq, deps, auth_deps, ts, kind, body: Vec::new() };
-    Ok((fields, reader))
+    Ok((Envelope { server, scope, author, seq, deps, auth_deps, ts, code }, reader))
 }
 
 /// The body length, bounded by the kind's limit before anything is read.
@@ -1050,7 +1177,7 @@ mod tests {
     /// A body of `len` bytes that passes the kind's own header check.
     fn body_for(kind: Kind, len: usize) -> Vec<u8> {
         let mut body = vec![0; len];
-        if kind == Kind::KeyRotation {
+        if matches!(kind, Kind::KeyRotation | Kind::SecretRotation) {
             body[ID_LEN + 1] = 1; // part 0 of 1
         }
         body
@@ -1083,14 +1210,15 @@ mod tests {
             assert!(kind.allowed_in(Scope::Control));
             assert!(!kind.allowed_in(Scope::Channel(ChannelId::from_bytes([1; 32]))));
         }
-        assert_eq!(Kind::from_code(25), None, "older cores still refuse what they don't know");
+        assert_eq!(Kind::from_code(25), Some(Kind::SecretRotation));
+        assert_eq!(Kind::from_code(26), None, "older cores still refuse what they don't know");
     }
 
     #[test]
     fn every_kind_has_one_scope_and_a_body_limit() {
         let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
         let codes: Vec<u16> = Kind::ALL.iter().map(|kind| kind.code()).collect();
-        assert_eq!(codes, (1..=24).collect::<Vec<u16>>(), "codes are dense and in order");
+        assert_eq!(codes, (1..=25).collect::<Vec<u16>>(), "codes are dense and in order");
         // The genesis has its own tests: its body must carry the nonce.
         for kind in Kind::ALL.into_iter().filter(|kind| *kind != Kind::Genesis) {
             assert_eq!(Kind::from_code(kind.code()), Some(kind));
@@ -1155,6 +1283,27 @@ mod tests {
         let at = body_offset(&record) + ID_LEN;
         bytes[at] = 1;
         assert_eq!(Record::decode(&bytes), Err(RecordError::BadRotationHeader));
+    }
+
+    #[test]
+    fn secret_rotation_parts_are_control_records_with_the_same_header() {
+        let secret = |header: &[u8]| {
+            let mut body = vec![7; ID_LEN];
+            body.extend_from_slice(header);
+            body.extend_from_slice(b"boxes");
+            Draft { kind: Kind::SecretRotation, body, ..draft() }.sign(&key(1))
+        };
+        for (part, parts) in [(0, 1), (7, 8), (31, 32)] {
+            let record = secret(&[part, parts]).unwrap();
+            assert_eq!(Record::decode(&record.encode()).unwrap(), record);
+        }
+        for bad in [&[0, 0][..], &[1, 1], &[0, 33], &[0], &[]] {
+            assert_eq!(secret(bad), Err(RecordError::BadRotationHeader), "header {bad:?}");
+        }
+        assert_eq!(Kind::SecretRotation.max_body(), Kind::LARGEST_BODY);
+        assert!(!Kind::SecretRotation.prunable());
+        let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
+        assert!(!Kind::SecretRotation.allowed_in(channel));
     }
 
     fn message() -> Record {
@@ -1313,5 +1462,175 @@ mod tests {
         let with_deps =
             Draft { deps: vec![RecordId::from_bytes([1; 32])], ..genesis_draft(&key(1), [0; 16]) };
         assert_eq!(with_deps.sign(&key(1)), Err(RecordError::GenesisWithDeps));
+    }
+
+    /// The first code no kind uses yet.
+    const NEXT_CODE: u16 = Kind::ALL.len() as u16 + 1;
+
+    /// The wire form of a record with kind `code`, laid out and signed the
+    /// way a newer build would write it.
+    fn unknown_bytes(
+        signer: &SigningKey,
+        scope: Scope,
+        deps: &[RecordId],
+        code: u16,
+        body: &[u8],
+    ) -> Vec<u8> {
+        unknown_bytes_with(signer, scope, deps, &[], code, body)
+    }
+
+    fn unknown_bytes_with(
+        signer: &SigningKey,
+        scope: Scope,
+        deps: &[RecordId],
+        auth_deps: &[RecordId],
+        code: u16,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let header = Header {
+            server: ServerId::from_bytes([1; 32]),
+            scope,
+            author: PublicKey(signer.verifying_key().to_bytes()),
+            seq: 3,
+            deps,
+            auth_deps,
+            ts: 1_700_000_000_000,
+            code,
+        };
+        let sig = signer.sign(&header.signing_message(body.len(), &body_hash(body))).to_bytes();
+        let mut out = Vec::new();
+        header.encode(&mut out);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(&sig);
+        out
+    }
+
+    fn some_deps() -> Vec<RecordId> {
+        vec![RecordId::from_bytes([3; 32]), RecordId::from_bytes([9; 32])]
+    }
+
+    #[test]
+    fn a_signed_record_of_an_unknown_kind_is_reported() {
+        let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
+        for scope in [Scope::Control, channel] {
+            for len in [0, 10, Kind::LARGEST_BODY] {
+                let bytes = unknown_bytes(&key(2), scope, &some_deps(), NEXT_CODE, &vec![7; len]);
+                assert_eq!(Record::decode(&bytes), Err(RecordError::UnknownKind(NEXT_CODE)));
+                assert_eq!(
+                    Record::peek_unknown(&bytes),
+                    Some(UnknownRecord {
+                        server: ServerId::from_bytes([1; 32]),
+                        scope,
+                        author: PublicKey(key(2).verifying_key().to_bytes()),
+                        code: NEXT_CODE,
+                    })
+                );
+            }
+        }
+        let far = unknown_bytes(&key(2), Scope::Control, &[], u16::MAX, b"x");
+        assert_eq!(Record::peek_unknown(&far).map(|unknown| unknown.code), Some(u16::MAX));
+    }
+
+    #[test]
+    fn a_known_kind_is_not_reported() {
+        let record = draft().sign(&key(1)).unwrap();
+        assert_eq!(Record::peek_unknown(&record.encode()), None);
+        // Even when it breaks its kind's own rules: decode reports those.
+        let post = Kind::Post.code();
+        let message_in_control = unknown_bytes(&key(1), Scope::Control, &[], post, b"hi");
+        assert!(Record::decode(&message_in_control).is_ok());
+        let code = Kind::Message.code();
+        let message_in_control = unknown_bytes(&key(1), Scope::Control, &[], code, b"hi");
+        assert_eq!(
+            Record::decode(&message_in_control),
+            Err(RecordError::KindNotAllowedInScope(Kind::Message))
+        );
+        assert_eq!(Record::peek_unknown(&message_in_control), None);
+    }
+
+    #[test]
+    fn anything_decode_would_reject_otherwise_is_not_reported() {
+        let bytes = unknown_bytes(&key(2), Scope::Control, &some_deps(), NEXT_CODE, b"newer");
+        assert!(Record::peek_unknown(&bytes).is_some());
+
+        let mut bad_sig = bytes.clone();
+        *bad_sig.last_mut().unwrap() ^= 1;
+        assert_eq!(Record::peek_unknown(&bad_sig), None);
+
+        // Signed by someone else than the author it names.
+        let mut swapped = bytes.clone();
+        let author_at = 1 + ID_LEN + 1;
+        swapped[author_at..author_at + ID_LEN].copy_from_slice(&key(3).verifying_key().to_bytes());
+        assert_eq!(Record::peek_unknown(&swapped), None);
+
+        let oversize = unknown_bytes(
+            &key(2),
+            Scope::Control,
+            &[],
+            NEXT_CODE,
+            &vec![0; Kind::LARGEST_BODY + 1],
+        );
+        assert_eq!(Record::peek_unknown(&oversize), None);
+        let mut huge = bytes.clone();
+        huge.resize(MAX_RECORD_BYTES + 1, 0);
+        assert_eq!(Record::peek_unknown(&huge), None);
+
+        let unsorted: Vec<RecordId> = some_deps().into_iter().rev().collect();
+        let unsorted = unknown_bytes(&key(2), Scope::Control, &unsorted, NEXT_CODE, b"newer");
+        assert_eq!(Record::peek_unknown(&unsorted), None);
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(Record::peek_unknown(&trailing), None);
+        assert_eq!(Record::peek_unknown(&bytes[..bytes.len() - 1]), None);
+
+        let mut version = bytes.clone();
+        version[0] = VERSION + 1;
+        assert_eq!(Record::peek_unknown(&version), None);
+
+        // A scope tag this build doesn't know: its layout can't be trusted.
+        let mut scope = bytes.clone();
+        scope[1 + ID_LEN] = 2;
+        assert_eq!(Record::peek_unknown(&scope), None);
+
+        // Control records can't carry auth deps, whatever their kind.
+        let auth = [RecordId::from_bytes([5; 32])];
+        let with_auth = unknown_bytes_with(&key(2), Scope::Control, &[], &auth, NEXT_CODE, b"x");
+        assert_eq!(Record::peek_unknown(&with_auth), None);
+        let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
+        let in_channel = unknown_bytes_with(&key(2), channel, &[], &auth, NEXT_CODE, b"x");
+        assert!(Record::peek_unknown(&in_channel).is_some());
+    }
+
+    #[test]
+    fn peeking_at_hostile_bytes_never_panics() {
+        let bytes = unknown_bytes(&key(2), Scope::Control, &some_deps(), NEXT_CODE, b"newer");
+        let reported = Record::peek_unknown(&bytes);
+        for cut in 0..bytes.len() {
+            assert_eq!(Record::peek_unknown(&bytes[..cut]), None);
+        }
+        for at in 0..bytes.len() {
+            for flip in [1u8, 0x80, 0xff] {
+                let mut mutated = bytes.clone();
+                mutated[at] ^= flip;
+                let peeked = Record::peek_unknown(&mutated);
+                assert!(peeked.is_none() || peeked == reported, "byte {at} flip {flip}");
+            }
+        }
+        // Pseudo-random inputs (xorshift, fixed seed).
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..2000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = (state % 600) as usize;
+            let noise: Vec<u8> =
+                (0..len).map(|i| (state.rotate_left(i as u32 % 64) >> (i % 8 * 8)) as u8).collect();
+            let mut prefixed = bytes[..bytes.len().min(len)].to_vec();
+            prefixed.extend_from_slice(&noise);
+            assert_eq!(Record::peek_unknown(&noise), None);
+            assert_eq!(Record::peek_unknown(&prefixed), None);
+        }
     }
 }

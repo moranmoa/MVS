@@ -501,6 +501,9 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `lv:N` is per release, not per feature (Tech Lead on #590). It means "this core decodes every kind introduced up to level N".
     - The first release that ships a new kind posts the next level, and every kind that release introduces gates on `lv >= N`.
     - The kind codes are fixed: `SecretRotation` (T17) is 25 and `ServerAgeLimit` (G-52) is 26. If both ship in one release, both gate on that release's level.
+- Server age limit (G-52, planned; design `docs/design/server-age-limit.md`, Security Lead on #590):
+  - After a raise to 18+, every channel's readers are members ∩ adults. The receiver rule's `reaches` must cover the later of the server-wide raise and the channel's own 18+ edit.
+  - **Accepted residual:** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata. T17's leave rotation never fires for it. Such members show as not adult to the owner and admins, who can kick them, and the kick rotates the secret.
 - 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
   - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
   - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.

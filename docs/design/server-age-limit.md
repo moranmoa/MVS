@@ -1,6 +1,6 @@
 # Design note: changing a server's age limit (G-52), core
 
-Status: draft for Security Lead and Tech Lead review; no code until then. Author: dev-identity. UX spec: `docs/ux/specs/server-age-limit.md` (#578, voice-c builds the UI).
+Status: approved by the Security Lead (#590, answers and residual below); kind code and level rule from the Tech Lead; the Tech Lead's full review pending. Author: dev-identity. UX spec: `docs/ux/specs/server-age-limit.md` (#578, voice-c builds the UI).
 
 ## Today
 - The limit (`none`, `16+`, `18+`) lives only in the genesis body (`GenesisBody.age_restriction`, JSON), so it can't change.
@@ -59,7 +59,11 @@ Status: draft for Security Lead and Tech Lead review; no code until then. Author
   - `too-young`, `not-allowed`, the `update-needed` gate, `countAgeAffected`, no-op, `server.updated`;
   - the join preview and `AgeBlocked` follow the effective limit.
 
-## Questions for review
-1. **SL:** is the server-wide receiver rule (step 2) needed, or is the key change (step 1) enough? I propose both, to match B7-k.
-2. **SL/PO:** should a raise also rotate at once from the owner's own core, rather than at the next moderator sync? I propose yes: the owner's `setAgeRestriction` runs the re-key in the same call.
+## Residual (Security Lead on #590)
+- **The risk.** A minor's core that refuses to leave after a raise (modified, or old) keeps the server's sync secret. It can read the plaintext control log and metadata. A leave never happens, so T17's leave rotation never fires.
+- **Mitigation.** After an accepted raise to 18+, every current member who isn't in `State.adults` and hasn't left shows to the owner and admins as **not adult**. This uses the `countAgeAffected` source, and `listMembers` marks them. The owner can then kick them, and a kick rotates the secret (T17). Channel keys already exclude them (step 1).
+
+## Questions for review (answered)
+1. **SL, answered on #590:** yes, both. The keys stop the reading, and the server-wide receiver rule stops posting with stale deps. When a server-wide raise and a channel's own 18+ edit both exist, `reaches` must cover **the later of the two**.
+2. **SL, answered on #590:** yes. The owner's `setAgeRestriction` re-keys in the same call. That helps availability, and the `Required` path already prevents sealing under a stale key.
 3. **TL, answered on #590:** kind 26 (T17 keeps 25). The gate is the level of the release that ships this kind.

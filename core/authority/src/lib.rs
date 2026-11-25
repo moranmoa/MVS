@@ -292,9 +292,7 @@ impl Action {
                 [vec![0], serde_json::to_vec(&json).expect("a JSON object")].concat()
             }
             Action::ServerIcon { icon: None } => vec![0, 0],
-            Action::ServerIcon { icon: Some(icon) } => {
-                [vec![0, icon.kind.byte()], icon.bytes.clone()].concat()
-            }
+            Action::ServerIcon { icon: Some(icon) } => [vec![0, icon.kind.byte()], icon.bytes.clone()].concat(),
             Action::ServerDescription { text } => [vec![0], text.as_bytes().to_vec()].concat(),
             Action::SecretRotation { rotation, part, parts, sealed } => {
                 [rotation.as_bytes().as_slice(), &[*part, *parts], sealed].concat()
@@ -660,9 +658,7 @@ pub fn server_description_ok(text: &str) -> bool {
     lines.len() <= MAX_SERVER_DESCRIPTION_LINES
         && lines.windows(2).all(|w| !(w[0].is_empty() && w[1].is_empty()))
         && lines.iter().all(|line| {
-            line.trim_end() == *line
-                && display_text_ok(line)
-                && !line.contains(['\u{2028}', '\u{2029}'])
+            line.trim_end() == *line && display_text_ok(line) && !line.contains(['\u{2028}', '\u{2029}'])
         })
 }
 
@@ -1142,9 +1138,9 @@ fn permitted(view: &impl View, record: &Record, action: &Action) -> bool {
         Action::AgeClaim { .. } => view.is_member(author),
         // Renaming is the owner's or an admin's.
         // G-51: the icon and description too.
-        Action::ServerEdit { .. }
-        | Action::ServerIcon { .. }
-        | Action::ServerDescription { .. } => author_role >= Role::Admin,
+        Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+            author_role >= Role::Admin
+        }
         // T17: who may rotate a channel key may rotate the server secret.
         Action::SecretRotation { .. } => author_role >= Role::Moderator && view.is_member(author),
         // A member leaves, but the owner can't (no ownership transfer in v1),

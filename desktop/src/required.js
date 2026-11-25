@@ -51,8 +51,11 @@ const READ_ONLY = Object.freeze(
     // A local wipe, applied before any network (SL): someone stuck on an old
     // version must still be able to remove their data from this computer.
     'signOut',
-    // G-48: the reports this computer holds (read only).
+    // G-48: the reports this computer holds; dismissing one is a local flag,
+    // and the evidence is a stored box opened with a key held here (SL).
     'listReports',
+    'dismissReport',
+    'getReportEvidence',
   ]),
 );
 
@@ -114,11 +117,8 @@ const NOT_READ_ONLY = Object.freeze(
     'sendSignal',
     'setMemberRelay',
     'setMemberRelayCap',
-    // G-48 reports: a report is a signed record; dismissing one and the
-    // evidence fetch are kept off until confirmed local-only (SL to check).
+    // G-48: a report is a signed record.
     'reportContent',
-    'dismissReport',
-    'getReportEvidence',
   ]),
 );
 

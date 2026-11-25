@@ -376,8 +376,8 @@ async function joinViaUi() {
   joinedAt = Date.now();
   await check('V6.3', 'after OK: joined, the notice is remembered, focus on Mute', async () => {
     await page.locator('.call-bar').waitFor({ timeout: 15_000 });
-    const key = await page.evaluate(() => localStorage.getItem('mvs.notices.voiceIp.v1'));
-    if (key !== '1') throw new Error(`mvs.notices.voiceIp.v1 = ${key}`);
+    const key = await page.evaluate(() => localStorage.getItem('mvs.notices.voiceIp.v2'));
+    if (key !== '1') throw new Error(`mvs.notices.voiceIp.v2 = ${key}`);
     const focused = await page.evaluate(() => document.activeElement?.classList.contains('call-mute'));
     return focused ? 'focus on Mute' : 'joined (focus not on Mute)';
   });
@@ -805,6 +805,40 @@ try {
       });
     }
     await take('ptt-done');
+  }
+
+  // #513 (engine lift): a call survives opening Home. A opens Home; the call
+  // stays up and B still hears A; back on the server it's the same call.
+  if (ROLE === 'a') {
+    await page.locator('.rail-home').first().click();
+    const onHome = await check('G78H.1', 'A opens Home in a call: the connection stays up and A still hears B', async () => {
+      await page.getByRole('heading', { level: 1 }).first().waitFor({ timeout: 10_000 }).catch(() => {});
+      await sleep(1500);
+      const e = await energyOver(3000);
+      if (!(await live()).some((x) => x.state === 'connected')) throw new Error('no connected peer on Home');
+      if (!(e > 0)) throw new Error(`no audio energy from B on Home: ${e}`);
+      return `energy ${e.toExponential(2)} in 3 s on Home`;
+    });
+    put('on-home', { onHome });
+    await take('home-heard');
+    const rail = page.locator('nav').filter({ has: page.getByRole('button', { name: new RegExp(`^${SERVER}`) }) }).first();
+    await rail.getByRole('button', { name: new RegExp(`^${SERVER}`) }).click();
+    await check('G78H.2', 'back on the server: the call bar is up and both are still in the roster', async () => {
+      await page.locator('.call-bar .call-leave').waitFor({ timeout: 10_000 });
+      await until('2 in roster', () => rosterHas([NAME.a, NAME.b]), 10_000);
+      return 'same call';
+    });
+    put('home-back');
+  } else {
+    await take('on-home');
+    await sleep(1500);
+    const e = await energyOver(3000);
+    await check('G78H.3', 'B still hears A while A is on Home', () => {
+      if (!(e > 0)) throw new Error(`no audio energy from A: ${e}`);
+      return `energy ${e.toExponential(2)} in 3 s`;
+    });
+    put('home-heard');
+    await take('home-back');
   }
 
   // Leave: B leaves first; then A leaves while B watches from outside the call.

@@ -281,7 +281,7 @@ describe('G-48 follow-ups', () => {
       const me = (await core.getIdentity())!.id;
       const server = (await core.listServers()).find((s) => s.ownerId === me)!;
       await act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id, reason: 'minor', text: 'secret note' }) }));
-      expect(notify).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
       const n = (notify.mock.calls[0] as unknown as [{ title: string; body: string }])[0];
       expect(n.title).toBe(server.name);
       expect(n.body).toBe(`New report in \u2068${server.name}\u2069`);
@@ -353,7 +353,7 @@ describe('G-48 (PO on #567): report notifications through a mute, with their own
       localStorage.setItem('mvs.mute.v1', JSON.stringify({ ['server:' + id]: Date.now() + 3_600_000 })),
     );
     await report();
-    expect(notify).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
   });
 
   it('the level "none" alone: still notifies', async () => {
@@ -361,7 +361,7 @@ describe('G-48 (PO on #567): report notifications through a mute, with their own
     const id = (await core.listServers())[0]!.id;
     const { notify, report } = await owned(undefined, { notify: { ...defaultNotifyPrefs(), servers: { [id]: { level: 'none' } } } });
     await report();
-    expect(notify).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
   });
 
   it('"Report notifications" off for the server: none', async () => {

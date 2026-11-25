@@ -63,6 +63,9 @@ export function useOpenReports(): Readonly<Record<Id, number>> {
 
 /** G-48 (PO): at most one report notification per server this often; more are grouped into one. */
 export const REPORT_NOTIFY_GAP_MS = 60_000;
+/** A report that arrives before its server's channels are loaded waits for them, this often, this many times. */
+const CHANNEL_WAIT_MS = 250;
+const CHANNEL_WAIT_TRIES = 40;
 
 /**
  * G-48 (PO decision on #567): a desktop notification when a report reaches
@@ -83,13 +86,19 @@ export function useReportNotifications() {
   const waiting = useRef(new Map<Id, { count: number; timer: ReturnType<typeof setTimeout> }>());
   useEffect(() => () => waiting.current.forEach((w) => clearTimeout(w.timer)), []);
 
-  const send = (serverId: Id, count: number) => {
+  const send = (serverId: Id, count: number, tries = 0) => {
     const notify = shellNotify();
     const s = store.getState();
     const server = s.servers.find((x) => x.id === serverId);
     const channel = s.channels[serverId]?.[0];
     const { intl, prefs } = now.current;
-    if (!notify || !server || !channel || !prefs.desktop || !reportsOn(prefs, serverId)) return;
+    if (!notify || !prefs.desktop || !reportsOn(prefs, serverId)) return;
+    // Right after start-up the server's channels may not be loaded yet (the
+    // click opens its first channel): wait a little rather than drop it.
+    if (!server || !channel) {
+      if (tries < CHANNEL_WAIT_TRIES) setTimeout(() => send(serverId, count, tries + 1), CHANNEL_WAIT_MS);
+      return;
+    }
     last.current.set(serverId, Date.now());
     void notify({
       title: server.name,

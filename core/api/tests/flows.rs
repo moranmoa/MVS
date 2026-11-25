@@ -607,7 +607,9 @@ fn dispatcher_errors() {
         serde_json::from_str(&peer.core.handle(r#"{"cmd":"getAppInfo"}"#)).unwrap();
     assert_eq!(
         info["ok"],
-        serde_json::json!({ "version": "0.1.0-alpha", "updateChannel": "stable", "relayOnly": false })
+        // `updateRequired` is always present: `null` unless a required
+        // update is pending (the contract #586 reads).
+        serde_json::json!({ "version": "0.1.0-alpha", "updateChannel": "stable", "relayOnly": false, "updateRequired": null })
     );
     // A bad argument is a bad request, not a change.
     assert_eq!(error(r#"{"cmd":"setRelayOnly","args":{"on":"yes"}}"#), "bad-request");

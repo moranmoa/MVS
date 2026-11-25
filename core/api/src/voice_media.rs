@@ -56,6 +56,11 @@ impl MediaGate {
         }
     }
 
+    /// The call frames may go to and come from now.
+    pub fn current(&self) -> Option<[u8; 16]> {
+        *self.call.lock().expect("not poisoned")
+    }
+
     /// Frames dropped by the fast path (malformed, or the gate closed).
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)

@@ -2184,6 +2184,38 @@ impl Core {
     }
 
     /// `leaveCall`: idempotent.
+    /// G-81: a voice frame the node passed (gate, caps, sequence): out as
+    /// `voice.frame`, only while it is still my call (a frame overtaking
+    /// `leaveCall` is a no-op). Never takes the core's lock.
+    pub fn voice_media_frame(&self, from: PublicKey, frame: sync::VoiceFrame) {
+        if self.media.current() != Some(frame.call_id) {
+            return;
+        }
+        use base64::Engine as _;
+        self.ports.events.emit(&Event::VoiceFrame {
+            call_id: hex::encode(frame.call_id),
+            from: model::hex_id(from.as_bytes()),
+            seq: frame.seq,
+            ts: frame.ts,
+            data: base64::engine::general_purpose::STANDARD.encode(&frame.opus),
+        });
+    }
+
+    /// G-81: how my frames reach `peer` changed (`CallParticipant.path`).
+    pub fn voice_media_path(&self, peer: PublicKey, path: sync::VoicePath) {
+        let kind = match path {
+            sync::VoicePath::Lan => VoicePathKind::Lan,
+            sync::VoicePath::Direct => VoicePathKind::Direct,
+            sync::VoicePath::Circuit => VoicePathKind::Circuit,
+            sync::VoicePath::MemberCircuit => VoicePathKind::MemberCircuit,
+            sync::VoicePath::None => VoicePathKind::None,
+        };
+        let _ = self.voice(|calls, ctx, _| {
+            calls.set_path(ctx, peer, kind);
+            Ok(())
+        });
+    }
+
     /// G-81 `setCallWebrtcPeers({ identities })`: the call peers the UI has a
     /// live LAN WebRTC connection to. The core sends voice frames over
     /// libp2p to every other participant; the UI can only exclude, never

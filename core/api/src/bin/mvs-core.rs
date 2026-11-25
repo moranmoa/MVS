@@ -234,6 +234,9 @@ fn main() -> ExitCode {
     // delivery thread ends with the node.
     if let Some(net) = &sync {
         core.set_voice(net.clone());
+        if let Some(media) = net.take_media() {
+            std::thread::spawn(move || api::syncnet::deliver_media(media, core));
+        }
         if let Some(signals) = net.take_voice() {
             std::thread::spawn(move || api::syncnet::deliver_voice(signals, core));
         }

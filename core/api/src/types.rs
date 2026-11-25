@@ -596,6 +596,11 @@ pub enum Event {
     /// answers come only verified (see `voice`), so the flag is always true.
     #[serde(rename = "call.signal", rename_all = "camelCase")]
     CallSignal { from: Id, kind: SignalKind, payload: String, fingerprint_verified: bool },
+    /// G-81: a voice frame from a participant of my current call, over
+    /// libp2p (#509 §2.3). `callId` 32 hex, `from` the sender's user ID,
+    /// `data` standard base64 of at most 400 bytes (empty: a DTX gap).
+    #[serde(rename = "voice.frame", rename_all = "camelCase")]
+    VoiceFrame { call_id: String, from: Id, seq: u32, ts: u32, data: String },
     /// Voice rooms: a server's live rooms changed (created, gone, join,
     /// leave, mute, timeout, kick, rename, limit), mine or not: the whole
     /// list, oldest first. At most one per server per sync round, only

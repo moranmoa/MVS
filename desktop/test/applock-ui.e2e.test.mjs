@@ -20,7 +20,7 @@ const LOCK_FILE = join(CORE_DIR, 'fake-applock.json');
 let app;
 let page;
 
-const until = async (cond, ms = 8_000) => {
+const until = async (cond, ms = 15_000) => {
   const end = Date.now() + ms;
   while (!(await cond().catch(() => false))) {
     if (Date.now() > end) return false;
@@ -79,8 +79,8 @@ test('path A: a wrong passcode is said and cleared; the right one reloads unlock
   await field().fill('2468');
   await submit().click();
   assert.ok(await until(async () => !(await url()).includes('locked')), await url());
-  await page.waitForLoadState('domcontentloaded');
-  assert.equal((await lockState()).locked, false);
+  // The reload may still be under way: wait for the new page's answer.
+  assert.ok(await until(async () => (await lockState()).locked === false), 'unlocked after the reload');
 });
 
 test('settings: lock:config shows only the settings; set/clear never go through core:invoke', async () => {
@@ -123,9 +123,8 @@ test('path B: Ctrl+L in a call: the overlay, the content unmounted, set refused,
   // Leave: the call ends, main reloads into the plain lock screen.
   await page.locator('button.lock-leave').click();
   assert.ok(await until(async () => (await url()).endsWith('?locked')), await url());
-  await page.waitForLoadState('domcontentloaded');
-  await field().waitFor({ timeout: 10_000 });
-  assert.equal((await lockState()).path, 'A');
+  await field().waitFor({ timeout: 15_000 });
+  assert.ok(await until(async () => (await lockState()).path === 'A'), 'path A after the reload');
   assert.equal(await page.locator('.lock-call').count(), 0);
 });
 

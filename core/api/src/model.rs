@@ -198,11 +198,15 @@ pub(crate) const ADULT_KEYS_CAP: &str = "adult-keys-v1";
 /// records. Older cores refuse an unknown kind and stall the control log
 /// behind it, so nobody sets either until every member posts this.
 pub(crate) const SERVER_META_CAP: &str = "server-meta-v1";
+/// T17: the first level (Tech Lead on #590): this version decodes every
+/// kind up to level 1, `SecretRotation` (25) included. A gate checks
+/// `lv >= k`; the next release that adds a kind posts `lv:2`.
+pub(crate) const LEVEL_CAP: &str = "lv:1";
 /// Every cap this version posts, and the only names `getUpdateNeeded`
 /// takes. Frozen after server-meta-v1: later gates use one `lv:N` cap
 /// (Tech Lead on #555).
-pub(crate) const CAPS: [&str; 5] =
-    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP];
+pub(crate) const CAPS: [&str; 6] =
+    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP, LEVEL_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {
@@ -1091,7 +1095,7 @@ mod tests {
     fn every_cap_is_posted_once() {
         let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();
         assert_eq!(unique.len(), CAPS.len(), "a cap twice");
-        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP] {
+        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP, LEVEL_CAP] {
             assert!(CAPS.contains(&cap), "{cap} missing");
         }
     }

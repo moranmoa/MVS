@@ -28,11 +28,12 @@ pub mod invite;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use groupkeys::{ChannelKeys, Error, MemberSecret};
+use groupkeys::{ChannelKeys, Error, MemberSecret, Part, Rotation};
 use rand_core::OsRng;
 use records::{ChannelId, Kind, PublicKey, Record, RecordId, Scope, ServerId};
 
-use crate::ports::{CipherError, CipherOutcome, GroupCipher, Opened};
+use crate::ports::{CipherError, CipherOutcome, GroupCipher, Opened, OpenedSecret};
+use zeroize::Zeroizing;
 
 /// The real group cipher. Starts locked: everything but bookkeeping returns
 /// `Unavailable` until [`Self::unlock`].
@@ -254,6 +255,47 @@ impl GroupCipher for GroupKeysCipher {
         let me = state.secret.as_ref().ok_or(CipherError::Unavailable)?.public();
         let keys = state.channel(server, channel)?;
         keys.rotate(me, members, &mut OsRng).map_err(cipher_error)
+    }
+
+    fn seal_secret(
+        &self,
+        server: ServerId,
+        epoch: u64,
+        prev: Option<RecordId>,
+        recipients: &BTreeSet<PublicKey>,
+    ) -> Result<(Vec<Vec<u8>>, Zeroizing<[u8; 32]>), CipherError> {
+        let me = self.state().secret.as_ref().ok_or(CipherError::Unavailable)?.public();
+        let (parts, secret) =
+            Rotation::create_secret(server, me, epoch, prev, recipients, &mut OsRng).map_err(cipher_error)?;
+        Ok((parts, Zeroizing::new(*secret.as_bytes())))
+    }
+
+    fn open_secret(&self, server: ServerId, parts: &[Record]) -> Result<OpenedSecret, CipherError> {
+        let decoded = parts
+            .iter()
+            .map(|r| {
+                if r.kind() != Kind::SecretRotation || r.server() != server {
+                    return Err(CipherError::Rejected);
+                }
+                // The records header (rotation, part, parts) comes first;
+                // groupkeys reads the whole body.
+                Part::decode_secret(server, r.author(), r.body()).map_err(cipher_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rotation = Rotation::assemble(server, decoded).map_err(cipher_error)?;
+        let member = self.state().secret.clone();
+        let secret = match member {
+            Some(member) if rotation.is_recipient(&member.public()) => {
+                Some(Zeroizing::new(*rotation.unwrap_secret(&member).map_err(cipher_error)?.as_bytes()))
+            }
+            _ => None,
+        };
+        Ok(OpenedSecret {
+            rotation: rotation.id(),
+            epoch: rotation.epoch(),
+            recipients: rotation.recipients().copied().collect(),
+            secret,
+        })
     }
 }
 

@@ -398,6 +398,10 @@ struct Inner {
     /// kind this version doesn't know (`ServerSummary.updateNeeded`). In
     /// memory only, so a restart (after an update) clears it.
     update_needed: BTreeSet<ServerId>,
+    /// T17: whether this core writes secret rotations. Off until the release
+    /// that requires updating (Tech Lead on #592): an older core refuses kind 25
+    /// and stalls on the rest of the control log.
+    write_secret_rotation: bool,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -510,6 +514,15 @@ struct PendingJoin {
 
 /// Events collected while the lock is held, emitted after it is released.
 type Events = Vec<Event>;
+
+/// T17: whether this release writes `SecretRotation` records. It flips with
+/// the release that requires updating; reading them is always on.
+const WRITE_SECRET_ROTATION: bool = false;
+
+/// T17: the rotation whose secret this device moved to, per server.
+fn secret_rotation_key(server: ServerId) -> String {
+    format!("secret-rotation/{}", hex::encode(server.as_bytes()))
+}
 
 fn vault_error(e: VaultError) -> CoreError {
     match e {
@@ -638,6 +651,7 @@ impl Core {
             join_key_wait: HashMap::new(),
             adult_keys_warned: HashSet::new(),
             update_needed: BTreeSet::new(),
+            write_secret_rotation: WRITE_SECRET_ROTATION,
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -2104,6 +2118,14 @@ impl Core {
                     });
                 }
             }
+            // T17 (PO on #557): a kick rotates the server secret at once.
+            // The kick stands even if the rotation fails; the sync round
+            // retries it.
+            if matches!(action, Action::Kick { .. }) {
+                if let Err(e) = inner.apply_secret_rotation(ports, server, events) {
+                    eprintln!("mvs-core: the server secret wasn't rotated after a kick: {:?}", e.code);
+                }
+            }
             Ok(record.id())
         })
     }
@@ -2709,6 +2731,13 @@ impl Core {
             .map(|due| due.max(REKEY_WAKE_FLOOR))
     }
 
+    /// T17, tests only: write secret rotations before the release that
+    /// requires updating turns them on for everyone.
+    #[doc(hidden)]
+    pub fn enable_secret_rotation_writes(&self) {
+        self.lock().write_secret_rotation = true;
+    }
+
     /// Rust addition (`syncNow`): pulls every server's records from the
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
@@ -2812,6 +2841,12 @@ impl Core {
                 // B7-k K2: owners and admins learn when older members would
                 // key an 18+ channel for minors too.
                 let _ = inner.adult_keys_notice(server, me, events);
+                // T17: move to a newer sync secret sealed for me, and rotate
+                // as a rotator when a removal calls for it. Never aborts the
+                // round; the next one retries.
+                if let Err(e) = inner.apply_secret_rotation(ports, server, events) {
+                    eprintln!("mvs-core: the server secret rotation wasn't applied: {:?}", e.code);
+                }
                 let after = inner.view(server)?;
                 if after.is_kicked(&me) {
                     inner.join_waiting.remove(&server);
@@ -4010,6 +4045,148 @@ impl Inner {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let key = *me.identity.storage_key().expose_secret();
         self.db.save_server_secret(&key, server, secret)
+    }
+
+    // ---- T17: server secret rotation (docs/design/server-secret-rotation.md)
+
+    /// The latest complete secret rotation authority accepts, assembled:
+    /// accepted parts grouped by rotation (one author, every part, no gaps,
+    /// SL on #592); the group whose last part comes latest in linear order
+    /// that assembles wins. `None` before the first rotation.
+    fn current_secret_rotation(
+        &self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+    ) -> CoreResult<Option<crate::ports::OpenedSecret>> {
+        let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+        let accepted = &log.resolver.state().secret_rotations;
+        if accepted.is_empty() {
+            return Ok(None);
+        }
+        let by_id: HashMap<RecordId, &Record> = log.records.iter().map(|r| (r.id(), r)).collect();
+        // Rotation -> its parts, ordered by where each rotation's latest
+        // part sits in linear order.
+        let mut groups: Vec<(RecordId, Vec<Record>)> = Vec::new();
+        for id in accepted {
+            let Some(record) = by_id.get(id) else { continue };
+            let Some(Action::SecretRotation { rotation, .. }) = Action::from_record(record) else { continue };
+            match groups.iter().position(|(r, _)| *r == rotation) {
+                Some(at) => {
+                    let mut group = groups.remove(at);
+                    group.1.push((*record).clone());
+                    groups.push(group);
+                }
+                None => groups.push((rotation, vec![(*record).clone()])),
+            }
+        }
+        Ok(groups.iter().rev().find_map(|(_, parts)| cipher.open_secret(server, parts).ok()))
+    }
+
+    /// T17: moves to the server's newest sync secret when a rotation sealed
+    /// one for me: stored sealed, sync reopened on it, `server.updated` (the
+    /// invite link changes). Never logs the secret. Then, as a rotator, makes
+    /// a new rotation when the current secret is held by someone no longer a
+    /// member (S2 `Required`) or misses a member (S2 `Add`): see
+    /// [`Self::secret_rotation_due`].
+    fn apply_secret_rotation(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<()> {
+        let current = self.current_secret_rotation(&*ports.cipher, server)?;
+        if let Some(opened) = &current {
+            let marker = secret_rotation_key(server);
+            let seen = self.db.get(&marker)?.is_some_and(|v| v == opened.rotation.as_bytes());
+            if let (false, Some(secret)) = (seen, &opened.secret) {
+                self.save_secret(server, secret)?;
+                self.db.set(&marker, opened.rotation.as_bytes())?;
+                // TODO(T17 S3/S4, dev-sync): keep reading the old secret's
+                // frozen prefix, read-only, for up to 7 days.
+                self.open_sync(ports, server)?;
+                // TODO(T17 S5): re-issue open invites, re-key the backup and
+                // the LAN beacon from the new secret.
+                events.push(Event::ServerUpdated(self.counted_summary(&*ports.cipher, server)?));
+            }
+        }
+        if self.secret_rotation_due(server, current.as_ref())? {
+            self.rotate_secret(ports, server, current.as_ref(), events)?;
+        }
+        Ok(())
+    }
+
+    /// Whether I should rotate `server`'s secret now. Writing is behind
+    /// [`Inner::write_secret_rotation`] (the required-update gate, Tech Lead
+    /// on #592). Only a rotator (moderator or above) does, and to keep
+    /// moderators from all rotating at once: the owner always; anyone else
+    /// only for a removal they signed themselves (their kick).
+    /// - No rotation yet: due once anyone was kicked or left, since everyone
+    ///   who ever had an invite link holds the server's first secret.
+    /// - Otherwise: due when a recipient is no longer a member (S2
+    ///   `Required`), or, for the owner, when a member is missing (S2 `Add`).
+    fn secret_rotation_due(
+        &self,
+        server: ServerId,
+        current: Option<&crate::ports::OpenedSecret>,
+    ) -> CoreResult<bool> {
+        if !self.write_secret_rotation {
+            return Ok(false);
+        }
+        let Some(me) = self.me.as_ref().map(Me::key) else { return Ok(false) };
+        let view = self.view(server)?;
+        let state = &view.state;
+        if state.closed.is_some() || !state.is_member(me) || state.role(me) < authority::Role::Moderator {
+            return Ok(false);
+        }
+        let owner = state.role(me) == authority::Role::Owner;
+        let gone: BTreeSet<PublicKey> = match current {
+            Some(opened) => opened.recipients.iter().filter(|k| !state.members.contains(*k)).copied().collect(),
+            None => {
+                let joined = view.records.iter().filter(|r| r.kind() == records::Kind::Join).map(|r| r.author());
+                joined.chain(state.removed.keys().copied()).filter(|k| !state.members.contains(k)).collect()
+            }
+        };
+        let mine = |target: &PublicKey| {
+            state.removed.get(target).and_then(|kick| view.records.iter().find(|r| r.id() == *kick)).is_some_and(|r| r.author() == me)
+        };
+        if !gone.is_empty() && (owner || gone.iter().any(mine)) {
+            return Ok(true);
+        }
+        let missing = current.is_some_and(|opened| state.members.iter().any(|m| !opened.recipients.contains(m)));
+        Ok(owner && missing)
+    }
+
+    /// T17: seals a fresh secret for the members now (S2) and signs every
+    /// part as its own `SecretRotation`, all or none; then moves to it.
+    fn rotate_secret(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        current: Option<&crate::ports::OpenedSecret>,
+        events: &mut Events,
+    ) -> CoreResult<()> {
+        let members = self.view(server)?.state.members.clone();
+        let (epoch, prev) = match current {
+            Some(opened) => (opened.epoch.checked_add(1).ok_or(ErrorCode::Internal)?, Some(opened.rotation)),
+            None => (0, None),
+        };
+        let (bodies, _secret) =
+            ports.cipher.seal_secret(server, epoch, prev, &members).map_err(|_| ErrorCode::Internal)?;
+        let mut actions = Vec::with_capacity(bodies.len());
+        for body in &bodies {
+            let (rotation, rest) = body.split_at_checked(32).ok_or(ErrorCode::Internal)?;
+            let [part, parts, sealed @ ..] = rest else { return Err(ErrorCode::Internal.into()) };
+            let rotation = RecordId::from_bytes(rotation.try_into().map_err(|_| ErrorCode::Internal)?);
+            actions.push(Action::SecretRotation { rotation, part: *part, parts: *parts, sealed: sealed.to_vec() });
+        }
+        for action in &actions {
+            self.publish_control(ports, server, action)?;
+        }
+        // My own box opens like anyone's: one path for the switch.
+        let current = self.current_secret_rotation(&*ports.cipher, server)?;
+        if let Some(opened) = current.filter(|o| o.secret.is_some()) {
+            let secret = opened.secret.as_ref().expect("checked");
+            self.save_secret(server, secret)?;
+            self.db.set(&secret_rotation_key(server), opened.rotation.as_bytes())?;
+            self.open_sync(ports, server)?;
+            events.push(Event::ServerUpdated(self.counted_summary(&*ports.cipher, server)?));
+        }
+        Ok(())
     }
 
     /// T8-02: a short link for my new invite. A fresh k (kept sealed, S4),

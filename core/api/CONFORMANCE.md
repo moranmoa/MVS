@@ -611,6 +611,22 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `ServerSummary` gains `updateNeeded: boolean` (additive, default false). It turns true when a current member of a server I'm in wrote a validly signed record of a kind this version doesn't know (`records::Record::peek_unknown`): they run a newer version, and mine may miss what it adds. The UI shows an "update to keep up" hint for that server.
   - Sync still refuses that record: it's never stored, forwarded or acked. Anyone else's (a stranger, a kicked member, a broken signature, a server I'm not in) never sets the flag.
   - One `server.updated` when it turns true, then none for further records. In memory only: never cleared by a timer, only by a restart, so it comes back after one only if such a record is seen again.
+- Server secret rotation (T17, `docs/design/server-secret-rotation.md`; step 2b, draft):
+  - **Reading** is always on.
+    - The accepted `SecretRotation` parts are grouped by rotation, and only complete ones count: one author, every part, no gaps.
+    - The complete rotation whose last part is latest in linear order wins.
+    - When it sealed a secret for me, I store it (sealed), reopen sync on it, and send `server.updated`: the invite link carries the new secret.
+    - The secret never appears in a log or an event.
+  - **Writing** waits for the release that requires updating (`WRITE_SECRET_ROTATION`, Tech Lead on #592). Then:
+    - a kick rotates at once, from the kicker's core (PO on #557);
+    - the owner's core rotates whenever the current secret is held by someone who is no longer a member (a kick or a leave: S2 `Required`), or misses a member (S2 `Add`);
+    - a moderator rotates only for their own kick, so moderators don't all rotate at once.
+    - A rotation seals a fresh secret for the current members only (S2).
+  - `lv:1` joins the posted caps: this core decodes every kind up to level 1.
+  - Not yet, still to come in T17:
+    - the old secret's read-only frozen prefix (S3/S4, dev-sync);
+    - re-issued invites with the owner notice, the backup and the LAN beacon key following the rotation (S5);
+    - the 7-day switch window (Q2).
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

@@ -15,7 +15,9 @@ afterEach(() => {
 
 const rail = () => screen.getByRole('navigation', { name: /servers/i });
 const serverButtons = () => [...rail().querySelectorAll<HTMLButtonElement>('button[data-server-id]')];
-const order = () => serverButtons().map((b) => b.title);
+// G-06: the name is the aria-label's first part (no native title next to the tooltip).
+const nameOf = (b: Element | null | undefined) => (b?.getAttribute('aria-label') ?? '').split(', ')[0];
+const order = () => serverButtons().map(nameOf);
 
 async function setup(initialSettings: Settings = en) {
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
@@ -49,7 +51,7 @@ describe('server order in the rail (G-01)', () => {
       fireEvent.keyDown(first, { key: 'ArrowDown', altKey: true, shiftKey: true });
     });
     expect(order()).toEqual([before[1], before[0], ...before.slice(2)]);
-    expect(document.activeElement?.getAttribute('title')).toBe(before[0]);
+    expect(nameOf(document.activeElement)).toBe(before[0]);
     expect(rail().querySelector('[aria-live]')?.textContent).toBe(`⁨${before[0]}⁩ moved to position ⁨2⁩ of ⁨${before.length}⁩`);
     // In the local settings only; a fresh start reads it back from there.
     const ids = serverButtons().map((b) => b.dataset.serverId);

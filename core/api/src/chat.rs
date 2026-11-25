@@ -23,7 +23,7 @@ use authority::{
 use records::{ChannelId, Kind, PublicKey, Record, RecordId, Scope, ServerId, Stub, MAX_DEPS};
 
 use crate::model::Log;
-use crate::ports::{GroupCipher, Opened};
+use crate::ports::{CipherError, GroupCipher, Opened};
 use crate::reaction::{causal_order, Gate, Node, OnMessage, Reaction};
 
 /// The channel records of one server, as `authority` asks about them: full
@@ -92,6 +92,7 @@ impl ChannelGraph for Graph<'_> {
 /// edit replaced its record).
 fn stub_accepted(resolver: &Resolver, stub: &Stub, graph: &Graph) -> bool {
     check_stub(resolver, stub, graph) == Verdict::Accept
+        && adult_ok(resolver, stub.kind(), stub.scope(), stub.author(), stub.auth_deps())
 }
 
 /// The records of `channel`, in the order they were added.
@@ -101,6 +102,67 @@ pub(crate) fn channel_records(log: &Log, channel: ChannelId) -> Vec<Record> {
 
 fn accepted(resolver: &Resolver, record: &Record, graph: &Graph) -> bool {
     check_channel(resolver, record, graph) == Verdict::Accept
+        && adult_ok(resolver, record.kind(), record.scope(), record.author(), record.auth_deps())
+}
+
+/// B7-k, the receiver rule (Tech Lead and Security Lead on #544): in a
+/// channel that is 18+ in my current fold, a Message, MessageEdit or
+/// Reaction counts only if
+/// - (a) its author is an adult at the record's causal position
+///   (`Resolver::adult_at` its `auth_deps`), and
+/// - (b) when its `auth_deps` don't reach the latest edit that made the
+///   channel 18+ (`State.adult_edits`), its author is also an adult now.
+///
+/// A failing record is dropped like a kicked author's: not shown, never
+/// unread, a mention or a notice; it stays in the log. A plain channel (or
+/// one turned plain) has no check. Recomputed on every fold: positions shift
+/// as records land, so nothing is cached per record. Accepted residual
+/// (Security Lead): a former adult whose claim was lowered by a modified
+/// client can still post with stale deps pointing at an adult moment after
+/// the edit; the claim is self-attested anyway (GAP-22).
+fn adult_ok(resolver: &Resolver, kind: Kind, scope: Scope, author: PublicKey, auth_deps: &[RecordId]) -> bool {
+    if !matches!(kind, Kind::Message | Kind::MessageEdit | Kind::Reaction) {
+        return true;
+    }
+    let Scope::Channel(channel) = scope else { return true };
+    let state = resolver.state();
+    if !state.channels.get(&channel).is_some_and(|c| c.adult) {
+        return true;
+    }
+    if resolver.adult_at(author, auth_deps) != Ok(true) {
+        return false;
+    }
+    let reaches = state.adult_edits.get(&channel).is_some_and(|edit| reaches_cached(resolver, *edit, auth_deps));
+    reaches || state.adults.contains(&author)
+}
+
+thread_local! {
+    /// B7-k (Security Lead nit on #551): `reaches` answers by (edit,
+    /// auth_deps), so a fold doesn't walk the control DAG per record. The
+    /// answer is pure ancestry between records already joined: a record
+    /// joins only once its deps have, and `adult_ok` asks only after
+    /// `adult_at` found every dep held. So it never changes. Bounded.
+    static REACHES: std::cell::RefCell<HashMap<(RecordId, Vec<RecordId>), bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Entries the [`REACHES`] memo holds before it starts over.
+const REACHES_MAX: usize = 16_384;
+
+fn reaches_cached(resolver: &Resolver, edit: RecordId, auth_deps: &[RecordId]) -> bool {
+    let key = (edit, auth_deps.to_vec());
+    REACHES.with(|memo| {
+        if let Some(known) = memo.borrow().get(&key) {
+            return *known;
+        }
+        let answer = resolver.reaches(edit, auth_deps);
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= REACHES_MAX {
+            memo.clear();
+        }
+        memo.insert(key, answer);
+        answer
+    })
 }
 
 /// The channels authority knows for `server`: those its accepted
@@ -126,8 +188,13 @@ fn in_known(record: &Record, known: &BTreeSet<ChannelId>) -> bool {
 /// a rotation it already holds is a no-op (`Applied::Duplicate`).
 /// TODO(perf): replay only after an unlock, once the core drives it.
 pub(crate) fn sync_cipher(cipher: &dyn GroupCipher, server: ServerId, log: &Log) {
-    let known = known_channels(server, log.resolver.state());
+    let state = log.resolver.state();
+    let known = known_channels(server, state);
     cipher.set_channels(server, &known);
+    // B7-k: an 18+ channel's key is for the adults among the members only.
+    let adult_channels: BTreeSet<ChannelId> =
+        known.iter().copied().filter(|c| state.channels.get(c).is_some_and(|c| c.adult)).collect();
+    cipher.set_adults(server, &state.adults, &adult_channels);
     let graph = Graph::new(&log.channel, &log.stubs);
     let rotations: Vec<&Record> = log
         .channel
@@ -155,6 +222,45 @@ pub(crate) struct Shown {
     /// G-26: the emoji shown under it and who has each on
     /// (`reaction::OnMessage::shown`); none on a deleted message.
     pub reactions: Vec<(String, Vec<PublicKey>)>,
+    /// A placeholder: the message keeps its place, but its text doesn't
+    /// open here (TODO #21, the PO's table). `text` is empty, with no
+    /// reactions.
+    pub unreadable: Option<Unreadable>,
+}
+
+/// Why a shown message has no text (the PO's placeholder rules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unreadable {
+    /// Sealed under a key this device doesn't hold, by someone who had
+    /// already seen me join (the lost-message P1 residual). Not final: a
+    /// later rotation may open it. Before my join, it stays hidden instead.
+    NoKey,
+    /// Opens only under a rotation authority doesn't accept (#21): shown
+    /// without its author, text or reactions.
+    Untrusted,
+}
+
+/// The control records from my latest `Join` on (it included): a channel
+/// record whose auth deps name one was written by someone who had seen me
+/// join. The server's creator (no `Join`, the genesis author) has them
+/// all. None when I'm unknown or neither. `log.records` is deps-first
+/// (topological), so one pass is enough; were it ever out of order, a
+/// record would only miss the set, so it errs towards hiding (SL on #527).
+pub(crate) fn after_my_join(log: &Log, me: Option<PublicKey>) -> HashSet<RecordId> {
+    let mut after = HashSet::new();
+    let Some(me) = me else { return after };
+    let join = log.records.iter().rev().find(|r| r.kind() == Kind::Join && r.author() == me);
+    let creator = log.records.first().is_some_and(|g| g.kind() == Kind::Genesis && g.author() == me);
+    if join.is_none() && !creator {
+        return after;
+    }
+    let join = join.map(Record::id);
+    for record in &log.records {
+        if join.is_none() || Some(record.id()) == join || record.deps().iter().any(|d| after.contains(d)) {
+            after.insert(record.id());
+        }
+    }
+    after
 }
 
 /// G-26: the reactions of one channel, folded in causal order
@@ -217,21 +323,29 @@ pub(crate) fn reactions(
     folded
 }
 
-/// Opens a message or edit body; `None` unless it opens under an accepted
-/// rotation (#21) as text within `message_text_ok`.
-fn open(
+/// Opens a message or edit body: its text only if it opens under an
+/// accepted rotation (#21) as text within `message_text_ok`. Otherwise
+/// why not: `Some(_)` for a placeholder's reason, `None` for what is never
+/// shown (malformed, or text over the limit).
+fn try_open(
     cipher: &dyn GroupCipher,
     server: ServerId,
     channel: ChannelId,
     author: PublicKey,
     body: &[u8],
-) -> Option<String> {
+) -> Result<String, Option<Unreadable>> {
     match cipher.decrypt(server, channel, author, body) {
         Ok(Opened { plaintext, accepted: true }) => {
-            let text = String::from_utf8(plaintext).ok()?;
-            message_text_ok(&text).then_some(text)
+            let text = String::from_utf8(plaintext).map_err(|_| None)?;
+            if message_text_ok(&text) {
+                Ok(text)
+            } else {
+                Err(None)
+            }
         }
-        _ => None,
+        Ok(Opened { accepted: false, .. }) => Err(Some(Unreadable::Untrusted)),
+        Err(CipherError::NoKey) => Err(Some(Unreadable::NoKey)),
+        Err(_) => Err(None),
     }
 }
 
@@ -249,26 +363,29 @@ pub(crate) fn messages(
     channel: ChannelId,
     log: &Log,
     now: u64,
+    me: Option<PublicKey>,
 ) -> Vec<Shown> {
     if !known_channels(server, log.resolver.state()).contains(&channel) {
         return Vec::new();
     }
     let replaced = Replaced::of(log, channel);
     let graph = Graph::new(&log.channel, &log.stubs);
+    let after = after_my_join(log, me);
+    let seen_join = |auth_deps: &[RecordId]| auth_deps.iter().any(|d| after.contains(d));
     // Full messages, and stubs of messages a delete or edit replaced.
     let full = channel_records(log, channel)
         .into_iter()
         .filter(|r| r.kind() == Kind::Message && accepted(&log.resolver, r, &graph))
-        .map(|r| (Meta::of_record(&r), Some(r)));
+        .map(|r| (Meta::of_record(&r), seen_join(r.auth_deps()), Some(r)));
     let pruned = log
         .stubs
         .values()
         .filter(|s| s.scope() == Scope::Channel(channel) && s.kind() == Kind::Message)
         .filter(|s| stub_accepted(&log.resolver, s, &graph))
-        .map(|s| (Meta::of_stub(s), None));
+        .map(|s| (Meta::of_stub(s), seen_join(s.auth_deps()), None));
     let mut shown: Vec<Shown> = full
         .chain(pruned)
-        .filter_map(|(meta, record)| {
+        .filter_map(|(meta, seen_join, record)| {
             if replaced.deleted.contains(&meta.id) {
                 return Some(Shown {
                     record: meta,
@@ -276,22 +393,59 @@ pub(crate) fn messages(
                     edited_at: None,
                     deleted: true,
                     reactions: Vec::new(),
+                    unreadable: None,
                 });
             }
+            // The PO's rules: untrusted always gets a placeholder; no key
+            // only when the author had seen me join (else hidden, as all
+            // history from before my join).
+            let placeholder =
+                |why: Option<Unreadable>| why.filter(|w| *w != Unreadable::NoKey || seen_join);
+            let mut why = None;
             if let Some(edit) = replaced.latest_edit.get(&meta.id) {
-                let text = open(cipher, server, channel, edit.author(), edit.body().get(32..)?)?;
-                return Some(Shown {
+                let opened = edit
+                    .body()
+                    .get(32..)
+                    .ok_or(None)
+                    .and_then(|body| try_open(cipher, server, channel, edit.author(), body));
+                match opened {
+                    Ok(text) => {
+                        return Some(Shown {
+                            record: meta,
+                            text,
+                            edited_at: Some(edit.ts()),
+                            deleted: false,
+                            reactions: Vec::new(),
+                            unreadable: None,
+                        })
+                    }
+                    // An edit that doesn't open: the original, if it does.
+                    Err(e) => why = e,
+                }
+            }
+            let opened = match &record {
+                Some(record) => try_open(cipher, server, channel, record.author(), record.body()),
+                // Pruned: only its edit had a text, and that didn't open.
+                None => Err(why),
+            };
+            match opened {
+                Ok(text) => Some(Shown {
                     record: meta,
                     text,
-                    edited_at: Some(edit.ts()),
+                    edited_at: None,
                     deleted: false,
                     reactions: Vec::new(),
-                });
+                    unreadable: None,
+                }),
+                Err(e) => placeholder(e).map(|why| Shown {
+                    record: meta,
+                    text: String::new(),
+                    edited_at: None,
+                    deleted: false,
+                    reactions: Vec::new(),
+                    unreadable: Some(why),
+                }),
             }
-            // Neither deleted nor edited: only a full record has a text.
-            let record = record?;
-            let text = open(cipher, server, channel, record.author(), record.body())?;
-            Some(Shown { record: meta, text, edited_at: None, deleted: false, reactions: Vec::new() })
         })
         .collect();
     shown.sort_by_key(|s| (s.record.ts(), s.record.id()));
@@ -300,8 +454,12 @@ pub(crate) fn messages(
     if !log.channel.iter().any(|r| r.kind() == Kind::Reaction && r.scope() == scope) {
         return shown;
     }
-    let live: HashSet<RecordId> =
-        shown.iter().filter(|s| !s.deleted).map(|s| s.record.id()).collect();
+    // Placeholders take no reactions.
+    let live: HashSet<RecordId> = shown
+        .iter()
+        .filter(|s| !s.deleted && s.unreadable.is_none())
+        .map(|s| s.record.id())
+        .collect();
     let folded = reactions(cipher, server, channel, log, &live, now);
     for s in &mut shown {
         if let Some(on) = folded.on.get(&s.record.id()) {
@@ -446,4 +604,122 @@ pub(crate) fn deps_with(log: &Log, channel: ChannelId, target: RecordId) -> Vec<
     deps.push(target);
     deps.sort();
     deps
+}
+
+#[cfg(test)]
+mod adult_rule_tests {
+    //! B7-k, the receiver rule (`adult_ok`), over a signed control log.
+    use super::*;
+    use authority::{sign_control, sign_genesis, Action};
+    use records::{Draft, SigningKey};
+
+    struct World {
+        resolver: Resolver,
+        server: ServerId,
+        keys: Vec<SigningKey>,
+        seq: Vec<u64>,
+        head: RecordId,
+    }
+
+    impl World {
+        /// The owner (0) and members 1 and 2, joined; no channels yet.
+        fn new() -> World {
+            let keys: Vec<SigningKey> = (0..3u8).map(|n| SigningKey::from_bytes(&[n + 10; 32])).collect();
+            let genesis = sign_genesis(&keys[0], [0; 16], 1, b"{}").unwrap();
+            let server = genesis.server();
+            let mut resolver = Resolver::new(server);
+            resolver.insert(genesis.clone());
+            let mut w = World { resolver, server, keys, seq: vec![1, 0, 0], head: genesis.id() };
+            let invite = w.control(0, Action::Invite { expires_ms: 0, max_uses: 0 });
+            for n in 1..3 {
+                w.control(n, Action::Join { invite });
+            }
+            w
+        }
+
+        fn key(&self, n: usize) -> PublicKey {
+            PublicKey::from_bytes(self.keys[n].verifying_key().to_bytes())
+        }
+
+        /// A control record by `n` on the current head; it becomes the head.
+        fn control(&mut self, n: usize, action: Action) -> RecordId {
+            let record = sign_control(&self.keys[n], self.server, self.seq[n], vec![self.head], 1, &action).unwrap();
+            self.seq[n] += 1;
+            self.head = record.id();
+            self.resolver.insert(record);
+            self.head
+        }
+
+        /// Would a message by `n` in `channel`, relying on `auth_deps`, count?
+        fn counts(&self, n: usize, channel: ChannelId, auth_deps: RecordId) -> bool {
+            let message = Draft {
+                server: self.server,
+                scope: Scope::Channel(channel),
+                seq: 0,
+                deps: vec![],
+                auth_deps: vec![auth_deps],
+                ts: 1,
+                kind: Kind::Message,
+                body: vec![0; 40],
+            }
+            .sign(&self.keys[n])
+            .unwrap();
+            adult_ok(&self.resolver, message.kind(), message.scope(), message.author(), message.auth_deps())
+        }
+    }
+
+    const NIGHT: ChannelId = ChannelId::from_bytes([7; 32]);
+
+    #[test]
+    fn the_receiver_rule_at_the_record_and_now() {
+        let mut w = World::new();
+        w.control(0, Action::ChannelCreate { channel: NIGHT, adult: false, name: "night".into() });
+        let adult1 = w.control(1, Action::AgeClaim { adult: true });
+        // A plain channel: no check at all.
+        assert!(w.counts(2, NIGHT, w.head), "plain: anyone");
+        let before_flip = w.head;
+        let flip = w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "night".into() });
+        let after_flip = w.head;
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip));
+
+        // (a): someone who never claimed 18+ never counts.
+        assert!(!w.counts(2, NIGHT, after_flip), "a minor after the flip");
+        assert!(!w.counts(2, NIGHT, before_flip), "a minor with stale deps");
+        // An adult counts, after the flip and (adult now) with stale deps too.
+        assert!(w.counts(1, NIGHT, after_flip));
+        assert!(w.counts(1, NIGHT, before_flip), "(b) passes: adult now");
+        assert!(w.counts(1, NIGHT, adult1));
+
+        // 1 lowers: posts made after the flip while adult still count
+        // (a holds at them, and their deps reach the flip)...
+        w.control(1, Action::AgeClaim { adult: false });
+        assert!(w.counts(1, NIGHT, after_flip), "an adult's history survives a lowering");
+        // ...stale deps from before the flip don't: (b) needs adult now.
+        assert!(!w.counts(1, NIGHT, before_flip), "pre-flip, now not adult: hidden (the accepted cost)");
+        // And deps after the lowering fail (a).
+        assert!(!w.counts(1, NIGHT, w.head));
+
+        // A rename of the 18+ channel doesn't move the transition (Security
+        // Lead on #551): 1's post after the flip still counts.
+        w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "late".into() });
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip));
+        assert!(w.counts(1, NIGHT, after_flip), "rename, then lower: the history stays");
+
+        // Off and on again: the latest flip counts for (b).
+        w.control(1, Action::AgeClaim { adult: true });
+        let adult_again = w.head;
+        w.control(0, Action::ChannelEdit { channel: NIGHT, adult: false, name: "night".into() });
+        assert!(w.counts(2, NIGHT, w.head), "turned plain: no check");
+        let flip2 = w.control(0, Action::ChannelEdit { channel: NIGHT, adult: true, name: "night".into() });
+        assert_eq!(w.resolver.state().adult_edits.get(&NIGHT), Some(&flip2));
+        w.control(1, Action::AgeClaim { adult: false });
+        assert!(!w.counts(1, NIGHT, adult_again), "reaches the first flip only, not adult now");
+        assert!(w.counts(1, NIGHT, flip2), "reaches the latest flip while adult");
+
+        // Unknown deps: never counted (pending).
+        assert!(!w.counts(1, NIGHT, RecordId::from_bytes([9; 32])));
+        // Key rotations and deletes are never judged by it.
+        let rotation_kind = adult_ok(&w.resolver, Kind::KeyRotation, Scope::Channel(NIGHT), w.key(2), &[before_flip]);
+        assert!(rotation_kind);
+    }
 }

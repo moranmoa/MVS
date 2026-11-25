@@ -38,6 +38,11 @@ const KV_UPDATE_CHANNEL: &str = "update-channel";
 /// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
 /// about this computer's network.
 const KV_RELAY_ONLY: &str = "relay-only";
+/// G-51: when this device last set a server's icon, per server (u64 LE ms).
+const KV_ICON_SET_PREFIX: &str = "icon-set/";
+/// G-51: at most one icon change per server per 10 minutes from this device:
+/// every icon (up to 8 KiB) stays in the control log.
+const ICON_EVERY_MS: u64 = 10 * 60_000;
 /// Device link: "a new device was added" notices not yet acknowledged
 /// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
 /// start until acknowledged; the cross-device notice will feed it too.
@@ -174,6 +179,16 @@ fn trusted() -> bool {
 struct PendingBirth {
     date: String,
     effective_at: u64,
+    /// G-77: a correction (`correctBirthDate`) that raises my age. My
+    /// birth date stays the current one until `effective_at`, then becomes
+    /// `date`. False: the restore form, where the birth date is already
+    /// `date` and I count as at most 17 until then.
+    #[serde(default)]
+    correction: bool,
+    /// G-77: a correction made while a restore-form raise was waiting: I
+    /// still count as at most 17 until `effective_at`.
+    #[serde(default)]
+    capped: bool,
 }
 
 /// Decision 18: a raise of the age takes effect this long after it was found.
@@ -186,21 +201,56 @@ impl Profile {
     }
 
     /// My age as it counts at `now`: from the birth date, but at most 17
-    /// while a raise is pending (the earlier "not adult" claim stands).
+    /// while a restore-form raise is pending (the earlier "not adult" claim
+    /// stands). A pending correction counts from the current date.
     fn effective_age(&self, now: u64) -> Option<u32> {
         let age = model::age_on(&self.birth_date, now)?;
-        Some(if self.raise_pending(now) { age.min(17) } else { age })
+        Some(if self.cap_waiting(now) { age.min(17) } else { age })
     }
 
-    /// A pending raise whose 30 days are up takes effect. True if it did.
+    /// A restore's cap (at most 17) is still waiting at `now`: a restore-form
+    /// pending, or a correction made over one.
+    fn cap_waiting(&self, now: u64) -> bool {
+        self.raise_pending(now) && self.pending_birth_date.as_ref().is_some_and(|p| !p.correction || p.capped)
+    }
+
+    /// G-77: applies a correction already judged as `kind` (never
+    /// `too-young`). A raise waits until `effective_at` and keeps a waiting
+    /// restore cap. Same or lower: the date at once, but a waiting restore
+    /// cap stays until its own time, for the new date, so a lowering can't
+    /// lift it (Tech Lead on #512); cancel can't remove it (restore form).
+    fn correct(&mut self, kind: AgeCorrectionKind, date: &str, effective_at: u64, now: u64) {
+        let cap = self.cap_waiting(now);
+        if kind == AgeCorrectionKind::Raise {
+            self.pending_birth_date =
+                Some(PendingBirth { date: date.to_owned(), effective_at, correction: true, capped: cap });
+            return;
+        }
+        let until = self.pending_birth_date.as_ref().map_or(0, |p| p.effective_at);
+        self.birth_date = date.to_owned();
+        self.pending_birth_date = cap.then(|| PendingBirth {
+            date: date.to_owned(),
+            effective_at: until,
+            correction: false,
+            capped: false,
+        });
+    }
+
+    /// A pending raise whose 30 days are up takes effect: a correction's
+    /// date becomes my birth date. True if it did.
     fn settle(&mut self, now: u64) -> bool {
-        match &self.pending_birth_date {
+        match self.pending_birth_date.take() {
             Some(p) if now >= p.effective_at => {
+                if p.correction {
+                    self.birth_date = p.date;
+                }
                 self.birth_date_trusted = true;
-                self.pending_birth_date = None;
                 true
             }
-            _ => false,
+            other => {
+                self.pending_birth_date = other;
+                false
+            }
         }
     }
 }
@@ -335,7 +385,12 @@ struct Inner {
     /// Channels whose current key some members can't read, and since when
     /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
     /// once nobody is missing.
-    join_key_wait: HashMap<(ServerId, ChannelId), u64>,
+    /// Who was missing then: a new joiner (someone not in that set) starts
+    /// a wait of its own (dev-identity on #517).
+    join_key_wait: HashMap<(ServerId, ChannelId), (BTreeSet<PublicKey>, u64)>,
+    /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
+    /// once every member posts the cap, so it comes again if it reopens.
+    adult_keys_warned: HashSet<ServerId>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -366,6 +421,7 @@ impl KeyPending {
             mentions: None,
             mentions_me: None,
             reactions: None,
+            unreadable: None,
         }
     }
 }
@@ -520,7 +576,7 @@ pub fn finish_sign_out(
 
 fn phrase_error(e: PhraseError) -> CoreError {
     let positions = e.positions().into_iter().map(|p| p + 1).collect();
-    CoreError { code: ErrorCode::InvalidWords, positions: Some(positions) }
+    CoreError { code: ErrorCode::InvalidWords, positions: Some(positions), servers: None }
 }
 
 fn parse_user(id: &str) -> CoreResult<PublicKey> {
@@ -572,6 +628,7 @@ impl Core {
             typing: typing::Typing::default(),
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
+            adult_keys_warned: HashSet::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -624,16 +681,28 @@ impl Core {
     /// the commands.
     pub fn lock_keys(&self) {
         let _ = self.leave_call();
+        // Messages held for a key: their text is dropped (zeroized) at lock
+        // and sign-out, never kept past them (lost-message P1, SL C3). Each
+        // one still listed turns `failed` with no text (`message.updated`),
+        // so the UI never shows it as about to be sent (dev-identity on
+        // #517). Before the cipher locks: the index needs the count.
+        let _ = self.run(|inner, ports, events| {
+            let held = std::mem::take(&mut inner.key_pending);
+            inner.join_key_wait.clear();
+            let mut before: HashMap<ChannelId, usize> = HashMap::new();
+            for mut p in held {
+                let earlier = before.entry(p.channel).or_default();
+                let index = inner.message_count(&*ports.cipher, p.server, p.channel).unwrap_or(0) + *earlier;
+                *earlier += 1;
+                p.failed = true;
+                p.body = Zeroizing::new(String::new());
+                events.push(Event::MessageUpdated(p.message(index)));
+            }
+            Ok(())
+        });
         self.ports.cipher.lock();
         self.ports.network.lock();
         self.keys_locked.store(true, Ordering::SeqCst);
-        // Messages held for a key: their text is dropped (zeroized) at lock
-        // and sign-out, never kept past them (lost-message P1, SL C3).
-        {
-            let mut inner = self.lock();
-            inner.key_pending.clear();
-            inner.join_key_wait.clear();
-        }
         // G-91 (Security Lead on #457): the server secrets a restore took
         // from the backup go too; the backup is fetched again after unlock.
         let mut restore = self.restore.lock().expect("not poisoned");
@@ -1529,6 +1598,70 @@ impl Core {
         })
     }
 
+    /// G-51 `setServerIcon(serverId, dataUrl | null)`: a still PNG or WebP
+    /// of at most 8 KiB and 128 px a side (`avatar::icon_from_data_url`),
+    /// or `null` to clear. The owner or an admin; behind `server-meta-v1`;
+    /// at most one change per [`ICON_EVERY_MS`] per server from this device
+    /// (`rate-limited`), since every icon stays in the control log. The
+    /// same icon again signs nothing.
+    pub fn set_server_icon(&self, server_id: &str, data_url: Option<&str>) -> CoreResult<ServerSummary> {
+        let icon = match data_url {
+            None => None,
+            Some(url) => Some(crate::avatar::icon_from_data_url(url).ok_or(ErrorCode::BadRequest)?),
+        };
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            if inner.view(server)?.state.server_icon == icon {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            inner.cap_gate(server, model::SERVER_META_CAP)?;
+            let now = ports.clock.now_ms();
+            let key = format!("{KV_ICON_SET_PREFIX}{}", model::hex_id(server.as_bytes()));
+            // Only setting an image is limited: an admin must be able to
+            // remove an offensive or mistaken icon at once, and a clear is
+            // 2 bytes (Tech Lead on #555).
+            let setting = icon.is_some();
+            let last = inner.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
+            if setting && last.is_some_and(|last| now.saturating_sub(last) < ICON_EVERY_MS) {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            inner.publish_control(ports, server, &Action::ServerIcon { icon })?;
+            if setting {
+                inner.db.set(&key, &now.to_le_bytes())?;
+            }
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
+    /// G-51 `setServerDescription(serverId, text)`: trimmed; empty clears
+    /// it; otherwise `authority::server_description_ok` (`\n` only, at most
+    /// 5 lines, 500 code points) or `bad-request`. The owner or an admin;
+    /// behind `server-meta-v1`. The same text again signs nothing. Shown as
+    /// plain text, never Markdown or links.
+    pub fn set_server_description(&self, server_id: &str, text: &str) -> CoreResult<ServerSummary> {
+        let text = text.trim();
+        if !text.is_empty() && !authority::server_description_ok(text) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            if inner.view(server)?.state.server_description.as_deref().unwrap_or("") == text {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            inner.cap_gate(server, model::SERVER_META_CAP)?;
+            inner.publish_control(ports, server, &Action::ServerDescription { text: text.to_owned() })?;
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
     /// `leaveServer`: any member but the owner (`not-allowed`; the owner
     /// deletes instead). The `Leave` goes out, so the others re-key; then
     /// the server leaves this device (`server.removed`, `left`). A leaver
@@ -1794,6 +1927,7 @@ impl Core {
             server_id,
             channel_id: model::hex_id(channel.as_bytes()),
             name: current.name,
+            reason: Some(ChannelRemovedReason::Deleted),
         });
         Ok(())
     }
@@ -2292,7 +2426,7 @@ impl Core {
                 events.push(Event::MessageAdded(message.clone()));
                 return Ok(message);
             }
-            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
+            let sealed = match inner.seal_with(ports, server, channel, body.as_bytes(), false) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
                     let message = inner.hold_for_key(ports, server, channel, body)?;
@@ -2324,6 +2458,7 @@ impl Core {
         }
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             let sealed = inner.seal(ports, server, channel, body.as_bytes())?;
             let body = [target.as_bytes().as_slice(), &sealed].concat();
             inner.tombstone_or_edit(ports, events, server, channel, target, Kind::MessageEdit, body)
@@ -2347,6 +2482,7 @@ impl Core {
     pub fn delete_message(&self, message_id: &str) -> CoreResult<()> {
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             let body = target.as_bytes().to_vec();
             inner.tombstone_or_edit(
                 ports,
@@ -2375,6 +2511,7 @@ impl Core {
         let emoji = reaction::normalize(emoji).ok_or(ErrorCode::BadRequest)?;
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             // 18+ channels only with an accepted 18+ claim (B7).
             if !inner.visible(server)?.contains(&channel) {
                 return Err(ErrorCode::NotFound.into());
@@ -2622,6 +2759,11 @@ impl Core {
                 inner.load(server)?;
                 inner.seed_announced(&*ports.cipher, server)?;
                 let name_before = inner.view(server)?.state.server_name.clone();
+                // G-51: the icon and description change the summary too.
+                let meta_before = {
+                    let view = inner.view(server)?;
+                    (view.state.server_icon.clone(), view.state.server_description.clone())
+                };
                 let topics_before = inner.view(server)?.state.topics.clone();
                 let mut changed = false;
                 for record in records {
@@ -2634,7 +2776,12 @@ impl Core {
                     inner.close_locally(ports, server, events)?;
                     continue;
                 }
-                if inner.view(server)?.state.server_name != name_before {
+                let meta_changed = {
+                    let view = inner.view(server)?;
+                    view.state.server_name != name_before
+                        || (view.state.server_icon.clone(), view.state.server_description.clone()) != meta_before
+                };
+                if meta_changed {
                     events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
                 // G-14: a topic set or cleared elsewhere. Only
@@ -2643,6 +2790,9 @@ impl Core {
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
                 let _ = inner.post_caps(ports, server);
+                // B7-k K2: owners and admins learn when older members would
+                // key an 18+ channel for minors too.
+                let _ = inner.adult_keys_notice(server, me, events);
                 let after = inner.view(server)?;
                 if after.is_kicked(&me) {
                     inner.join_waiting.remove(&server);
@@ -2652,6 +2802,7 @@ impl Core {
                     events.push(Event::ServerRemoved {
                         server_id: model::hex_id(server.as_bytes()),
                         reason: None,
+                        required: None,
                     });
                 } else if changed {
                     events.push(Event::MembersChanged {
@@ -2696,6 +2847,87 @@ impl Core {
         self.run(|inner, _, events| {
             let blocked = !inner.db.is_blocked(&user)?;
             inner.set_blocked(user, blocked, events)
+        })
+    }
+
+    // ---- birth date (G-77, B7 §2) -------------------------------------------
+
+    /// `previewBirthDateCorrection(date)`: what [`Core::correct_birth_date`]
+    /// would do. Changes nothing. `bad-request` for a date that isn't a real
+    /// `YYYY-MM-DD` from 1900 to today.
+    pub fn preview_birth_date_correction(&self, date: &str) -> CoreResult<AgeCorrectionPreview> {
+        let now = self.ports.clock.now_ms();
+        self.lock().age_correction(date, now)
+    }
+
+    /// `correctBirthDate(date)`, by date against my current birth date:
+    /// - **same** (the identical date): a waiting correction is dropped;
+    /// - **lower** (a later date): at once. The new claim goes to every
+    ///   server I'm in; an 18+ server I'm no longer old enough for is left
+    ///   (`server.removed`, `reason: 'age'`, `required`); elsewhere its 18+
+    ///   channels go (`channel.removed`, `reason: 'age'`). A waiting restore
+    ///   cap stays. Refused (`owns-restricted-server`, `servers`) while I
+    ///   own a server whose restriction is above the new age (PO);
+    /// - **raise** (an earlier date): pending for 30 days
+    ///   (`Identity.pendingBirthDate`); a new correction replaces it;
+    /// - **under 16:** `too-young`, nothing changed.
+    ///
+    /// `identity.changed` follows any change. Same and lower never make the
+    /// date "the one my claims come from" (a restored date stays untrusted,
+    /// so a date a day short of 18 still waits 30 days after turning 18); a
+    /// raise does once it settles, having waited its own 30 days.
+    pub fn correct_birth_date(&self, date: &str) -> CoreResult<AgeCorrectionPreview> {
+        let preview = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let preview = inner.age_correction(date, now)?;
+            match preview.kind {
+                AgeCorrectionKind::TooYoung => return Err(ErrorCode::TooYoung.into()),
+                AgeCorrectionKind::OwnsRestrictedServer => {
+                    return Err(CoreError {
+                        code: ErrorCode::OwnsRestrictedServer,
+                        positions: None,
+                        servers: Some(preview.blocked_by.iter().map(|s| s.name.clone()).collect()),
+                    });
+                }
+                kind => {
+                    let effective_at = preview.effective_at.unwrap_or(0);
+                    inner.update_profile_with(|p| p.correct(kind, date, effective_at, now))?;
+                    if kind == AgeCorrectionKind::Lower {
+                        inner.apply_lowered_age(ports, now, events)?;
+                    }
+                }
+            }
+            let identity = inner.identity_json(inner.me.as_ref().ok_or(ErrorCode::NotFound)?)?;
+            events.push(Event::IdentityChanged(identity));
+            Ok(preview)
+        })?;
+        self.flush_leaves();
+        Ok(preview)
+    }
+
+    /// `cancelBirthDateCorrection()`: drops a waiting correction. A raise
+    /// found after a restore (not a correction) can't be cancelled: there's
+    /// no earlier date to go back to (`not-allowed`). Nothing waiting: `ok`.
+    pub fn cancel_birth_date_correction(&self) -> CoreResult<()> {
+        self.run(|inner, _, events| {
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            let pending = me.profile.pending_birth_date.as_ref().map(|p| (p.correction, p.capped, p.effective_at));
+            match pending {
+                None => return Ok(()),
+                Some((false, _, _)) => return Err(ErrorCode::NotAllowed.into()),
+                Some((true, true, effective_at)) => {
+                    // The restore-form wait goes on, for the date it had.
+                    inner.update_profile_with(|p| {
+                        let date = p.birth_date.clone();
+                        p.pending_birth_date =
+                            Some(PendingBirth { date, effective_at, correction: false, capped: false });
+                    })?;
+                }
+                Some(_) => inner.update_profile_with(|p| p.pending_birth_date = None)?,
+            }
+            let identity = inner.identity_json(inner.me.as_ref().ok_or(ErrorCode::NotFound)?)?;
+            events.push(Event::IdentityChanged(identity));
+            Ok(())
         })
     }
 
@@ -3334,7 +3566,7 @@ impl Inner {
             let date = self.me.as_ref().expect("checked above").profile.birth_date.clone();
             self.update_profile_with(|p| {
                 p.pending_birth_date =
-                    Some(PendingBirth { date, effective_at: now + AGE_RAISE_DELAY_MS });
+                    Some(PendingBirth { date, effective_at: now + AGE_RAISE_DELAY_MS, correction: false, capped: false });
             })?;
             return Ok(None);
         }
@@ -3587,6 +3819,133 @@ impl Inner {
         }
         let identity = self.identity_json(self.me.as_ref().expect("checked above"))?;
         events.push(Event::IdentityChanged(identity));
+        Ok(())
+    }
+
+    /// G-77: what correcting my birth date to `date` would do at `now`, by
+    /// date against my current birth date (a waiting raise counts as not
+    /// yet).
+    fn age_correction(&mut self, date: &str, now: u64) -> CoreResult<AgeCorrectionPreview> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        if !model::valid_birth_date(date, now) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let new = model::age_on(date, now).ok_or(ErrorCode::BadRequest)?;
+        let preview = |kind, effective_at| AgeCorrectionPreview {
+            kind,
+            effective_at,
+            loses: Vec::new(),
+            blocked_by: Vec::new(),
+        };
+        if new < 16 {
+            return Ok(preview(AgeCorrectionKind::TooYoung, None));
+        }
+        // By date, not by whole years: an earlier date that leaves my age the
+        // same today still makes me older sooner, so it's a raise and waits
+        // (Tech Lead and Security Lead on #512). Valid dates compare as
+        // strings.
+        let key = me.key();
+        let waiting = me.profile.pending_birth_date.as_ref().filter(|p| p.correction && now < p.effective_at);
+        Ok(match date.cmp(me.profile.birth_date.as_str()) {
+            std::cmp::Ordering::Equal => preview(AgeCorrectionKind::Same, None),
+            // The same raise again keeps its clock.
+            std::cmp::Ordering::Less if waiting.is_some_and(|p| p.date == date) => {
+                preview(AgeCorrectionKind::Raise, waiting.map(|p| p.effective_at))
+            }
+            std::cmp::Ordering::Less => preview(AgeCorrectionKind::Raise, Some(now + AGE_RAISE_DELAY_MS)),
+            std::cmp::Ordering::Greater => {
+                let (loses, blocked_by) = self.age_losses(key, new)?;
+                // PO: never below the restriction of a server I own.
+                if blocked_by.is_empty() {
+                    AgeCorrectionPreview { loses, ..preview(AgeCorrectionKind::Lower, None) }
+                } else {
+                    AgeCorrectionPreview { blocked_by, ..preview(AgeCorrectionKind::OwnsRestrictedServer, None) }
+                }
+            }
+        })
+    }
+
+    /// G-77: what an age of `age` takes away: 18+ servers I'm a member of
+    /// but don't own (whole), else the 18+ channels I see now. Second: the
+    /// servers I own whose restriction is above `age` (they refuse it).
+    fn age_losses(&mut self, key: PublicKey, age: u32) -> CoreResult<(Vec<AgeLoss>, Vec<AgeLoss>)> {
+        let (mut out, mut owned) = (Vec::new(), Vec::new());
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            let view = self.view(server)?;
+            if !view.state.is_member(key) {
+                continue;
+            }
+            let server_id = model::hex_id(server.as_bytes());
+            let name = view.state.server_name.clone().unwrap_or_else(|| view.genesis.name.clone());
+            let owner = view.state.role(key) == authority::Role::Owner;
+            if view.genesis.age_restriction.min_age() > age {
+                let loss = AgeLoss { server_id, name, channel: None };
+                if owner { owned.push(loss) } else { out.push(loss) }
+            } else if age < 18 && view.state.adults.contains(&key) {
+                let mut channels: Vec<String> =
+                    view.state.channels.values().filter(|c| c.adult).map(|c| c.name.clone()).collect();
+                channels.sort();
+                for channel in channels {
+                    out.push(AgeLoss { server_id: server_id.clone(), name: name.clone(), channel: Some(channel) });
+                }
+            }
+        }
+        Ok((out, owned))
+    }
+
+    /// G-77: after a lowering. The new claim goes to every server I'm in.
+    /// An 18+ server I'm no longer old enough for, and don't own, is left:
+    /// its `Leave` goes through the leave outbox, and it leaves this device
+    /// (`server.removed`, `age`). Elsewhere, the 18+ channels I saw go
+    /// (`channel.removed`, `age`).
+    fn apply_lowered_age(&mut self, ports: &Ports, now: u64, events: &mut Events) -> CoreResult<()> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let (key, age) = (me.key(), me.profile.effective_age(now).unwrap_or(0));
+        for server in self.db.servers()? {
+            if self.db.closed_at(server)?.is_some() {
+                continue;
+            }
+            self.load(server)?;
+            let view = self.view(server)?;
+            if !view.state.is_member(key) {
+                continue;
+            }
+            let was_adult = view.state.adults.contains(&key);
+            let leave = view.genesis.age_restriction.min_age() > age && view.state.role(key) != authority::Role::Owner;
+            let adult_channels: Vec<(String, String)> = view
+                .state
+                .channels
+                .iter()
+                .filter(|(_, c)| c.adult)
+                .map(|(id, c)| (model::hex_id(id.as_bytes()), c.name.clone()))
+                .collect();
+            if let Some(claim) = self.age_claim(ports, server)? {
+                self.store(server, claim.clone())?;
+                ports.network.publish(&claim);
+            }
+            if leave {
+                let record = self.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
+                self.db.set_leave(server, &record)?;
+                if self.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
+                    ports.network.publish(&record);
+                }
+                self.purge_server(ports, server, RemovedReason::Age, &[], true, events)?;
+            } else if was_adult && age < 18 {
+                let server_id = model::hex_id(server.as_bytes());
+                for (channel_id, name) in adult_channels {
+                    events.push(Event::ChannelRemoved {
+                        server_id: server_id.clone(),
+                        channel_id,
+                        name,
+                        reason: Some(ChannelRemovedReason::Age),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4059,7 +4418,7 @@ impl Inner {
                     i += 1;
                     continue;
                 }
-                match self.seal(ports, server, channel, body.as_bytes()) {
+                match self.seal_with(ports, server, channel, body.as_bytes(), false) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
                         let record =
@@ -4113,16 +4472,22 @@ impl Inner {
         let cipher = &*ports.cipher;
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        let missing = cipher.missing_readers(server, channel).len();
-        if missing == 0 {
+        let missing: BTreeSet<PublicKey> = cipher.missing_readers(server, channel).into_iter().collect();
+        if missing.is_empty() {
             self.join_key_wait.remove(&(server, channel));
             return Ok(false);
         }
         let now = ports.clock.now_ms();
-        let since = *self.join_key_wait.entry((server, channel)).or_insert(now);
-        if now.saturating_sub(since) < JOIN_KEY_WAIT.as_millis() as u64 {
+        let wait = self.join_key_wait.entry((server, channel)).or_insert_with(|| (missing.clone(), now));
+        // Someone missing who wasn't before (a later joiner): its own wait,
+        // from now. The same set (or fewer) keeps counting from its start.
+        if !missing.is_subset(&wait.0) {
+            *wait = (missing.clone(), now);
+        }
+        if now.saturating_sub(wait.1) < JOIN_KEY_WAIT.as_millis() as u64 {
             return Ok(true);
         }
+        let missing = missing.len();
         tracing::info!(target: "mvs::keys", missing, "join key wait over: sending under the current key");
         Ok(false)
     }
@@ -4143,18 +4508,36 @@ impl Inner {
         channel: ChannelId,
         plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
+        self.seal_with(ports, server, channel, plaintext, true)
+    }
+
+    /// [`Self::seal`]; `sync: false` when [`Self::waits_for_join_key`] has
+    /// just given the cipher the members and rotations (dev-identity on
+    /// #517: not twice per send).
+    fn seal_with(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        channel: ChannelId,
+        plaintext: &[u8],
+        sync: bool,
+    ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
         let view = self.view(server)?;
         let members = view.state.members.clone();
+        let readers = channel_readers(&view, channel);
         let may_rotate = view.state.role(key) >= authority::Role::Moderator;
         let auth_deps = auth_deps(&view);
-        cipher.membership_changed(server, &members);
-        chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        if sync {
+            cipher.membership_changed(server, &members);
+            chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        }
         match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).
-                self.rotate_channel(ports, server, channel, &members, &auth_deps)
+                // B7-k: an 18+ channel's key goes to its adult readers only.
+                self.rotate_channel(ports, server, channel, &readers, &auth_deps)
                     .map_err(|_| CoreError::from(ErrorCode::NotAllowed))?;
                 cipher.encrypt(server, channel, plaintext).map_err(cipher_error)
             }
@@ -4331,9 +4714,15 @@ impl Inner {
         let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
         let server_id = model::hex_id(server.as_bytes());
+        // B7-k: each channel's readers; an 18+ channel's are its adults.
+        let channels = self.known(server)?;
+        let view = self.view(server)?;
+        let readers: HashMap<ChannelId, BTreeSet<PublicKey>> =
+            channels.iter().map(|c| (*c, channel_readers(&view, *c))).collect();
         // Channels a join left stale: re-keyed together, for one token.
         let mut joined = Vec::new();
-        for channel in self.known(server)? {
+        for channel in channels {
+            let members = &readers[&channel];
             // A probe: an empty plaintext, never sent.
             let probe = cipher.encrypt(server, channel, b"");
             if probe != Err(CipherError::RotationRequired) {
@@ -4342,7 +4731,7 @@ impl Inner {
                 // channel for everyone now, so a joiner can write and read
                 // without waiting for a moderator to send first. A failure only
                 // leaves things as they were: the next round tries again.
-                let stale = self.keyed_for.get(&(server, channel)) != Some(&members);
+                let stale = self.keyed_for.get(&(server, channel)) != Some(members);
                 let no_key = probe == Err(CipherError::NoKey);
                 if may_rotate && (no_key || (probe.is_ok() && stale)) && members.len() > 1 {
                     joined.push(channel);
@@ -4358,7 +4747,7 @@ impl Inner {
             // one, and the channel stays blocked by `RotationRequired` until the
             // next sync or send retries.
             let renewed = may_rotate
-                && self.rotate_channel(ports, server, channel, &members, &auth_deps).is_ok();
+                && self.rotate_channel(ports, server, channel, members, &auth_deps).is_ok();
             let kind =
                 if renewed { NoticeKind::EncryptionRenewed } else { NoticeKind::RekeyWaiting };
             events.push(Event::Notice { kind, server_id: server_id.clone() });
@@ -4377,7 +4766,7 @@ impl Inner {
         for channel in joined {
             // Fail closed, as for a kick: a failed rotation is never announced
             // as one, and the UI learns the channel waits.
-            if self.rotate_channel(ports, server, channel, &members, &auth_deps).is_err() {
+            if self.rotate_channel(ports, server, channel, &readers[&channel], &auth_deps).is_err() {
                 let kind = NoticeKind::RekeyWaiting;
                 events.push(Event::Notice { kind, server_id: server_id.clone() });
             }
@@ -4429,6 +4818,22 @@ impl Inner {
             .map_err(|_| ErrorCode::BadRequest.into())
     }
 
+    /// A placeholder (`Message.unreadable`) takes no reaction, edit or
+    /// delete: `bad-request`, as the UI offers none (the PO, dev-ui).
+    fn refuse_unreadable(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+        channel: ChannelId,
+        target: RecordId,
+    ) -> CoreResult<()> {
+        let shown = self.shown(cipher, server, channel)?;
+        if shown.iter().any(|s| s.record.id() == target && s.unreadable.is_some()) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        Ok(())
+    }
+
     /// The channel's shown messages, after giving the cipher what's new.
     fn shown(
         &mut self,
@@ -4437,11 +4842,12 @@ impl Inner {
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
         let now = self.clock.now_ms();
+        let me = self.me.as_ref().map(Me::key);
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log, now))
+        Ok(chat::messages(cipher, server, channel, log, now, me))
     }
 
     /// G-21: my read marker in `channel`: the last message I read, as
@@ -4477,7 +4883,9 @@ impl Inner {
             let marker = self.read_marker(server, channel)?;
             let shown = self.shown(cipher, server, channel)?;
             let after = |s: &chat::Shown| (s.record.ts(), *s.record.id().as_bytes()) > marker;
-            let unread = |s: &&chat::Shown| after(s) && s.record.author() != me;
+            // Placeholders never count as unread (the PO).
+            let unread =
+                |s: &&chat::Shown| after(s) && s.record.author() != me && s.unreadable.is_none();
             let count = shown.iter().filter(unread).count() as u64;
             json.unread_count = Some(count);
             json.first_unread_index = shown.iter().position(|s| unread(&s)).map(|i| i as u64);
@@ -4803,6 +5211,27 @@ impl Inner {
     /// The release that adds a cap: my latest profile post in `server` lacks
     /// one of [`model::CAPS`] (posted by an older version), so post it
     /// again, once.
+    /// B7-k K2 (Security Lead on #544): to an owner or admin of a server
+    /// with an 18+ channel, `notice: adult-keys-outdated` once while some
+    /// member's latest profile post lacks `adult-keys-v1` (such a member, if
+    /// a moderator, re-keys 18+ channels for every member). Sent again only
+    /// after the list has been empty.
+    fn adult_keys_notice(&mut self, server: ServerId, me: PublicKey, events: &mut Events) -> CoreResult<()> {
+        let view = self.view(server)?;
+        let outdated = view.state.role(me) >= authority::Role::Admin
+            && view.state.channels.values().any(|c| c.adult)
+            && !view.lacking(model::ADULT_KEYS_CAP, me).is_empty();
+        if !outdated {
+            self.adult_keys_warned.remove(&server);
+        } else if self.adult_keys_warned.insert(server) {
+            events.push(Event::Notice {
+                kind: NoticeKind::AdultKeysOutdated,
+                server_id: model::hex_id(server.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());
@@ -4838,6 +5267,10 @@ impl Inner {
         leaving: bool,
         events: &mut Events,
     ) -> CoreResult<()> {
+        // G-77: an age removal says which restriction I'm now under.
+        let required = (reason == RemovedReason::Age)
+            .then(|| self.view(server).ok().map(|v| v.genesis.age_restriction))
+            .flatten();
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
         // Held text goes with the server (lost-message P1, SL C3).
@@ -4848,6 +5281,7 @@ impl Inner {
         events.push(Event::ServerRemoved {
             server_id: model::hex_id(server.as_bytes()),
             reason: Some(reason),
+            required,
         });
         Ok(())
     }
@@ -5001,7 +5435,7 @@ impl Inner {
                     Some(name) => Some(name),
                     None => self.db.get(&blocked_name_key(&user))?.and_then(|b| String::from_utf8(b).ok()),
                 };
-                Ok(BlockedUser { user_id: model::hex_id(user.as_bytes()), name })
+                Ok(BlockedUser { user_id: model::hex_id(user.as_bytes()), short_code: model::short_code(&user), name })
             })
             .collect()
     }
@@ -5209,6 +5643,8 @@ impl ServerView<'_> {
             unread: false,
             mentions: 0,
             closed: self.state.closed.is_some(),
+            icon_data_url: self.state.server_icon.as_ref().map(crate::avatar::icon_data_url),
+            description: self.state.server_description.clone(),
             id,
         }
     }
@@ -5268,6 +5704,17 @@ impl ServerView<'_> {
     }
 }
 
+/// B7-k: who a channel's key is for, as the cipher counts it: the
+/// members, and for an 18+ channel only those with an accepted 18+ claim.
+fn channel_readers(view: &ServerView, channel: ChannelId) -> BTreeSet<PublicKey> {
+    let members = view.state.members.iter().copied();
+    if view.state.channels.get(&channel).is_some_and(|c| c.adult) {
+        members.filter(|m| view.state.adults.contains(m)).collect()
+    } else {
+        members.collect()
+    }
+}
+
 /// Control heads a channel record relies on, at most `MAX_AUTH_DEPS`.
 fn auth_deps(view: &ServerView) -> Vec<RecordId> {
     let heads = view.deps(None);
@@ -5276,7 +5723,8 @@ fn auth_deps(view: &ServerView) -> Vec<RecordId> {
 
 /// What `message.updated` compares: the edit, the deletion, the send state
 /// and (G-26) the reactions shown.
-type Announced = (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>);
+type Announced =
+    (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>, Option<chat::Unreadable>);
 
 /// Where my messages' send states come from: the network's live state and
 /// the last one stored, so a restart doesn't lose it.
@@ -5286,7 +5734,8 @@ struct Status<'a> {
 }
 
 fn announced(s: &chat::Shown, me: Option<PublicKey>, st: &Status) -> Announced {
-    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone())
+    // A placeholder that opens later changes: `message.updated` (the PO).
+    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone(), s.unreadable)
 }
 
 /// B6, on my own messages only: `pending` until it left this device,
@@ -5337,20 +5786,28 @@ fn message_json(
         .filter(|key| members.contains(*key))
         .map(|key| model::hex_id(key.as_bytes()))
         .collect();
+    let unreadable = s.unreadable.map(|why| match why {
+        chat::Unreadable::NoKey => Unreadable::NoKey,
+        chat::Unreadable::Untrusted => Unreadable::Untrusted,
+    });
+    // An untrusted placeholder names no author (the PO).
+    let untrusted = unreadable == Some(Unreadable::Untrusted);
     Message {
         id: model::hex_id(s.record.id().as_bytes()),
         channel_id: model::hex_id(channel.as_bytes()),
         index,
-        author_id: model::hex_id(s.record.author().as_bytes()),
+        author_id: if untrusted { String::new() } else { model::hex_id(s.record.author().as_bytes()) },
         body: s.text.clone(),
         created_at: s.record.ts(),
         edited_at: s.edited_at,
         deleted: s.deleted.then_some(true),
-        send_state: send_state(s, me, st),
+        send_state: if untrusted { None } else { send_state(s, me, st) },
         replaces: None,
+        // A placeholder's text is empty: no tokens, so neither of these.
         mentions: (!listed.is_empty()).then_some(listed),
         mentions_me: me.filter(|me| tokens.contains(me)).map(|_| true),
         reactions: reactions_json(&s.reactions, me),
+        unreadable,
     }
 }
 
@@ -5735,5 +6192,84 @@ mod device_notice_tests {
         let stored = super::device_notices(&db).unwrap();
         assert_eq!(stored.len(), 32);
         assert_eq!((stored[0], stored[31]), (8, 39), "the newest are kept");
+    }
+}
+
+#[cfg(test)]
+mod birth_date_tests {
+    use super::{PendingBirth, Profile, AGE_RAISE_DELAY_MS};
+
+    /// 2026-11-03.
+    const NOW: u64 = 20_760 * 86_400_000;
+
+    fn profile(birth: &str, pending: Option<PendingBirth>) -> Profile {
+        Profile { birth_date: birth.into(), pending_birth_date: pending, ..Profile::default() }
+    }
+
+    fn pending(date: &str, correction: bool, capped: bool) -> Option<PendingBirth> {
+        Some(PendingBirth { date: date.into(), effective_at: NOW + AGE_RAISE_DELAY_MS, correction, capped })
+    }
+
+    /// G-77: a correction counts from the current date until it settles,
+    /// then its date replaces it; the restore form counts at most 17; a
+    /// correction made over a waiting restore-form raise keeps the cap.
+    #[test]
+    fn corrections_count_from_the_current_date_until_they_settle() {
+        let mut fix = profile("2010-01-01", pending("1990-01-01", true, false));
+        assert_eq!(fix.effective_age(NOW), Some(16));
+        assert!(!fix.settle(NOW + AGE_RAISE_DELAY_MS - 1));
+        assert!(fix.pending_birth_date.is_some(), "not due: kept");
+        assert!(fix.settle(NOW + AGE_RAISE_DELAY_MS));
+        assert_eq!(fix.birth_date, "1990-01-01");
+        assert!(fix.pending_birth_date.is_none() && fix.birth_date_trusted);
+
+        let restored = profile("1990-01-01", pending("1990-01-01", false, false));
+        assert_eq!(restored.effective_age(NOW), Some(17));
+        let mut over = profile("1990-01-01", pending("1980-01-01", true, true));
+        assert_eq!(over.effective_age(NOW), Some(17), "the restore cap stays");
+        assert!(over.settle(NOW + AGE_RAISE_DELAY_MS));
+        assert_eq!(over.effective_age(NOW + AGE_RAISE_DELAY_MS), Some(46));
+
+        // An adult raising an adult age: no cap while it waits.
+        let older = profile("1990-01-01", pending("1980-01-01", true, false));
+        assert_eq!(older.effective_age(NOW), Some(36));
+    }
+
+    /// Tech Lead on #512: a lowering (or the same date) over a waiting
+    /// restore cap keeps the cap until its own time, for the new date; a
+    /// raise over it keeps it too. Without a cap, a lowering leaves nothing.
+    #[test]
+    fn a_restore_cap_survives_corrections() {
+        use crate::types::AgeCorrectionKind::{Lower, Raise, Same};
+        let until = NOW + AGE_RAISE_DELAY_MS;
+        // Restored as 1990 (capped at 17); "corrected" to 17 today, 18 tomorrow.
+        let mut p = profile("1990-01-01", pending("1990-01-01", false, false));
+        p.correct(Lower, "2008-11-04", 0, NOW);
+        assert_eq!(p.birth_date, "2008-11-04");
+        let kept = p.pending_birth_date.as_ref().unwrap();
+        assert_eq!((kept.effective_at, kept.correction), (until, false), "the cap stays, uncancellable");
+        assert_eq!(p.effective_age(NOW + 2 * 86_400_000), Some(17), "18 by date, still capped");
+        assert_eq!(p.effective_age(until), Some(18));
+
+        let mut same = profile("1990-01-01", pending("1990-01-01", false, false));
+        same.correct(Same, "1990-01-01", 0, NOW);
+        assert_eq!(same.effective_age(NOW), Some(17));
+
+        let mut raised = profile("1990-01-01", pending("1990-01-01", false, false));
+        raised.correct(Raise, "1980-01-01", NOW + 2 * AGE_RAISE_DELAY_MS, NOW);
+        assert!(raised.pending_birth_date.as_ref().unwrap().capped);
+        assert_eq!(raised.effective_age(NOW), Some(17));
+
+        let mut free = profile("1990-01-01", None);
+        free.correct(Lower, "2000-01-01", 0, NOW);
+        assert!(free.pending_birth_date.is_none());
+        assert_eq!(free.effective_age(NOW), Some(26));
+    }
+
+    /// Profiles saved before G-77 read their pending as the restore form.
+    #[test]
+    fn an_old_pending_reads_as_the_restore_form() {
+        let old: PendingBirth = serde_json::from_str(r#"{"date":"1990-01-01","effectiveAt":5}"#).unwrap();
+        assert!(!old.correction && !old.capped);
     }
 }

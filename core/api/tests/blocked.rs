@@ -53,9 +53,15 @@ fn block_events(peer: &Peer) -> Vec<Vec<BlockedUser>> {
 fn the_list_keeps_names_after_we_share_no_server() {
     let world = World::new();
     let (owner, member, stranger) = (world.peer(), world.peer(), world.peer());
-    sign_up(&owner, "Owner");
-    let bob = sign_up(&member, "Bob").id;
-    let carol = sign_up(&stranger, "Carol").id;
+    let owner_code = sign_up(&owner, "Owner").short_code;
+    let bob_me = sign_up(&member, "Bob");
+    let carol_me = sign_up(&stranger, "Carol");
+    let (bob, carol) = (bob_me.id.clone(), carol_me.id.clone());
+    let row = |id: &str, code: &str, name: Option<&str>| BlockedUser {
+        user_id: id.to_owned(),
+        short_code: code.to_owned(),
+        name: name.map(str::to_owned),
+    };
     let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
     member.core.join_server(&server.invite_link).unwrap();
     owner.core.sync_now().unwrap();
@@ -63,8 +69,8 @@ fn the_list_keeps_names_after_we_share_no_server() {
 
     assert_eq!(call(&owner, "listBlocked", json!({})).unwrap(), json!([]));
     call(&owner, "setBlocked", json!({ "userId": bob, "blocked": true })).unwrap();
-    let want = vec![BlockedUser { user_id: bob.clone(), name: Some("Bob".into()) }];
-    assert_eq!(block_events(&owner), [want.clone()]);
+    let want = vec![row(&bob, &bob_me.short_code, Some("Bob"))];
+    assert_eq!(block_events(&owner), std::slice::from_ref(&want));
     assert_eq!(owner.core.list_blocked().unwrap(), want);
 
     // Idempotent: blocking again changes nothing and says nothing.
@@ -79,7 +85,12 @@ fn the_list_keeps_names_after_we_share_no_server() {
     assert_eq!(no_name.name, None);
     let wire = call(&owner, "listBlocked", json!({})).unwrap();
     let carol_wire = wire.as_array().unwrap().iter().find(|b| b["userId"] == json!(carol)).unwrap();
-    assert_eq!(*carol_wire, json!({ "userId": carol }), "no name: the field is absent");
+    assert_eq!(
+        *carol_wire,
+        json!({ "userId": carol, "shortCode": carol_me.short_code }),
+        "no name: the field is absent; the code is always there (G-47b)"
+    );
+    assert_ne!(carol_me.short_code, bob_me.short_code);
 
     // Bob blocks the owner, then is kicked: he's in no server now, and the
     // owner is still listed with the name kept when he blocked.
@@ -88,7 +99,7 @@ fn the_list_keeps_names_after_we_share_no_server() {
     owner.core.kick_member(&server.id, &bob).unwrap();
     member.core.sync_now().unwrap();
     assert!(member.core.list_servers().unwrap().is_empty());
-    let kept = BlockedUser { user_id: owner_id.clone(), name: Some("Owner".into()) };
+    let kept = row(&owner_id, &owner_code, Some("Owner"));
     assert_eq!(member.core.list_blocked().unwrap(), [kept]);
     // The kept name and the blocked ID stay local: not in the diagnostics.
     let report = member.core.export_diagnostics().unwrap();
@@ -106,7 +117,7 @@ fn the_list_keeps_names_after_we_share_no_server() {
 
     // The owner still has Bob's profile in the server's log: still named.
     let list = owner.core.list_blocked().unwrap();
-    assert!(list.contains(&BlockedUser { user_id: bob.clone(), name: Some("Bob".into()) }));
+    assert!(list.contains(&row(&bob, &bob_me.short_code, Some("Bob"))));
 }
 
 #[test]

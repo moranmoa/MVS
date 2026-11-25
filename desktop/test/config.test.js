@@ -138,7 +138,7 @@ test('valid STUN URLs', () => {
 });
 
 test('anything but a plain STUN URL is refused', () => {
-  for (const bad of ['turn:turn.example.org:3478', 'turns:turn.example.org', 'stun:user:pass@stun.example.org', 'stun:stun.example.org/path', 'stun:stun.example.org?transport=udp', 'stun:stun.example.org#x', 'stun:stun example.org', 'stun:', 'https://stun.example.org', '//stun.example.org', 'stun.example.org:3478', 'stun:' + 'a'.repeat(MAX_STUN), '', 7, null, ['stun:stun.example.org'], {}]) {
+  for (const bad of ['turn:turn.example.org:3478', 'turns:turn.example.org', 'stun:user:pass@stun.example.org', 'stun:stun.example.org/path', 'stun:stun.example.org?transport=udp', 'stun:stun.example.org#x', 'stun:stun example.org', 'stun:a.example.org:3478,stun:b.example.org:3478', 'stun:a.example.org:3478 stun:b.example.org', 'stun:stun.example.org:0', 'stun:stun.example.org:70000', 'stun:stun.example.org:3478:1', 'stun:stun_x.example.org', 'stun:', 'https://stun.example.org', '//stun.example.org', 'stun.example.org:3478', 'stun:' + 'a'.repeat(MAX_STUN), '', 7, null, ['stun:stun.example.org'], {}]) {
     assert.equal(validStun(bad), false, String(bad));
   }
 });

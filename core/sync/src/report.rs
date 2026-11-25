@@ -186,8 +186,9 @@ mod tests {
             let mut sink = futures::io::Cursor::new(Vec::new());
             ReportCodec.write_response(&protocol, &mut sink, ()).await.unwrap();
             assert_eq!(sink.into_inner(), [ACK]);
-            let read = |bytes: Vec<u8>| async move {
-                ReportCodec.read_response(&protocol, &mut futures::io::Cursor::new(bytes)).await
+            let read = |bytes: Vec<u8>| {
+                let protocol = protocol.clone();
+                async move { ReportCodec.read_response(&protocol, &mut futures::io::Cursor::new(bytes)).await }
             };
             assert!(read(vec![ACK]).await.is_ok());
             // A dropped box: the stream closes empty. Never an ack.

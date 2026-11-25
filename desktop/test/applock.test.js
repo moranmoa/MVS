@@ -251,6 +251,93 @@ test('unlock: passcode goes to the core NFC-normalised; wrong and rate-limited s
   assert.ok(!JSON.stringify(h.states).includes('1234'));
 });
 
+test('settings: config while unlocked only, never the verifier or attempts', async () => {
+  const h = harness({ config: { enabled: true, idleMinutes: 15, lockOnSleep: false, method: 'passcode', verifier: 'x', attempts: 3 } });
+  await h.lock.start();
+  assert.equal(h.lock.config(), null, 'locked: nothing');
+  await h.lock.unlock({ passcode: '1234' });
+  assert.deepEqual(h.lock.config(), { enabled: true, idleMinutes: 15, lockOnSleep: false, method: 'passcode' });
+});
+
+test('settings: set / clear are checked by main, then by the core; main never fills current', async () => {
+  const sent = [];
+  let answer = { result: 'ok' };
+  let cfg = { enabled: false };
+  const lock = createAppLock({
+    request: async (cmd, args) => {
+      sent.push([cmd, args]);
+      if (cmd === 'getAppLock') return { ok: cfg };
+      if (cmd === 'setAppLock' || cmd === 'clearAppLock') return { ok: answer };
+      return { error: { code: 'bad-request' } };
+    },
+    inCall: () => false,
+    onChange: () => {},
+  });
+  await lock.start();
+  assert.equal(lock.state.locked, false);
+  // Shapes main refuses before the core sees them.
+  for (const bad of [
+    null,
+    'x',
+    [],
+    { passcode: '12', idleMinutes: 5, lockOnSleep: true },
+    { passcode: '1234', idleMinutes: 0, lockOnSleep: true },
+    { passcode: '1234', idleMinutes: 61, lockOnSleep: true },
+    { passcode: '1234', idleMinutes: 5.5, lockOnSleep: true },
+    { passcode: '1234', idleMinutes: 5, lockOnSleep: 'yes' },
+    { passcode: '1234', idleMinutes: 5, lockOnSleep: true, current: '1' },
+    { passcode: '1234', idleMinutes: 5, lockOnSleep: true, method: 'os' },
+    { passcode: '1234', idleMinutes: 5, lockOnSleep: true, verifier: 'x' },
+  ]) {
+    assert.deepEqual(await lock.set(bad), { result: 'invalid' }, JSON.stringify(bad));
+  }
+  assert.equal(sent.filter(([c]) => c === 'setAppLock').length, 0);
+  // Turning it on: no current (none is set); the core re-reads after ok.
+  cfg = { enabled: true, idleMinutes: 5, lockOnSleep: true };
+  assert.deepEqual(await lock.set({ passcode: 'était1', idleMinutes: 5, lockOnSleep: true }), { result: 'ok' });
+  assert.deepEqual(sent.find(([c]) => c === 'setAppLock')[1], { passcode: 'était1', method: 'passcode', idleMinutes: 5, lockOnSleep: true });
+  assert.equal(lock.state.enabled, true, 'refreshed');
+  // A wrong current counts (core) and comes back as wrong, with the delay.
+  answer = { result: 'wrong', retryAfter: 30 };
+  assert.deepEqual(await lock.clear({ current: '9999' }), { result: 'wrong', retryAfter: 30 });
+  assert.deepEqual(sent.at(-1), ['clearAppLock', { current: '9999' }]);
+  assert.deepEqual(await lock.clear({}), { result: 'invalid' });
+  assert.deepEqual(await lock.clear({ current: '12' }), { result: 'invalid' });
+  // Nothing main hands on carries a passcode.
+  assert.ok(!JSON.stringify(lock.state).includes('9999'));
+});
+
+test('settings: one change at a time; refused while locked', async () => {
+  let release;
+  const lock = createAppLock({
+    request: async (cmd) => {
+      if (cmd === 'getAppLock') return { ok: { enabled: true } };
+      if (cmd === 'verifyAppLock') return { ok: { result: 'ok' } };
+      if (cmd === 'setAppLock') return new Promise((r) => (release = () => r({ ok: { result: 'ok' } })));
+      return { error: { code: 'bad-request' } };
+    },
+    inCall: () => false,
+    onChange: () => {},
+  });
+  await lock.start();
+  const input = { current: '1234', passcode: '5678', idleMinutes: 5, lockOnSleep: true };
+  assert.deepEqual(await lock.set(input), { result: 'locked' });
+  assert.deepEqual(await lock.clear({ current: '1234' }), { result: 'locked' });
+  await lock.unlock({ passcode: '1234' });
+  const first = lock.set(input);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(await lock.set(input), { result: 'busy' });
+  assert.deepEqual(await lock.clear({ current: '1234' }), { result: 'busy' });
+  release();
+  assert.deepEqual(await first, { result: 'ok' });
+});
+
+test('start: a running delay (retryAfter from getAppLock) shows at once and survives a restart', async () => {
+  const h = harness({ config: { enabled: true, idleMinutes: 5, lockOnSleep: true, retryAfter: 42.2 } });
+  await h.lock.start();
+  assert.equal(h.lock.state.retryAfter, 43);
+});
+
 test('forgot: the words clear the lock (core-checked, same counter)', async () => {
   const h = harness();
   await h.lock.start();

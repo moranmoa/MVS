@@ -105,7 +105,13 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
   // G-41: a search field from 15 members; cleared on switching server.
   const searchable = members.length >= SEARCH_FROM;
   const [query, setQuery] = useState('');
-  useEffect(() => setQuery(''), [server.id]);
+  // Cleared on switching server, during render: an effect would also run on
+  // mount, and if a key came first (a slow start) it wiped what was typed.
+  const [queryServer, setQueryServer] = useState(server.id);
+  if (queryServer !== server.id) {
+    setQueryServer(server.id);
+    setQuery('');
+  }
   const q = searchable ? query : '';
   const listId = useId();
 

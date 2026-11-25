@@ -355,8 +355,10 @@ mod tests {
             let report = about(Target::Message { channel: CHANNEL, record: msg.id() }, msg.encode());
             assert_eq!(report.sign(&key(1)).unwrap().len(), PLAIN_LEN + 4 + bucket + 64, "{body}");
         }
-        assert!(MAX_SIGNED + groupkeys::BOX_OVERHEAD <= sync::MAX_REPORT_BLOB);
     }
+
+    /// The largest sealed report fits a `/mvs/report/1` box.
+    const _: () = assert!(MAX_SIGNED + groupkeys::BOX_OVERHEAD <= sync::MAX_REPORT_BLOB);
 
     #[test]
     fn only_what_sign_makes_verifies() {

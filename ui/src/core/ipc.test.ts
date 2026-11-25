@@ -55,6 +55,23 @@ describe('ipc core', () => {
     expect(second).toEqual([{ link: 'mvs://join/c' }]);
   });
 
+  it('G-30: keeps a link.message too, separately from link.open, for its first listener', async () => {
+    const { bridge, emit } = fakeBridge(() => ({ ok: null }));
+    const core = createIpcCore(bridge);
+    const ids = (n: string) => ({ serverId: n.repeat(64), channelId: 'c'.repeat(64), messageId: 'd'.repeat(64) });
+    emit('link.message', ids('a'));
+    emit('link.message', ids('b'));
+    emit('link.open', { link: 'mvs://join/x' });
+    const msgs: unknown[] = [];
+    const invites: unknown[] = [];
+    core.on('link.message' as never, (p: unknown) => msgs.push(p));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(msgs).toEqual([ids('b')]);
+    core.on('link.open' as never, (p: unknown) => invites.push(p));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(invites).toEqual([{ link: 'mvs://join/x' }]);
+  });
+
   it('gives the latest core.status to every listener, also ones that come late (T8-01)', async () => {
     const { bridge, emit } = fakeBridge(() => ({ ok: null }));
     const core = createIpcCore(bridge);

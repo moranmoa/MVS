@@ -13,7 +13,8 @@ use libp2p::{
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
 use sync::{
-    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, ReportError, TypingError, VoiceError,
+    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ReportError, ServerSecret, TypingError,
+    VoiceCall, VoiceError, VoiceFrame, VoicePath,
     MAX_REPORT_BLOB, MAX_TYPING_BLOB, MAX_VOICE_BLOB,
 };
 use tokio::sync::mpsc;
@@ -760,6 +761,297 @@ async fn the_voice_rate_cap_holds() {
     assert!(got.len() >= 20, "only {} arrived", got.len());
     assert!(got.len() <= allowed, "{} arrived, at most {allowed} allowed", got.len());
     assert!(got.iter().all(|(from, _)| *from == voice_id(25)));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+// ---- voice media (G-81, `/mvs/voice-media/1`) -----------------------------
+
+/// A call with `others` (all of them targets).
+fn voice_call(id: u8, others: &[records::PublicKey]) -> VoiceCall {
+    VoiceCall { call_id: [id; 16], participants: others.to_vec(), targets: others.to_vec() }
+}
+
+fn vframe(call: u8, seq: u32) -> VoiceFrame {
+    VoiceFrame { call_id: [call; 16], seq, ts: seq.wrapping_mul(1920), opus: vec![seq as u8; 80] }
+}
+
+/// The voice frames that arrive within `wait`, and the paths reported.
+async fn voice_media(events: &mut mpsc::Receiver<NodeEvent>, wait: Duration) -> (Vec<(records::PublicKey, VoiceFrame)>, Vec<VoicePath>) {
+    let (mut frames, mut paths) = (Vec::new(), Vec::new());
+    let deadline = tokio::time::Instant::now() + wait;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        match event {
+            NodeEvent::VoiceFrame { from, frame } => frames.push((from, frame)),
+            NodeEvent::VoicePath { path, .. } => paths.push(path),
+            _ => {}
+        }
+    }
+    (frames, paths)
+}
+
+/// Sends frames from `seq` on at 25 a second until `events` has one (the
+/// substream is up), within 20 s; returns the next seq to send.
+async fn voice_until_flowing(from: &Node, events: &mut mpsc::Receiver<NodeEvent>, call: u8, mut seq: u32) -> u32 {
+    let start = Instant::now();
+    loop {
+        from.voice_frame(vframe(call, seq));
+        seq += 1;
+        let (got, _) = voice_media(events, Duration::from_millis(40)).await;
+        if !got.is_empty() {
+            return seq;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "voice media never flowed");
+    }
+}
+
+/// Two participants exchange frames through our relay's circuit, and on a
+/// LAN on the direct connection (a call that starts relayed moves to it):
+/// in order, from the right identity, the path reported, nothing lost
+/// beyond the jitter budget once it flows.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_participants_exchange_voice_frames_relayed_and_on_a_lan() {
+    for lan in [false, true] {
+        let (relay, _relay) = voice_relay();
+        let (a, mut ea) = bound_node_events(&format!("media-a-{lan}"), &relay, 31, lan, Arc::new(AcceptAll)).await;
+        let (b, mut eb) = bound_node_events(&format!("media-b-{lan}"), &relay, 32, lan, Arc::new(AcceptAll)).await;
+        voice_meet(&a, &b, voice_id(31), voice_id(32), false).await;
+        a.set_voice_call(Some(voice_call(1, &[voice_id(32)]))).unwrap();
+        b.set_voice_call(Some(voice_call(1, &[voice_id(31)]))).unwrap();
+
+        let mut seq = voice_until_flowing(&a, &mut eb, 1, 1).await;
+        // Then 5 s at 25 a second: the LAN run moves to direct meanwhile.
+        let first = seq;
+        for _ in 0..125 {
+            a.voice_frame(vframe(1, seq));
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let (got, _) = voice_media(&mut eb, Duration::from_secs(2)).await;
+        let seqs: Vec<u32> = got.iter().filter(|(_, f)| f.seq >= first).map(|(_, f)| f.seq).collect();
+        assert!(got.iter().all(|(from, f)| *from == voice_id(31) && f.call_id == [1; 16]));
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "out of order or repeated: {seqs:?}");
+        let missing = (seq - first) as usize - seqs.len();
+        // Make-before-break (TL fix 2): nothing lost, even across the move.
+        assert_eq!(missing, 0, "{missing} frames lost of {}", seq - first);
+
+        let (_, paths) = voice_media(&mut ea, Duration::from_millis(200)).await;
+        let want = if lan { VoicePath::Lan } else { VoicePath::Circuit };
+        assert_eq!(paths.last(), Some(&want), "paths reported: {paths:?}");
+        if !lan {
+            assert!(a.direct_peers().await.unwrap().is_empty(), "the relayed run went direct");
+        }
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+}
+
+/// Relay-only (SL B5): voice stays on our relay's circuit, never direct,
+/// even on one LAN.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_only_voice_never_goes_direct() {
+    let (relay, _relay) = voice_relay();
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let (a, mut ea) = bound_node_on_events("media-ro-a", &relay, 33, true, Arc::new(AcceptAll), listen.clone(), vec![], true).await;
+    let (b, mut eb) = bound_node_on_events("media-ro-b", &relay, 34, true, Arc::new(AcceptAll), listen, vec![], true).await;
+    voice_meet(&a, &b, voice_id(33), voice_id(34), false).await;
+    a.set_voice_call(Some(voice_call(2, &[voice_id(34)]))).unwrap();
+    b.set_voice_call(Some(voice_call(2, &[voice_id(33)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 2, 1).await;
+    let (_, paths) = voice_media(&mut ea, Duration::from_millis(500)).await;
+    assert!(paths.iter().all(|p| *p == VoicePath::Circuit), "relay-only paths: {paths:?}");
+    assert!(a.direct_peers().await.unwrap().is_empty());
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// The gate (SL B1): frames come only from participants of my current call
+/// who are current members, and only under my call ID. A member outside
+/// the call, another call, and a kicked member get nothing through.
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_frames_come_from_my_calls_participants_only() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    let (a, _ea) = bound_node_events("media-gate-a", &relay, 35, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-gate-b", &relay, 36, false, Arc::new(gate.clone())).await;
+    let (c, _ec) = bound_node_events("media-gate-c", &relay, 37, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(35), voice_id(36), false).await;
+    voice_meet(&c, &b, voice_id(37), voice_id(36), false).await;
+    // B's call has A only; C thinks B is in its call.
+    b.set_voice_call(Some(voice_call(3, &[voice_id(35)]))).unwrap();
+    a.set_voice_call(Some(voice_call(3, &[voice_id(36)]))).unwrap();
+    c.set_voice_call(Some(voice_call(3, &[voice_id(36)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 3, 1).await;
+    for seq in 100..125 {
+        c.voice_frame(vframe(3, seq));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(1)).await;
+    assert!(got.iter().all(|(from, _)| *from == voice_id(35)), "a non-participant's frame arrived");
+
+    // A under another call ID: dropped.
+    a.set_voice_call(Some(voice_call(4, &[voice_id(36)]))).unwrap();
+    for seq in 200..225 {
+        a.voice_frame(vframe(4, seq));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(1)).await;
+    assert!(got.is_empty(), "another call's frame arrived");
+
+    // Back in the call, then kicked: nothing more.
+    a.set_voice_call(Some(voice_call(3, &[voice_id(36)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 3, 300).await;
+    gate.set(voice_id(35), true);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(100)).await;
+    for seq in 400..425 {
+        a.voice_frame(vframe(3, seq));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(1)).await;
+    assert!(got.is_empty(), "a kicked member's frame arrived");
+    for node in [a, b, c] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The sequence rules (SL #530) and the caps (SL B2): an old or repeated
+/// seq is dropped, and so is a jump over 2^16; a flood gets at most the caps.
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_frames_keep_their_sequence_rules_and_caps() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-seq-a", &relay, 38, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-seq-b", &relay, 39, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(38), voice_id(39), false).await;
+    a.set_voice_call(Some(voice_call(5, &[voice_id(39)]))).unwrap();
+    b.set_voice_call(Some(voice_call(5, &[voice_id(38)]))).unwrap();
+    let next = voice_until_flowing(&a, &mut eb, 5, 1000).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(300)).await;
+    for seq in [next, next - 5, next, next + (1 << 16) + 1, next + 1] {
+        a.voice_frame(vframe(5, seq));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(1)).await;
+    let seqs: Vec<u32> = got.iter().map(|(_, f)| f.seq).collect();
+    assert_eq!(seqs, vec![next, next + 1]);
+
+    // A flood: my own cap sends at most 60 in a burst; B takes 60 a second.
+    let start = Instant::now();
+    for n in 0..300 {
+        a.voice_frame(vframe(5, next + 2 + n));
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(2)).await;
+    let allowed = 60 + 60 * start.elapsed().as_secs_f64().ceil() as usize;
+    assert!(!got.is_empty() && got.len() <= allowed, "{} arrived, at most {allowed}", got.len());
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// Relay-only switched on mid-call (TL fix 1, SL B5): a LAN call leaves its
+/// direct path at once and goes on over our relay's circuit.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_only_mid_call_moves_voice_off_the_direct_path() {
+    let (relay, _relay) = voice_relay();
+    let (a, mut ea) = bound_node_events("media-mid-a", &relay, 40, true, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-mid-b", &relay, 41, true, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(40), voice_id(41), true).await;
+    a.set_voice_call(Some(voice_call(6, &[voice_id(41)]))).unwrap();
+    b.set_voice_call(Some(voice_call(6, &[voice_id(40)]))).unwrap();
+    let mut seq = voice_until_flowing(&a, &mut eb, 6, 1).await;
+    let (_, paths) = voice_media(&mut ea, Duration::from_millis(300)).await;
+    assert_eq!(paths.last(), Some(&VoicePath::Lan), "{paths:?}");
+
+    a.set_relay_only(true).unwrap();
+    let start = Instant::now();
+    let mut circuit = false;
+    while !circuit {
+        assert!(start.elapsed() < Duration::from_secs(20), "never moved to the circuit");
+        let (_, paths) = voice_media(&mut ea, Duration::from_millis(200)).await;
+        circuit = paths.last() == Some(&VoicePath::Circuit);
+    }
+    assert!(a.direct_peers().await.unwrap().is_empty(), "relay-only kept a direct link");
+    seq = voice_until_flowing(&a, &mut eb, 6, seq + 10).await;
+    let (_, paths) = voice_media(&mut ea, Duration::from_millis(300)).await;
+    assert!(paths.iter().all(|p| *p == VoicePath::Circuit), "{paths:?} after seq {seq}");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL fix 4: a participant who leaves and rejoins the same call is heard at
+/// once, though its sequence starts again from 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejoin_to_the_same_call_is_heard_at_once() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-rejoin-a", &relay, 42, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-rejoin-b", &relay, 43, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(42), voice_id(43), false).await;
+    a.set_voice_call(Some(voice_call(7, &[voice_id(43)]))).unwrap();
+    b.set_voice_call(Some(voice_call(7, &[voice_id(42)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 7, 5000).await;
+
+    // A leaves; B's call goes on without A; then A comes back.
+    a.set_voice_call(None).unwrap();
+    b.set_voice_call(Some(voice_call(7, &[]))).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(200)).await;
+    b.set_voice_call(Some(voice_call(7, &[voice_id(42)]))).unwrap();
+    a.set_voice_call(Some(voice_call(7, &[voice_id(43)]))).unwrap();
+    let start = Instant::now();
+    voice_until_flowing(&a, &mut eb, 7, 1).await;
+    assert!(start.elapsed() < Duration::from_secs(5), "silence after the rejoin: {:?}", start.elapsed());
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL fix 3: a flooding participant doesn't crowd out another's frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flooding_participant_does_not_silence_another() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-flood-a", &relay, 44, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-flood-b", &relay, 45, false, Arc::new(AcceptAll)).await;
+    let (c, _ec) = bound_node_events("media-flood-c", &relay, 46, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(44), voice_id(45), false).await;
+    voice_meet(&c, &b, voice_id(46), voice_id(45), false).await;
+    b.set_voice_call(Some(voice_call(8, &[voice_id(44), voice_id(46)]))).unwrap();
+    a.set_voice_call(Some(voice_call(8, &[voice_id(45)]))).unwrap();
+    c.set_voice_call(Some(voice_call(8, &[voice_id(45)]))).unwrap();
+    let mut seq = voice_until_flowing(&a, &mut eb, 8, 1).await;
+    voice_until_flowing(&c, &mut eb, 8, 1).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(300)).await;
+
+    // C floods for 2 s while A talks at 25 a second.
+    let first = seq;
+    for tick in 0..50u32 {
+        for n in 0..40 {
+            c.voice_frame(vframe(8, 1000 + tick * 40 + n));
+        }
+        a.voice_frame(vframe(8, seq));
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let (got, _) = voice_media(&mut eb, Duration::from_secs(1)).await;
+    let from_a = got.iter().filter(|(from, f)| *from == voice_id(44) && f.seq >= first).count();
+    assert!(from_a >= 48, "only {from_a} of 50 of A's frames arrived during C's flood");
+    for node in [a, b, c] {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// SL nit on #554: a sender whose engine restarts mid-call (its seq back to
+/// 1 on the same substream) is heard again at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_senders_restart_mid_call_is_heard_at_once() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("media-restart-a", &relay, 47, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("media-restart-b", &relay, 48, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(47), voice_id(48), false).await;
+    a.set_voice_call(Some(voice_call(9, &[voice_id(48)]))).unwrap();
+    b.set_voice_call(Some(voice_call(9, &[voice_id(47)]))).unwrap();
+    voice_until_flowing(&a, &mut eb, 9, 200_000).await;
+    let _ = voice_media(&mut eb, Duration::from_millis(300)).await;
+    let start = Instant::now();
+    voice_until_flowing(&a, &mut eb, 9, 1).await;
+    assert!(start.elapsed() < Duration::from_secs(2), "the restart went unheard for {:?}", start.elapsed());
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }

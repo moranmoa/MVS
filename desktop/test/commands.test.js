@@ -41,6 +41,15 @@ test('commands outside the list are refused, including prototype names', () => {
   }
 });
 
+test('G-78: the app lock commands never go through core:invoke (main-only, lock:* IPCs)', () => {
+  // getAppLock / verifyAppLock: main calls them itself. set / clear / words:
+  // only through lock:set, lock:clear and lock:unlock (applock.js).
+  for (const cmd of ['getAppLock', 'verifyAppLock', 'setAppLock', 'clearAppLock', 'clearAppLockWithWords']) {
+    assert.equal(Object.hasOwn(COMMANDS, cmd), false, cmd);
+    assert.deepEqual(toRequest(cmd, [{ current: '1234', passcode: '5678' }]), { error: 'not-allowed' }, cmd);
+  }
+});
+
 test('positional args become the core\'s named args', () => {
   assert.deepEqual(toRequest('getMessages', ['c1', 0, 100]), { cmd: 'getMessages', args: { channelId: 'c1', start: 0, end: 100 } });
   assert.deepEqual(toRequest('sendMessage', ['c1', 'hi']), { cmd: 'sendMessage', args: { channelId: 'c1', body: 'hi' } });

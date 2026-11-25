@@ -40,11 +40,13 @@ mod invite;
 mod report;
 mod typing;
 mod voice;
+mod voice_media;
 #[cfg(test)]
 pub(crate) mod testutil;
 
 pub use access::{binding_message, Binder, Handle, ReadGate, ServerSecret};
-pub use node::{Access, Node, NodeConfig, NodeEvent, PresenceState, Reachability, Via};
+pub use node::{Access, Node, NodeConfig, NodeEvent, PresenceState, Reachability, Via, VoiceCall, VoicePath};
+pub use voice_media::{VoiceFrame, MAX_OPUS as MAX_VOICE_OPUS};
 pub use records::{ChannelId, Record, RecordId, Scope, ServerId, Stub};
 pub use backup::MAX_BACKUP;
 pub use lan_beacon::BEACON_PORT as LAN_BEACON_PORT;

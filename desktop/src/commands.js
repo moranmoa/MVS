@@ -23,6 +23,8 @@ const COMMANDS = Object.freeze({
   listChannels: ['serverId'],
   createChannel: ['serverId', 'input'],
   updateChannel: ['channelId', 'input'],
+  // G-14 channel topic
+  setChannelTopic: ['channelId', 'topic'],
   deleteChannel: ['channelId'],
   listMembers: ['serverId'],
   createServer: ['input'],
@@ -48,6 +50,8 @@ const COMMANDS = Object.freeze({
   markRead: ['channelId'],
   // Safety
   blockUser: ['userId'],
+  listBlocked: [],
+  setBlocked: ['userId', 'blocked'],
   kickMember: ['serverId', 'userId'],
   listRemovedMembers: ['serverId'],
   undoKick: ['serverId', 'userId'],

@@ -24,8 +24,10 @@ pub struct Identity {
     pub bio: Option<String>,
     pub country: String,
     pub birth_date: String,
-    /// B7 §9: a correction that raises my age, waiting its 30 days
-    /// (decision 18). Until `effectiveAt` I count as under 18.
+    /// B7 §9: a raise of my age waiting its 30 days (decision 18). Until
+    /// `effectiveAt` my age counts from `birthDate`: a correction's new date
+    /// (G-77) only then replaces it. After a restore, the waiting date is
+    /// `birthDate` itself and I count as under 18 until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_birth_date: Option<PendingBirthDate>,
     pub recovery_checked: bool,
@@ -109,6 +111,14 @@ pub struct ServerSummary {
     /// for 30 days after the close was received (additive).
     #[serde(default)]
     pub closed: bool,
+    /// G-51: the server's icon as a `data:image/(png|webp);base64,` URL;
+    /// absent when there is none (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_data_url: Option<String>,
+    /// G-51: the server's description, up to 5 lines of plain text; absent
+    /// when there is none (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +159,19 @@ pub enum SendState {
     Failed,
 }
 
+/// Why a message is a placeholder (`Message.unreadable`, the PO's rules,
+/// TODO #21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unreadable {
+    /// Sent after my join under a key this device doesn't hold; it may
+    /// open later (`message.updated` with the text).
+    NoKey,
+    /// Under a rotation authority doesn't accept: no author, no reactions,
+    /// never a reply target.
+    Untrusted,
+}
+
 /// `Message` in types.ts. TODO: replies, edits, deletes, mentions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -157,6 +180,8 @@ pub struct Message {
     pub channel_id: Id,
     /// Position in the channel as shown, oldest first.
     pub index: usize,
+    /// Absent (empty) only on an `untrusted` placeholder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author_id: Id,
     pub body: String,
     pub created_at: Timestamp,
@@ -183,6 +208,11 @@ pub struct Message {
     /// first appeared; absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactions: Option<Vec<ReactionCount>>,
+    /// A placeholder (TODO #21): the body is "" and doesn't open here.
+    /// No mentions or reactions; not unread; react, edit and delete on it
+    /// get `bad-request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<Unreadable>,
 }
 
 /// `getSettings`: what the core keeps on this device.
@@ -287,6 +317,10 @@ pub struct CoreError {
     /// 1-based word positions that were not recognised (restore).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<Vec<usize>>,
+    /// G-77 `owns-restricted-server`: the names of the servers I own whose
+    /// age restriction is above the corrected age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub servers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +353,12 @@ pub enum ErrorCode {
     /// rename, leave or delete (no `server-lifecycle-v1` cap); nothing was
     /// signed.
     UpdateNeeded,
+    /// G-77 (B7 §2): a birth-date correction to under 16. Nothing changed.
+    TooYoung,
+    /// G-77 (PO): a lowering below the restriction of a server I own (an
+    /// owner can't leave, and its restriction is never lifted for me).
+    /// `servers` names them. Nothing changed.
+    OwnsRestrictedServer,
     /// Rust addition: malformed command JSON or arguments.
     BadRequest,
     /// Rust addition: in the contract, not done by this core yet.
@@ -350,7 +390,7 @@ pub enum ErrorCode {
 
 impl CoreError {
     pub fn new(code: ErrorCode) -> CoreError {
-        CoreError { code, positions: None }
+        CoreError { code, positions: None, servers: None }
     }
 }
 
@@ -480,6 +520,11 @@ pub enum NoticeKind {
     /// Rust addition: removed members still hold a channel key and only a
     /// moderator can renew it; the channel can't be written to until then.
     RekeyWaiting,
+    /// B7-k (to owners and admins of a server with an 18+ channel): some
+    /// members run a version that keys 18+ channels for every member, so
+    /// minors there may read what's sent. `getUpdateNeeded(serverId,
+    /// 'adult-keys-v1')` lists them. Sent once until that list is empty.
+    AdultKeysOutdated,
 }
 
 /// `CoreEvents` in api.ts, as `{ "event": name, "payload": ... }`.
@@ -506,11 +551,21 @@ pub enum Event {
         server_id: Id,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         reason: Option<RemovedReason>,
+        /// G-77: with `reason: 'age'`, the restriction I'm now under.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        required: Option<AgeRestriction>,
     },
     #[serde(rename = "channel.added")]
     ChannelAdded(Channel),
     #[serde(rename = "channel.removed", rename_all = "camelCase")]
-    ChannelRemoved { server_id: Id, channel_id: Id, name: String },
+    ChannelRemoved {
+        server_id: Id,
+        channel_id: Id,
+        name: String,
+        /// G-77 (additive): `deleted` or `age`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        reason: Option<ChannelRemovedReason>,
+    },
     #[serde(rename = "channel.updated")]
     ChannelUpdated(Channel),
     #[serde(rename = "members.changed", rename_all = "camelCase")]
@@ -679,6 +734,61 @@ pub enum RemovedReason {
     /// The owner closed (deleted) it, mine or read; sent when its 30 days
     /// are up and the rest of it is purged.
     Closed,
+    /// G-77 (B7 §2, §5): I corrected my birth date below the server's age
+    /// restriction (`required` says which); I left it.
+    Age,
+}
+
+/// G-77: why `channel.removed` fired (additive; older events had none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelRemovedReason {
+    Deleted,
+    /// An 18+ channel I no longer count as adult for (B7 §4).
+    Age,
+}
+
+/// G-77 `previewBirthDateCorrection` / `correctBirthDate` (B7 §2, §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgeCorrectionKind {
+    /// My age as it counts now doesn't change.
+    Same,
+    /// Lower: at once.
+    Lower,
+    /// Higher: pending for 30 days (`effectiveAt`).
+    Raise,
+    /// Under 16: refused (`correctBirthDate` rejects with `too-young`).
+    TooYoung,
+    /// A lowering below the restriction of a server I own: refused
+    /// (`owns-restricted-server`); `blockedBy` lists them.
+    OwnsRestrictedServer,
+}
+
+/// G-77: a server or channel a lowering would take away.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeLoss {
+    pub server_id: Id,
+    /// The server's name.
+    pub name: String,
+    /// An 18+ channel's name; absent when the whole server goes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub channel: Option<String>,
+}
+
+/// G-77: what a birth-date correction does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeCorrectionPreview {
+    pub kind: AgeCorrectionKind,
+    /// For `raise`: when it takes effect.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub effective_at: Option<Timestamp>,
+    pub loses: Vec<AgeLoss>,
+    /// For `owns-restricted-server`: my servers in the way (no `channel`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub blocked_by: Vec<AgeLoss>,
 }
 
 /// Voice rooms: a live room and who is in it, from verified hellos (soft

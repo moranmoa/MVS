@@ -17,6 +17,8 @@
   "diag.person": "שם",
   "diag.state": "מצב",
   "diag.path": "נתיב",
+  "diag.route": "מסלול",
+  "diag.playout": "השמעה: {type}",
   "diag.candidates": "המועמדים שלי",
   "diag.setup": "זמן התחברות",
   "diag.ms": "{n} מ״ש",

@@ -1766,6 +1766,7 @@ describe('voice engine: G-81 diagnostics', () => {
     ...['host', 'srflx', 'prflx', 'relay', 'unknown'],
     ...['new', 'checking', 'connecting', 'connected', 'completed', 'failed', 'disconnected', 'closed'],
     ...['stun', 'stunAnswered', 'gatherWindowS', 'peers', 'state', 'ice', 'gathered', 'pair', 'local', 'remote', 'gatherMs', 'setupMs'],
+    ...['playout', 'route', 'lan-webrtc', 'direct', 'circuit', 'member-circuit', 'none', 'loopback', 'speakers', 'element'],
     A,
     B,
   ]);
@@ -1829,7 +1830,7 @@ describe('voice engine: G-81 diagnostics', () => {
   it('outside a call: no peers', async () => {
     const h = fakeEnv();
     const engine = createVoiceEngine(new FakeCore(A, [A, B]), { env: h.env, stunUrl: 'stun:stun.example.test:3478' });
-    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, gatherWindowS: 3, peers: {} });
+    expect(await engine.diagnostics()).toEqual({ stun: true, playout: 'element', stunAnswered: null, gatherWindowS: 3, peers: {} });
     engine.dispose();
   });
 
@@ -1885,7 +1886,7 @@ describe('voice engine: G-81 diagnostics', () => {
     expect(h.mics).toHaveLength(0);
     expect(core.sent).toEqual([]);
     expect(errors).toEqual([]);
-    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, gatherWindowS: 3, peers: {} });
+    expect(await engine.diagnostics()).toEqual({ stun: true, playout: 'element', stunAnswered: null, gatherWindowS: 3, peers: {} });
     engine.dispose();
   });
 });
@@ -2076,6 +2077,34 @@ describe('voice engine: G-81 C2 (LAN WebRTC, else media over the P2P network)', 
     await vi.advanceTimersByTimeAsync(31_000);
     expect(errors).toEqual([{ code: 'peer-failed', peer: B }]);
     expect(yB(parts)).toBe('failed');
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('diagnostics: each peer route (B circuit, LAN WebRTC) and the playout, types only', async () => {
+    const b = await call('circuit');
+    await b.mx.push(3);
+    await vi.advanceTimersByTimeAsync(400);
+    const db = await b.ey.diagnostics();
+    expect(db.peers[A]).toMatchObject({ route: 'circuit', state: 'connected', ice: 'unknown', pair: null });
+    expect(['loopback', 'speakers', 'element']).toContain(db.playout);
+    b.ex.dispose();
+    b.ey.dispose();
+    const l = await call('lan');
+    expect((await l.ex.diagnostics()).peers[B]).toMatchObject({ route: 'lan-webrtc' });
+    l.ex.dispose();
+    l.ey.dispose();
+  });
+
+  it('diagnostics: a hostile or unknown path from the core shows as none, and nothing address-like comes out', async () => {
+    const { cx, ex, ey } = await call('circuit');
+    for (const bad of ['192.168.1.5', '/ip4/10.0.0.1/tcp/4001', 'relay.example.org', '<img>', 'direct ']) {
+      cx.paths[B] = bad as CallPath;
+      cx.emitState(cx.state());
+      const d = await ex.diagnostics();
+      expect(d.peers[B]!.route, bad).toBe('none');
+      expect(JSON.stringify(d), bad).not.toMatch(/\d+\.\d+\.\d+\.\d+|\/ip4|example|<img/);
+    }
     ex.dispose();
     ey.dispose();
   });

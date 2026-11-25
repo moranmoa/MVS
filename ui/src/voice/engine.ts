@@ -86,11 +86,23 @@ export interface PeerDiagnostics {
   gatherMs: number | null;
   /** From starting this connection to its first "connected", in ms. */
   setupMs: number | null;
+  /**
+   * G-81 C2: how this person's audio travels. `lan-webrtc`: WebRTC on my LAN;
+   * otherwise B over the P2P network: `direct` (LAN or punched), `circuit`
+   * (our relay), `member-circuit` (a member's relay), `none` (no path yet).
+   */
+  route: VoiceRoute;
 }
+
+export type VoiceRoute = 'lan-webrtc' | 'direct' | 'circuit' | 'member-circuit' | 'none';
+/** How the call's boosted and B audio is played: the loopback (AEC sees it), the speakers directly (its fallback), or only the elements (nobody boosted, no B). */
+export type VoicePlayout = 'loopback' | 'speakers' | 'element';
 
 export interface VoiceDiagnostics {
   /** A STUN server is configured (its address is never shown). */
   stun: boolean;
+  /** G-81: how boosted and B audio is played (a type only). */
+  playout: VoicePlayout;
   /** Whether it answered (any srflx gathered); null before any gathering or without STUN. */
   stunAnswered: boolean | null;
   /** How long gathering may take before the description goes out anyway, in seconds (UX: "no answer within {s} s"). */
@@ -317,6 +329,11 @@ async function selectedPair(pc: RTCPeerConnection): Promise<{ local: CandidateTy
 export function remotePeerConnection(env: Pick<VoiceEnv, 'createPeerConnection'>, relayOnly: boolean, config: RTCConfiguration): RTCPeerConnection {
   if (relayOnly) throw new Error('relay-only: no direct connection to a peer');
   return env.createPeerConnection(config);
+}
+
+/** G-81 B: a core path as a diagnostics route (a fixed set; anything unknown is `none`). */
+function bRoute(path: CallPath | undefined): VoiceRoute {
+  return path === 'lan' || path === 'direct' ? 'direct' : path === 'circuit' || path === 'member-circuit' ? path : 'none';
 }
 
 /** G-81 B: the shell's frame channel (#526), or null without it. */
@@ -1571,7 +1588,13 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       return out;
     },
     async diagnostics() {
-      const out: VoiceDiagnostics = { stun: stunConfigured, stunAnswered: null, gatherWindowS: gatherTimeoutMs / 1000, peers: {} };
+      const out: VoiceDiagnostics = {
+        stun: stunConfigured,
+        playout: playout ? 'loopback' : limiter ? 'speakers' : 'element',
+        stunAnswered: null,
+        gatherWindowS: gatherTimeoutMs / 1000,
+        peers: {},
+      };
       for (const p of peers.values()) {
         const ice = p.pc.iceConnectionState;
         out.peers[p.id] = {
@@ -1581,8 +1604,22 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
           pair: await selectedPair(p.pc),
           gatherMs: p.gatherMs,
           setupMs: p.setupMs,
+          route: 'lan-webrtc',
         };
         if (stunConfigured && p.gathered) out.stunAnswered = out.stunAnswered === true || p.gathered.srflx > 0;
+      }
+      // G-81 B peers: no WebRTC stats, only their route and state.
+      for (const id of bPeers.keys()) {
+        if (peers.has(id)) continue;
+        out.peers[id] = {
+          state: bFailed.has(id) ? 'failed' : usableB(id) && session ? 'connected' : 'connecting',
+          ice: 'unknown',
+          gathered: null,
+          pair: null,
+          gatherMs: null,
+          setupMs: null,
+          route: bRoute(paths.get(id)),
+        };
       }
       return out;
     },

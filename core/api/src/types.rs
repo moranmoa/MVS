@@ -387,6 +387,9 @@ pub enum ErrorCode {
     /// trying).
     LockedOut,
     DiskFull,
+    /// A required update is pending (RU1): the core signs nothing and
+    /// sends nothing until it runs a version that isn't revoked.
+    UpdateRequired,
 }
 
 impl CoreError {
@@ -476,6 +479,20 @@ pub struct AppInfo {
     /// through the relay, and calls are off.
     #[serde(default)]
     pub relay_only: bool,
+    /// A required update (`docs/design/required-update.md`): `null` unless
+    /// an accepted signed manifest revoked this version. Then the app is
+    /// local read-only plus update, and the core signs and syncs nothing
+    /// (RU1) for the rest of the process.
+    #[serde(default)]
+    pub update_required: Option<UpdateRequired>,
+}
+
+/// `AppInfo.updateRequired` and `update.required`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRequired {
+    /// The newer version on offer; `null`: none yet ("not available yet").
+    pub version: Option<String>,
 }
 
 /// `getRecoveryChallenge`'s result: 1-based positions.
@@ -588,6 +605,9 @@ pub enum Event {
     MessageAdded(Message),
     #[serde(rename = "update.ready")]
     UpdateReady(UpdateInfo),
+    /// A required update turned on (or the version on offer changed).
+    #[serde(rename = "update.required")]
+    UpdateRequired(UpdateRequired),
     /// Voice: my call changed (join, leave, mute, timeout). After a leave,
     /// or a refusal by a full call, its participants are empty.
     #[serde(rename = "call.state")]

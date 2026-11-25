@@ -64,6 +64,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::JoinStatus(_) => "join.status",
             Event::BlocksChanged { .. } => "blocks.changed",
             Event::UpdateReady(_) => "update.ready",
+            Event::UpdateRequired(_) => "update.required",
             Event::UpdateInstalled { .. } => "update.installed",
             Event::UpdateRolledBack { .. } => "update.rolledBack",
             Event::Notice { .. } => "notice",

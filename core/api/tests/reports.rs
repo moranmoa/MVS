@@ -404,3 +404,62 @@ fn through_the_dispatcher() {
     );
     assert_eq!(again["error"]["code"], "already-reported");
 }
+
+fn advance(world: &World, ms: u64) {
+    *world.clock.0.lock().unwrap() += ms;
+}
+
+/// A box delivered more than 30 days after it was signed is dropped, and so
+/// is one claiming a time more than 10 minutes in the future.
+#[test]
+fn the_ts_window_drops_stale_and_future_reports() {
+    let (world, r, message) = room();
+    r.plain.core.report_content(&r.server.id, &target_message(&message), "spam", None).unwrap();
+    r.plain.core.report_tick();
+    let queued: Vec<_> = std::mem::take(&mut *r.hub.queue.lock().unwrap());
+    let to_owner = |q: &[(PublicKey, PublicKey, Vec<u8>)]| {
+        q.iter().find(|(_, to, _)| *to == key_of(&r.owner_id.id)).unwrap().clone()
+    };
+    let (from, _, blob) = to_owner(&queued);
+    // 30 days and a minute later: dropped.
+    advance(&world, 30 * 24 * 60 * 60 * 1000 + 60_000);
+    r.owner.core.report_received(Some(from), &blob);
+    assert!(received(&r.owner).is_empty(), "too old");
+
+    // Signed by a clock 11 minutes ahead of the owner's: dropped.
+    let another = r.rude.core.send_message(&r.channel, "again", None).unwrap();
+    r.sync_all();
+    advance(&world, 11 * 60 * 1000);
+    r.plain.core.report_content(&r.server.id, &target_message(&another), "spam", None).unwrap();
+    r.plain.core.report_tick();
+    let (from, _, ahead) = to_owner(&std::mem::take(&mut *r.hub.queue.lock().unwrap()));
+    *world.clock.0.lock().unwrap() -= 11 * 60 * 1000;
+    r.owner.core.report_received(Some(from), &ahead);
+    assert!(received(&r.owner).is_empty(), "from the future");
+    // Ten minutes back on the owner's clock: within the window.
+    advance(&world, 2 * 60 * 1000);
+    r.owner.core.report_received(Some(from), &ahead);
+    assert_eq!(received(&r.owner).len(), 1);
+}
+
+/// The reporter's own caps: 5 an hour, 20 a day per server.
+#[test]
+fn twenty_a_day_per_server() {
+    let (world, r, _) = room();
+    let mut messages = Vec::new();
+    for n in 0..21 {
+        messages.push(r.rude.core.send_message(&r.channel, &format!("spam {n}"), None).unwrap());
+    }
+    r.sync_all();
+    for (i, message) in messages.iter().take(20).enumerate() {
+        if i > 0 && i % 5 == 0 {
+            advance(&world, 60 * 60 * 1000 + 1);
+        }
+        r.plain.core.report_content(&r.server.id, &target_message(message), "spam", None).unwrap();
+    }
+    advance(&world, 60 * 60 * 1000 + 1);
+    let code = r.plain.core.report_content(&r.server.id, &target_message(&messages[20]), "spam", None).unwrap_err().code;
+    assert_eq!(code, ErrorCode::RateLimited, "the 21st within a day");
+    advance(&world, 24 * 60 * 60 * 1000);
+    r.plain.core.report_content(&r.server.id, &target_message(&messages[20]), "spam", None).unwrap();
+}

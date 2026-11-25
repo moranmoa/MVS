@@ -48,8 +48,9 @@ pub type VoiceSignal = (PublicKey, Vec<u8>);
 /// (sync caps them at 30 at once and 10 a second from everyone).
 const TYPING_QUEUE: usize = 64;
 
-/// G-48: received report boxes waiting for the core; more are dropped (sync
-/// caps them at 20 at once and 2 a second from everyone, and acked them).
+/// G-48: received report boxes waiting for the core. Sync acks a box only
+/// once it is in here (a full queue: unacked, the sender retries); sync caps
+/// them at 20 at once and 2 a second from everyone.
 const REPORT_QUEUE: usize = 32;
 
 /// A `--relay` address: a multiaddr that ends in `/p2p/<peer id>`, so Noise
@@ -239,6 +240,8 @@ impl SyncNetwork {
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
         let (typing_tx, typing) = std::sync::mpsc::sync_channel(TYPING_QUEUE);
         let (report_tx, reports) = std::sync::mpsc::sync_channel(REPORT_QUEUE);
+        // G-48: boxes go straight to this queue, acked only once in it.
+        node.set_report_sink(report_tx.clone())?;
         let invite_pushes: InvitePushes = Arc::default();
         let pushes = invite_pushes.clone();
         let link_inbox: LinkInbox = Arc::default();
@@ -401,21 +404,22 @@ pub fn deliver_typing(signals: Receiver<VoiceSignal>, core: &Core) {
     }
 }
 
-/// G-48: hands each received report box to the core, and delivers its
-/// outbox about every 10 seconds, until the node stops. Its own thread:
-/// delivery waits for acks.
+/// G-48: hands each received report box to the core until the node stops.
+/// Its own thread, which never waits on the network: sync acked each box
+/// only once it was in this queue, so draining it promptly is what keeps
+/// new boxes acked (the Tech Lead's #515 review).
 pub fn deliver_reports(boxes: Receiver<VoiceSignal>, core: &Core) {
-    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    for (from, sealed) in boxes {
+        core.report_received(Some(from), &sealed);
+    }
+}
+
+/// G-48: delivers my outbox about every 10 seconds, forever. Its own thread:
+/// each delivery may wait up to 30 s for an ack.
+pub fn run_report_outbox(core: &Core) {
     loop {
-        match boxes.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok((from, sealed)) => core.report_received(Some(from), &sealed),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-        if last.elapsed() >= std::time::Duration::from_secs(10) {
-            last = std::time::Instant::now();
-            core.report_tick();
-        }
+        core.report_tick();
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 }
 

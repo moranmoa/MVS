@@ -2804,6 +2804,11 @@ impl Core {
                     });
                 }
             }
+            // G-48 (A3, the Tech Lead's #515 review): a leave, kick or
+            // demotion read this round drops the reports I held as staff and
+            // my outbox rows there, with or without a network. Never fails
+            // the round; the next one retries.
+            let _ = inner.prune_reports(ports.clock.now_ms());
             // Messages held for their key: sent now if it came.
             inner.send_key_pending(ports, events)
         })
@@ -6188,6 +6193,8 @@ const REPORTS_PER_DAY: usize = 20;
 const RECEIVED_PER_REPORTER_HOUR: usize = 10;
 /// Stored reports per server; the oldest dismissed go first, then the oldest.
 const MAX_STORED_REPORTS: usize = 1000;
+/// Received report IDs remembered for dedup, at most (oldest out).
+const MAX_SEEN_REPORTS: usize = 4096;
 const HOUR_MS: u64 = 60 * 60 * 1000;
 const DAY_MS: u64 = 24 * HOUR_MS;
 
@@ -6382,10 +6389,22 @@ impl Core {
         let _ = self.run(|inner, ports, events| {
             let now = ports.clock.now_ms();
             let Some((server, opened)) = inner.open_report(sealed)? else { return Ok(()) };
+            // Its log may not be loaded yet (right after start).
+            inner.load(server)?;
             let me = inner.me.as_ref().map(Me::key);
             let fresh = opened.ts <= now.saturating_add(report::MAX_AHEAD_MS)
                 && now.saturating_sub(opened.ts) <= report::MAX_AGE_MS;
             if from != Some(opened.reporter) || me == Some(opened.reporter) || !fresh {
+                return Ok(());
+            }
+            // Never a report about me, sealed to me by a modified client.
+            let about_me = match opened.target {
+                report::Target::Member(m) => Some(m) == me,
+                report::Target::Message { .. } => {
+                    report::check_evidence(&opened).is_some_and(|r| Some(r.author()) == me)
+                }
+            };
+            if about_me {
                 return Ok(());
             }
             {
@@ -6409,6 +6428,11 @@ impl Core {
             let reporter = model::hex_id(opened.reporter.as_bytes());
             let mut seen: Vec<SeenRow> = inner.kv_json(KV_REPORT_SEEN)?.unwrap_or_default();
             seen.retain(|r| now.saturating_sub(r.at) < report::MAX_AGE_MS + DAY_MS);
+            // Bounded by count too (oldest out): beyond it, a replay of the
+            // oldest is still refused by the 30-day `ts` window only.
+            if seen.len() >= MAX_SEEN_REPORTS {
+                seen.drain(..=seen.len() - MAX_SEEN_REPORTS);
+            }
             let recent = seen
                 .iter()
                 .filter(|r| r.reporter == reporter && now.saturating_sub(r.at) < HOUR_MS)
@@ -6488,7 +6512,7 @@ impl Core {
             if opened.reason.sensitive() && !inner.view(server)?.state.adults.contains(&me) {
                 return Err(ErrorCode::NotAllowed.into());
             }
-            let record = report::check_evidence(&opened).ok_or(ErrorCode::BadRequest)?;
+            let record = inner.report_evidence(server, &opened)?.ok_or(ErrorCode::BadRequest)?;
             let report::Target::Message { channel, .. } = opened.target else {
                 return Err(ErrorCode::NotFound.into());
             };
@@ -6511,8 +6535,29 @@ fn report_target_hex(target: &report::Target) -> String {
 }
 
 impl Inner {
+    /// A report store's rows. Unreadable bytes are never overwritten: they
+    /// are kept aside under `<key>.unreadable` (the latest only), logged
+    /// without content, and the store starts empty.
     fn kv_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> CoreResult<Option<T>> {
-        Ok(self.db.get(key)?.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+        let Some(bytes) = self.db.get(key)? else { return Ok(None) };
+        match serde_json::from_slice(&bytes) {
+            Ok(rows) => Ok(Some(rows)),
+            Err(_) => {
+                tracing::warn!(store = key, len = bytes.len(), "unreadable report store kept aside");
+                self.db.set(&format!("{key}.unreadable"), &bytes)?;
+                self.db.delete(key)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// R4 and the Tech Lead's #515 review: the evidence of a message report,
+    /// if it is that very message (`report::check_evidence`) in a channel
+    /// that exists in `server`.
+    fn report_evidence(&self, server: ServerId, opened: &Report) -> CoreResult<Option<Record>> {
+        let Some(record) = report::check_evidence(opened) else { return Ok(None) };
+        let report::Target::Message { channel, .. } = opened.target else { return Ok(None) };
+        Ok(self.known(server)?.contains(&channel).then_some(record))
     }
 
     fn set_kv_json<T: Serialize>(&self, key: &str, value: &T) -> CoreResult<()> {
@@ -6577,7 +6622,7 @@ impl Inner {
         received_at: u64,
         dismissed: bool,
     ) -> CoreResult<ReportSummary> {
-        let evidence = report::check_evidence(opened);
+        let evidence = self.report_evidence(server, opened)?;
         let (target, reported) = match opened.target {
             report::Target::Message { channel, record } => (
                 ReportTarget::Message {

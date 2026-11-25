@@ -1147,6 +1147,39 @@ async fn report_boxes_go_between_members_acked_with_their_own_caps() {
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
+
+/// G-48 (the Tech Lead's #515 review): with a report sink, a box is acked
+/// only once it is in the sink. A stalled receiver (a full sink nobody
+/// drains) leaves boxes unacked, so the sender's outbox keeps them; once it
+/// drains, the next one is acked. Nothing acked is ever lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_report_inbox_never_acks() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("report-stall-a", &relay, 34, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("report-stall-b", &relay, 35, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(34), voice_id(35), false).await;
+    let (sink, inbox) = std::sync::mpsc::sync_channel(1);
+    b.set_report_sink(sink).unwrap();
+
+    assert_eq!(a.report_send(voice_id(35), b"first".to_vec()).await, Ok(()), "room for one");
+    assert_eq!(
+        a.report_send(voice_id(35), b"second".to_vec()).await,
+        Err(ReportError::NotAcked),
+        "the inbox is full: not acked, so the sender keeps it"
+    );
+    assert_eq!(inbox.try_recv().unwrap(), (voice_id(34), b"first".to_vec()));
+    assert!(inbox.try_recv().is_err(), "the unacked box never went in");
+    // Drained: acked again (a token is back after 10 s).
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(a.report_send(voice_id(35), b"third".to_vec()).await, Ok(()));
+    assert_eq!(inbox.try_recv().unwrap().1, b"third".to_vec());
+    // With a sink, boxes never travel the event stream.
+    while let Ok(event) = eb.try_recv() {
+        assert!(!matches!(event, NodeEvent::ReportBox { .. }));
+    }
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
 /// T8-02 piece 3: a member's invite publication reaches the other members
 /// (`/mvs/invite-pub/1`), also one that binds later; anyone, a stranger
 /// with no server secret included, can ask for its envelope handle

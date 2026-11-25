@@ -248,6 +248,8 @@ fn main() -> ExitCode {
         if let Some(boxes) = net.take_reports() {
             std::thread::spawn(move || api::syncnet::deliver_reports(boxes, core));
         }
+        // Delivery waits for acks: never on the thread that receives.
+        std::thread::spawn(move || api::syncnet::run_report_outbox(core));
     }
     eprintln!("mvs-core: ready");
     // With a network, a background sync beside the request loop; it stops

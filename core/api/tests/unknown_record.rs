@@ -162,6 +162,12 @@ fn nobody_but_a_current_member_can_flag_a_server() {
     // A member's record for a server I'm not in.
     let elsewhere = ServerId::from_bytes([77; 32]);
     world.network.offer_raw(&newer_record(&member, elsewhere, Scope::Control, NEWER));
+    // A kicked member's, signed correctly.
+    let kicked = SigningKey::from_bytes(&[64; 32]);
+    join(&world, &server, &kicked);
+    owner.core.sync_now().unwrap();
+    owner.core.kick_member(&server.id, &hex::encode(kicked.verifying_key().to_bytes())).unwrap();
+    world.network.offer_raw(&newer_record(&kicked, id, Scope::Control, NEWER));
     // A known kind is decoded like any record, never a sign of an update.
     world.network.offer_raw(&newer_record(&member, id, Scope::Control, Kind::Post.code()));
     owner.core.sync_now().unwrap();

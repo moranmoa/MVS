@@ -2715,10 +2715,6 @@ impl Core {
         self.run(|inner, ports, events| {
             let Some(me) = inner.me.as_ref() else { return Ok(()) };
             let me = me.key();
-            // The detector: records sync rejected for a kind it doesn't know.
-            for unknown in ports.network.take_unknown_records() {
-                inner.note_unknown_record(&*ports.cipher, unknown, events)?;
-            }
             // Closed servers past their 30 days: purged but for their
             // genesis and close.
             inner.expire_closed(ports, events)?;
@@ -2807,6 +2803,14 @@ impl Core {
                         server_id: model::hex_id(server.as_bytes()),
                         members: inner.members_json(&view)?,
                     });
+                }
+            }
+            // The detector: records sync rejected for a kind it doesn't know,
+            // judged against this round's membership. One that fails is
+            // logged and skipped: it never aborts the round or the others.
+            for unknown in ports.network.take_unknown_records() {
+                if let Err(e) = inner.note_unknown_record(&*ports.cipher, unknown, events) {
+                    eprintln!("mvs-core: a newer-version record wasn't checked: {:?}", e.code);
                 }
             }
             // Messages held for their key: sent now if it came.

@@ -68,5 +68,7 @@ app.whenReady().then(() => {
   });
   const sinkIdx = process.argv.indexOf('--sink');
   const sink = sinkIdx > 0 ? process.argv[sinkIdx + 1] : '';
-  win.loadFile(path.join(__dirname, 'page.html'), { query: { mode, sink } });
+  const gainIdx = process.argv.indexOf('--gain');
+  const gain = gainIdx > 0 ? process.argv[gainIdx + 1] : '';
+  win.loadFile(path.join(__dirname, 'page.html'), { query: { mode, sink, gain } });
 });

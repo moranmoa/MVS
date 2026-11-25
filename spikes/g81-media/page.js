@@ -160,6 +160,9 @@ async function micMeter(echoCancellation) {
 }
 
 /** Starts the test sound on one playout path; returns stop(). */
+/** --gain: the playback gain before the limiter (0 or absent: the plain source). */
+const GAIN = Number(new URLSearchParams(location.search).get('gain')) || 0;
+
 /** The output to play to (--sink: part of its label), or '' for the default. */
 let sinkId = '';
 let sinkLabel = 'default';
@@ -181,14 +184,28 @@ async function play(path) {
   b.copyToChannel(speechish(0, len).map((v) => v * 2), 0);
   const src = ctx.createBufferSource();
   src.buffer = b;
+  // --gain: the #585 chain, source → gain → the engine's limiter (same settings) → the path.
+  let out = src;
+  if (GAIN) {
+    const g = ctx.createGain();
+    g.gain.value = GAIN;
+    const lim = ctx.createDynamicsCompressor();
+    lim.threshold.value = -3;
+    lim.knee.value = 0;
+    lim.ratio.value = 20;
+    lim.attack.value = 0.002;
+    lim.release.value = 0.1;
+    src.connect(g).connect(lim);
+    out = lim;
+  }
   if (path === 'webaudio') {
-    src.connect(ctx.destination);
+    out.connect(ctx.destination);
     src.start();
     return () => (src.stop(), void ctx.close());
   }
   // loopback: through a local RTCPeerConnection pair (iceServers: [], in-process), played as a WebRTC track.
   const dest = ctx.createMediaStreamDestination();
-  src.connect(dest);
+  out.connect(dest);
   const a = new RTCPeerConnection({ iceServers: [] });
   const z = new RTCPeerConnection({ iceServers: [] });
   a.onicecandidate = (e) => e.candidate && z.addIceCandidate(e.candidate);
@@ -214,6 +231,7 @@ async function aec() {
   (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach((t) => t.stop());
   await chooseSink();
   out.playedOn = sinkLabel;
+  out.gain = GAIN || 1;
   for (const path of ['webaudio', 'loopback']) {
     for (const ec of [false, true]) {
       status(`aec: ${path}, echoCancellation ${ec}…`);

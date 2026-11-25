@@ -64,3 +64,19 @@ With no echo to cancel, the "attenuation" figures (3.1 dB and 1.5 dB) are noise.
 - **The loopback path passes: 27.3 dB attenuation** (target ≥ 20 dB). The decoded audio is played as a WebRTC track: a MediaStreamDestination feeds a local RTCPeerConnection pair (`iceServers: []`, in-process, no SDP leaves), which feeds an `<audio>` element with `setSinkId`. Chromium's AEC takes that playout as its reference and cancels it.
 - **Plain Web Audio: not shown.** Even with AEC off, its playout didn't reach the mic, so this run can't measure it. That alone is a reason not to rely on it.
 - **Decision for C2:** B's playout goes through the loopback path (the design's fallback, #509 §5). Each B peer's decoded audio goes to a MediaStreamDestination. One loopback RTCPeerConnection pair carries all of them, then plays through an `<audio>` element on the chosen output. Volume and deafen stay on the per-peer gain before the destination.
+
+## AEC speaker test, run 3 (2026-11-25, owner approved, gain 2.0 through the #585 chain): inconclusive
+
+`electron spikes/g81-media/main.js aec --sink VG27A --gain 2`. Both paths use source → gain 2.0 → the engine's limiter (-3 dB threshold, ratio 20) → the path.
+
+| Path | Room RMS | While playing RMS | Echo above room |
+| --- | --- | --- | --- |
+| Web Audio (ctx.destination), AEC off | 0.00207 | 0.00208 | +0.1 dB |
+| Web Audio, AEC on | 0.00216 | 0.00171 | -2.0 dB |
+| Loopback, AEC off | 0.00251 | 0.00238 | -0.5 dB |
+| Loopback, AEC on | 0.00211 | 0.00173 | -1.8 dB |
+
+- **No echo reached the mic, even with AEC off,** on either path. Run 2 had +23.5 dB on the same speaker, so the sound didn't come out of the VG27A audibly this time.
+- Windows' default output had changed to Digital Output; the run still played to the VG27A by name, but its speakers may be muted or turned down.
+- **No result** against the 27.3 dB baseline. A rerun needs the VG27A's speakers confirmed audible (volume up, not muted).
+- All Electron processes had exited, and the throwaway profiles are removed.

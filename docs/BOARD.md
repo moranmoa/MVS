@@ -165,7 +165,8 @@ Last updated: 2026-11-25, pm batch. **0.5.0 is being tagged.** Since the 2026-11
 | B16 | Settings export/import, message density, date separators (UX-12) | dev-ui | todo | – | – | M | – |
 | B21 | Accessibility + keyboard (UX-11, UX-20, UX-21, UX-34, UX-37, UX-38); channel list as a drawer below ~700 px (from B12/QA-12, non-blocking) | dev-ui | todo | – | – | M | – |
 | B22 | Flow polish (UX-22..32 part, UX-41..48, QA-05, QA-07, QA-09, QA-11) | dev-ui | todo | – | – | M | – |
-| B24 | About screen: abuse-report address, links to the agreement and privacy notice (business plan §3.3, approved by product-lead in #16) | dev-ui | todo (5.1 decided; spec in #35) | – | 5.1 | S | M3 |
+| B24a | About screen, part a (split by the manager; dev-ui agreed): the version line with "Copy version details"; the abuse-report section shows the build's abuse address as text with Copy, **no mailto** (sec-lead on #552), or the pending text when unset. Spec `docs/ux/specs/B24-about.md` (its mailto/`openExternal` part dropped) | voice-c | in progress | – | #552 | S | M3 |
+| B24b | About screen, part b: the in-app documents view (terms and privacy from plan-1) and the licence list | voice-c | blocked: (1) the owner approves the legal text; (2) a privacy-contact build variable like `MVS_ABUSE_ADDRESS` (#534, #535, #552); (3) the licence list after B9/T22 | – | owner, T22 | M | M3 |
 | UX-10 | `mvs://` links not clickable in WhatsApp/Telegram/Discord → https landing page on `<relay-domain>` | devops + dev-ui | todo (5.1 decided) | – | T4 | S | M3 |
 
 ### UX gaps ([`docs/ux/GAPS.md`](ux/GAPS.md), #320; priorities from product-lead on #320)
@@ -256,12 +257,13 @@ Last updated: 2026-11-25, pm batch. **0.5.0 is being tagged.** Since the 2026-11
 | RD2 | Relay-down part 2: LAN beacon (derived tags, previous epoch, fixed 8 tags padded, caps, firewall check, TTL 1; sec-lead call on the open question) | dev-sync | in review (#460, dev-sync, changes requested) | #460 | RD1 | M | 0.4.x |
 | HK | Hickory advisories (RUSTSEC-2026-0118/0119): peer-learned DNS names dropped (#416), vendored `libp2p-dns` on hickory 0.26 (#412), gossipsub PRUNE fix (#421, RUSTSEC-2026-0534); open: relay keeps DNS names out of the DHT and drops `/dns*` from identify, advisory watch for the vendored crates | dev-sync, dev-updater, devops | in progress (#423, #424 merged; relay hickory bump and identify change are devops) | #412 #416 #421 #423 #424 | – | S | 0.4.x |
 | EP | Email + password sign-in (design #365, behind `available=false` until 2 bootstraps) | dev-identity, devops (mailer) | deferred (design only) | #365 | MR | L | – |
-| RIA | **Relay-in-app epic** (design #561, approved by tech-lead and sec-lead with amendments): R1 → R1b port mapping → R1c address propagation → R2 → R3. Owner questions open: the seed list, serving strangers, the removal date, port-mapping opt-in | dev-sync | in progress (R1 draft #565) | #561 #565 | – | L | – |
-| R1 | Relay-in-app, stage 1 | dev-sync | in progress | #565 | #561 | M | – |
-| R1b | Port mapping for home NAT (opt-in pending the owner) | dev-sync | todo | – | R1 | M | – |
-| R1c | Relay address propagation | dev-sync | todo | – | R1b | S | – |
-| R2 | Relay-in-app, stage 2 | dev-sync | todo | – | R1c | M | – |
-| R3 | Relay-in-app, stage 3 | dev-sync | todo | – | R2 | M | – |
+| RIA | **Relay-in-app epic** (design #561, approved by tech-lead and sec-lead with amendments): RIA-R1 → RIA-R1b port mapping → RIA-R1c address propagation → RIA-R2 → RIA-R3. Owner questions open: the seed list, serving strangers, the removal date, port-mapping opt-in | dev-sync | in progress (R1 draft #565) | #561 #565 | – | L | – |
+| RIA-R1 | Relay-in-app, stage 1 | dev-sync | in progress | #565 | #561 | M | – |
+| RIA-R1b | Port mapping for home NAT (opt-in pending the owner) | dev-sync | todo | – | RIA-R1 | M | 0.6.0 |
+| NC-1 | **Alpha network counters in the diagnostics file** (#576, point 1): (a) sync counts connections by path type (direct, hole-punched, member relay, our relay) for each of join, sync and call, plus the RIA-R1 reachability verdict (open IP, home NAT mapped or not, CGNAT). Counters only: no addresses, peer IDs or server names. (b) The api/desktop side writes them into the diagnostics file. A test proves no IP, peer ID or server name ever reaches the file. qa checks the path-log format. Needed before alpha week 5 | dev-sync (a) → dev-identity / voice-shell (b); qa | todo | – | RIA-R1 (reachability) | S–M | 0.6.0 |
+| RIA-R1c | Relay address propagation | dev-sync | todo | – | RIA-R1b | S | – |
+| RIA-R2 | Relay-in-app, stage 2 | dev-sync | todo | – | RIA-R1c | M | – |
+| RIA-R3 | Relay-in-app, stage 3 | dev-sync | todo | – | RIA-R2 | M | – |
 
 ### Reviews, QA, security, business
 
@@ -480,7 +482,8 @@ All rows below are **awaiting owner**: the recommendations are written, and the 
 | G-81 | Run a TURN media relay for calls with CGNAT/cellular peers (G-81)? | **Decided: no.** The app works without a central server; calls go over the P2P network, no STUN/TURN server (owner, 2026-11-18) | decided | G-81 (#433) | Before 0.5.0 |
 | K2-req | Is the B7-k release (K2) a required update? | – | awaiting owner | B7-k rollout | Next release |
 | G-81-mf | Member-first relays for P2P calls (G-81 C2 uses our relays first) | – | awaiting owner | G-81 | – |
-| RIA-q | Relay-in-app (#561): seed list, serving strangers, removal date, port-mapping opt-in | tech-lead + sec-lead amendments in #561 | awaiting owner | R1b, R2, R3 | Before R1b |
+| RIA-q | Relay-in-app (#561): seed list, serving strangers, removal date, port-mapping opt-in | tech-lead + sec-lead amendments in #561 | awaiting owner | RIA-R1b, RIA-R2, RIA-R3 | Before RIA-R1b |
+| B24-legal | Approve the in-app terms of use and privacy notice text (from business plan 1) | biz + product-lead drafts in plan-1 | awaiting owner | B24b | Before M3 |
 
 (5.6 is the heading for 5.7–5.13 in the plan, not a decision.)
 | GAP-2 | `auth_deps` format: the kick names the kicker's channel heads so backdated messages are voided (technical, tech-lead + sec-lead; owner informed) | tech-lead, sec-lead | B4 | Now |

@@ -67,6 +67,8 @@ use records::{ChannelId, Kind, PublicKey, RecordId, ServerId};
 use zeroize::Zeroizing;
 
 mod channel;
+mod report_box;
+pub use report_box::{seal_box, BOX_OVERHEAD, BOX_VERSION};
 pub use channel::{
     Applied, ChannelKeys, Decrypted, RotationNeed, MAX_UNACCEPTED, MAX_UNACCEPTED_BYTES,
 };

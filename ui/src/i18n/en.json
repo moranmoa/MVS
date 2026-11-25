@@ -689,6 +689,10 @@
   "settings.about.stable": "Stable",
   "settings.about.beta": "Beta",
   "settings.about.channelHint": "Updates always install. You can only choose to get them earlier.",
+  "about.copyVersion": "Copy version details",
+  "about.report": "Report abuse or illegal content",
+  "about.report.body": "There's no central server, so we can't delete content from other people's computers. Report a message to the server's owner first. Illegal content, especially anything harming minors, can also be reported to us:",
+  "about.report.pending": "The address appears in builds shipped to testers.",
   "settings.about.licenses": "Built on open-source components including React, react-intl and TanStack Virtual (MIT and BSD licences).",
 
   "chat.clipped": "This message is too long, so only part of it is shown",

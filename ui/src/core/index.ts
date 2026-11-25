@@ -64,6 +64,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     pendingDob: params.has('pendingDob'),
     keyPending: (params.get('keyPending') as MockOptions['keyPending']) ?? undefined,
     relayOnly: params.has('relayOnly'),
+    abuseAddress: params.has('abuse'),
     unreadable: params.has('unreadable'),
     typing: params.has('typing') ? Number(params.get('typing')) || 1 : undefined,
     restore: (['searching', 'waiting', 'done'] as const).find((s) => s === params.get('restore')),

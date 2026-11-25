@@ -211,6 +211,11 @@ async function aec() {
     }
   }
   const att = (path) => +(20 * Math.log10(out[`${path}/raw`].playingRms / Math.max(out[`${path}/aec`].playingRms, 1e-6))).toFixed(1);
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const pick = (k) => devs.filter((d) => d.kind === k && (d.deviceId === 'default' || d.deviceId === 'communications')).map((d) => d.deviceId + ': ' + d.label);
+    out.devices = { input: pick('audioinput'), output: pick('audiooutput') };
+  } catch {}
   out.summary = { webaudioAttenuationDb: att('webaudio'), loopbackAttenuationDb: att('loopback'), goal: 'AEC removes the played sound: echo with aec near the room level (about 20 dB or more attenuation)' };
   return out;
 }

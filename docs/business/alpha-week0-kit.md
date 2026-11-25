@@ -13,7 +13,7 @@ Tester-facing texts are in Hebrew, gender-neutral; everything else is in English
 | 3 | Sign-up form created from §3 and its link ready | owner or business | open |
 | 4 | Welcome message (§4) filled in: release link, testers'-server invite, both addresses | owner | open |
 | 5 | Links checked (§5) | business | done for 0.5.0, see §5 |
-| 6 | **Member relays in 0.5.0:** the setting exists (#368 slice 1) and defaults to `auto`, so a reachable adult tester may relay for fellow members. The product owner ruled that member relays stay off for testers until R2 and notice v3 (#576, point 4). Decide: ship a default-off build, use the global off switch, or accept slice 1 as is | product owner + manager | **open, blocks wave 0** |
+| 6 | **Member relays in 0.5.0:** the setting exists (#368 slice 1) and defaults to `auto`, so a reachable adult tester may relay for fellow members. The product owner ruled that member relays stay off for testers until R2 and notice v3 (#576, point 4). **Decided (product owner):** accept slice 1. It relays only for server owners and admins, and only after the disclosure is acknowledged (test `member_relay_follows_my_role_and_is_forced_off`). #576 point 4 is about R2. Condition: the welcome message says so (§4, item 5) | product owner | done |
 | 7 | The owner says go | owner | open |
 
 ## 2. Testers' server
@@ -63,7 +63,7 @@ This replaces plan-1 §1.4 (c) for 0.5.0. Send it privately to each tester.
 > 2. **12 מילות השחזור הן החשבון שלכם.** רושמים אותן על נייר. אין לנו עותק, ואי אפשר לשחזר אותן.
 > 3. **שרת הבודקים:** מצטרפים כאן: `<testers-server-invite>`. שם מדווחים, שואלים ומקבלים עדכונים.
 > 4. **משהו נשבר?** הגדרות ← אבחון ← "ייצוא קובץ אבחון", ומצרפים לדיווח ב-#באגים. הקובץ כולל רק מספרים וגרסאות, בלי כתובות IP ובלי מזהים.
-> 5. **פרטיות:** מה נשמר איפה ומי רואה מה: `<privacy-note-link>`. בקצרה: אין שרת מרכזי ששומר הודעות, ואין איסוף נתוני שימוש.
+> 5. **פרטיות:** מה נשמר איפה ומי רואה מה: `<privacy-note-link>`. בקצרה: אין שרת מרכזי ששומר הודעות, ואין איסוף נתוני שימוש. **ממסר דרך חברים:** בעלים ומנהלים של שרת, בני 18 ומעלה, שהמחשב שלהם נגיש מהאינטרנט, יכולים להעביר חיבורים של חברי השרת שלהם. זה קורה רק אחרי שאישרו הודעה באפליקציה, ואפשר לכבות את זה בהגדרות. מי שמעביר חיבור רואה את כתובת ה-IP של מי שעובר דרכו, אבל לא את התוכן, שנשאר מוצפן.
 > 6. **דיווח על פגיעה או תוכן לא חוקי:** `<abuse-contact>`.
 >
 > זו גרסת בדיקה: לא להעביר את קובץ ההתקנה הלאה, ועדיף לא לשמור בה מידע רגיש. אפשר לעזוב בכל רגע.

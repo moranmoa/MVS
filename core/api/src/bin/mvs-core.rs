@@ -242,6 +242,14 @@ fn main() -> ExitCode {
         if let Some(signals) = net.take_typing() {
             std::thread::spawn(move || api::syncnet::deliver_typing(signals, core));
         }
+        // G-48: report boxes over their own member-only protocol, and the
+        // outbox.
+        core.set_report_net(net.clone());
+        if let Some(boxes) = net.take_reports() {
+            std::thread::spawn(move || api::syncnet::deliver_reports(boxes, core));
+        }
+        // Delivery waits for acks: never on the thread that receives.
+        std::thread::spawn(move || api::syncnet::run_report_outbox(core));
     }
     eprintln!("mvs-core: ready");
     // With a network, a background sync beside the request loop; it stops

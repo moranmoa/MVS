@@ -16,9 +16,11 @@ import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
 import { AgeLimitSetting } from './AgeLimit';
 import { RemovedAccounts } from './RemovedAccounts';
+import { ReportsPage } from './Reports';
+import { useOpenReports } from './reportsState';
 
-export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'removed' | 'danger';
-const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'removed', 'danger'];
+export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'removed' | 'reports' | 'danger';
+const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'removed', 'reports', 'danger'];
 
 const NO_CHANNELS: Channel[] = [];
 const NO_MEMBERS: Member[] = [];
@@ -38,6 +40,8 @@ export function ServerSettings({
 }) {
   const intl = useIntl();
   const [page, setPage] = useState<ServerSettingsPage>('general');
+  // G-48: open reports here, for the Reports tab.
+  const openReports = useOpenReports()[server.id] ?? 0;
   const navRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const moved = useRef(false);
@@ -105,6 +109,12 @@ export function ServerSettings({
                   onClick={() => choose(p)}
                 >
                   <FormattedMessage id={`server.settings.nav.${p}`} />
+                  {p === 'reports' && openReports > 0 && (
+                    // The tab keeps its name; the rail button's label says the count in words.
+                    <span className="badge settings-count" aria-hidden="true">
+                      {openReports}
+                    </span>
+                  )}
                 </button>
               </li>
             ))}
@@ -119,6 +129,7 @@ export function ServerSettings({
           {page === 'invite' && <InvitePage server={server} onOpenRemoved={() => choose('removed')} />}
           {page === 'members' && <MembersPage server={server} />}
           {page === 'removed' && <RemovedAccounts server={server} />}
+          {page === 'reports' && <ReportsPage server={server} />}
           {page === 'danger' && <ClosePanel server={server} />}
         </section>
       </div>

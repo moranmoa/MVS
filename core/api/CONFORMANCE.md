@@ -168,6 +168,62 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the in-app updater (hourly check) narrows the window;
     - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
+- Report to the owners (G-48; design `docs/design/report-to-owners.md`, with the Tech Lead's Amendment 1, the security lead's R1–R7 and the Product Owner's decisions):
+  - `reportContent({ serverId, target, reason, text? })` returns `{ reportId, recipients }`.
+    - `target` is `{ kind: 'message', messageId }` or `{ kind: 'member', userId }`.
+    - `reason` is one of: `spam`, `harassment`, `hate`, `violence`, `sexual`, `minor`, `self-harm`, `illegal`, `impersonation`, `other`.
+    - `text` is optional and trimmed. It follows the topic rule (one line, the strict text rule), up to 280 code points and 1024 bytes.
+    - Errors, with nothing signed:
+      - `bad-request`: the reason or text is wrong;
+      - `not-found`: no such message (in a channel I can see) or member (current or removed) in that server;
+      - `not-allowed`: reporting myself or my own message, or I'm not a member;
+      - `rate-limited`: 5 an hour or 20 a day per server;
+      - `already-reported`: the same target within 30 days;
+      - `no-recipient`: nobody is left to receive it. The UI then points at the abuse address (B24).
+  - **Who gets it:**
+    - Recipients are the server's owner and admins, current and not kicked, minus the reported member and me. For a message, the reported member is its author.
+    - Moderators don't get reports in v1.
+    - Admins added after a report don't get it.
+  - **Delivery:**
+    - A direct, members-only protocol, `/mvs/report/1`. A box goes to each recipient on its own; nothing enters a log, so other members never learn a report exists.
+    - The reporter's outbox retries about every 10 seconds while the recipient is online, and drops a row once it is acked.
+    - At each send, the recipient is resolved again (R1): a row whose recipient is no longer owner or admin, or is the reported member, is dropped, and so are rows older than 30 days or for a server I left.
+    - `report.status { reportId, delivered, pending }` follows progress.
+  - **Staff:**
+    - `listReports(serverId)` lists reports newest first. It is `not-allowed` unless I am owner or admin now, and losing that role, leaving or a kick deletes the reports I hold.
+    - `report.received { serverId, report }` fires on arrival.
+    - `dismissReport(reportId)` is local triage only.
+    - A `ReportSummary` is `{ id, serverId, reporterId, target, reportedId, reason, text?, ts, receivedAt, dismissed, evidenceValid, evidenceWithheld }`. It **never carries evidence**: not in the list, the event, a notification or a preview.
+  - **`getReportEvidence(reportId)`** (an explicit click) returns `{ authorId, channelId, ts, text? }`, the reported message as its author signed it.
+    - `text` is absent when I hold no key for it.
+    - Show it as plain text: never Markdown with live links, never HTML.
+    - Errors:
+      - `bad-request`: the evidence isn't that message (R4: the ID, server, channel, kind `Message` and the author's signature must all check);
+      - `not-allowed`: for `sexual` and `minor`, staff without an 18+ claim (Product Owner). `evidenceWithheld: true` says so in advance.
+    - No API path exports or forwards evidence.
+    - The evidence outlives the author's delete. That's a deliberate retention exception.
+  - **Non-repudiation is intended:** staff hold the reporter's signature. The UI must say "the owner and admins will see that you reported this".
+  - **Wire:**
+    - The signed report is a fixed 1200-byte part, then `ev_len u32` and the evidence (the reported message's own signed record, padded to 0, 2 KiB, 8 KiB or the largest record), then an Ed25519 signature under `mvs/report/v1`.
+    - Each box is X25519 to the recipient's key (from Ed25519, as `groupkeys`), BLAKE3 `derive_key`, then XChaCha20-Poly1305. The associated data is `"mvs/report-box/v1" ‖ ephemeral ‖ recipient ‖ server`, and an all-zero shared secret is refused.
+    - A box is at most 20 KiB.
+    - Sync caps per peer: a burst of 3, then one every 10 s. Across all peers: a burst of 20, then 2 a second.
+    - Sync acks every box that passes those caps before the core tries to open it, so the answer never depends on what the box holds (R7).
+  - **Receiving:**
+    - A box is dropped quietly unless:
+      - it opens for me in one of my servers;
+      - the report verifies;
+      - its signer is the identity sync bound the peer to;
+      - its time is within 30 days back and 10 minutes ahead;
+      - I'm staff there;
+      - the reporter is a current member;
+      - a member target is current or removed;
+      - it's new: report IDs are kept 31 days;
+      - the reporter has sent under 10 an hour.
+    - Each server stores at most 1000 reports.
+  - **Storage:** only sealed boxes are on disk, both the outbox and the reports I received. Neither is in the account backup or the logs. The report commands aren't in the app lock's allow-set (G-78).
+  - **Older peers** don't speak `/mvs/report/1`: the row stays in the outbox until they update or it expires.
+
 - Channel topic (G-14; design `docs/design/channel-topic.md`):
   - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
   - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.
@@ -258,6 +314,10 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - The app then starts at "create or restore". No new event: the UI goes back to onboarding on `ok` (pending requests fail with `core-restarted`).
 
 - `updateProfile` with a new display name (trimmed) posts a new profile post to every server I'm still a member of (not kicked, not left, not closed); the latest one wins for everyone. The same name, or a new bio or avatar only, posts nothing: bio and avatar stay on this device, since the profile post carries the name (and caps) only. A server that refuses the post is skipped; the call still succeeds. Errors as before: `bad-request` for a bad name, bio or avatar, `not-found` with no identity.
+  - **`profile-too-large`** (new code): the name, small picture and colour together don't fit one profile post (4 KiB with the caps).
+    - This happens only with a long name of 4-byte characters (emoji) beside a picture near the 2,560-byte cap. For example, 128 emoji and the largest picture are refused.
+    - Nothing is saved or posted, and the old profile stays. The UI says to shorten the name or use a smaller picture.
+    - The budget: a 32-emoji name, the largest picture, a colour and every cap leave at least 256 bytes for later releases' caps (`lv:N`). A test guards this.
 
 - Age claims and the 30-day rule (decision 18, B13 §3, B7 §9). Each claim is decided from my latest accepted claim in that server:
   - A birth date that raises me from "not adult" to adult posts nothing. It sets `Identity.pendingBirthDate: { date, effectiveAt }` (`effectiveAt` = when found + 30 days). Until then I count as under 18: the core refuses 18+ joins (`age-blocked`), and servers keep my earlier claim.
@@ -498,6 +558,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
   - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1', 'adult-keys-v1', 'server-meta-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
   - **Caps are frozen after `server-meta-v1`** (Tech Lead on #555): released cores gate on these exact names, so they are posted for good. The next gated feature adds one cap of the form `"lv:N"`, a single level that implies every feature up to N; a gate checks `lv >= k`, older cores ignore it, and the profile post stops growing with each release.
+    - `lv:N` is per release, not per feature (Tech Lead on #590). It means "this core decodes every kind introduced up to level N".
+    - The first release that ships a new kind posts the next level, and every kind that release introduces gates on `lv >= N`.
+    - The kind codes are fixed: `SecretRotation` (T17) is 25 and `ServerAgeLimit` (G-52) is 26. If both ship in one release, both gate on that release's level.
+- Server age limit (G-52, planned; design `docs/design/server-age-limit.md`, Security Lead on #590):
+  - After a raise to 18+, every channel's readers are members ∩ adults. The receiver rule's `reaches` must cover the later of the server-wide raise and the channel's own 18+ edit.
+  - **Accepted residual:** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata. T17's leave rotation never fires for it. Such members show as not adult to the owner and admins, who can kick them, and the kick rotates the secret.
 - 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
   - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
   - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
@@ -541,6 +607,10 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - A failing record is dropped like a kicked author's: not shown, never unread, a mention or a notice. It stays in the log. A plain channel, or one turned plain, has no check. Nothing is cached per record: it's recomputed on every fold.
   - So a minor's post with stale deps is dropped, and an adult who lowers their age keeps what they posted after the channel turned 18+. Posts from before the flip by someone who isn't an adult now are hidden: the accepted cost.
   - **Accepted residual (Security Lead):** a former adult whose claim a modified client lowered can still post with stale deps that point at an adult moment after the edit. The claim is self-attested anyway (GAP-22).
+- Newer versions in a server (the detector, Tech Lead plan):
+  - `ServerSummary` gains `updateNeeded: boolean` (additive, default false). It turns true when a current member of a server I'm in wrote a validly signed record of a kind this version doesn't know (`records::Record::peek_unknown`): they run a newer version, and mine may miss what it adds. The UI shows an "update to keep up" hint for that server.
+  - Sync still refuses that record: it's never stored, forwarded or acked. Anyone else's (a stranger, a kicked member, a broken signature, a server I'm not in) never sets the flag.
+  - One `server.updated` when it turns true, then none for further records. In memory only: never cleared by a timer, only by a restart, so it comes back after one only if such a record is seen again.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

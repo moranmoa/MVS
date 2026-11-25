@@ -193,6 +193,19 @@ pub enum Action {
     ServerDescription {
         text: String,
     },
+    /// T17: one part of a server secret rotation, by a moderator or above.
+    /// Body: `rotation [u8; 32]`, `part u8`, `parts u8` (records checks the
+    /// header), then the sealed boxes, opaque here (`groupkeys`, box label
+    /// `mvs/sync-secret-box/v1`). Privileged, so a concurrent kick or revoke
+    /// voids it; `State::secret_rotations` lists the accepted parts in
+    /// linear order, and `core/api` assembles and picks the latest complete
+    /// rotation.
+    SecretRotation {
+        rotation: RecordId,
+        part: u8,
+        parts: u8,
+        sealed: Vec<u8>,
+    },
     /// A member other than the owner leaves the server. It ends their role
     /// and membership; unlike a kick, they may join again. Body: a cut.
     Leave {
@@ -233,6 +246,7 @@ impl Action {
             Action::ServerEdit { .. } => Kind::ServerEdit,
             Action::ServerIcon { .. } => Kind::ServerIcon,
             Action::ServerDescription { .. } => Kind::ServerDescription,
+            Action::SecretRotation { .. } => Kind::SecretRotation,
             Action::Leave { .. } => Kind::Leave,
             Action::ServerClose => Kind::ServerClose,
         }
@@ -280,6 +294,9 @@ impl Action {
             Action::ServerIcon { icon: None } => vec![0, 0],
             Action::ServerIcon { icon: Some(icon) } => [vec![0, icon.kind.byte()], icon.bytes.clone()].concat(),
             Action::ServerDescription { text } => [vec![0], text.as_bytes().to_vec()].concat(),
+            Action::SecretRotation { rotation, part, parts, sealed } => {
+                [rotation.as_bytes().as_slice(), &[*part, *parts], sealed].concat()
+            }
             Action::Leave { cut } => {
                 let mut body = Vec::new();
                 cut.encode(&mut body);
@@ -396,6 +413,17 @@ impl Action {
                     .filter(|t| t.is_empty() || server_description_ok(t))?;
                 Some(Action::ServerDescription { text })
             }
+            // T17: records already checked the header (part < parts <= 32).
+            Kind::SecretRotation => {
+                let (rotation, rest) = body.split_at_checked(32)?;
+                let [part, parts, sealed @ ..] = rest else { return None };
+                Some(Action::SecretRotation {
+                    rotation: id(rotation)?,
+                    part: *part,
+                    parts: *parts,
+                    sealed: sealed.to_vec(),
+                })
+            }
             Kind::Leave => Some(Action::Leave { cut: Cut::parse(body)? }),
             Kind::ServerClose => body.is_empty().then_some(Action::ServerClose),
             // Channel kinds are judged by the channel checks (B4-4).
@@ -427,6 +455,7 @@ impl Action {
             | Action::ServerEdit { .. }
             | Action::ServerIcon { .. }
             | Action::ServerDescription { .. }
+            | Action::SecretRotation { .. }
             | Action::Leave { .. }
             | Action::ServerClose => None,
         }
@@ -474,6 +503,7 @@ impl Action {
                     | Action::ServerEdit { .. }
                     | Action::ServerIcon { .. }
                     | Action::ServerDescription { .. }
+                    | Action::SecretRotation { .. }
                     | Action::ServerClose
             )
     }
@@ -914,6 +944,8 @@ pub struct State {
     /// G-51: the latest accepted description in linear order; `None` when
     /// cleared or never set.
     pub server_description: Option<String>,
+    /// T17: accepted `SecretRotation` parts, in linear order.
+    pub secret_rotations: Vec<RecordId>,
     /// The latest accepted rename in linear order; `None` keeps the genesis
     /// name.
     pub server_name: Option<String>,
@@ -1109,6 +1141,8 @@ fn permitted(view: &impl View, record: &Record, action: &Action) -> bool {
         Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
             author_role >= Role::Admin
         }
+        // T17: who may rotate a channel key may rotate the server secret.
+        Action::SecretRotation { .. } => author_role >= Role::Moderator && view.is_member(author),
         // A member leaves, but the owner can't (no ownership transfer in v1),
         // and a kicked key can't (refused above), so a ban survives.
         Action::Leave { .. } => view.is_member(author) && author_role != Role::Owner,
@@ -1184,6 +1218,7 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
         | Action::ServerEdit { .. }
         | Action::ServerIcon { .. }
         | Action::ServerDescription { .. }
+        | Action::SecretRotation { .. }
         | Action::ServerClose => None,
     }
 }
@@ -1198,6 +1233,7 @@ fn apply_server(state: &mut State, record: &Record, action: &Action) {
             state.server_description = (!text.is_empty()).then(|| text.clone());
         }
         Action::ServerClose => state.closed = Some(record.id()),
+        Action::SecretRotation { .. } => state.secret_rotations.push(record.id()),
         _ => {}
     }
 }
@@ -1581,6 +1617,7 @@ impl<'a> Graph<'a> {
                 | Action::ServerEdit { .. }
                 | Action::ServerIcon { .. }
                 | Action::ServerDescription { .. }
+                | Action::SecretRotation { .. }
                 | Action::ServerClose => continue,
                 Action::RevokeInvite { invite } => {
                     pass.voided.extend(self.voids_of(i));

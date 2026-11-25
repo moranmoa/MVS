@@ -57,6 +57,11 @@ const COMMANDS = Object.freeze({
   kickMember: ['serverId', 'userId'],
   listRemovedMembers: ['serverId'],
   undoKick: ['serverId', 'userId'],
+  // G-48: report to the owners (core #515)
+  reportContent: ['serverId', 'target', 'reason', 'text'],
+  listReports: ['serverId'],
+  dismissReport: ['reportId'],
+  getReportEvidence: ['reportId'],
   // Device link (device-link-slice.md)
   startDeviceLink: [],
   cancelDeviceLink: [],

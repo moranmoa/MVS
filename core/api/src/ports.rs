@@ -207,6 +207,11 @@ pub trait Network: Send + Sync {
         let _ = on;
     }
 
+    /// A required update (RU1): the node goes quiet for the rest of the
+    /// process. No dialling, gossip, sync or relaying; update checks (over
+    /// HTTPS, not this network) are the only traffic left.
+    fn set_quiet(&self) {}
+
     /// Member relays (#368, slice 2): relay for bound current members of
     /// servers we share (`MemberRelay.effective`), up to `daily_cap_mb` a
     /// day; `role`: an owner or admin relay (members try those first). At

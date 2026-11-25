@@ -1056,6 +1056,39 @@ async fn a_senders_restart_mid_call_is_heard_at_once() {
     b.shutdown().await.unwrap();
 }
 
+/// Required update (#577 RU1): a quiet node signs, syncs and serves nothing
+/// for the rest of the process. It drops its member peers, closes any new
+/// connection at once (so a reachable quiet node answers nothing), and
+/// appends nothing of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_node_takes_and_serves_nothing() {
+    let (relay, _relay) = voice_relay();
+    let a = bound_node("quiet-a", &relay, 60, true, Arc::new(AcceptAll)).await;
+    let b = bound_node("quiet-b", &relay, 61, true, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(60), voice_id(61), false).await;
+    a.set_quiet().unwrap();
+    let start = Instant::now();
+    while a.peers().await.unwrap().contains(&b.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(20), "the quiet node kept its member peer");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // B keeps trying (discovery, pulls): nothing sticks.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(!a.peers().await.unwrap().contains(&b.peer_id()), "a quiet node took a connection");
+    assert!(a.append(messages(1).remove(0)).await.is_err(), "a quiet node appended a record");
+    // Nothing signed goes to the relay's mailboxes, or to a member (SL on #593).
+    assert!(a.put_backup(vec![1; 64]).await.is_err(), "a quiet node put a backup");
+    assert!(a.put_notice(vec![1; 64]).await.is_err(), "a quiet node put a notice");
+    assert!(a.report_send(voice_id(61), vec![1; 64]).await.is_err(), "a quiet node sent a report");
+    // A record B writes never reaches A.
+    b.append(messages(2).remove(0)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let log = log_name(test_server().0, Scope::Channel(test_server().1));
+    assert!(a.heads(&log).await.unwrap_or_default().is_empty(), "a quiet node took a record");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 /// G-29: `/mvs/typing/1` between members through the relay, with its own
 /// caps (a burst of 3, then one every 2 s), never arriving as voice; a
 /// non-member's is dropped and none go to one; 512 bytes at most.

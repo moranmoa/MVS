@@ -349,6 +349,15 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npx playwright test --project=smoke
+      # A flaky failure (e.g. channels.spec rename) needs its trace: keep the
+      # Playwright results (traces, screenshots, page snapshots) when it fails.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: qa-smoke-test-results
+          path: qa/test-results
+          retention-days: 7
+          if-no-files-found: warn
 
   relay-image:
     name: relay image build

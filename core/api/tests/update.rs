@@ -410,3 +410,145 @@ fn update_error_codes_and_events_match_conformance() {
         json!({ "event": "update.rolledBack", "payload": { "failed": "1.1.0", "running": "1.0.0" } })
     );
 }
+
+/// A 1.1.0 release whose manifest revokes `revoked` (`--require-from`).
+fn required_release(channel: &str, revoked: &[&str]) -> Release {
+    let (payload, unpacked) = payload();
+    let (sha256, size) = hash_reader(Cursor::new(&payload)).unwrap();
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert(PLATFORM.to_string(), Artifact { sha256, size, unpacked_bytes: Some(unpacked) });
+    let body = ManifestBody {
+        format: FORMAT,
+        channel: channel.into(),
+        version: v("1.1.0"),
+        issued_at: NOW - 60,
+        expires_at: NOW + 86_400,
+        artifacts,
+        revoked: revoked.iter().map(|r| v(r)).collect(),
+        notes: BTreeMap::from([("en".to_string(), "Required".to_string())]),
+    };
+    let mut m = SignedManifest::new(&body).unwrap();
+    m.sign(&key(1));
+    Release { manifest: m.to_json().into_bytes(), payload }
+}
+
+/// `core_at`, on a shared `world`, so other peers can reach it.
+fn core_in(world: &World, dir: &std::path::Path, host: &Host, installed: &str) -> Peer {
+    let dirs = UpdateDirs::new(dir.join("install"), dir.join("state"));
+    let h = host.clone();
+    let setup = UpdateSetup {
+        dirs,
+        core_data: dir.join("data"),
+        platform: PLATFORM.into(),
+        installed: v(installed),
+        baseline: Baseline::default(),
+        root: Some(TrustRoot::single(key(1).verifying_key()).unwrap()),
+        source: Arc::new(move |channel| {
+            Ok(Box::new(Fake { host: h.clone(), channel: channel.into() }) as Box<dyn UpdateSource>)
+        }),
+    };
+    // The real cipher, so a message gets as far as signing.
+    let mut peer = world.peer_with(
+        Arc::new(identity::MemoryStore::new()),
+        None,
+        Arc::new(api::crypto::GroupKeysCipher::locked()),
+    );
+    peer.core = peer.core.with_updates(Updates::new(setup));
+    peer
+}
+
+fn signed_up(peer: &Peer, name: &str) {
+    let created = peer
+        .core
+        .create_identity(NewIdentityInput { locale: Locale::En, country: "IL".into(), birth_date: "1990-05-01".into() })
+        .unwrap();
+    let positions = peer.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(peer.core.check_recovery_words(answers).unwrap().ok);
+    peer.core
+        .update_profile(ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None })
+        .unwrap();
+}
+
+fn required_events(peer: &Peer) -> Vec<Option<String>> {
+    peer.events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::UpdateRequired(r) => Some(r.version),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Required updates (§2) and RU1: a manifest revoking the running version
+/// turns `updateRequired` on (once, and again after a restart). From then
+/// on the core signs nothing and sends nothing: a join that arrives is
+/// neither accepted nor answered with a re-key, and commands that would
+/// sign are `update-required`.
+#[test]
+fn a_required_core_signs_and_sends_nothing() {
+    let dir = std::env::temp_dir().join(format!("mvs-api-update-required-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("install")).unwrap();
+    fs::write(dir.join("install").join(APP_EXE), b"base").unwrap();
+    fs::create_dir_all(dir.join("data")).unwrap();
+    let world = World::new();
+    let host = Host::default();
+    let owner = core_in(&world, &dir, &host, "1.0.0");
+    signed_up(&owner, "Owner");
+    let server = owner.core.create_server("Old", AgeRestriction::None).unwrap();
+    let channel = owner.core.list_channels(&server.id).unwrap().remove(0).id;
+    assert_eq!(owner.core.get_app_info().unwrap().update_required, None);
+
+    host.publish(required_release("alpha", &["1.0.0"]), "alpha");
+    owner.events.take();
+    call(&owner, "checkForUpdate").unwrap();
+    assert_eq!(required_events(&owner), [Some("1.1.0".to_string())], "once");
+    assert_eq!(
+        owner.core.get_app_info().unwrap().update_required,
+        Some(UpdateRequired { version: Some("1.1.0".into()) })
+    );
+    let info = owner.core.handle_value("getAppInfo", Value::Null).unwrap();
+    assert_eq!(info["updateRequired"], json!({ "version": "1.1.0" }));
+    call(&owner, "checkForUpdate").unwrap();
+    assert!(required_events(&owner).is_empty(), "not again");
+
+    // Someone joins: their records arrive, but the owner signs nothing.
+    let key_of = |id: &str| records::ServerId::from_bytes(hex::decode(id).unwrap().try_into().unwrap());
+    let records_by_owner = || {
+        let me = owner.core.get_identity().unwrap().unwrap().id;
+        world
+            .network
+            .fetch(key_of(&server.id))
+            .iter()
+            .filter(|r| hex::encode(r.author().as_bytes()) == me)
+            .count()
+    };
+    let before = records_by_owner();
+    let guest = world.peer();
+    signed_up(&guest, "Guest");
+    guest.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    owner.core.sync_now().unwrap();
+    assert_eq!(records_by_owner(), before, "no acceptance, re-key or rotation signed or sent");
+
+    // Commands that would sign are refused, with nothing signed.
+    let code = |r: CoreResult<ServerSummary>| r.unwrap_err().code;
+    assert_eq!(code(owner.core.create_server("New", AgeRestriction::None)), ErrorCode::UpdateRequired);
+    assert_eq!(owner.core.send_message(&channel, "hi", None).unwrap_err().code, ErrorCode::UpdateRequired);
+    assert_eq!(records_by_owner(), before);
+    assert_eq!(serde_json::to_value(ErrorCode::UpdateRequired).unwrap(), "update-required");
+
+    // A restart keeps it, before any check.
+    drop(owner);
+    let again = core_in(&world, &dir, &host, "1.0.0");
+    assert_eq!(
+        again.core.get_app_info().unwrap().update_required,
+        Some(UpdateRequired { version: Some("1.1.0".into()) })
+    );
+    // Running the newer version: not required.
+    let newer = core_in(&world, &dir, &host, "1.1.0");
+    assert_eq!(newer.core.get_app_info().unwrap().update_required, None);
+    let _ = fs::remove_dir_all(&dir);
+}

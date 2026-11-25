@@ -169,8 +169,9 @@ fn create_identity_server_grant_kick() {
     ));
     assert!(matches!(
         bob.events.take().last(),
-        Some(Event::JoinStatus(JoinStatus::Invalid { .. }))
+        Some(Event::JoinStatus(JoinStatus::Removed { .. }))
     ));
+    assert!(bob.core.list_servers().unwrap().is_empty(), "removed: nothing joined");
 
     owner.core.sync_now().unwrap();
     let ids: Vec<String> =
@@ -1456,6 +1457,14 @@ fn removed_members_age_claims_and_clean_names() {
     );
     adult.core.sync_now().unwrap();
     assert!(adult.core.list_servers().unwrap().is_empty());
+    // Joining again while removed: told so, nothing else, nothing joined.
+    adult.events.take();
+    adult.core.join_server(&server.invite_link).unwrap();
+    let told: Vec<Event> = adult.events.take();
+    assert!(matches!(told.last(), Some(Event::JoinStatus(JoinStatus::Removed { link })) if *link == server.invite_link));
+    let wire = serde_json::to_value(told.last().unwrap()).unwrap();
+    assert_eq!(wire["payload"], serde_json::json!({ "phase": "removed", "link": server.invite_link }));
+    assert!(adult.core.list_servers().unwrap().is_empty());
     owner.core.undo_kick(&server.id, &adult_id).unwrap();
     assert!(owner.core.list_removed_members(&server.id).unwrap().is_empty());
     adult.core.join_server(&server.invite_link).unwrap();
@@ -2483,6 +2492,34 @@ fn a_keychain_that_comes_up_after_the_core_is_used() {
 /// checked), junk under its handle doesn't stop a join (C3), a forged
 /// publication is refused (C1), and the envelope stops being served when
 /// its invite is used up, revoked or expired (S1).
+#[test]
+fn a_removed_account_is_told_so_by_a_short_link_too() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    let server = owner.core.create_server("Short", AgeRestriction::None).unwrap();
+    let (guest, other) = (world.peer(), world.peer());
+    let guest_id = sign_up(&guest, "Guest").id;
+    sign_up(&other, "Other");
+    guest.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    owner.core.kick_member(&server.id, &guest_id).unwrap();
+    guest.core.sync_now().unwrap();
+    assert!(guest.core.list_servers().unwrap().is_empty());
+
+    let made = owner.core.create_invite(&server.id, None, None).unwrap();
+    guest.events.take();
+    guest.core.join_server(&made.short_link).unwrap();
+    assert!(matches!(
+        guest.events.take().last(),
+        Some(Event::JoinStatus(JoinStatus::Removed { .. }))
+    ));
+    assert!(guest.core.list_servers().unwrap().is_empty());
+    // The same link for anyone else: a normal join, nothing about the kick.
+    other.core.join_server(&made.short_link).unwrap();
+    assert_eq!(other.core.list_servers().unwrap().len(), 1);
+}
+
 #[test]
 fn short_links_join_and_die_with_their_invite() {
     use api::crypto::invite::{handle, seal, InvitePublication};

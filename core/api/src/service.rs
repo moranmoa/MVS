@@ -1409,9 +1409,14 @@ impl Core {
                 }
                 let fetched = self.open_and_fetch(server, &secret);
                 tracing::info!(target: "mvs::join", records = fetched.len(), "join: fetched the server's control log");
-                self.run(|inner, ports, events| {
+                let status = self.run(|inner, ports, events| {
                     inner.join(ports, server, invite, &secret, link, fetched, events)
-                })
+                })?;
+                if matches!(status, JoinStatus::Removed { .. }) {
+                    // Final for me: don't stay subscribed to the server.
+                    self.close_candidate(server)?;
+                }
+                Ok(status)
             }
             Ok(InviteLink::V1 { key, server_prefix }) => self.try_join_short(link, &key, &server_prefix),
             Err(_) => Ok(JoinStatus::Invalid { link: link.to_owned() }),
@@ -1487,6 +1492,11 @@ impl Core {
                     if !matches!(status, JoinStatus::Invalid { .. }) {
                         status = joined;
                     }
+                }
+                JoinStatus::Removed { .. } => {
+                    // Final for me: don't stay subscribed to the server.
+                    self.close_candidate(server)?;
+                    return Ok(joined);
                 }
                 _ => return Ok(joined),
             }
@@ -5505,6 +5515,11 @@ impl Inner {
             return Ok(JoinStatus::Closed { link });
         }
         let key = me.key();
+        // Kicked and not let back: say so, before the age gate. Only I learn
+        // it, about my own account; nothing else about the server is told.
+        if view.is_kicked(&key) {
+            return Ok(JoinStatus::Removed { link });
+        }
         // Already a member (this device lost its copy, e.g. a restore on a
         // new computer): no new join, and nothing that would overwrite what
         // the server already holds about me.
@@ -5521,10 +5536,6 @@ impl Inner {
             && age.is_none_or(|age| age < required.min_age())
         {
             return Ok(JoinStatus::AgeBlocked { link, required });
-        }
-        if view.is_kicked(&key) {
-            // TODO(ui): a "you were removed from this server" phase.
-            return Ok(JoinStatus::Invalid { link });
         }
         let sign = |view: &ServerView, deps, action: &Action| {
             authority::sign_control(
@@ -6018,7 +6029,8 @@ fn removal_shown(server: ServerId, me: PublicKey, fetched: &[Record]) -> bool {
 
 fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
     match status {
-        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,
+        // Removed: the log holds an accepted kick of me, which is evidence.
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. } | JoinStatus::Removed { .. }) => true,
         Ok(JoinStatus::Invalid { .. }) => judged,
         Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. } | JoinStatus::AgeBlocked { .. }) | Err(_) => false,
     }
@@ -6032,6 +6044,7 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
         JoinStatus::Invalid { .. } => "invalid",
         JoinStatus::AgeBlocked { .. } => "age-blocked",
         JoinStatus::Closed { .. } => "closed",
+        JoinStatus::Removed { .. } => "removed",
     }
 }
 

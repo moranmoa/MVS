@@ -430,6 +430,11 @@ pub enum JoinStatus {
     Closed {
         link: String,
     },
+    /// I was removed (kicked) from this server, and not let back: told to
+    /// me only, about my own account, and nothing else about the server.
+    Removed {
+        link: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

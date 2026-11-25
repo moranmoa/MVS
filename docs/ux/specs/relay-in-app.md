@@ -39,13 +39,10 @@ The status line is a `role="status"` element under the switch. It shows one stat
 | relaying (reachable, R1 proven) | `פועל: המחשב הזה נגיש מבחוץ ומשמש כממסר.` | `On: this computer is reachable and relays for members.` |
 | checking (R1 dial-back pending) | `בודקים אם המחשב הזה נגיש מבחוץ…` | `Checking whether this computer can be reached…` |
 | on but unreachable | `המתג פועל, אבל המחשב הזה לא נגיש מבחוץ, ולכן הוא לא משמש כממסר כרגע.` | `It's on, but this computer can't be reached from outside, so it isn't relaying right now.` |
+| paused (on battery, or a metered connection) | `מושהה: המחשב עובד על סוללה או בחיבור עם מגבלת נתונים. הממסר יחזור לפעול כשזה ישתנה.` | `Paused: this computer is on battery or a metered connection. Relaying resumes when that changes.` |
 | behind CGNAT (PM2) | `ספק האינטרנט לא מאפשר חיבורים נכנסים למחשב הזה, ולכן הוא לא יכול לשמש כממסר.` | `Your internet provider doesn't allow incoming connections to this computer, so it can't relay.` |
 
-New disabled reasons, next to the existing ones (`minor`, `relayOnly`, `metered`, `globalOff`):
-
-| Key | Hebrew | English |
-| --- | --- | --- |
-| `memberRelay.reason.battery` | `כבוי בזמן עבודה על סוללה.` | `Off while on battery power.` |
+**Battery and metered are a pause, not a disabled switch (SL):** they change during the day, so the switch keeps the person's choice and stays enabled, and the status line says "paused" (above). The existing `memberRelay.reason.metered` is no longer used to disable the switch, and there's no `reason.battery`. The disabled reasons stay `minor`, `relayOnly` and `globalOff`. While paused, no port is mapped (PM1/PM4); the port-mapping status shows nothing until relaying resumes.
 
 - When the address changes (PM9), the status goes back to "checking" until R1 proves it again. There's no separate message.
 - When "unreachable" shows, add a link-button "מה אפשר לעשות?" / "What can I do?" that expands one line: "אפשר להפעיל 'פתיחת פורט בנתב' למטה, או לפתוח פורט ידנית בהגדרות הנתב." / "Turn on 'Open a port on my router' below, or open a port in your router's settings."
@@ -91,14 +88,14 @@ A separate child switch, **off by default**, never for a minor. It's separate fr
 | Key | Hebrew | English |
 | --- | --- | --- |
 | `inviteAddr.label` | `הכתובת שלי בקישורי הזמנה` | `My address in invite links` |
-| `inviteAddr.hint` | `קישורי הזמנה שחברי השרתים יוצרים יכולים לכלול את כתובת ה-IP של המחשב הזה, כדי שמי שמצטרפים יוכלו להתחבר גם בלי ממסר של MVS. כל מי שמחזיקים בקישור יכולים לראות את הכתובת, גם אם הוא מתפרסם ברבים.` | `Invite links that members create can include this computer's IP address, so people joining can connect even without an MVS relay. Anyone who has the link can see the address, even if it's posted publicly.` |
+| `inviteAddr.hint` | `קישורי הזמנה שחברי השרתים יוצרים יכולים לכלול את כתובת ה-IP של המחשב הזה, כדי שמי שמצטרפים יוכלו להתחבר גם בלי ממסר של MVS. כל מי שמחזיקים בקישור יכולים לראות את הכתובת, גם אם הוא מתפרסם ברבים. קישורים ששותפו כבר ימשיכו לכלול את הכתובת עד שהתוקף שלהם יפוג, גם אם המתג הזה יכובה.` | `Invite links that members create can include this computer's IP address, so people joining can connect even without an MVS relay. Anyone who has the link can see the address, even if it's posted publicly. Links already shared keep the address until they expire, even if you turn this off.` |
 
 **Turning it on asks once more** (a small dialog), because the address can end up public:
 - title: `להוסיף את כתובת המחשב הזה לקישורי הזמנה?` / `Add this computer's address to invite links?`
 - body: `inviteAddr.hint` (the same text)
 - buttons: `הוספה` / `Add` (primary) and `ביטול` / `Cancel`. Initial focus on Cancel, since the safe choice comes first here. Esc = Cancel.
 
-Turning it off needs no confirmation. Links already shared keep the old hint until they expire (PM10); the hint text doesn't promise otherwise.
+Turning it off needs no confirmation. Links already shared keep the address until they expire (PM10), and the hint says so plainly (SL).
 
 ## 5. The invite dialog
 
@@ -126,6 +123,7 @@ Relay-only users never relay. All three switches are disabled with the existing 
 1. A fresh adult account on desktop: relay follows #368's default; port mapping and invite addresses are off.
 2. Under 18: all three switches are disabled with the 18+ reason, and no mapping or hint is ever created (core test).
 3. Relay on but unreachable: the "unreachable" status, plus the "What can I do?" line.
+3a. Relay on, then the laptop unplugs or joins a metered network: the switch stays on and enabled, and the status says "paused". It returns to "checking" or "relaying" when power or the network changes back.
 4. Port mapping on: "asking", then "port open", while the relay status shows "checking" until the dial-back proves it.
 5. A router refusal shows the manual-port line, with the port number LTR and no IP anywhere in the DOM.
 6. CGNAT: the relay shows the provider line, and port mapping shows "not possible".

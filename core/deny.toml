@@ -99,6 +99,23 @@ allow-wildcard-paths = true
 # libp2p-dns (core/vendor/libp2p-dns/README.md). Cargo.lock still lists 0.25.2
 # as libp2p-mdns 0.48's entry; the mdns feature is off everywhere, so it is
 # never compiled (cargo tree -i hickory-proto@0.25.2 --target all is empty).
-# Advisories reported for it are known and non-blocking until libp2p 0.57.
+# cargo-deny doesn't report it (it isn't in the build graph); it leaves the
+# lock with libp2p 0.57.
 [advisories]
 version = 2
+# B10: advisories block CI (the licence job). Each exception names why it
+# is safe and when it goes; a vulnerability is fixed, never listed here.
+# Unmaintained notices only, no known vulnerability:
+ignore = [
+  # paste: a proc-macro (build time only, no runtime code), through
+  # libp2p-quic -> if-watch -> netlink-packet-core (Linux). Goes with the
+  # libp2p upgrade that drops it (T3b, 0.57).
+  { id = "RUSTSEC-2024-0436", reason = "paste: build-time proc-macro via libp2p-quic/if-watch; unmaintained, not vulnerable; goes with libp2p 0.57" },
+  # zvariant, zbus_names, zvariant_derive: zbus 5, the D-Bus client of the
+  # Linux Secret Service keyring (identity -> secret-service, keyring). The
+  # zbus project renamed and moved these crates; revisit with the next
+  # keyring/secret-service release that takes the new ones.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: via zbus (Linux keyring, identity); unmaintained notice only" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: via zbus (Linux keyring, identity); unmaintained notice only" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: via zbus (Linux keyring, identity); unmaintained notice only" },
+]

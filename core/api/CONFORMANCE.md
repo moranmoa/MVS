@@ -266,6 +266,19 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - A raise means a *changed* date. A date entered at sign-up on this computer, or one a server's **"adult"** claim already agrees with, is the one my claims come from. A "not adult" agreement proves nothing: a restored date a day short of 18 still waits. Turning 18 with it is a birthday, with no wait.
   - **Known limit,** until the encrypted backup (#291) brings the old birth date back: after a restore with a new adult date, a server I join for the first time has no earlier claim to compare, so it gets "adult" at once. Joining a fresh server first doesn't lift the wait on the old ones: only an agreeing claim or the 30 days do. The client clock, or a modified client, can also skip the wait (Security Lead, GAP-22).
 
+- Correcting the birth date (G-77, B7 §2, §9). `date` is a real `YYYY-MM-DD` from 1900 to today (UTC); anything else is `bad-request`. Each answer is `AgeCorrectionPreview { kind: 'same' | 'lower' | 'raise' | 'too-young' | 'owns-restricted-server', effectiveAt?, loses: { serverId, name, channel? }[], blockedBy?: { serverId, name }[] }`, judged by date against my current birth date (a waiting raise doesn't count yet): an earlier date is a raise, a later one a lowering, even when my age today is the same (Tech Lead on #512: an earlier birthday at the same age would otherwise skip the wait).
+  - `previewBirthDateCorrection(date)` changes nothing.
+  - `correctBirthDate(date)` applies it and fires `identity.changed`:
+    - **same** (the identical date): any waiting correction is dropped.
+    - **lower:** at once. A restore's waiting cap (at most 17) stays until its own time, for the new date; a lowering can't lift it, and cancel can't remove it. The new age claim goes to every server I'm in. An 18+ server I'm now too young for is left (one I own refuses the correction instead, below): its `Leave` goes through the leave outbox (as `leaveServer`), and `server.removed { serverId, reason: 'age', required: '18+' }` fires. Elsewhere, each 18+ channel I saw fires `channel.removed { …, reason: 'age' }`. `loses` lists them beforehand: a whole server has no `channel`.
+    - **raise:** pending for 30 days: `Identity.pendingBirthDate = { date, effectiveAt }`, and `birthDate` stays until then. A new correction replaces it; the same one again keeps its clock. When it's due, the next sync round makes it my birth date, posts the claims and fires `identity.changed`. A server left on a lowering doesn't come back by itself.
+    - **too-young** (under 16): rejected with the new error code `too-young`; nothing changes.
+    - **owns-restricted-server:** see "An owner" below.
+  - `cancelBirthDateCorrection()` drops a waiting correction (`ok` with none). A raise found after a restore isn't a correction and can't be cancelled (`not-allowed`): there's no earlier date to go back to.
+  - Same and lower never make the date "the one my claims come from": a restored date stays untrusted, so a date a day short of 18 still waits 30 days. A raise does once it settles, having waited its own 30 days (Security Lead on #512). A correction made while a restore's raise waits keeps that cap (at most 17) until its own 30 days.
+  - `channel.removed` gains `reason?: 'deleted' | 'age'`; `server.removed` gains `reason: 'age'` and `required?`.
+  - **An owner** (PO on #512): a lowering below the restriction of a server I own is refused with the new code `owns-restricted-server`, and `CoreError.servers` names those servers (the preview: `kind: 'owns-restricted-server'`, `blockedBy: { serverId, name }[]`). Nothing changes. The restriction is never lifted for me; the UI says to lower the restriction or close the server first (and, once G-43 exists, to transfer ownership). Raises and lowerings that keep me at or above every restriction I own still work.
+
 - Restore on a new computer:
   - `restoreIdentity(words, input?: { locale, country, birthDate })`. The words don't carry the country or birth date, so the UI asks them again (with the agreement) before the words and passes them here, as `createIdentity` takes them. The name follows with `updateProfile`.
   - Rejoining a server I'm still a member of (its invite link, after a restore) signs no new join. It never posts an empty display name or an age claim without a birth date: the server keeps the profile and claim it holds. With no birth date it isn't age-blocked either: my earlier claim stands. A known age below the server's minimum still blocks.
@@ -456,6 +469,11 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - It stays listed, failed, until a restart or `discardMessage(messageId)`, which drops a held or failed `pending-…` message and wipes its text (`not-found` for any other ID). "Send again" is `discardMessage` plus a new `sendMessage`.
   - `Message.replaces?: string` is new, and appears only on that one `message.updated`.
   - A moderator or above never gets a pending message: they make the key on the way. A non-member, or someone kicked, still gets `not-allowed` at once.
+- `Message.unreadable?: 'no-key' | 'untrusted'` (additive, TODO #21, the PO's placeholders). The message keeps its place (`index`, `createdAt`, `id`), and its `body` is `""`. It has no `mentions`, `mentionsMe` or `reactions`. It counts in `getMessageCount` but never in `unreadCount`, `firstUnreadIndex` or `mentions`.
+  - `'no-key'`: sealed under a key this device doesn't hold, by someone who had already seen me join (their record's auth deps reach my latest `Join`). It keeps its `authorId`. It isn't final: if a later rotation opens it, `message.updated` (same `id`) brings the text with no `unreadable`. A message from before my join that doesn't open is never listed, as before.
+  - `'untrusted'`: it opens only under a rotation authority doesn't accept (#21). It has **no `authorId`** and no `sendState`, and it's never a reply target.
+  - `react`, `editMessage` and `deleteMessage` on a placeholder give `bad-request`.
+  - An edit that doesn't open leaves the original text shown (with no `editedAt`); the message is a placeholder only when the original doesn't open either.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):
@@ -477,13 +495,44 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `not-allowed`: not permitted (role), or the owner leaving.
     - `bad-request`: a name that fails the rule.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
-  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1', 'adult-keys-v1', 'server-meta-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
+  - **Caps are frozen after `server-meta-v1`** (Tech Lead on #555): released cores gate on these exact names, so they are posted for good. The next gated feature adds one cap of the form `"lv:N"`, a single level that implies every feature up to N; a gate checks `lv >= k`, older cores ignore it, and the profile post stops growing with each release.
+- 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
+  - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
+  - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
+  - Someone entering it (a new 18+ claim) is like a join: re-keyed through the GAP-8 bucket.
+  - Sending: an 18+ channel isn't listed to, or found by, a member without an 18+ claim, so the send is `not-found` (B7 §4: no hint it exists). A raise counts only after its 30 days (decision 18, already in force), so a raised claim never gets the key early.
+  - The cipher's adults are fresh at every seal: a channel turned 18+ and written to at once (no sync between) is re-keyed for the adults first, never sealed under the old key.
+  - **Rollout (Security Lead K2):** profile posts carry the new cap `adult-keys-v1`, and `getUpdateNeeded(serverId, 'adult-keys-v1')` lists members whose latest post lacks it. A moderator on an older version still re-keys 18+ channels for every member, so what's sent while such a member re-keys is readable by minors (**residual**, until everyone updates). Owners and admins of a server with an 18+ channel get `notice` `{ kind: 'adult-keys-outdated', serverId }` once while that list isn't empty, and again only after it has emptied. The release carrying B7-k should be a required update for the open alpha.
+  - Not covered yet (its own PR, rule agreed by the TL and SL): receivers drop a Message, MessageEdit or Reaction in an 18+ channel whose author isn't an adult at the record's causal position, or, if its deps don't reach the latest ChannelEdit that made the channel 18+, isn't an adult now.
+- Display names with emoji ZWJ sequences (B23-z2, Tech Lead on #241), in two steps so a name never reaches a core that would drop it:
+  - **Now (the reader):** other people's display names from profile posts pass `authority::display_name_ok`. That's the strict rule, except that a zero-width joiner may join two emoji ("👨‍👩‍👧", "👩🏽‍💻"). A stray ZWJ, or any bidi, control or other zero-width character, is still refused: that post's name is ignored and the previous good one stays.
+  - **One release later (the writer):** `updateProfile` accepts such a name for me too (`WRITE_ZWJ_NAMES` in `model.rs` flips to true). Until then my own name keeps the strict rule (`bad-request`).
+  - Server, channel and room names keep the strict rule for good: a ZWJ is never allowed there.
+  - The UI side (dev-ui): guardCore allows a ZWJ in display names only, never in server or channel names.
+
+- Server icon and description (G-51, `docs/design/server-icon-description.md`):
+  - `setServerIcon(serverId, dataUrl | null)` returns the updated `ServerSummary`.
+    - `dataUrl` is `data:image/(png|webp);base64,…`, checked in this order: the prefix, a length cap on the base64 text, strict base64, then the magic bytes against the prefix's type, still (no APNG or animated WebP), at most 8 KiB and 128 px a side. Anything else is `bad-request`. `null` clears the icon.
+    - Setting an image: at most once per server every 10 minutes from this device (`rate-limited`), since every icon stays in the control log. Clearing it (`null`) is never limited, so an admin can remove an icon at once.
+  - `setServerDescription(serverId, description)` returns the updated `ServerSummary`.
+    - The text is trimmed; empty clears it. Otherwise up to 500 code points and 5 lines (`\n` only), with no `\r` or U+2028/2029, no blank first or last line, no two blank lines in a row, and no line ending in whitespace. Anything else is `bad-request`.
+    - Shown as plain text with its line breaks (`white-space: pre-line`): never Markdown or links.
+  - Both commands: the owner or an admin only (`not-allowed`), `not-found` for a server I'm not in, and `update-needed` while a member's latest profile lacks `server-meta-v1` (`getUpdateNeeded(serverId, 'server-meta-v1')` lists who). Setting what's already set signs nothing.
+  - `ServerSummary` gains `iconDataUrl?` and `description?` (additive; absent when unset). Any change, mine or read by sync, fires `server.updated`. It's never unread, a mention or a notice.
+  - Plaintext inside the server, like the name: every member, or a modified client, can read them (GAP-22).
 - Blocked accounts (G-47):
   - `listBlocked()` returns `BlockedUser[]`, `{ userId, shortCode, name? }`, ordered by `userId` (`shortCode` is the identity code, as `Member.shortCode`, so rows without a name can be told apart, G-47b): everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
   - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
+- 18+ channels, the receiver rule (B7-k, Tech Lead and Security Lead on #544). In a channel that is 18+ in my current fold, a Message, MessageEdit or Reaction counts only if:
+  - (a) its author is an adult at the record's causal position: their latest accepted age claim before its `auth_deps` (`Resolver::adult_at`); and
+  - (b) if its `auth_deps` don't reach the latest edit that made the channel 18+ (`State.adult_edits`, `Resolver::reaches`), its author is also an adult now.
+  - A failing record is dropped like a kicked author's: not shown, never unread, a mention or a notice. It stays in the log. A plain channel, or one turned plain, has no check. Nothing is cached per record: it's recomputed on every fold.
+  - So a minor's post with stale deps is dropped, and an adult who lowers their age keeps what they posted after the channel turned 18+. Posts from before the flip by someone who isn't an adult now are hidden: the accepted cost.
+  - **Accepted residual (Security Lead):** a former adult whose claim a modified client lowered can still post with stale deps that point at an adult moment after the edit. The claim is self-attested anyway (GAP-22).
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

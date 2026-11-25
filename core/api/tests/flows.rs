@@ -570,7 +570,7 @@ fn restore_and_identity_rules() {
     let world = World::new();
     let peer = world.peer();
     let err = peer.core.restore_identity(vec!["legal".into(); 11]).unwrap_err();
-    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]) });
+    assert_eq!(err, CoreError { code: ErrorCode::InvalidWords, positions: Some(vec![]), servers: None });
     let words: Vec<String> = LEGAL.split(' ').map(String::from).collect();
     let restored = peer.core.restore_identity(words.clone()).unwrap();
     assert!(restored.recovery_checked);
@@ -762,6 +762,9 @@ struct Spy {
     channels: std::sync::Mutex<BTreeSet<records::ChannelId>>,
     /// When set, `rotate` fails (a re-key that can't happen).
     fail_rotate: std::sync::atomic::AtomicBool,
+    /// When set, what opens opens as untrusted (a rotation authority
+    /// doesn't accept, #21).
+    distrust: std::sync::atomic::AtomicBool,
 }
 
 impl Spy {
@@ -770,6 +773,7 @@ impl Spy {
             inner: api::crypto::GroupKeysCipher::locked(),
             channels: Default::default(),
             fail_rotate: Default::default(),
+            distrust: Default::default(),
         }
     }
 
@@ -799,7 +803,9 @@ impl GroupCipher for Spy {
         b: &[u8],
     ) -> Result<Opened, CipherError> {
         self.saw(c);
-        self.inner.decrypt(s, c, a, b)
+        let opened = self.inner.decrypt(s, c, a, b)?;
+        let distrust = self.distrust.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(Opened { accepted: opened.accepted && !distrust, ..opened })
     }
     fn apply_rotation(&self, r: &records::Record) -> Result<Vec<records::RecordId>, CipherError> {
         if let Scope::Channel(c) = r.scope() {
@@ -3248,6 +3254,7 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     assert!(guest.events.take().contains(&Event::ServerRemoved {
         server_id: server.id.clone(),
         reason: Some(RemovedReason::Left),
+        required: None,
     }));
     assert!(guest.core.list_servers().unwrap().is_empty());
     assert_eq!(guest.core.get_messages(&channel, 0, 9).unwrap_err().code, ErrorCode::NotFound);
@@ -3304,7 +3311,7 @@ fn servers_are_renamed_left_and_deleted_behind_the_rollout_gate() {
     *world.clock.0.lock().unwrap() += 20_000;
     third.core.sync_now().unwrap();
     let removed =
-        Event::ServerRemoved { server_id: server.id.clone(), reason: Some(RemovedReason::Closed) };
+        Event::ServerRemoved { server_id: server.id.clone(), reason: Some(RemovedReason::Closed), required: None };
     assert!(third.events.take().contains(&removed));
     assert!(third.core.list_servers().unwrap().is_empty());
     assert_eq!(third.core.list_channels(&server.id).unwrap_err().code, ErrorCode::NotFound);
@@ -3444,6 +3451,7 @@ fn a_leave_waits_in_the_outbox_until_the_gate_opens() {
         assert!(peer.events.take().contains(&Event::ServerRemoved {
             server_id: server.id.clone(),
             reason: Some(RemovedReason::Left),
+            required: None,
         }));
         assert!(peer.core.list_servers().unwrap().is_empty());
         assert_eq!(leaves_by(&world, server_key, id), 0, "a Leave went out past the gate");
@@ -5061,10 +5069,13 @@ fn profile_picture_and_colour_reach_other_members() {
     assert_eq!(err(profile(Some(&small_webp(65, 0)), None)), ErrorCode::BadRequest);
     assert_eq!(err(profile(None, Some("blue"))), ErrorCode::BadRequest);
     assert_eq!(err(profile(Some(&small_webp(48, 2_600)), None)), ErrorCode::BadRequest);
-    // The largest valid profile (128 four-byte emoji, a 2,556-byte picture,
-    // a colour) fits one post and is published (the 4 KiB check guards it).
+    // A near-largest profile (116 four-byte emoji, a 2,556-byte picture, a
+    // colour) fits one post and is published (the 4 KiB check guards it).
+    // Every cap a release adds (adult-keys-v1 here, server-meta-v1 next)
+    // takes ~16 bytes of every profile post, so the name room left beside
+    // the largest picture shrinks: 128 emoji no longer fit (B7-k).
     let mut largest = profile(Some(&small_webp(48, 2_512)), Some("#ffffff"));
-    largest.display_name = "🙂".repeat(128);
+    largest.display_name = "🙂".repeat(116);
     // #378: an explicit save posts at once, up to a burst of three.
     let before = posts();
     bob.core.update_profile(largest).unwrap();
@@ -5951,4 +5962,149 @@ fn a_log_missing_my_join_keeps_a_restored_server_waiting() {
 fn peer_key(peer: &Peer) -> PublicKey {
     let id = peer.core.get_identity().unwrap().unwrap().id;
     PublicKey::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
+}
+
+/// dev-identity on #517: a joiner after an earlier join's wait ran out gets
+/// a wait of its own, so its first messages aren't sealed under a key it
+/// never gets.
+#[test]
+fn a_later_joiner_gets_its_own_join_key_wait() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Later");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+
+    // B joins with the owner away; A's wait for it runs out.
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "for B", None).unwrap();
+    advance(&world, 2 * JOIN_KEY_WAIT.as_millis() as u64);
+    a.core.sync_now().unwrap();
+    let sent = a.core.send_message(&channel, "B's wait is over", None).unwrap();
+    assert_ne!(sent.send_state, Some(SendState::Pending), "{sent:?}");
+
+    // C joins later: a new wait, so A holds again.
+    let _c = joiner(&world, &server, "C");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "for C", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending), "{held:?}");
+}
+
+/// dev-identity on #517: messages held for a key and dropped at the app
+/// lock turn `failed` with no text (`message.updated`), never left pending.
+#[test]
+fn held_messages_dropped_at_lock_turn_failed() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Lock");
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+    let _b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    let held = a.core.send_message(&channel, "secret", None).unwrap();
+    assert_eq!(held.send_state, Some(SendState::Pending));
+    a.events.take();
+    a.core.lock_keys();
+    let updated: Vec<Message> = a
+        .events
+        .take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::MessageUpdated(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0].id, held.id);
+    assert_eq!(updated[0].send_state, Some(SendState::Failed));
+    assert_eq!(updated[0].body, "");
+    a.core.unlock_keys();
+}
+
+/// TODO #21, the PO's placeholders: a message sent after my join that this
+/// device can't open keeps its place (author, time, no text). One from
+/// before my join stays hidden. Neither counts as unread, and react,
+/// edit and delete on a placeholder get `bad-request`.
+#[test]
+fn a_message_the_joiner_cant_open_is_a_placeholder_in_place() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Placeholder");
+    owner.core.send_message(&channel, "before B joined", None).unwrap();
+    let a = joiner(&world, &server, "A");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    a.core.sync_now().unwrap();
+
+    // B joins and A sees it, but the owner (the only re-keyer) stays away
+    // past any wait for the join re-key: A's message goes out under the
+    // key B never gets.
+    let b = joiner(&world, &server, "B");
+    a.core.sync_now().unwrap();
+    a.core.send_message(&channel, "B can't open this", None).unwrap();
+    advance(&world, 60_000);
+    a.core.sync_now().unwrap();
+    // Then the owner re-keys for B and writes under the new key.
+    owner.core.sync_now().unwrap();
+    owner.core.send_message(&channel, "after the re-key", None).unwrap();
+    b.core.sync_now().unwrap();
+
+    let got = b.core.get_messages(&channel, 0, 9).unwrap().messages;
+    let a_id = peer_key(&a);
+    // The message from before B joined is hidden, not a placeholder.
+    assert_eq!(got.len(), 2, "{got:?}");
+    let held = &got[0];
+    assert_eq!(held.unreadable, Some(Unreadable::NoKey), "{got:?}");
+    assert_eq!(held.body, "");
+    assert_eq!(held.author_id, hex::encode(a_id.as_bytes()));
+    assert_eq!(held.reactions, None);
+    assert_eq!(got[1].body, "after the re-key");
+    assert_eq!(got[1].unreadable, None);
+    assert_eq!(b.core.get_message_count(&channel).unwrap(), 2);
+
+    // Not unread: only the owner's readable message is.
+    let listed = b.core.list_channels(&server.id).unwrap();
+    let ch = listed.iter().find(|c| c.id == channel).unwrap();
+    assert_eq!(ch.unread_count, Some(1), "{ch:?}");
+
+    // Nothing to do on a placeholder.
+    let code = |r: CoreResult<()>| r.unwrap_err().code;
+    assert_eq!(code(b.core.react(&held.id, "👍", true)), ErrorCode::BadRequest);
+    assert_eq!(code(b.core.edit_message(&held.id, "x")), ErrorCode::BadRequest);
+    assert_eq!(code(b.core.delete_message(&held.id)), ErrorCode::BadRequest);
+}
+
+/// TODO #21, the PO: a message that opens only under a rotation authority
+/// doesn't accept is a placeholder with no author, text or reactions, and
+/// isn't unread.
+#[test]
+fn an_untrusted_message_is_a_placeholder_without_its_author() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Untrusted");
+    let spy = Arc::new(Spy::new());
+    let reader = world.peer_with(Arc::new(MemoryStore::new()), None, spy.clone());
+    sign_up(&reader, "Reader");
+    reader.core.join_server(&server.invite_link).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    reader.core.sync_now().unwrap();
+    owner.core.send_message(&channel, "hello", None).unwrap();
+    reader.core.sync_now().unwrap();
+    let got = reader.core.get_messages(&channel, 0, 9).unwrap().messages;
+    assert_eq!(got.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["hello"]);
+
+    spy.distrust.store(true, std::sync::atomic::Ordering::SeqCst);
+    let got = reader.core.get_messages(&channel, 0, 9).unwrap().messages;
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].unreadable, Some(Unreadable::Untrusted));
+    assert_eq!(got[0].body, "");
+    assert_eq!(got[0].reactions, None);
+    let json = serde_json::to_value(&got[0]).unwrap();
+    assert!(json.get("authorId").is_none(), "{json}");
+    assert_eq!(json["unreadable"], "untrusted");
+    let listed = reader.core.list_channels(&server.id).unwrap();
+    let ch = listed.iter().find(|c| c.id == channel).unwrap();
+    assert_eq!(ch.unread_count, Some(0), "{ch:?}");
 }

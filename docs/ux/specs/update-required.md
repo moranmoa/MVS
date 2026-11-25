@@ -2,7 +2,7 @@
 
 - **Owner:** dev-ui (the banner and the disabled states), with voice-shell for main's gate. **Screenshots:** 560–569.
 - **Follows the approved design note** `docs/design/required-update.md` (#577, TL and SL). The UI only reacts to the core's `getAppInfo().updateRequired` and the `update.required { version }` event. The trigger is "my running version is revoked by a signed manifest", never a new manifest field.
-- **It isn't a full block (TL amendment 1).** The app stays open on its own content, read-only, so nobody is locked out of their data while an update can't be fetched yet. Everything that writes or connects is disabled.
+- **It isn't a full block: read-only is the default (TL amendment 1; the owner may still decide otherwise).** The app stays open on its own content, read-only, so nobody is locked out of their data while an update can't be fetched yet. Everything that writes or connects is disabled.
 - **RU1 (SL):** while an update is required, the core signs nothing and stops sync. Update checks and downloads are its only network traffic. The UI never offers anything that would sign.
 
 ## 1. The banner

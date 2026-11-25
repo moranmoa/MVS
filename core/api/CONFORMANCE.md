@@ -635,6 +635,15 @@ plus a relaunch through the launcher.
 | `update.ready` (exists: `UpdateInfo`) | `{ "version": "1.3.0", "waitingForCall": false }` | after a stage, and again when a call ends |
 | `update.installed` (new) | `{ "version": "1.3.0", "notes": "plain text" \| null }` | once, after `markHealthy` commits a new version; `notes` comes from `ManifestBody::notes_for(<UI language>)`. The UI shows it as **text only** |
 | `update.rolledBack` (new) | `{ "failed": "1.3.0", "running": "1.2.0" }` | once, on the first healthy start after the launcher rolled back |
+| `update.required` (new) | `{ "version": "1.3.0" \| null }` | when a required update turns on (an accepted manifest revoked the running version), or when the version on offer changes; `null`: none yet |
+
+**Required updates** (`docs/design/required-update.md`):
+- `getAppInfo` gains `updateRequired: { version: string | null } | null`. It's set from the first moment of a start when an earlier check found the running version revoked (`policy.json`), and after any check that does. It never clears within a process; only a restart into a version that isn't revoked clears it.
+- While it's set:
+  - the download starts at once and checks repeat every 15 minutes;
+  - a version that failed its trial here is never fetched again;
+  - **RU1:** the core signs nothing and syncs nothing. Every command that would sign answers `update-required` (a new `ErrorCode`), with nothing signed. The sync round, re-keys, rotations, re-joins, profile posts and the report outbox don't run, and the node goes quiet (no gossip, pulls, dials or relaying). Local reads still answer.
+- `checkForUpdate` keeps working; it's what the banner's Try again calls.
 
 **Rules the core keeps:**
 - The first check runs once the UI is up (the first `markHealthy`, so the

@@ -1,0 +1,62 @@
+# Design note: changing a server's age limit (G-52), core
+
+Status: draft for Security Lead and Tech Lead review; no code until then. Author: dev-identity. UX spec: `docs/ux/specs/server-age-limit.md` (#578, voice-c builds the UI).
+
+## Today
+- The limit (`none`, `16+`, `18+`) lives only in the genesis body (`GenesisBody.age_restriction`, JSON), so it can't change.
+- It is enforced by each member's own core:
+  - `joinServer` refuses with `AgeBlocked` when my effective age is below it;
+  - when my own age drops below it, I leave (`apply_lowered_age`, `server.removed` with reason `age`);
+  - I can't lower my age below the limit of a server I own (`owns-restricted-server`).
+- Channel keys don't look at the server limit. Only 18+ *channels* are keyed for members ∩ adults (B7-k, `channel_readers`).
+
+## The record
+| | |
+| --- | --- |
+| Kind | `ServerAgeLimit = 25`, control scope only. **TL:** T17's `SecretRotation` also needs a code; whichever merges first takes 25. |
+| Body | `min u8`: 0, 16 or 18. Anything else doesn't parse. |
+| `max_body` | 1 |
+| Authority | The author is the **owner** (not admins), privileged, so a kick or revoke voids it like other privileged actions. For `18`, the owner must be in `State.adults` at the record (the PO's owner rule from #512); otherwise it isn't accepted. |
+| Which wins | The latest accepted record in linear order. `State.age_limit: Option<u8>`; the effective limit is `state.age_limit` or else the genesis value. |
+
+- It is plaintext inside the server, like the name.
+- A `ServerAgeLimit` that equals the current limit signs nothing (no-op).
+
+## API
+- `setAgeRestriction(serverId, 'none' | '16+' | '18+')` returns the updated `ServerSummary`.
+  - Owner only, else `not-allowed`. A server I'm not in is `not-found`.
+  - `18+` while my effective age is under 18: `too-young`.
+  - Gated with `update-needed` while any member's latest profile lacks `lv:1` (the first level cap, per the frozen-caps rule on #555). `getUpdateNeeded(serverId, 'lv:1')` lists who.
+  - The UI confirms before calling (spec §2, §3). The core doesn't take a "confirmed" flag: an extra argument wouldn't stop a modified client.
+- `countAgeAffected(serverId, '18+')` returns `{ count }` for the raise dialog: current members other than me who aren't in `State.adults`. No names. For `none` and `16+` it is 0, because the app's minimum is 16.
+- Everywhere that reads `genesis.age_restriction` reads the effective limit instead: `ServerSummary.ageRestriction`, the join preview, `AgeBlocked`, `age_losses`, `apply_lowered_age`, and `purge_server`'s `required`.
+- A change, mine or read by sync, fires `server.updated`.
+
+## Raising to 18+
+1. **Keys:** while the effective limit is 18, `channel_readers` is members ∩ adults for **every** channel, not only 18+ channels. Readers shrink, so the next moderator's sync re-keys each channel without the minors (the B7-k removal path: `keyed_for` goes stale). Older epochs stay readable to those who had them ("messages they already received stay").
+2. **Receiver rule:** B7-k's rule then applies to every channel. The raise record is the edit that `reaches` must cover, kept as `State.server_adult_edit: Option<RecordId>`, the server-wide counterpart of `adult_edits`. So a minor's post with stale deps is dropped everywhere.
+3. **The minor's own core:** seeing an accepted raise above its effective age, it leaves as in `apply_lowered_age`: `Leave` through the outbox, `server.removed` with reason `age` and `required: 18+` (spec §4: the existing B7 notice). An owner never leaves, but can't be a minor here by the authority rule.
+4. **Joins:** `AgeBlocked` follows the effective limit.
+
+## Lowering from 18+
+- Readers grow, so the moderator's next sync re-keys with **a new epoch** that includes the 16–17-year-olds. groupkeys is forward-only: a new reader gets no wrap for an earlier epoch. So nothing written while the server was 18+ ever opens to them. That covers the PO's G-77 rule at the key level, and the UI's confirm dialog covers it for the person.
+- 18+ channels keep their own readers (members ∩ adults), so nothing in them opens.
+- Existing members get no notice (spec §3).
+- `none` ↔ `16+`: the same people; no re-key and no dialog.
+
+## Older cores (why the gate)
+- An older core can't decode kind 25. From #589 on, it shows `updateNeeded` (the detector). Until it updates, it keeps keying every channel for all members, so an old moderator could hand a raised server's new keys to minors.
+- The `lv:1` gate keeps the owner from raising while a member could still do that. A member who downgrades afterwards is the same residual as B7-k K2. The `adult-keys-outdated` notice logic extends to "a member lacks `lv:1` in an 18+ server" and is sent once.
+
+## Tests (plan)
+- **authority:** owner only; an 18 by a non-adult owner isn't accepted; the latest wins; kick/revoke voiding; a bad body doesn't parse.
+- **api:**
+  - raise: the minor member's core leaves with `required: 18+`; the next rotation excludes them; their stale-deps post is dropped;
+  - lower: the next rotation includes a 17-year-old, who can't decrypt a pre-lowering message and can't see an 18+ channel;
+  - `too-young`, `not-allowed`, the `update-needed` gate, `countAgeAffected`, no-op, `server.updated`;
+  - the join preview and `AgeBlocked` follow the effective limit.
+
+## Questions for review
+1. **SL:** is the server-wide receiver rule (step 2) needed, or is the key change (step 1) enough? I propose both, to match B7-k.
+2. **SL/PO:** should a raise also rotate at once from the owner's own core, rather than at the next moderator sync? I propose yes: the owner's `setAgeRestriction` runs the re-key in the same call.
+3. **TL:** kind 25 vs T17, and `lv:1` as the first level cap (posted from this release on).

@@ -91,7 +91,8 @@ const shot = async (p, name) => {
   await p.getByLabel('שם תצוגה').fill('מורן');
   await shot(p, '08-onboarding-profile');
   await p.getByRole('button', { name: 'סיום' }).click();
-  await p.getByRole('heading', { name: 'ברוכים הבאים' }).waitFor();
+  // G-92: a new account's first Home says it's ready.
+  await p.getByRole('heading', { name: 'החשבון מוכן. מה עכשיו?' }).waitFor();
   await shot(p, '09-home-no-servers-reminder-banner');
   // The recovery words must not be anywhere in the page's storage.
   const stored = await p.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));
@@ -215,12 +216,12 @@ const shot = async (p, name) => {
   await p.getByRole('button', { name: 'בית' }).click();
   await p.getByRole('button', { name: /הצטרפות בלינק/ }).click();
   await p.getByLabel('לינק הזמנה').fill('mvp://join/valorant-7k2q');
-  await p.getByRole('button', { name: 'הצטרפות', exact: true }).click();
+  await p.getByRole('dialog').getByRole('button', { name: 'הצטרפות', exact: true }).click();
   await shot(p, '16-join-searching');
   await p.getByRole('button', { name: 'ביטול' }).click();
   await p.getByRole('button', { name: /הצטרפות בלינק/ }).click();
   await p.getByLabel('לינק הזמנה').fill('mvp://join/offline-crew');
-  await p.getByRole('button', { name: 'הצטרפות', exact: true }).click();
+  await p.getByRole('dialog').getByRole('button', { name: 'הצטרפות', exact: true }).click();
   await p.getByText('אף אחד מהשרת לא מחובר כרגע', { exact: false }).waitFor({ timeout: 5000 });
   await shot(p, '17-join-nobody-online');
   await p.close();
@@ -399,7 +400,7 @@ async function joinRoom(p, ok = 'הבנתי') {
   await p.getByRole('dialog').getByRole('button', { name: ok }).click();
 }
 {
-  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&voiceP2p', 'x'); // 243: the notice v3 (G-81 B on)
   await p.locator('.voice-room-people li').first().waitFor();
   await shot(p, '245-voice-room-he');
   await p.locator('.voice-room-row').first().click();
@@ -433,7 +434,7 @@ async function joinRoom(p, ok = 'הבנתי') {
   await p.close();
 }
 {
-  const p = await chat('?demo=1&still=1&lang=en&theme=light&update=999999', 'x');
+  const p = await chat('?demo=1&still=1&lang=en&theme=light&update=999999&voiceP2p', 'x'); // 244: the notice v3 (G-81 B on)
   await p.locator('.voice-room-row').first().click();
   await p.getByRole('dialog').waitFor();
   await shot(p, '244-call-ip-notice-en-light');
@@ -696,14 +697,16 @@ const BIDI_EXPECTED = [
 async function checkBidi(p, name, lang, partial = false) {
   const lines = await p.evaluate(() =>
     [...document.querySelectorAll('.msg-line')].map((el) => ({
-      text: el.firstChild?.textContent ?? '',
+      // The whole line: since G-25 a link is its own element inside it.
+      text: el.textContent ?? '',
       dir: el.getAttribute('dir'),
       align: getComputedStyle(el).textAlign,
     })),
   );
   const side = lang === 'he' ? 'right' : 'left';
   for (const [text, dir] of BIDI_EXPECTED) {
-    const line = lines.find((l) => l.text === text);
+    // An edited line ends with the edited tag after the text.
+    const line = lines.find((l) => l.text === text || l.text.startsWith(text + ' '));
     if (!line) {
       if (!partial) problems.push(`${name}: no message line "${text}"`);
     } else if (line.dir !== dir || line.align !== side) problems.push(`${name}: "${text}" is ${line.dir}/${line.align}, expected ${dir}/${side}`);
@@ -1551,6 +1554,20 @@ for (const [query, name, opts, which] of [
   await p.close();
 }
 
+
+// ---- About (B24a: 140, 144) ---------------------------------------------------
+for (const [query, name] of [
+  ['lang=he&theme=light', '140-about-he'],
+  ['lang=he&theme=light&abuse=1', '144-about-abuse-address-he'],
+]) {
+  const p = await chat('?demo=1&still=1&update=999999&' + query, 'x');
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'אודות' }).click();
+  await p.locator('.about-report').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, name);
+  await p.close();
+}
 await browser.close();
 await server.close();
 

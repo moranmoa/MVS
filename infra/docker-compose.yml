@@ -99,19 +99,6 @@ services:
           cpus: "0.5"
           memory: 128M
 
-  # Update seeder: always-on peer serving signed update artifacts (B8).
-  # TODO(B8): not built yet; replace with the seeder image when it lands.
-  # A headless sync node is deliberately not run here: until sync pulls are
-  # gated on membership (GAP-4) it would serve every log to anyone.
-  seeder:
-    image: debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
-    profiles: ["seeder"]
-    command: ["sh", "-c", "echo 'seeder: not built yet (B8)' >&2; exit 1"]
-    restart: "no"
-    network_mode: none
-    read_only: true
-    cap_drop: [ALL]
-
   # STUN only, for voice v1: tells a client its public address, so no
   # third-party STUN server sees users' IPs. No TURN, no relaying, no auth,
   # no media through this host. Start with: --profile stun (needs 3478/udp

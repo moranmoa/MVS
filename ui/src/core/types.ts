@@ -129,6 +129,8 @@ export interface CoreStatus {
   detail?: CoreDownDetail;
   /** Our STUN server for voice (#222), from the shell's config; absent without one. */
   stunUrl?: string;
+  /** G-81 B: calls over the P2P network are on in this build (off by default). */
+  voiceP2p?: boolean;
 }
 
 /** Commands reject with this shape; `code` maps to a translated message. */
@@ -271,6 +273,8 @@ export interface AppInfo {
   updateChannel: UpdateChannel;
   /** Relay-only (GAP-6r, #272): this device is reached only through the relay; calls are off. */
   relayOnly?: boolean;
+  /** G-48 / B24: where to report abuse to the MVS team, from the build (the shell, #552); absent when unset. */
+  abuseAddress?: string;
 }
 
 /**

@@ -469,6 +469,9 @@ pub(crate) struct Calls {
     dirty: BTreeSet<ServerId>,
     /// The user's relay-only setting (`setRelayOnly`), kept by the core.
     relay_only: bool,
+    /// G-81 `--voice-p2p`: calls run over libp2p, so relay-only (our
+    /// relays' circuits only) no longer ends or refuses them.
+    voice_p2p: bool,
     /// The room my own identity is in from another computer, and when its
     /// last hello reached us. `createVoiceRoom` and `joinCall` here answer
     /// `in-call-elsewhere` (one room per identity).
@@ -498,6 +501,23 @@ impl Calls {
     /// Relay-only is on: the setting, or the transport says so.
     pub fn relay_only(&self) -> bool {
         self.relay_only || self.net.as_ref().is_some_and(|net| net.relay_only())
+    }
+
+    /// G-81 `--voice-p2p` (the shell's flag, off by default): with it on,
+    /// calls run over libp2p and so work under relay-only too (over our
+    /// relays' circuits only, which the node enforces).
+    pub fn set_voice_p2p(&mut self, on: bool) {
+        self.voice_p2p = on;
+    }
+
+    pub fn voice_p2p(&self) -> bool {
+        self.voice_p2p
+    }
+
+    /// Calls are refused, and a call in progress ends: relay-only without
+    /// `--voice-p2p` (its media would go direct over WebRTC).
+    fn calls_blocked(&self) -> bool {
+        self.relay_only() && !self.voice_p2p
     }
 
     /// One `voice.rooms` for `server` at the next tick (its `relayOnly`
@@ -622,7 +642,7 @@ impl Calls {
         server: ServerId,
         channel: Option<ChannelId>,
     ) -> CoreResult<()> {
-        if self.relay_only() {
+        if self.calls_blocked() {
             return Err(ErrorCode::RelayOnly.into());
         }
         self.net()?;
@@ -884,7 +904,7 @@ impl Calls {
         if let Some(server) = self.mine.as_ref().map(|m| m.server) {
             // Kicked, or relay-only turned on mid-call (the media would go
             // direct): leave, with a bye.
-            if self.relay_only() || !members.may_call(ctx.me(), server) {
+            if self.calls_blocked() || !members.may_call(ctx.me(), server) {
                 self.leave(ctx, members);
             }
         }

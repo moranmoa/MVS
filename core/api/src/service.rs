@@ -2117,6 +2117,12 @@ impl Core {
         crate::VoiceFrames(self.media.clone())
     }
 
+    /// G-81 `--voice-p2p` (the shell's flag, off by default): calls run over
+    /// libp2p, so relay-only no longer refuses or ends them.
+    pub fn set_voice_p2p(&self, on: bool) {
+        self.lock().calls.set_voice_p2p(on);
+    }
+
     pub fn set_voice(&self, net: Arc<dyn VoiceNet>) {
         self.media.set_net(net.clone());
         self.lock().calls.set_net(net);
@@ -3074,8 +3080,15 @@ impl Core {
     /// `relayOnly` at the next tick. Needs no identity.
     pub fn set_relay_only(&self, on: bool) -> CoreResult<()> {
         if on {
-            self.lock().calls.set_relay_only(true);
-            self.leave_call()?;
+            let mut inner = self.lock();
+            inner.calls.set_relay_only(true);
+            // G-81: with `--voice-p2p` the call goes on, over our relays'
+            // circuits only (the node switches its path).
+            let voice_p2p = inner.calls.voice_p2p();
+            drop(inner);
+            if !voice_p2p {
+                self.leave_call()?;
+            }
         }
         self.run(|inner, ports, _| {
             inner.db.set(KV_RELAY_ONLY, &[u8::from(on)])?;

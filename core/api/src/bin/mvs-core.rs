@@ -64,6 +64,8 @@ struct Args {
     relays: Vec<String>,
     bootstrap: Vec<String>,
     update_root: Option<PathBuf>,
+    /// G-81: `--voice-p2p` (no value), from the shell's voiceP2p flag.
+    voice_p2p: bool,
 }
 
 fn args() -> Option<Args> {
@@ -75,7 +77,12 @@ fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
     let mut relays = Vec::new();
     let mut bootstrap = Vec::new();
     let mut update_root = None;
+    let mut voice_p2p = false;
     while let Some(flag) = args.next() {
+        if flag.to_str()? == "--voice-p2p" {
+            voice_p2p = true;
+            continue;
+        }
         let value = args.next()?;
         match flag.to_str()? {
             "--data-dir" if data_dir.is_none() => data_dir = Some(PathBuf::from(value)),
@@ -85,7 +92,7 @@ fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
             _ => return None,
         }
     }
-    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root })
+    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root, voice_p2p })
 }
 
 /// What is logged without RUST_LOG (see `init_logging`).
@@ -234,6 +241,7 @@ fn main() -> ExitCode {
     // delivery thread ends with the node.
     if let Some(net) = &sync {
         core.set_voice(net.clone());
+        core.set_voice_p2p(args.voice_p2p);
         if let Some(media) = net.take_media() {
             std::thread::spawn(move || api::syncnet::deliver_media(media, core));
         }

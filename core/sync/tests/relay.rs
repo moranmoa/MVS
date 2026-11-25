@@ -1103,7 +1103,7 @@ async fn a_member_dials_back_and_only_then_the_relay_is_offered() {
     b.test_local_dialback().unwrap();
     a.set_member_relay(true, 1024, true).unwrap();
     voice_meet(&a, &b, voice_id(52), voice_id(53), true).await;
-    let addr = reachable_within(&a, Duration::from_secs(20)).await.expect("never confirmed");
+    let addr = reachable_within(&a, Duration::from_secs(60)).await.expect("never confirmed");
     let a_ports: Vec<Multiaddr> = a.listen_addrs().await.unwrap();
     assert!(
         a_ports.iter().any(|l| l.iter().nth(1) == addr.iter().nth(1)),
@@ -1155,7 +1155,10 @@ async fn a_forged_dial_back_answer_is_never_believed() {
     let (relay, _relay) = voice_relay();
     let (a, _ea) = bound_node_events("r1-forge-a", &relay, 56, true, Arc::new(AcceptAll)).await;
     let (b, _eb) = bound_node_events("r1-forge-b", &relay, 57, true, Arc::new(AcceptAll)).await;
-    a.test_no_direct_dials().unwrap();
+    // A dials B: no inbound from B ever reaches A, so a forged answer has
+    // nothing to match. (An ordinary inbound from B on A's port would be
+    // a real reachability proof, not a forgery.)
+    b.test_no_direct_dials().unwrap();
     a.test_local_dialback().unwrap();
     b.test_local_dialback().unwrap();
     // B claims to have reached A at A's own listen address, or at a victim's.

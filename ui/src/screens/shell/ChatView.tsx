@@ -4,7 +4,7 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { isCoreError, useCore, type Id, type Member, type Message, type ServerSummary } from '../../core';
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
-import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
+import { BackIcon, CloseIcon, EditIcon, HashIcon, RefreshIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
 import { EmojiPicker } from '../../components/EmojiPicker';
 import { TopicDialog } from './TopicDialog';
 import { useUserTextProps } from '../../app/textDir';
@@ -190,6 +190,15 @@ export function ChatView({
         </button>
       </header>
       {channel && <TopicDialog channel={channel} canEdit={isOwner && !server.closed} open={topicOpen} onClose={() => setTopicOpen(false)} />}
+      {/* #589: members here run a newer MVS; this computer may miss what it adds. */}
+      {server.updateNeeded && (
+        <div className="offline-banner update-needed-banner" role="status">
+          <RefreshIcon />
+          <span>
+            <FormattedMessage id="server.syncUpdateNeeded" />
+          </span>
+        </div>
+      )}
       {nobodyOnline && (
         <div className="offline-banner" role="status">
           <WifiOffIcon />

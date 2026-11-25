@@ -100,3 +100,27 @@ describe('profile save (0.4.5)', () => {
     expect(dialog.querySelector<HTMLButtonElement>('.profile-actions .primary')?.disabled).toBe(false);
   });
 });
+
+describe('profile-too-large (#594)', () => {
+  it('says the name is too long for this picture, and keeps the draft', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    // Spied before render: the app wraps the core and keeps the methods it was given.
+    core.updateProfile = async () => {
+      throw { code: 'profile-too-large' };
+    };
+    render(<App core={core} initialSettings={en} />);
+    await screen.findByRole('textbox', { name: /^Message / });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Edit profile' }));
+    });
+    const dialog = await screen.findByRole('dialog', { name: 'Settings' });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('radio', { name: 'Pink' }));
+    });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    });
+    expect(within(dialog).getByRole('alert').textContent).toBe('The name is too long for this picture. Shorten the name or choose a smaller picture.');
+    expect(within(dialog).getByRole('radio', { name: 'Pink' }).getAttribute('aria-checked')).toBe('true');
+  });
+});

@@ -49,3 +49,18 @@ A throwaway profile each time. `aec` plays sound out loud and asks for the micro
 With no echo to cancel, the "attenuation" figures (3.1 dB and 1.5 dB) are noise. **No decision.**
 
 **Rerun needed:** playback must go to audible speakers. The candidates on this PC are the VG27A monitor (HDMI) and Digital Output; the harness can target one with `setSinkId` without changing the system default. Headphones don't test echo at all. With headphones there is no echo, so they're the safe case for any playout path.
+
+## AEC speaker test, run 2 (2026-11-25, owner approved, VG27A monitor speakers): **GO, with loopback playout**
+
+`electron spikes/g81-media/main.js aec --sink VG27A`, a throwaway profile; mic: USB PnP microphone.
+
+| Path | Room RMS | While playing RMS | Echo above room |
+| --- | --- | --- | --- |
+| Web Audio, AEC off | 0.00261 | 0.00259 | -0.1 dB (no echo reached the mic) |
+| Web Audio, AEC on | 0 (mic warm-up artefact) | 0.00147 | n/a |
+| **Loopback RTCPeerConnection, AEC off** | 0.00197 | **0.0295** | **+23.5 dB** (clear echo) |
+| **Loopback RTCPeerConnection, AEC on** | 0.00165 | **0.00127** | **-2.2 dB (below the room)** |
+
+- **The loopback path passes: 27.3 dB attenuation** (target ≥ 20 dB). The decoded audio is played as a WebRTC track: a MediaStreamDestination feeds a local RTCPeerConnection pair (`iceServers: []`, in-process, no SDP leaves), which feeds an `<audio>` element with `setSinkId`. Chromium's AEC takes that playout as its reference and cancels it.
+- **Plain Web Audio: not shown.** Even with AEC off, its playout didn't reach the mic, so this run can't measure it. That alone is a reason not to rely on it.
+- **Decision for C2:** B's playout goes through the loopback path (the design's fallback, #509 §5). Each B peer's decoded audio goes to a MediaStreamDestination. One loopback RTCPeerConnection pair carries all of them, then plays through an `<audio>` element on the chosen output. Volume and deafen stay on the per-peer gain before the destination.

@@ -15,6 +15,7 @@ Tester-facing texts are in Hebrew, gender-neutral; everything else is in English
 | 5 | Links checked (§5) | business | done for 0.5.0, see §5 |
 | 6 | **Member relays in 0.5.0:** the setting exists (#368 slice 1) and defaults to `auto`, so a reachable adult tester may relay for fellow members. The product owner ruled that member relays stay off for testers until R2 and notice v3 (#576, point 4). **Decided (product owner):** accept slice 1. It relays only for server owners and admins, and only after the disclosure is acknowledged (test `member_relay_follows_my_role_and_is_forced_off`). #576 point 4 is about R2. Condition: the welcome message says so (§4, item 5) | product owner | done |
 | 7 | The owner says go | owner | open |
+| 8 | **LM-2 fixed before wave 1** (QA P1: the owner's first message can be lost for a member who just joined on the same LAN). Product owner ruling: wave 0, the owner's own circle, may start on 0.5.0; wave 1 invites wait for a release with the fix | dev team, QA verifies | **open, blocks wave 1** |
 
 ## 2. Testers' server
 

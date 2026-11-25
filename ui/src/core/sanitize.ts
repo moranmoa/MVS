@@ -235,6 +235,7 @@ export function cleanServer(s: ServerSummary): ServerSummary {
     unread: s.unread === true,
     mentions: count(s.mentions),
     closed: s.closed === true,
+    updateNeeded: s.updateNeeded === true,
   };
 }
 

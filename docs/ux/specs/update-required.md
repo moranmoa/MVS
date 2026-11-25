@@ -3,6 +3,7 @@
 - **Owner:** voice-shell, with the screen built in the UI. **Screenshots:** 560–569.
 - **When:** the signed update manifest says this version is below the minimum the network needs, for example a release like B7-k (K2) that the owner marks as required (BOARD K2-req). This isn't the per-action `update-needed` message, where *other* members are on old versions (`server.updateNeeded`); this screen is about *my* version.
 - **Open owner question:** whether a required update blocks the whole app, or only sending and syncing. This spec covers the blocking screen, plus the in-call exception, which is the conservative reading. If the owner chooses "read-only until updated", only §1's buttons change.
+- **SL RU1 (core rule, whatever the owner decides):** while a required update is pending, the core stops all background signing: no messages, reactions, edits, profile or server records, relay offers or receipts. So even a "read-only" mode signs nothing. In read-only mode the composer and every action that would sign are disabled, with the reason `update.required.readOnly` "צריך לעדכן את MVS כדי לשלוח ולשנות דברים." / "Update MVS to send messages or make changes."
 
 ## 1. The screen
 

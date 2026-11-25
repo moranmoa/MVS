@@ -10,6 +10,11 @@ export type NotifyLevel = 'all' | 'mentions' | 'none';
 /** A server's or a channel's choice. */
 export interface NotifyScope {
   level?: NotifyLevel;
+  /**
+   * G-48 (PO): servers only, staff only: report notifications here. Absent =
+   * on. Neither a mute nor the level "none" silences reports; this does.
+   */
+  reports?: false;
 }
 
 export interface NotifyPrefs {
@@ -48,8 +53,12 @@ function cleanScopes(v: unknown): Record<Id, NotifyScope> {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return out;
   for (const [k, s] of Object.entries(v as Record<string, unknown>).slice(0, 2000)) {
     if (!s || typeof s !== 'object' || k.length > 128) continue;
-    const { level } = s as Record<string, unknown>;
-    if (LEVELS.includes(level as NotifyLevel)) out[k] = { level: level as NotifyLevel };
+    const { level, reports } = s as Record<string, unknown>;
+    const scope: NotifyScope = {
+      ...(LEVELS.includes(level as NotifyLevel) ? { level: level as NotifyLevel } : {}),
+      ...(reports === false ? { reports: false as const } : {}),
+    };
+    if (scope.level || scope.reports === false) out[k] = scope;
   }
   return out;
 }
@@ -77,10 +86,27 @@ export function levelFor(prefs: NotifyPrefs, serverId: Id, channelId: Id): Notif
 /** Sets one server's or channel's level; null goes back to the default (a channel: its server's). */
 export function withLevel(prefs: NotifyPrefs, kind: 'servers' | 'channels', id: Id, level: NotifyLevel | null): NotifyPrefs {
   const scopes = { ...prefs[kind] };
-  if (level) scopes[id] = { level };
+  // G-48: the server's report switch stays as it is.
+  const keep: NotifyScope = scopes[id]?.reports === false ? { reports: false } : {};
+  if (level) scopes[id] = { ...keep, level };
+  else if (keep.reports === false) scopes[id] = keep;
   else delete scopes[id];
   return { ...prefs, [kind]: scopes };
 }
+
+/** G-48: a server's report notifications on or off (staff). The level stays as it is. */
+export function withReports(prefs: NotifyPrefs, serverId: Id, on: boolean): NotifyPrefs {
+  const servers = { ...prefs.servers };
+  const level = servers[serverId]?.level;
+  if (on) {
+    if (level) servers[serverId] = { level };
+    else delete servers[serverId];
+  } else servers[serverId] = { ...(level ? { level } : {}), reports: false };
+  return { ...prefs, servers };
+}
+
+/** G-48: whether report notifications are on for this server (they are unless switched off). */
+export const reportsOn = (prefs: NotifyPrefs, serverId: Id) => prefs.servers[serverId]?.reports !== false;
 
 export interface NotifyContext {
   prefs: NotifyPrefs;

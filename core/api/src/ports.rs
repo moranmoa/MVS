@@ -173,6 +173,15 @@ pub trait Network: Send + Sync {
         Vec::new()
     }
 
+    /// The detector: records peers sent that `records::Record::peek_unknown`
+    /// reported (validly signed, of a kind this version doesn't know), since
+    /// the last call. The network never stores, forwards or acks them, and
+    /// reports each (server, author, code) at most once per run. The core
+    /// decides what they mean (`ServerSummary.updateNeeded`).
+    fn take_unknown_records(&self) -> Vec<records::UnknownRecord> {
+        Vec::new()
+    }
+
     /// GAP-4: sync `server` members-only, with its secret, and these
     /// channels (the ones authority knows). Called at load and whenever
     /// the channels change; opening again is harmless.
@@ -349,6 +358,8 @@ pub struct LoopbackNetwork {
     buddies: Mutex<HashMap<[u8; 32], HeldBackups>>,
     /// Device link: the one open link (the frozen port's fake guidance).
     link: Mutex<Option<FakeLink>>,
+    /// The detector: what `offer_raw` peeked, for `take_unknown_records`.
+    unknown: Mutex<Vec<records::UnknownRecord>>,
 }
 
 impl LoopbackNetwork {
@@ -366,9 +377,25 @@ impl LoopbackNetwork {
         let buddies = self.buddies.lock().expect("not poisoned");
         buddies.get(member.as_bytes()).map(|held| held.keys().copied().collect()).unwrap_or_default()
     }
+
+    /// Tests: bytes a peer sent, as sync's ingest sees them. A record
+    /// decodes and is published; one of a kind this version doesn't know
+    /// goes to `take_unknown_records` if `peek_unknown` reports it; anything
+    /// else is dropped.
+    pub fn offer_raw(&self, bytes: &[u8]) {
+        if let Ok(record) = Record::decode(bytes) {
+            self.publish(&record);
+        } else if let Some(unknown) = Record::peek_unknown(bytes) {
+            self.unknown.lock().expect("not poisoned").push(unknown);
+        }
+    }
 }
 
 impl Network for LoopbackNetwork {
+    fn take_unknown_records(&self) -> Vec<records::UnknownRecord> {
+        std::mem::take(&mut *self.unknown.lock().expect("not poisoned"))
+    }
+
     fn publish(&self, record: &Record) {
         let mut records = self.records.lock().expect("not poisoned");
         let list = records.entry(record.server()).or_default();

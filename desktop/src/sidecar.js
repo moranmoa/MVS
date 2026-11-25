@@ -171,6 +171,19 @@ class Sidecar {
         this.log(`core: ${l.slice(0, 1000)}`);
       }
     });
+    // The core's pipes can fail when it exits under us (EPIPE writing to a
+    // dead stdin, notably on Windows). An unhandled stream error would crash
+    // main (Electron shows a modal "Uncaught Exception"), so: log it, fail
+    // what's waiting, and let 'exit' do the restart as for any crash.
+    const pipeError = (which) => (e) => {
+      this.log(`core ${which} closed: ${(e && e.code) || 'error'}`);
+      if (this.child === child) this.failAll('core-restarted');
+    };
+    // (Only on real streams: test fakes may hand over plain objects.)
+    const onError = (stream, which) => typeof stream?.on === 'function' && stream.on('error', pipeError(which));
+    onError(child.stdin, 'input');
+    onError(child.stdout, 'output');
+    onError(child.stderr, 'log');
     // A spawn failure (not found, not executable) may come without an exit.
     child.on('error', (e) => {
       this.log(`core failed to start: ${e.code || e.message}`);
@@ -203,10 +216,19 @@ class Sidecar {
     }
   }
 
+  /** Can we write to the core right now (running, its input still open)? */
+  writable() {
+    const stdin = this.child && this.child.stdin;
+    // Closed only when the stream says so (test fakes may lack these flags).
+    return !!stdin && typeof stdin.write === 'function' && stdin.writable !== false && stdin.destroyed !== true;
+  }
+
   /** Resolves with { ok } or { error: { code, positions? } }; never rejects. */
   request(cmd, args) {
     return new Promise((resolve) => {
       if (!this.child) return resolve({ error: this.unavailable() });
+      // The core is exiting (its input is closed): don't write into a dead pipe.
+      if (!this.writable()) return resolve({ error: { code: 'core-restarted' } });
       const id = this.nextId++;
       const line = `${JSON.stringify({ id, cmd, args })}\n`;
       if (Buffer.byteLength(line) > MAX_OUT_LINE) return resolve({ error: { code: 'too-large' } });
@@ -216,7 +238,14 @@ class Sidecar {
         resolve({ error: { code: 'timeout' } });
       }, ms);
       this.pending.set(id, { resolve, timer });
-      this.child.stdin.write(line);
+      try {
+        this.child.stdin.write(line);
+      } catch {
+        // A synchronous write failure: this request fails, nothing crashes.
+        clearTimeout(timer);
+        this.pending.delete(id);
+        resolve({ error: { code: 'core-restarted' } });
+      }
     });
   }
 
@@ -227,11 +256,15 @@ class Sidecar {
    * worth nothing, and it must never queue behind a slow core.
    */
   send(cmd, args) {
-    if (!this.child || !this.child.stdin || !this.child.stdin.writable) return false;
+    if (!this.writable()) return false;
     if (this.child.stdin.writableLength > MAX_FIRE_BACKLOG) return false;
     const line = `${JSON.stringify({ cmd, args })}\n`;
     if (Buffer.byteLength(line) > MAX_FIRE_LINE) return false;
-    this.child.stdin.write(line);
+    try {
+      this.child.stdin.write(line);
+    } catch {
+      return false;
+    }
     return true;
   }
 
@@ -282,7 +315,11 @@ class Sidecar {
     clearTimeout(this.restartTimer);
     this.failAll('core-stopped');
     if (this.child) {
-      this.child.stdin.end();
+      try {
+        this.child.stdin?.end();
+      } catch {
+        // already closed
+      }
       const c = this.child;
       setTimeout(() => c.exitCode === null && c.kill(), 3000).unref();
     }

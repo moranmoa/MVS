@@ -110,24 +110,16 @@ jobs:
         run: |
           git clone --quiet --depth 1 https://github.com/rustsec/advisory-db "$RUNNER_TEMP/advisory-db"
           python3 .github/scripts/check-vendored-advisories.py "$RUNNER_TEMP/advisory-db"
-
-  advisories:
-    # Informational for now: the open advisories are all in libp2p 0.54's
-    # tree (see the PR that added this). Make it blocking after the upgrade.
-    name: security advisories (non-blocking)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - name: Install cargo-deny (checksum verified)
-        run: .github/scripts/install-cargo-deny.sh
-      - name: core
+      # B10: RustSec advisories block, here in the required licence job (the
+      # old informational "security advisories (non-blocking)" job is gone).
+      # A vulnerability is fixed; an unmaintained-only notice may be listed in
+      # core/deny.toml with its reason. The relay too: it has public listeners
+      # (RUSTSEC-2026-0525, a remote panic in libp2p-quic, was only caught by
+      # hand), and it runs even if core fails.
+      - name: advisories (core)
+        if: always()
         run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
-      # The relay too: it has public listeners (e.g. RUSTSEC-2026-0525, a remote
-      # panic in libp2p-quic, was only caught by hand). Runs even if core fails.
-      - name: relay
+      - name: advisories (relay)
         if: always()
         run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check advisories
 

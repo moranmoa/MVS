@@ -224,7 +224,8 @@ function createCheckThrottle({ run, now = Date.now, every = CHECK_EVERY_MS }) {
     last = now();
     try {
       const res = await run();
-      if (res && res.error) return typeof res.error.code === 'string' ? res.error.code : 'internal';
+      // Only a plain code goes back to the page (TL): anything else is 'internal'.
+      if (res && res.error) return typeof res.error.code === 'string' && /^[a-z-]{1,40}$/.test(res.error.code) ? res.error.code : 'internal';
       return 'ok';
     } catch {
       return 'internal';

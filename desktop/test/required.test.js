@@ -117,6 +117,11 @@ test('Retry (update:check): main runs the check at most every 30 s; only a code 
   assert.equal(await slow(), 'too-soon');
   release();
   assert.equal(await first, 'ok');
+  // Only a plain code goes back.
+  for (const code of ['<b>x</b>', 'Offline', 'x'.repeat(41), 42, '']) {
+    const odd = createCheckThrottle({ run: async () => ({ error: { code } }) });
+    assert.equal(await odd(), 'internal', String(code));
+  }
   // A throw is 'internal', never an exception to the page.
   const bad = createCheckThrottle({ run: async () => { throw new Error('no'); } });
   assert.equal(await bad(), 'internal');

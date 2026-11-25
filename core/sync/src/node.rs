@@ -2288,9 +2288,10 @@ impl Task {
                     debug!(%peer, "report inbox full: not acked, the sender retries");
                     return;
                 }
+                // Closed (shutting down): stays closed, so later boxes stay
+                // unacked too, never acked into nowhere.
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     debug!("report inbox closed: not acked");
-                    self.report_sink = None;
                     return;
                 }
             }

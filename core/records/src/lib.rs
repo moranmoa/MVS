@@ -220,6 +220,11 @@ pub enum Kind {
     /// (reserved for D30, written as 0), then the description, UTF-8, at most
     /// [`MAX_SERVER_DESCRIPTION_BYTES`]; empty clears it.
     ServerDescription = 24,
+    /// One part of a server secret rotation (T17): the new sync secret sealed
+    /// to each remaining member. Body: a [header](ROTATION_HEADER_LEN), as a
+    /// `KeyRotation` part's, then what `groupkeys` puts there under its own
+    /// box label (`mvs/sync-secret-box/v1`). Control scope.
+    SecretRotation = 25,
 }
 
 /// Largest server icon image, in bytes (G-51).
@@ -255,7 +260,7 @@ pub const MAX_ROTATION_PARTS: u8 = 32;
 pub const ROTATION_HEADER_LEN: usize = ID_LEN + 2;
 
 impl Kind {
-    const ALL: [Kind; 24] = [
+    const ALL: [Kind; 25] = [
         Kind::Genesis,
         Kind::Grant,
         Kind::Revoke,
@@ -280,6 +285,7 @@ impl Kind {
         Kind::ChannelTopic,
         Kind::ServerIcon,
         Kind::ServerDescription,
+        Kind::SecretRotation,
     ];
 
     const LARGEST_BODY: usize = 16 * 1024;
@@ -311,7 +317,9 @@ impl Kind {
             // Channel ID, history byte, flags and a name.
             Kind::ChannelCreate | Kind::ChannelEdit => 512,
             Kind::Post => 4 * 1024,
-            Kind::Message | Kind::MessageEdit | Kind::KeyRotation => Kind::LARGEST_BODY,
+            Kind::Message | Kind::MessageEdit | Kind::KeyRotation | Kind::SecretRotation => {
+                Kind::LARGEST_BODY
+            }
             // A sealed 64-byte plaintext (121 bytes today), with room to spare.
             Kind::Reaction => 256,
             // Channel ID, history byte and the topic.
@@ -479,7 +487,7 @@ impl Fields {
                 return Err(RecordError::GenesisServerMismatch);
             }
         }
-        if self.kind == Kind::KeyRotation {
+        if matches!(self.kind, Kind::KeyRotation | Kind::SecretRotation) {
             let header = self.body.get(ID_LEN..ROTATION_HEADER_LEN);
             let valid =
                 header.is_some_and(|h| (1..=MAX_ROTATION_PARTS).contains(&h[1]) && h[0] < h[1]);
@@ -1050,7 +1058,7 @@ mod tests {
     /// A body of `len` bytes that passes the kind's own header check.
     fn body_for(kind: Kind, len: usize) -> Vec<u8> {
         let mut body = vec![0; len];
-        if kind == Kind::KeyRotation {
+        if matches!(kind, Kind::KeyRotation | Kind::SecretRotation) {
             body[ID_LEN + 1] = 1; // part 0 of 1
         }
         body
@@ -1083,14 +1091,15 @@ mod tests {
             assert!(kind.allowed_in(Scope::Control));
             assert!(!kind.allowed_in(Scope::Channel(ChannelId::from_bytes([1; 32]))));
         }
-        assert_eq!(Kind::from_code(25), None, "older cores still refuse what they don't know");
+        assert_eq!(Kind::from_code(25), Some(Kind::SecretRotation));
+        assert_eq!(Kind::from_code(26), None, "older cores still refuse what they don't know");
     }
 
     #[test]
     fn every_kind_has_one_scope_and_a_body_limit() {
         let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
         let codes: Vec<u16> = Kind::ALL.iter().map(|kind| kind.code()).collect();
-        assert_eq!(codes, (1..=24).collect::<Vec<u16>>(), "codes are dense and in order");
+        assert_eq!(codes, (1..=25).collect::<Vec<u16>>(), "codes are dense and in order");
         // The genesis has its own tests: its body must carry the nonce.
         for kind in Kind::ALL.into_iter().filter(|kind| *kind != Kind::Genesis) {
             assert_eq!(Kind::from_code(kind.code()), Some(kind));
@@ -1155,6 +1164,27 @@ mod tests {
         let at = body_offset(&record) + ID_LEN;
         bytes[at] = 1;
         assert_eq!(Record::decode(&bytes), Err(RecordError::BadRotationHeader));
+    }
+
+    #[test]
+    fn secret_rotation_parts_are_control_records_with_the_same_header() {
+        let secret = |header: &[u8]| {
+            let mut body = vec![7; ID_LEN];
+            body.extend_from_slice(header);
+            body.extend_from_slice(b"boxes");
+            Draft { kind: Kind::SecretRotation, body, ..draft() }.sign(&key(1))
+        };
+        for (part, parts) in [(0, 1), (7, 8), (31, 32)] {
+            let record = secret(&[part, parts]).unwrap();
+            assert_eq!(Record::decode(&record.encode()).unwrap(), record);
+        }
+        for bad in [&[0, 0][..], &[1, 1], &[0, 33], &[0], &[]] {
+            assert_eq!(secret(bad), Err(RecordError::BadRotationHeader), "header {bad:?}");
+        }
+        assert_eq!(Kind::SecretRotation.max_body(), Kind::LARGEST_BODY);
+        assert!(!Kind::SecretRotation.prunable());
+        let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
+        assert!(!Kind::SecretRotation.allowed_in(channel));
     }
 
     fn message() -> Record {

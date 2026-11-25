@@ -123,7 +123,8 @@ pub struct Resolver {
     /// Every channel create, in linear order, accepted or not. The first
     /// accepted one is #general.
     channel_creates: Vec<RecordId>,
-    /// Every server rename, in linear order, accepted or not.
+    /// Every server rename, icon, description (G-51) and secret rotation part
+    /// (T17), in linear order, accepted or not.
     server_edits: Vec<RecordId>,
 
     // What the reference run would hold for the joined records.
@@ -324,7 +325,12 @@ impl Resolver {
         // G-51: the icon and description are server meta, like a rename.
         if matches!(
             action,
-            Some(Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. })
+            Some(
+                Action::ServerEdit { .. }
+                    | Action::ServerIcon { .. }
+                    | Action::ServerDescription { .. }
+                    | Action::SecretRotation { .. }
+            )
         ) {
             let pos = &self.pos;
             let edits = &mut self.server_edits;
@@ -429,7 +435,10 @@ impl Resolver {
                 }
                 return Ok(());
             }
-            Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+            Action::ServerEdit { .. }
+            | Action::ServerIcon { .. }
+            | Action::ServerDescription { .. }
+            | Action::SecretRotation { .. } => {
                 // Changes no roles; whether it counts depends on the author's
                 // role, which must be the same in every pass. The latest in
                 // linear order names the server.
@@ -766,6 +775,14 @@ impl Resolver {
         let mut name = None;
         let mut icon = None;
         let mut description = None;
+        // T17: every accepted secret rotation part, in linear order.
+        self.state.secret_rotations = self
+            .server_edits
+            .iter()
+            .filter(|id| self.state.accepted.contains(*id))
+            .filter(|id| matches!(self.actions[*id], Some(Action::SecretRotation { .. })))
+            .copied()
+            .collect();
         for id in self.server_edits.iter().rev().filter(|id| self.state.accepted.contains(*id)) {
             match &self.actions[id] {
                 Some(Action::ServerEdit { name: n }) if name.is_none() => name = Some(n.clone()),
@@ -900,7 +917,10 @@ impl Resolver {
                     }
                     dirty.insert(author);
                 }
-                Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+                Action::ServerEdit { .. }
+                | Action::ServerIcon { .. }
+                | Action::ServerDescription { .. }
+                | Action::SecretRotation { .. } => {
                     if now {
                         self.state.accepted.insert(id);
                     } else {

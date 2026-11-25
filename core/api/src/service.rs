@@ -831,6 +831,11 @@ impl Core {
             let result = f(&mut inner, &self.ports, &mut events);
             // Member relays: anything the command changed is announced.
             inner.check_member_relay(&self.ports, &mut events);
+            // G-81: my call changed: the frame gate and the node follow, the
+            // gate first (SL on #554).
+            if events.iter().any(|e| matches!(e, Event::CallState(_))) {
+                self.media.apply(inner.calls.media_call());
+            }
             result
         };
         self.emit(events);

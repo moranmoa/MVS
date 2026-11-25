@@ -45,6 +45,17 @@ impl MediaGate {
         *self.call.lock().expect("not poisoned") = call;
     }
 
+    /// My call changed (join, leave, members, WebRTC peers, lock, sign-out):
+    /// the gate first, synchronously, so no queued frame of a call I left
+    /// goes out (SL on #554); then the node.
+    pub fn apply(&self, call: Option<sync::VoiceCall>) {
+        self.set_call(call.as_ref().map(|c| c.call_id));
+        let net = self.net.lock().expect("not poisoned").clone();
+        if let Some(net) = net {
+            net.set_media_call(call);
+        }
+    }
+
     /// Frames dropped by the fast path (malformed, or the gate closed).
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)

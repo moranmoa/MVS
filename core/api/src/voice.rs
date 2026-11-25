@@ -706,6 +706,9 @@ impl Calls {
         channel: ChannelId,
         joined_at: u64,
     ) -> CoreResult<CallState> {
+        // G-81: a new call: no WebRTC peers or paths carried over.
+        self.webrtc.clear();
+        self.paths.clear();
         self.mine = Some(Mine { server, channel, muted: false, deafened: false, joined_at, since: ctx.now, call_id: { let mut id = [0u8; 16]; OsRng.fill_bytes(&mut id); id } });
         self.dirty.insert(server);
         self.hello(ctx, members, None);
@@ -1267,6 +1270,30 @@ impl Calls {
         }
         self.rooms.retain(|channel, room| !room.peers.is_empty() || Some(*channel) == mine);
         changed
+    }
+
+    /// G-81: my current call for voice media (`sync::VoiceCall`): its ID,
+    /// everyone else in it, and those of them my frames go to over libp2p
+    /// (everyone not on LAN WebRTC, `setCallWebrtcPeers`). None with no
+    /// call.
+    pub fn media_call(&self) -> Option<sync::VoiceCall> {
+        let mine = self.mine.as_ref()?;
+        let participants: Vec<PublicKey> =
+            self.rooms.get(&mine.channel).map(|room| room.peers.keys().copied().collect()).unwrap_or_default();
+        let targets = participants.iter().filter(|p| !self.webrtc.contains(p)).copied().collect();
+        Some(sync::VoiceCall { call_id: mine.call_id, participants, targets })
+    }
+
+    /// G-81 `setCallWebrtcPeers`: the call peers the UI has on LAN WebRTC
+    /// (others are ignored). It only excludes: the core picks the targets.
+    pub fn set_webrtc_peers(&mut self, peers: HashSet<PublicKey>) {
+        self.webrtc = peers;
+    }
+
+    /// G-81: the node says how my frames reach `peer` now. True if it
+    /// changed (a `call.state` is due).
+    pub fn set_path(&mut self, peer: PublicKey, path: VoicePathKind) -> bool {
+        self.paths.insert(peer, path) != Some(path)
     }
 
     /// My call: me first, then the others by key.

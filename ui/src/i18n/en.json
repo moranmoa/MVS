@@ -746,7 +746,7 @@
   "notify.inherit": "Same as the server",
   "notify.localHint": "Saved on this computer only.",
   "notify.reports.label": "Report notifications",
-  "notify.reports.hint": "Reports come through even when the server is muted. Only this switch stops them.",
+  "notify.reports.hint": "Report notifications come through even when the server is muted. Turn this off to stop them.",
   "notify.settings.title": "Notifications",
   "notify.settings.desktop": "Desktop notifications",
   "notify.settings.desktopHint": "Shown when the MVS window isn't in front. Each server and channel can be set from its menu (right-click).",

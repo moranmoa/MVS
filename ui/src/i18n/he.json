@@ -746,7 +746,7 @@
   "notify.inherit": "כמו בשרת",
   "notify.localHint": "נשמר רק במחשב הזה.",
   "notify.reports.label": "התראות על דיווחים",
-  "notify.reports.hint": "דיווחים מגיעים גם כשהשרת מושתק. רק כיבוי של המתג הזה מפסיק אותם.",
+  "notify.reports.hint": "התראות על דיווחים מגיעות גם כשהשרת מושתק. כדי להפסיק אותן, אפשר לכבות את המתג הזה.",
   "notify.settings.title": "התראות",
   "notify.settings.desktop": "התראות דסקטופ",
   "notify.settings.desktopHint": "מופיעות כשהחלון של MVS לא בחזית. אפשר לכוון כל שרת וערוץ מהתפריט שלו (לחיצה ימנית).",

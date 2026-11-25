@@ -78,9 +78,17 @@ process.stdin.on('data', (chunk) => {
     }
     record(m);
     switch (m.cmd) {
-      case 'getAppInfo':
-        out({ type: 'response', id: m.id, ok: { argv: process.argv.slice(2), env: Object.keys(process.env).sort(), args: m.args } });
+      case 'getAppInfo': {
+        // Required updates (#577): <data-dir>/fake-required.json holds updateRequired.
+        let updateRequired = null;
+        try {
+          updateRequired = JSON.parse(fs.readFileSync(path.join(dataDir, 'fake-required.json'), 'utf8'));
+        } catch {
+          // not required
+        }
+        out({ type: 'response', id: m.id, ok: { argv: process.argv.slice(2), env: Object.keys(process.env).sort(), args: m.args, updateRequired } });
         break;
+      }
       case 'joinServer':
         out({ type: 'event', event: 'join.status', payload: { link: m.args.link, state: 'searching' } });
         out({ type: 'response', id: m.id, ok: { link: m.args.link, state: 'searching' } });

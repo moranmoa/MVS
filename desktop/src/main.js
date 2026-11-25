@@ -23,6 +23,7 @@ const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, ab
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
+const required = require('./required');
 const { createNotifier } = require('./notify');
 const ptt = require('./ptt');
 const badge = require('./badge');
@@ -111,7 +112,33 @@ const globalMute = ptt.createGlobalMute({
 });
 
 /** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
+/**
+ * Required updates (#577, required.js): once the core says the running
+ * version is revoked, the page may only read local data and update. It waits
+ * for a call to end, for at most 30 min (then main ends the call).
+ */
+const requiredGate = required.createRequiredGate({
+  inCall: () => callGate.inCall,
+  endCall: () => {
+    callGate.end();
+    syncCall();
+    core?.request('leaveCall', {}).catch(() => {});
+  },
+  onChange: (st) => toPages('update.gate', st),
+});
+
+/** Asks the core whether this version must update (at every core start). */
+function checkRequired() {
+  if (!core) return;
+  Promise.resolve(core.request('getAppInfo', {}))
+    .then((res) => {
+      if (res && res.ok && res.ok.updateRequired) requiredGate.set(res.ok.updateRequired);
+    })
+    .catch(() => {});
+}
+
 function syncCall() {
+  requiredGate.callChanged();
   if (!callGate.inCall) appLock.callEnded();
   if (!callGate.inCall || !lockOpen()) pushToTalk.reset();
   globalMute.sync();
@@ -232,6 +259,8 @@ function setCoreStatus(status) {
   if (status.state === 'up') appLock.coreUp().catch(() => {});
   // The core keeps the metered flag in memory: tell every core that comes up.
   if (status.state === 'up') sendMetered();
+  // Required updates (#577): a revoked version may only read and update.
+  if (status.state === 'up') checkRequired();
 }
 
 /** Member relays, slice 3a: the metered-connection watch (metered.js). */
@@ -290,6 +319,7 @@ function startCore() {
         voiceFrames.fromCore(payload);
         return;
       }
+      if (name === 'update.required') requiredGate.set(payload);
       callGate.onEvent(name, payload);
       syncCall();
       if (appLock.forwards(name)) toPages(name, payload);
@@ -312,6 +342,8 @@ function serveCoreIpc() {
     if (req.error) return { error: { code: req.error } };
     // G-78: while locked, only what the lock screen (and a call behind it) needs.
     if (!appLock.allows(req.cmd, req.args)) return { error: { code: 'locked' } };
+    // A required update: local read-only plus update (#577).
+    if (!requiredGate.allows(req.cmd)) return { error: { code: 'update-required' } };
     if (!core) return { error: { code: 'core-unavailable', detail: 'missing' } };
     // "Restart to update": the core's applyUpdate (refused during a call),
     // then a relaunch through the launcher, which starts the staged version.

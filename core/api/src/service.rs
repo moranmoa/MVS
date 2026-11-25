@@ -421,6 +421,7 @@ impl KeyPending {
             mentions: None,
             mentions_me: None,
             reactions: None,
+            unreadable: None,
         }
     }
 }
@@ -2457,6 +2458,7 @@ impl Core {
         }
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             let sealed = inner.seal(ports, server, channel, body.as_bytes())?;
             let body = [target.as_bytes().as_slice(), &sealed].concat();
             inner.tombstone_or_edit(ports, events, server, channel, target, Kind::MessageEdit, body)
@@ -2480,6 +2482,7 @@ impl Core {
     pub fn delete_message(&self, message_id: &str) -> CoreResult<()> {
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             let body = target.as_bytes().to_vec();
             inner.tombstone_or_edit(
                 ports,
@@ -2508,6 +2511,7 @@ impl Core {
         let emoji = reaction::normalize(emoji).ok_or(ErrorCode::BadRequest)?;
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             // 18+ channels only with an accepted 18+ claim (B7).
             if !inner.visible(server)?.contains(&channel) {
                 return Err(ErrorCode::NotFound.into());
@@ -4779,6 +4783,22 @@ impl Inner {
             .map_err(|_| ErrorCode::BadRequest.into())
     }
 
+    /// A placeholder (`Message.unreadable`) takes no reaction, edit or
+    /// delete: `bad-request`, as the UI offers none (the PO, dev-ui).
+    fn refuse_unreadable(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+        channel: ChannelId,
+        target: RecordId,
+    ) -> CoreResult<()> {
+        let shown = self.shown(cipher, server, channel)?;
+        if shown.iter().any(|s| s.record.id() == target && s.unreadable.is_some()) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        Ok(())
+    }
+
     /// The channel's shown messages, after giving the cipher what's new.
     fn shown(
         &mut self,
@@ -4787,11 +4807,12 @@ impl Inner {
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
         let now = self.clock.now_ms();
+        let me = self.me.as_ref().map(Me::key);
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log, now))
+        Ok(chat::messages(cipher, server, channel, log, now, me))
     }
 
     /// G-21: my read marker in `channel`: the last message I read, as
@@ -4827,7 +4848,9 @@ impl Inner {
             let marker = self.read_marker(server, channel)?;
             let shown = self.shown(cipher, server, channel)?;
             let after = |s: &chat::Shown| (s.record.ts(), *s.record.id().as_bytes()) > marker;
-            let unread = |s: &&chat::Shown| after(s) && s.record.author() != me;
+            // Placeholders never count as unread (the PO).
+            let unread =
+                |s: &&chat::Shown| after(s) && s.record.author() != me && s.unreadable.is_none();
             let count = shown.iter().filter(unread).count() as u64;
             json.unread_count = Some(count);
             json.first_unread_index = shown.iter().position(|s| unread(&s)).map(|i| i as u64);
@@ -5665,7 +5688,8 @@ fn auth_deps(view: &ServerView) -> Vec<RecordId> {
 
 /// What `message.updated` compares: the edit, the deletion, the send state
 /// and (G-26) the reactions shown.
-type Announced = (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>);
+type Announced =
+    (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>, Option<chat::Unreadable>);
 
 /// Where my messages' send states come from: the network's live state and
 /// the last one stored, so a restart doesn't lose it.
@@ -5675,7 +5699,8 @@ struct Status<'a> {
 }
 
 fn announced(s: &chat::Shown, me: Option<PublicKey>, st: &Status) -> Announced {
-    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone())
+    // A placeholder that opens later changes: `message.updated` (the PO).
+    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone(), s.unreadable)
 }
 
 /// B6, on my own messages only: `pending` until it left this device,
@@ -5726,20 +5751,28 @@ fn message_json(
         .filter(|key| members.contains(*key))
         .map(|key| model::hex_id(key.as_bytes()))
         .collect();
+    let unreadable = s.unreadable.map(|why| match why {
+        chat::Unreadable::NoKey => Unreadable::NoKey,
+        chat::Unreadable::Untrusted => Unreadable::Untrusted,
+    });
+    // An untrusted placeholder names no author (the PO).
+    let untrusted = unreadable == Some(Unreadable::Untrusted);
     Message {
         id: model::hex_id(s.record.id().as_bytes()),
         channel_id: model::hex_id(channel.as_bytes()),
         index,
-        author_id: model::hex_id(s.record.author().as_bytes()),
+        author_id: if untrusted { String::new() } else { model::hex_id(s.record.author().as_bytes()) },
         body: s.text.clone(),
         created_at: s.record.ts(),
         edited_at: s.edited_at,
         deleted: s.deleted.then_some(true),
-        send_state: send_state(s, me, st),
+        send_state: if untrusted { None } else { send_state(s, me, st) },
         replaces: None,
+        // A placeholder's text is empty: no tokens, so neither of these.
         mentions: (!listed.is_empty()).then_some(listed),
         mentions_me: me.filter(|me| tokens.contains(me)).map(|_| true),
         reactions: reactions_json(&s.reactions, me),
+        unreadable,
     }
 }
 

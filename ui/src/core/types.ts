@@ -74,6 +74,12 @@ export interface Channel {
   adult: boolean;
   /** The server's first channel (#general): it can be renamed but not deleted. */
   isDefault: boolean;
+  /**
+   * G-14: one line of plain text (at most 256 code points), set by the owner or
+   * an admin; absent when there is none. Visible to every member of the server
+   * (plaintext in the control log), even when an 18+ channel isn't listed to me.
+   */
+  topic?: string;
   unread: boolean;
   mentions: number;
   /**
@@ -204,6 +210,13 @@ export interface Message {
   replyTo?: { id: Id; index: number; authorId: Id; excerpt: string };
   /** Only set on messages written on this device. */
   sendState?: SendState;
+  /**
+   * TODO #21 / core #527: a message here that can't be opened. 'no-key': its
+   * channel key isn't on this computer (it may open later, as message.updated);
+   * 'untrusted': the sender can't be verified (no author). The body is empty,
+   * and it takes no reactions, replies, edits or deletes.
+   */
+  unreadable?: 'no-key' | 'untrusted';
   mentionsMe?: boolean;
   /**
    * G-24 (#330): the users this message mentions who are members now, as
@@ -236,7 +249,11 @@ export type JoinStatus =
   | { phase: 'nobody-online'; link: string }
   | { phase: 'joined'; link: string; serverId: Id }
   | { phase: 'invalid'; link: string }
-  | { phase: 'age-blocked'; link: string; required: AgeRestriction };
+  | { phase: 'age-blocked'; link: string; required: AgeRestriction }
+  /** G-53 (core #503): this account was removed from the server and not let back. Final: no retries. */
+  | { phase: 'removed'; link: string }
+  /** #261: the server behind this invite was closed by its owner. Final. */
+  | { phase: 'closed'; link: string };
 
 export interface StorageUsage {
   usedBytes: number;
@@ -330,6 +347,18 @@ export interface ReportReceipt {
   reportId: Id;
   /** How many staff it goes to. */
   recipients: number;
+}
+
+/**
+ * G-47 (core `listBlocked`, dev-identity #502): someone I blocked, whether
+ * or not we share a server. `name`: their name in a shared server, else the
+ * one kept from when I blocked them; absent if none was ever known.
+ */
+export interface BlockedUser {
+  userId: Id;
+  /** UX-19 (core #525): the identity short code, as on Member, so nameless rows can be told apart. */
+  shortCode?: string;
+  name?: string;
 }
 
 /** G-53 (core `listRemovedMembers`): an account the owner removed, who can't rejoin until the owner undoes it. */

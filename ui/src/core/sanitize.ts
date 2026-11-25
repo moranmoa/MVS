@@ -16,6 +16,7 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  BlockedUser,
   ReportEvidence,
   ReportSummary,
   ReportTarget,
@@ -252,6 +253,20 @@ export function cleanInvite(i: Invite): Invite {
 }
 
 /**
+ * G-47: a blocked account from the core, or null when its id isn't 64
+ * lower-case hex (SL, as for removed accounts): setBlocked only ever gets a
+ * real account id.
+ */
+export function cleanBlockedUser(b: BlockedUser): BlockedUser | null {
+  if (typeof b?.userId !== 'string' || !/^[0-9a-f]{64}$/.test(b.userId)) return null;
+  const name = cleanName(b.name);
+  const shortCode = cleanCode(b.shortCode);
+  return { userId: b.userId, ...(shortCode ? { shortCode } : {}), ...(name ? { name } : {}) };
+}
+const cleanBlockedList = (l: unknown): BlockedUser[] =>
+  Array.isArray(l) ? l.map(cleanBlockedUser).filter((b): b is BlockedUser => b !== null) : [];
+
+/**
  * G-53: a removed account from the core, or null when its id isn't 64
  * lower-case hex (SL): undoKick is only ever sent a real account id.
  */
@@ -340,8 +355,13 @@ const POSITION = /^[0-9A-Za-z]{0,31}[1-9A-Za-z]$/;
 /** A non-negative whole number below 2^31, or undefined. */
 const index = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 && (v as number) < 2 ** 31 ? (v as number) : undefined);
 
+/** G-14: at most 256 code points (the core's MAX_CHANNEL_TOPIC). */
+export const CHANNEL_TOPIC_MAX = 256;
+
 export function cleanChannel(c: Channel): Channel {
-  const { position, firstUnreadIndex, unreadCount, ...rest } = c;
+  const { position, firstUnreadIndex, unreadCount, topic: rawTopic, ...rest } = c;
+  // G-14: one line of plain text, cleaned like a name (no controls, bidi or line breaks).
+  const topic = cleanName(rawTopic, CHANNEL_TOPIC_MAX);
   const first = index(firstUnreadIndex);
   const n = index(unreadCount);
   return {
@@ -350,6 +370,7 @@ export function cleanChannel(c: Channel): Channel {
     ...(first !== undefined ? { firstUnreadIndex: first } : {}),
     ...(n !== undefined ? { unreadCount: n } : {}),
     ...(typeof position === 'string' && POSITION.test(position) ? { position } : {}),
+    ...(topic ? { topic } : {}),
     name: cleanName(c.name, CHANNEL_NAME_MAX) || '…',
     adult: c.adult === true,
     isDefault: c.isDefault === true,
@@ -416,10 +437,25 @@ function cleanReactions(raw: unknown): Message['reactions'] {
 }
 
 export function cleanMessage(m: Message): Message {
+  // Core #527: a placeholder carries no text, author (untrusted) or extras.
+  const unreadable = m.unreadable === 'no-key' || m.unreadable === 'untrusted' ? m.unreadable : undefined;
+  if (unreadable) {
+    return {
+      id: id(m.id),
+      channelId: id(m.channelId),
+      index: typeof m.index === 'number' && Number.isInteger(m.index) && m.index >= 0 ? m.index : 0,
+      authorId: unreadable === 'untrusted' ? '' : id(m.authorId),
+      createdAt: typeof m.createdAt === 'number' && Number.isFinite(m.createdAt) ? m.createdAt : 0,
+      body: '',
+      unreadable,
+      mentionsMe: false,
+    };
+  }
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
-  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
+  // An unknown unreadable kind is dropped: the message is shown as a message.
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, unreadable: _unknown, ...rest } = m;
   const mentions = cleanMentions(rawMentions);
   const reactions = cleanReactions(rawReactions);
   return {
@@ -435,9 +471,27 @@ export function cleanMessage(m: Message): Message {
   };
 }
 
-function cleanJoin(j: JoinStatus): JoinStatus {
-  const link = cleanLink(j.link);
-  return j.phase === 'age-blocked' ? { ...j, link, required: age(j.required) } : { ...j, link };
+/**
+ * A join status with only the fields of its phase. A phase this version
+ * doesn't know (a newer core) becomes 'invalid', so the join dialog always
+ * ends with something to say instead of waiting forever.
+ */
+export function cleanJoin(j: JoinStatus): JoinStatus {
+  const link = cleanLink(j?.link);
+  switch (j?.phase) {
+    case 'searching':
+    case 'nobody-online':
+    case 'invalid':
+    case 'removed':
+    case 'closed':
+      return { phase: j.phase, link };
+    case 'joined':
+      return { phase: 'joined', link, serverId: id(j.serverId) };
+    case 'age-blocked':
+      return { phase: 'age-blocked', link, required: age(j.required) };
+    default:
+      return { phase: 'invalid', link };
+  }
 }
 
 const cleanRange = (r: MessageRange): MessageRange => ({ ...r, messages: r.messages.map(cleanMessage) });
@@ -651,6 +705,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'channel.added': cleanChannel,
   'channel.removed': (p) => ({ serverId: p.serverId, channelId: p.channelId, name: cleanName(p.name, CHANNEL_NAME_MAX) || '…' }),
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
+  'blocks.changed': (p) => ({ blocked: cleanBlockedList(p?.blocked) }),
   // A report that doesn't clean up becomes an empty list's worth of nothing: dropped by the listener.
   'report.received': (p) => ({ serverId: id(p?.serverId), report: cleanReportSummary(p?.report) as ReportSummary }),
   'report.status': (p) => ({ reportId: id(p?.reportId), delivered: count(p?.delivered), pending: count(p?.pending) }),
@@ -721,12 +776,14 @@ export function guardCore(core: CoreApi): CoreApi {
     moveChannel: wrap(core.moveChannel, (l) => l.map(cleanChannel)),
     createChannel: wrap(core.createChannel, cleanChannel),
     updateChannel: wrap(core.updateChannel, cleanChannel),
+    setChannelTopic: wrap(core.setChannelTopic, cleanChannel),
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listBlocked: wrap(core.listBlocked, cleanBlockedList),
     listReports: wrap(core.listReports, cleanReports),
     getReportEvidence: wrap(core.getReportEvidence, cleanReportEvidence),
     reportContent: wrap(core.reportContent, (r) => ({ reportId: id(r?.reportId), recipients: count(r?.recipients) })),

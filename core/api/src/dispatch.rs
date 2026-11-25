@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! request:  { "cmd": "createServer", "args": { "name": "...", "ageRestriction": "none" } }
-//! response: { "ok": <result> }  or  { "error": { "code": "not-allowed", "positions"?: [...] } }
+//! response: { "ok": <result> }  or  { "error": { "code": "not-allowed", "positions"?: [...], "servers"?: [...] } }
 //! event:    { "event": "server.added", "payload": <ServerSummary> }   (via EventSink)
 //! ```
 //!
@@ -70,6 +70,23 @@ struct ReactArgs {
 struct RenameServerArgs {
     server_id: String,
     name: String,
+}
+
+/// G-51 `setServerIcon`: `dataUrl` null (or absent) clears it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerIconArgs {
+    server_id: String,
+    #[serde(default)]
+    data_url: Option<String>,
+}
+
+/// G-51 `setServerDescription`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerDescriptionArgs {
+    server_id: String,
+    description: String,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +283,19 @@ struct UserArg {
     user_id: String,
 }
 
+/// G-77: a birth date, `YYYY-MM-DD`.
+#[derive(Deserialize)]
+struct DateArg {
+    date: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBlockedArgs {
+    user_id: String,
+    blocked: bool,
+}
+
 #[derive(Deserialize)]
 struct BytesArg {
     bytes: u64,
@@ -457,10 +487,26 @@ impl Core {
 
             "markRead" => ok(self.mark_read(&args::<ChannelIdArg>(raw)?.channel_id)),
             "blockUser" => ok(self.block_user(&args::<UserArg>(raw)?.user_id)),
+            "previewBirthDateCorrection" => ok(self.preview_birth_date_correction(&args::<DateArg>(raw)?.date)),
+            "correctBirthDate" => ok(self.correct_birth_date(&args::<DateArg>(raw)?.date)),
+            "cancelBirthDateCorrection" => ok(self.cancel_birth_date_correction()),
+            "setBlocked" => {
+                let a: SetBlockedArgs = args(raw)?;
+                ok(self.set_blocked(&a.user_id, a.blocked))
+            }
+            "listBlocked" => ok(self.list_blocked()),
             // Server lifecycle (#251).
             "renameServer" => {
                 let a: RenameServerArgs = args(raw)?;
                 ok(self.rename_server(&a.server_id, &a.name))
+            }
+            "setServerIcon" => {
+                let a: ServerIconArgs = args(raw)?;
+                ok(self.set_server_icon(&a.server_id, a.data_url.as_deref()))
+            }
+            "setServerDescription" => {
+                let a: ServerDescriptionArgs = args(raw)?;
+                ok(self.set_server_description(&a.server_id, &a.description))
             }
             "leaveServer" => ok(self.leave_server(&args::<ServerArg>(raw)?.server_id)),
             "closeServer" => ok(self.close_server(&args::<ServerArg>(raw)?.server_id)),

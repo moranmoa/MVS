@@ -58,7 +58,7 @@ export interface ServerSeed {
   /** How many of PEOPLE are members, and how many of those are online. */
   members: number;
   online: number;
-  channels: { id: string; name: string; adult?: boolean; count: number }[];
+  channels: { id: string; name: string; adult?: boolean; count: number; topic?: string }[];
 }
 
 export const DEMO_SERVERS: ServerSeed[] = [
@@ -71,7 +71,7 @@ export const DEMO_SERVERS: ServerSeed[] = [
     members: 30,
     online: 12,
     channels: [
-      { id: 'c-general', name: 'כללי', count: 100_000 },
+      { id: 'c-general', name: 'כללי', count: 100_000, topic: 'ערב משחקים כל חמישי ב-21:00. מי שמחפש קבוצה מוזמן לערוץ מחפשים-קבוצה' },
       { id: 'c-lfg', name: 'מחפשים-קבוצה', count: 2_000 },
       { id: 'c-clips', name: 'clips', count: 500 },
       { id: 'c-adult', name: 'אחרי-חצות', adult: true, count: 200 },

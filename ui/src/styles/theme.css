@@ -1,5 +1,7 @@
 /* Design tokens. Every colour in the app comes from here, so a theme is just
-   a different set of values. `data-theme` on <html> is system | light | dark. */
+   a different set of values. `data-theme` on <html> is system | light | dark.
+   B20 (UX-13): every text token meets WCAG AA (4.5:1) on the surfaces it sits
+   on; src/test/contrast.test.ts checks it. */
 
 :root {
   --font-ui: 'Segoe UI', 'Noto Sans Hebrew', 'Noto Sans', system-ui, -apple-system, Arial, sans-serif;
@@ -30,20 +32,22 @@
   --border: rgba(30, 40, 60, 0.13);
   --text: #1d2129;
   --text-muted: #5a6170;
-  --text-faint: #8a909c;
+  --text-faint: #636a76;
   --accent: #4752c4;
   --accent-text: #ffffff;
   --accent-soft: rgba(71, 82, 196, 0.12);
   --danger: #c92a2a;
+  /* Text on a --danger background (buttons). */
+  --on-danger: #ffffff;
   --danger-soft: rgba(201, 42, 42, 0.1);
-  --success: #2b8a3e;
+  --success: #237032;
   --warning-bg: #fff4dc;
   --warning-border: #f0c36d;
   --warning-text: #6b4a00;
   --online: #2f9e44;
-  --offline: #868e96;
+  --offline: #7a818c;
   --badge: #e03131;
-  --update: #2b8a3e;
+  --update: #237032;
   --focus: #1c7ed6;
   --shadow: 0 0.5rem 2rem rgba(20, 25, 40, 0.18);
   --skeleton: rgba(30, 40, 60, 0.08);
@@ -63,19 +67,20 @@
   --border: rgba(255, 255, 255, 0.1);
   --text: #e6e8ec;
   --text-muted: #a3a9b4;
-  --text-faint: #767d89;
-  --accent: #7b86f0;
+  --text-faint: #959ca8;
+  --accent: #8f99f3;
   --accent-text: #0f1220;
-  --accent-soft: rgba(123, 134, 240, 0.18);
+  --accent-soft: rgba(143, 153, 243, 0.14);
   --danger: #ff6b6b;
+  --on-danger: #0f1220;
   --danger-soft: rgba(255, 107, 107, 0.14);
   --success: #69db7c;
   --warning-bg: #3a3020;
   --warning-border: #8a6a2a;
   --warning-text: #ffd98a;
   --online: #40c057;
-  --offline: #6c727c;
-  --badge: #f03e3e;
+  --offline: #7a818c;
+  --badge: #c92a2a;
   --update: #37b24d;
   --focus: #4dabf7;
   --shadow: 0 0.5rem 2rem rgba(0, 0, 0, 0.5);
@@ -97,19 +102,20 @@
     --border: rgba(255, 255, 255, 0.1);
     --text: #e6e8ec;
     --text-muted: #a3a9b4;
-    --text-faint: #767d89;
-    --accent: #7b86f0;
+    --text-faint: #959ca8;
+    --accent: #8f99f3;
     --accent-text: #0f1220;
-    --accent-soft: rgba(123, 134, 240, 0.18);
+    --accent-soft: rgba(143, 153, 243, 0.14);
     --danger: #ff6b6b;
+    --on-danger: #0f1220;
     --danger-soft: rgba(255, 107, 107, 0.14);
     --success: #69db7c;
     --warning-bg: #3a3020;
     --warning-border: #8a6a2a;
     --warning-text: #ffd98a;
     --online: #40c057;
-    --offline: #6c727c;
-    --badge: #f03e3e;
+    --offline: #7a818c;
+    --badge: #c92a2a;
     --update: #37b24d;
     --focus: #4dabf7;
     --shadow: 0 0.5rem 2rem rgba(0, 0, 0, 0.5);

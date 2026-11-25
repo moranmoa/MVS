@@ -553,6 +553,14 @@ pub trait GroupCipher: Send + Sync {
         Err(CipherError::Unavailable)
     }
 
+    /// Current members who can't read the channel's current key (they
+    /// joined since it was made): a message sealed now never reaches them.
+    /// Empty when there is no key, or nobody is missing.
+    fn missing_readers(&self, server: ServerId, channel: records::ChannelId) -> Vec<PublicKey> {
+        let _ = (server, channel);
+        Vec::new()
+    }
+
     /// Opens a channel message body whose record `author` signed.
     fn decrypt(
         &self,
@@ -585,6 +593,20 @@ pub trait GroupCipher: Send + Sync {
     /// drops its keys.
     fn set_channels(&self, server: ServerId, channels: &BTreeSet<records::ChannelId>) {
         let _ = (server, channels);
+    }
+
+    /// B7-k: the members of `server` with an accepted 18+ claim, and its
+    /// 18+ channels. An 18+ channel's readers are the members who are also
+    /// adults: its key rotates to them only, and an adult who leaves that
+    /// set is a removal (a re-key, as for a kick). Every other channel's
+    /// readers are all members, as before.
+    fn set_adults(
+        &self,
+        server: ServerId,
+        adults: &BTreeSet<PublicKey>,
+        adult_channels: &BTreeSet<records::ChannelId>,
+    ) {
+        let _ = (server, adults, adult_channels);
     }
 
     /// At identity unlock: `MemberSecret::new(signing_key)`. Until then

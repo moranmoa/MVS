@@ -2,13 +2,14 @@
 // from a message or a member, and the owner's "Reports" page.
 
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
 import type { Settings } from '../app/settings';
 import { MockCore } from '../core/mock';
 import { cleanReportEvidence, cleanReportSummary } from '../core/sanitize';
 import type { ReportSummary } from '../core';
-import { defaultNotifyPrefs } from '../app/notify';
+import { cleanNotifyPrefs, defaultNotifyPrefs, withLevel, withReports } from '../app/notify';
+import { REPORT_NOTIFY_GAP_MS } from '../screens/shell/reportsState';
 
 const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
@@ -282,8 +283,8 @@ describe('G-48 follow-ups', () => {
       await act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id, reason: 'minor', text: 'secret note' }) }));
       expect(notify).toHaveBeenCalledTimes(1);
       const n = (notify.mock.calls[0] as unknown as [{ title: string; body: string }])[0];
-      expect(n.title).toBe('New report');
-      expect(n.body).toBe(`A report arrived in \u2068${server.name}\u2069.`);
+      expect(n.title).toBe(server.name);
+      expect(n.body).toBe(`New report in \u2068${server.name}\u2069`);
       expect(JSON.stringify(n)).not.toMatch(/minor|secret|105/i);
     } finally {
       delete (window as { mvs?: unknown }).mvs;
@@ -324,5 +325,94 @@ describe('G-48 follow-ups', () => {
     await click(within(dialog).getByRole('button', { name: 'Send report' }));
     await within(dialog).findByText('Your report was sent to the owner and admins.');
     expect(await within(dialog).findByText('Delivered to the owner and admins.')).toBeTruthy();
+  });
+});
+
+describe('G-48 (PO on #567): report notifications through a mute, with their own switch', () => {
+  const emitOf = (core: MockCore) => (core as unknown as { emit: (e: string, p: unknown) => void }).emit.bind(core);
+  async function owned(prepare?: (serverId: string) => void, settings: Partial<Settings> = {}) {
+    const notify = vi.fn(async () => true);
+    (window as { mvs?: unknown }).mvs = { notify };
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const me = (await core.getIdentity())!.id;
+    const server = (await core.listServers()).find((x) => x.ownerId === me)!;
+    prepare?.(server.id);
+    render(<App core={core} initialSettings={{ ...en, ...settings }} />);
+    await screen.findByRole('textbox', { name: /^Message / });
+    const report = async () => act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id }) }));
+    return { notify, server, report };
+  }
+  afterEach(() => {
+    delete (window as { mvs?: unknown }).mvs;
+    localStorage.removeItem('mvs.mute.v1');
+  });
+
+  it('a muted server: a report still notifies', async () => {
+    const { notify, report } = await owned(
+(id) =>
+      localStorage.setItem('mvs.mute.v1', JSON.stringify({ ['server:' + id]: Date.now() + 3_600_000 })),
+    );
+    await report();
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('the level "none" alone: still notifies', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const id = (await core.listServers())[0]!.id;
+    const { notify, report } = await owned(undefined, { notify: { ...defaultNotifyPrefs(), servers: { [id]: { level: 'none' } } } });
+    await report();
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('"Report notifications" off for the server: none', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const id = (await core.listServers())[0]!.id;
+    const { notify, report } = await owned(undefined, { notify: { ...defaultNotifyPrefs(), servers: { [id]: { reports: false } } } });
+    await report();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('the switch is in the server\'s Notifications dialog, for staff, on by default; it keeps the level', async () => {
+    const { server, notify, report } = await owned();
+    const rail = screen.getByRole('navigation', { name: /servers/i });
+    fireEvent.contextMenu(within(rail).getByRole('button', { name: new RegExp('^' + server.name) }));
+    await click(menuItem('Notifications'));
+    const dialog = screen.getByRole('dialog');
+    await click(within(dialog).getByRole('radio', { name: 'Nothing' }));
+    const sw = within(dialog).getByRole('switch', { name: 'Report notifications' }) as HTMLInputElement;
+    expect(sw.checked).toBe(true);
+    await click(sw);
+    expect(sw.checked).toBe(false);
+    expect((within(dialog).getByRole('radio', { name: 'Nothing' }) as HTMLInputElement).checked).toBe(true);
+    await report();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('at most one a minute per server; the rest come as one grouped notification', async () => {
+    const { notify, report, server } = await owned();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await report();
+      await report();
+      await report();
+      expect(notify).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        vi.advanceTimersByTime(REPORT_NOTIFY_GAP_MS);
+      });
+      expect(notify).toHaveBeenCalledTimes(2);
+      const n = (notify.mock.calls[1] as unknown as [{ body: string }])[0];
+      expect(n.body).toBe(`2 new reports in \u2068${server.name}\u2069`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('prefs: the switch survives cleaning and setting the level', () => {
+    const prefs = cleanNotifyPrefs({ ...defaultNotifyPrefs(), servers: { s1: { reports: false }, s2: { reports: 'no' } } });
+    expect(prefs.servers).toEqual({ s1: { reports: false } });
+    const withNone = withLevel(prefs, 'servers', 's1', 'none');
+    expect(withNone.servers.s1).toEqual({ reports: false, level: 'none' });
+    expect(withLevel(withNone, 'servers', 's1', null).servers.s1).toEqual({ reports: false });
+    expect(withReports(withNone, 's1', true).servers.s1).toEqual({ level: 'none' });
   });
 });

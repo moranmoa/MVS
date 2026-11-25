@@ -8,7 +8,7 @@ import { useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { useSettings } from '../../app/settings';
-import { defaultNotifyPrefs, shellNotify } from '../../app/notify';
+import { defaultNotifyPrefs, reportsOn, shellNotify } from '../../app/notify';
 import { useCore, useCoreEvent, type Id } from '../../core';
 
 /** Fired (on window) when my own triage changes a count: a report dismissed. */
@@ -61,9 +61,16 @@ export function useOpenReports(): Readonly<Record<Id, number>> {
   return counts;
 }
 
+/** G-48 (PO): at most one report notification per server this often; more are grouped into one. */
+export const REPORT_NOTIFY_GAP_MS = 60_000;
+
 /**
- * G-48: a desktop notification when a report reaches me, if desktop
- * notifications are on. Title "New report", body the server's name only.
+ * G-48 (PO decision on #567): a desktop notification when a report reaches
+ * me as staff. It comes through a mute and the level "none" (it is addressed
+ * to staff, like an @mention); it follows the main desktop switch, the OS's
+ * own do-not-disturb (the shell's notification), and the server's "Report
+ * notifications" switch. Text-free: the server's name only, never the reason,
+ * the note or the content. At most one a minute per server, then grouped.
  * A click opens that server (its first channel), like a message's.
  */
 export function useReportNotifications() {
@@ -72,18 +79,42 @@ export function useReportNotifications() {
   const prefs = useSettings().settings.notify ?? defaultNotifyPrefs();
   const now = useRef({ intl, prefs });
   now.current = { intl, prefs };
-  useCoreEvent('report.received', (e) => {
+  const last = useRef(new Map<Id, number>());
+  const waiting = useRef(new Map<Id, { count: number; timer: ReturnType<typeof setTimeout> }>());
+  useEffect(() => () => waiting.current.forEach((w) => clearTimeout(w.timer)), []);
+
+  const send = (serverId: Id, count: number) => {
     const notify = shellNotify();
-    if (!notify || !e.report || !now.current.prefs.desktop) return;
     const s = store.getState();
-    const server = s.servers.find((x) => x.id === e.serverId);
-    const channel = s.channels[e.serverId]?.[0];
-    if (!server || !channel) return;
-    const { intl } = now.current;
+    const server = s.servers.find((x) => x.id === serverId);
+    const channel = s.channels[serverId]?.[0];
+    const { intl, prefs } = now.current;
+    if (!notify || !server || !channel || !prefs.desktop || !reportsOn(prefs, serverId)) return;
+    last.current.set(serverId, Date.now());
     void notify({
-      title: intl.formatMessage({ id: 'reports.notify.title' }),
-      body: intl.formatMessage({ id: 'reports.notify.body' }, { server: server.name }),
+      title: server.name,
+      body: intl.formatMessage({ id: 'reports.notify.body' }, { server: server.name, count }),
       channelId: channel.id,
     }).catch(() => {});
+  };
+
+  useCoreEvent('report.received', (e) => {
+    const { prefs } = now.current;
+    if (!e.report || !prefs.desktop || !reportsOn(prefs, e.serverId)) return;
+    const pending = waiting.current.get(e.serverId);
+    if (pending) {
+      pending.count += 1;
+      return;
+    }
+    const since = Date.now() - (last.current.get(e.serverId) ?? -Infinity);
+    if (since >= REPORT_NOTIFY_GAP_MS) return send(e.serverId, 1);
+    const w = {
+      count: 1,
+      timer: setTimeout(() => {
+        waiting.current.delete(e.serverId);
+        send(e.serverId, w.count);
+      }, REPORT_NOTIFY_GAP_MS - since),
+    };
+    waiting.current.set(e.serverId, w);
   });
 }

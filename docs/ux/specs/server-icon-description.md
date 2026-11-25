@@ -18,13 +18,13 @@
 
 - **One save for the page**, as in B11e (profile save): every change is a draft until "שמירה". The save bar becomes sticky and "כללי" gets a dot while there's a draft. Leaving with a draft shows the existing unsaved confirmation.
 - **The icon:**
-  - "בחירת אייקון" opens the file picker (PNG, JPEG, WebP), then the same crop circle as the profile picture (B11e §4): 256×256, at most 512 KB after encoding.
+  - "בחירת אייקון" opens the file picker (PNG, JPEG, WebP), then the same crop circle as the profile picture (B11e §4). **The core's limits (#555):** a still image, PNG or WebP, at most 128×128 and 8 KiB. The UI encodes the crop to 128×128 WebP, stepping the quality down until it fits 8 KiB, with PNG as a fallback. Any input format the browser can read (JPEG included) is fine, because it's re-encoded. Animated images are flattened to their first frame.
   - "הסרה" shows only when there is an icon. Without one, the initials on the server's colour show.
   - The preview updates at once; the rail and other members see it only after saving.
 - **The description:**
   - plain text, 4 rows, up to 300 characters, with the counter from 260 (`dir="ltr"` on the counter, as in #546);
   - `dir="auto"` in the field;
-  - line breaks are kept (at most 3 in a row);
+  - **at most 5 lines (the core):** on save, the UI trims trailing spaces on each line, drops blank first and last lines, and collapses blank runs to a single blank line. Above 5 lines, a hint replaces the counter: `server.desc.lines` "אפשר לכתוב עד 5 שורות." / "Up to 5 lines." (`role="alert"`), and "שמירה" is disabled until it fits;
   - no Markdown and no clickable links in v1.
 - **Who sees it:** members in the server header's info and in the join preview (B11a–d §3.3). Add one line under the field: `server.desc.hint` "התיאור מוצג למי שמקבלים הזמנה, לפני שהם מצטרפים." / "People see the description in the invite preview, before they join."
 
@@ -35,6 +35,7 @@
 - **Errors:**
   - an image that's too big or unreadable: `server.icon.error` "אי אפשר להשתמש בתמונה הזו. אפשר לבחור תמונה אחרת (PNG, JPEG או WebP)." / "This image can't be used. Choose another one (PNG, JPEG or WebP).", under the icon, with the draft kept;
   - `update-needed` (some members are on an older version): the existing `server.updateNeeded` block with its `.who` list and `.remedy`, with nothing saved;
+  - `rate-limited` (the core allows a new icon once every 10 minutes per server from this computer; removing is never limited): `server.icon.rateLimited` "אפשר להחליף את האייקון שוב בעוד כמה דקות." / "You can change the icon again in a few minutes.", under the icon, with the rest of the draft still saveable without the icon change;
   - any other failure: `error.generic` with "לנסות שוב", with the draft kept.
 
 ## 3. Strings (new)
@@ -44,6 +45,8 @@
 | `server.icon.choose` | `בחירת אייקון` | `Choose icon` |
 | `server.icon.remove` | `הסרה` | `Remove` |
 | `server.icon.error` | (above) | (above) |
+| `server.icon.rateLimited` | (above) | (above) |
+| `server.desc.lines` | `אפשר לכתוב עד 5 שורות.` | `Up to 5 lines.` |
 | `server.desc.label` | `תיאור` | `Description` |
 | `server.desc.hint` | (above) | (above) |
 | `server.desc.counter` | `⁨{n}⁩/300` | `{n}/300` |
@@ -59,8 +62,10 @@
 
 1. Change the icon, then "שמירה": the rail, header and settings title show the new icon at once, with no restart.
 2. Before "שמירה", only the preview changes.
-3. A 2 MB PNG is resized under 512 KB. A broken file shows `server.icon.error`, and the draft stays.
+3. A 2 MB JPEG becomes a 128×128 WebP under 8 KiB. A broken file shows `server.icon.error`, and the draft stays.
 4. A description with a Hebrew paragraph and an English line keeps each line's direction, both in the field and in the join preview.
+4a. A 6-line description shows `server.desc.lines`, and "שמירה" is disabled. Trailing spaces and extra blank lines are cleaned on save.
+4b. A second icon change within 10 minutes shows `server.icon.rateLimited`; removing the icon still works.
 5. With an old-version member, `update-needed` shows the list, and nothing is saved.
 
 **Screenshots:** 540 `540-server-general-edit-he` (a draft, with the dot), 541 `541-server-icon-crop-he`, 542 `542-server-general-saved-en-dark`, 543 `543-server-icon-error-he`.

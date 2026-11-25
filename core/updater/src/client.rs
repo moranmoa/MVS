@@ -313,6 +313,22 @@ impl<S: UpdateSource> Updater<S> {
         CheckResult { status, current: self.cfg.installed, freshness: policy.freshness(now) }
     }
 
+    /// A required update (`docs/design/required-update.md` §2): `Some` when
+    /// an accepted manifest revoked the running version, read from
+    /// `policy.json` so a restart keeps it. Inside, the newest version on
+    /// offer, if one is newer, not revoked and hasn't failed its trial here
+    /// (`None`: "not available yet").
+    pub fn required(&self) -> Option<Option<Version>> {
+        let policy = self.load_policy();
+        if !policy.is_revoked(self.cfg.installed) {
+            return None;
+        }
+        let state = self.load_state();
+        Some(policy.newest().filter(|v| {
+            *v > self.cfg.installed && !policy.is_revoked(*v) && !state.has_failed(*v)
+        }))
+    }
+
     /// Fetches root rotations and the channel manifest, verifies them, and
     /// updates `policy.json`. Never downloads the payload.
     pub fn check(&self, now: u64) -> Result<CheckResult, UpdateError> {
@@ -329,6 +345,11 @@ impl<S: UpdateSource> Updater<S> {
             CheckStatus::Staged(v) => return Ok(ready(v)),
             CheckStatus::Available(v) => v,
         };
+        // A version that failed its trial here is never fetched again; only a
+        // newer one is (no restart loop on a bad required release).
+        if self.load_state().has_failed(version) {
+            return Err(UpdateError::NothingToDownload);
+        }
         let manifest = manifest.expect("a version is available only from a manifest");
         let entry = manifest
             .body()
@@ -583,6 +604,12 @@ mod tests {
         }
 
         fn release_by(&self, signer: &SigningKey, payload: Vec<u8>, unpacked: u64) -> Mock {
+            self.release_revoking(signer, payload, unpacked, &[])
+        }
+
+        /// A 1.1.0 release whose manifest revokes `revoked` (a required
+        /// update, `--require-from`).
+        fn release_revoking(&self, signer: &SigningKey, payload: Vec<u8>, unpacked: u64, revoked: &[&str]) -> Mock {
             let (sha256, size) = crate::hash_reader(Cursor::new(&payload)).unwrap();
             let mut artifacts = BTreeMap::new();
             artifacts.insert(PLATFORM.to_string(), Artifact { sha256, size, unpacked_bytes: Some(unpacked) });
@@ -596,7 +623,7 @@ mod tests {
                 issued_at: NOW - 60,
                 expires_at: NOW + 86_400,
                 artifacts,
-                revoked: Default::default(),
+                revoked: revoked.iter().map(|r| v(r)).collect(),
                 notes,
             };
             let manifest = signed_by(&body, &[signer]).to_json().into_bytes();
@@ -658,6 +685,50 @@ mod tests {
         assert!(!w.data.join("core.db.pre-7").exists() && !w.dirs.snapshot_file().exists());
         assert_eq!(w.launch(), Boot::Normal(v("1.1.0")));
         assert_eq!(new.check(NOW).unwrap().status, CheckStatus::UpToDate);
+    }
+
+    /// Required updates (§2): a manifest revoking the running version makes
+    /// it required, a restart keeps it, and running the newer one clears it.
+    #[test]
+    fn a_revoked_running_version_is_required_until_a_newer_one_runs() {
+        let w = World::new("required");
+        let (zip, unpacked) = payload();
+        let up = w.updater("1.0.0", w.release_revoking(&w.key, zip.clone(), unpacked, &["1.0.0"]));
+        assert_eq!(up.required(), None, "no manifest accepted yet");
+        up.check(NOW).unwrap();
+        assert_eq!(up.required(), Some(Some(v("1.1.0"))));
+        assert_eq!(w.updater("1.0.0", Mock::default()).required(), Some(Some(v("1.1.0"))), "after a restart");
+        assert_eq!(w.updater("1.1.0", Mock::default()).required(), None, "the newer one runs");
+        // Not revoked: never required.
+        let other = World::new("not-required");
+        let plain = other.updater("1.0.0", other.release(zip, unpacked));
+        plain.check(NOW).unwrap();
+        assert_eq!(plain.required(), None);
+    }
+
+    /// A bad required release (§2, TL amendment 2): its trial fails, the
+    /// launcher starts the revoked version to fetch a fix, and the core
+    /// never downloads the same failed version again; it waits for a newer.
+    #[test]
+    fn a_failed_required_version_is_not_fetched_again() {
+        let w = World::new("required-failed");
+        let (zip, unpacked) = payload();
+        let up = w.updater("1.0.0", w.release_revoking(&w.key, zip, unpacked, &["1.0.0"]));
+        up.download(NOW).unwrap();
+        up.apply(false).unwrap();
+        // The trial never reports healthy: it fails after its attempts.
+        let mut boot = w.launch();
+        for _ in 0..10 {
+            if !matches!(boot, Boot::Trial(_)) {
+                break;
+            }
+            boot = w.launch();
+        }
+        assert_eq!(boot, Boot::RecoveryRequired, "the fallback is revoked");
+        let back = w.updater("1.0.0", w.release_revoking(&w.key, payload().0, payload().1, &["1.0.0"]));
+        assert_eq!(back.required(), Some(None), "required, nothing newer to take yet");
+        assert_eq!(back.download(NOW), Err(UpdateError::NothingToDownload));
+        assert_eq!(*back.source.artifact_calls.lock().unwrap(), 0, "the failed version isn't fetched again");
     }
 
     #[test]

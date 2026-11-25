@@ -467,6 +467,13 @@ impl Network for SyncNetwork {
         }
     }
 
+    /// RU1: the node takes, serves and sends nothing from now on (one-way).
+    fn set_quiet(&self) {
+        if let Err(e) = self.node.set_quiet() {
+            tracing::warn!(%e, "quiet not applied");
+        }
+    }
+
     fn set_member_relay(&self, on: bool, daily_cap_mb: u32, role: bool) {
         if let Err(e) = self.node.set_member_relay(on, daily_cap_mb, role) {
             tracing::warn!(%e, "member relay setting not applied");

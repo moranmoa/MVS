@@ -10,6 +10,9 @@
 // own factory, which relay-only allows (it reaches no one); one shared pair per
 // call, closed with it.
 
+/** How long the pair may take to deliver its track before the caller falls back (TL). */
+export const LOOPBACK_TRACK_MS = 2_000;
+
 /** The pair's only configuration: no ICE servers, nothing else (the loopback factory uses it; it takes no arguments). */
 export const LOOPBACK_CONFIG: RTCConfiguration = { iceServers: [] };
 
@@ -22,9 +25,11 @@ export interface LoopbackPlayout {
 
 /**
  * Builds the shared playout. `makePc` is the loopback factory (never the
- * remote one); `makeAudio` gives the element that plays it.
+ * remote one); `makeAudio` gives the element that plays it. `onFail` is
+ * called once if the pair can't negotiate or either end fails: the caller
+ * then plays to the speakers directly instead (better heard than silent).
  */
-export function loopbackPlayout(ctx: AudioContext, makePc: () => RTCPeerConnection, makeAudio: () => HTMLAudioElement): LoopbackPlayout {
+export function loopbackPlayout(ctx: AudioContext, makePc: () => RTCPeerConnection, makeAudio: () => HTMLAudioElement, onFail: () => void = () => {}): LoopbackPlayout {
   const bus = ctx.createGain();
   const dest = ctx.createMediaStreamDestination();
   bus.connect(dest);
@@ -33,6 +38,15 @@ export function loopbackPlayout(ctx: AudioContext, makePc: () => RTCPeerConnecti
   const audio = makeAudio();
   audio.autoplay = true;
   let closed = false;
+  let failed = false;
+  const fail = () => {
+    if (closed || failed) return;
+    failed = true;
+    onFail();
+  };
+  for (const pc of [a, z]) pc.onconnectionstatechange = () => pc.connectionState === 'failed' && fail();
+  // No track in time: as good as failed.
+  const noTrack = setTimeout(fail, LOOPBACK_TRACK_MS);
   // Candidates go straight to the other end of the pair, in this function only.
   a.onicecandidate = (e) => {
     if (e.candidate && !closed) void z.addIceCandidate(e.candidate).catch(() => {});
@@ -41,6 +55,7 @@ export function loopbackPlayout(ctx: AudioContext, makePc: () => RTCPeerConnecti
     if (e.candidate && !closed) void a.addIceCandidate(e.candidate).catch(() => {});
   };
   z.ontrack = (e) => {
+    clearTimeout(noTrack);
     if (closed) return;
     audio.srcObject = e.streams[0] ?? new MediaStream([e.track]);
     void audio.play?.()?.catch?.(() => {});
@@ -55,7 +70,7 @@ export function loopbackPlayout(ctx: AudioContext, makePc: () => RTCPeerConnecti
       if (closed) return;
       await a.setRemoteDescription(z.localDescription!);
     } catch {
-      // No loopback: B's audio isn't heard on this side (the call goes on).
+      fail(); // no loopback: the caller falls back to the speakers
     }
   })();
   return {
@@ -67,6 +82,7 @@ export function loopbackPlayout(ctx: AudioContext, makePc: () => RTCPeerConnecti
     close() {
       if (closed) return;
       closed = true;
+      clearTimeout(noTrack);
       try {
         bus.disconnect();
       } catch {

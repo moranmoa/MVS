@@ -104,10 +104,21 @@
   height: 1.375rem;
   border-radius: 50%;
   border: 0.1875rem solid var(--bg-rail);
-  background: var(--warning-bg);
-  color: var(--warning-text);
+  /* Solid amber with ink (UX on #567): about 3.6:1 against the light rail, white ink 4.8:1. */
+  background: #9a6700;
+  color: #ffffff;
   font-size: 0.75rem;
   pointer-events: none;
+}
+:root[data-theme='dark'] .rail-reports {
+  background: #d29922;
+  color: #121418;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-theme='system'] .rail-reports {
+    background: #d29922;
+    color: #121418;
+  }
 }
 .settings-count {
   margin-inline-start: 0.5rem;

@@ -510,7 +510,7 @@
   "report.abuseLine": "You can also contact the MVS team:",
   "report.send": "Send report",
   "report.sent": "Your report was sent to the owner and admins.",
-  "report.status.pending": "It's delivered once the owner or an admin is online.",
+  "report.status.pending": "It will be delivered once the owner or an admin is online.",
   "report.status.delivered": "Delivered to the owner and admins.",
   "reports.badge": "{count, plural, one {# open report} other {# open reports}}",
   "reports.notify.body": "{count, plural, one {New report in \u2068{server}\u2069} other {# new reports in \u2068{server}\u2069}}",

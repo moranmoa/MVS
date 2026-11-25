@@ -160,8 +160,22 @@ async function micMeter(echoCancellation) {
 }
 
 /** Starts the test sound on one playout path; returns stop(). */
+/** The output to play to (--sink: part of its label), or '' for the default. */
+let sinkId = '';
+let sinkLabel = 'default';
+async function chooseSink() {
+  const want = new URLSearchParams(location.search).get('sink');
+  if (!want) return;
+  const outs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audiooutput');
+  const hit = outs.find((d) => d.label.toLowerCase().includes(want.toLowerCase()) && d.deviceId !== 'default' && d.deviceId !== 'communications');
+  if (!hit) throw new Error(`no output matching "${want}": ` + outs.map((d) => d.label).join(' | '));
+  sinkId = hit.deviceId;
+  sinkLabel = hit.label;
+}
+
 async function play(path) {
   const ctx = new AudioContext({ sampleRate: SR });
+  if (sinkId) await ctx.setSinkId(sinkId);
   const len = SR * 8;
   const b = ctx.createBuffer(1, len, SR);
   b.copyToChannel(speechish(0, len).map((v) => v * 2), 0);
@@ -180,6 +194,7 @@ async function play(path) {
   a.onicecandidate = (e) => e.candidate && z.addIceCandidate(e.candidate);
   z.onicecandidate = (e) => e.candidate && a.addIceCandidate(e.candidate);
   const audio = new Audio();
+  if (sinkId) await audio.setSinkId(sinkId);
   z.ontrack = (e) => {
     audio.srcObject = e.streams[0];
     void audio.play();
@@ -195,6 +210,10 @@ async function play(path) {
 
 async function aec() {
   const out = {};
+  // Opening the mic first gives device labels, then the output can be picked.
+  (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach((t) => t.stop());
+  await chooseSink();
+  out.playedOn = sinkLabel;
   for (const path of ['webaudio', 'loopback']) {
     for (const ec of [false, true]) {
       status(`aec: ${path}, echoCancellation ${ec}…`);

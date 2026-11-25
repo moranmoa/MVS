@@ -66,5 +66,7 @@ app.whenReady().then(() => {
     height: 300,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, sandbox: true, backgroundThrottling: false },
   });
-  win.loadFile(path.join(__dirname, 'page.html'), { query: { mode } });
+  const sinkIdx = process.argv.indexOf('--sink');
+  const sink = sinkIdx > 0 ? process.argv[sinkIdx + 1] : '';
+  win.loadFile(path.join(__dirname, 'page.html'), { query: { mode, sink } });
 });

@@ -117,6 +117,63 @@ const WRAP_KDF: &str = "mvs/groupkeys v1 2026-11 wrap key";
 const MESSAGE_AD: &[u8] = b"mvs/groupkeys/message/v1\0";
 const MESSAGE_KDF: &str = "mvs/groupkeys v1 2026-11 message key";
 const ROTATION_ID_KDF: &str = "mvs/groupkeys v1 rotation id";
+// T17 (Security Lead S1): a server secret rotation's boxes, under strings of
+// their own, so a channel key box never opens as a secret box or back.
+const SECRET_WRAP_AD: &[u8] = b"mvs/sync-secret-box/v1\0";
+const SECRET_WRAP_KDF: &str = "mvs/sync-secret-box v1 2026-11 wrap key";
+const SECRET_ROTATION_ID_KDF: &str = "mvs/sync-secret-box v1 rotation id";
+
+/// What a rotation's boxes carry: a channel's epoch key (`KeyRotation`) or
+/// the server's sync secret (`SecretRotation`, T17). The two share the wire
+/// layout and differ in every string the boxes and the rotation ID are
+/// derived with. A secret rotation's channel field is all zeros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Domain {
+    ChannelKey,
+    SyncSecret,
+}
+
+impl Domain {
+    fn wrap_ad(self) -> &'static [u8] {
+        match self {
+            Domain::ChannelKey => WRAP_AD,
+            Domain::SyncSecret => SECRET_WRAP_AD,
+        }
+    }
+
+    fn wrap_kdf(self) -> &'static str {
+        match self {
+            Domain::ChannelKey => WRAP_KDF,
+            Domain::SyncSecret => SECRET_WRAP_KDF,
+        }
+    }
+
+    fn rotation_id_kdf(self) -> &'static str {
+        match self {
+            Domain::ChannelKey => ROTATION_ID_KDF,
+            Domain::SyncSecret => SECRET_ROTATION_ID_KDF,
+        }
+    }
+}
+
+/// The channel field of a secret rotation's header.
+const NO_CHANNEL: [u8; 32] = [0; 32];
+
+/// A server's 32-byte sync secret, as a secret rotation carries it (T17).
+/// Zeroed on drop; never printed.
+pub struct SyncSecret(Zeroizing<[u8; KEY_LEN]>);
+
+impl SyncSecret {
+    pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SyncSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SyncSecret(..)")
+    }
+}
 
 /// How many parts a rotation for `recipients` members takes.
 pub const fn parts_for(recipients: usize) -> usize {
@@ -135,11 +192,20 @@ pub const fn rotation_body_len(recipients: usize) -> usize {
 /// rotation; binding the server (the header names only the channel) keeps IDs
 /// apart across servers.
 pub fn rotation_id(server: ServerId, rotator: PublicKey, header: &[u8]) -> RecordId {
+    domain_rotation_id(Domain::ChannelKey, server, rotator, header)
+}
+
+fn domain_rotation_id(
+    domain: Domain,
+    server: ServerId,
+    rotator: PublicKey,
+    header: &[u8],
+) -> RecordId {
     let mut material = Vec::with_capacity(2 * 32 + header.len());
     material.extend_from_slice(rotator.as_bytes());
     material.extend_from_slice(server.as_bytes());
     material.extend_from_slice(header);
-    RecordId::from_bytes(blake3::derive_key(ROTATION_ID_KDF, &material))
+    RecordId::from_bytes(blake3::derive_key(domain.rotation_id_kdf(), &material))
 }
 
 /// The body limit of a records kind; checks the copy above stays in sync.
@@ -446,6 +512,7 @@ pub struct Part {
     /// ver..ephemeral, exactly as encoded. The same in every part.
     header: Vec<u8>,
     wraps: Vec<(PublicKey, [u8; WRAPPED_KEY_LEN])>,
+    domain: Domain,
 }
 
 impl Part {
@@ -453,6 +520,26 @@ impl Part {
     /// the signed record that carried it. Refuses a part whose rotation ID
     /// isn't the one its server, rotator and header give.
     pub fn decode(server: ServerId, rotator: PublicKey, body: &[u8]) -> Result<Part, Error> {
+        Part::decode_in(Domain::ChannelKey, server, rotator, body)
+    }
+
+    /// T17: parses the body of a `SecretRotation` part, the same way under
+    /// the secret box's own strings. A channel `KeyRotation` body is refused
+    /// here (its rotation ID doesn't match), and the other way round.
+    pub fn decode_secret(server: ServerId, rotator: PublicKey, body: &[u8]) -> Result<Part, Error> {
+        let part = Part::decode_in(Domain::SyncSecret, server, rotator, body)?;
+        if part.channel.as_bytes() != &NO_CHANNEL {
+            return Err(Error::WrongChannel);
+        }
+        Ok(part)
+    }
+
+    fn decode_in(
+        domain: Domain,
+        server: ServerId,
+        rotator: PublicKey,
+        body: &[u8],
+    ) -> Result<Part, Error> {
         let mut reader = Reader { bytes: body };
         let rotation = RecordId::from_bytes(reader.array()?);
         let index = reader.u8()?;
@@ -476,7 +563,7 @@ impl Part {
         }
         let ephemeral = MontgomeryPoint(reader.array()?);
         let header = body[PART_HEADER_LEN..body.len() - reader.bytes.len()].to_vec();
-        if rotation_id(server, rotator, &header) != rotation {
+        if domain_rotation_id(domain, server, rotator, &header) != rotation {
             return Err(Error::RotationIdMismatch);
         }
         let count = usize::from(reader.u16()?);
@@ -502,7 +589,19 @@ impl Part {
             }
             wraps.push((recipient, reader.array()?));
         }
-        Ok(Part { rotation, index, parts, rotator, channel, epoch, prev, ephemeral, header, wraps })
+        Ok(Part {
+            rotation,
+            index,
+            parts,
+            rotator,
+            channel,
+            epoch,
+            prev,
+            ephemeral,
+            header,
+            wraps,
+            domain,
+        })
     }
 
     /// The rotation this part belongs to.
@@ -543,6 +642,7 @@ pub struct Rotation {
     /// ver..ephemeral, exactly as encoded.
     header: Vec<u8>,
     wraps: Vec<(PublicKey, [u8; WRAPPED_KEY_LEN])>,
+    domain: Domain,
 }
 
 impl Rotation {
@@ -554,6 +654,37 @@ impl Rotation {
         server: ServerId,
         rotator: PublicKey,
         channel: ChannelId,
+        epoch: u64,
+        prev: Option<RecordId>,
+        recipients: impl IntoIterator<Item = &'a PublicKey>,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(Vec<Vec<u8>>, EpochKey), Error> {
+        let at = (Domain::ChannelKey, server, rotator, channel);
+        Rotation::create_in(at, epoch, prev, recipients, rng)
+    }
+
+    /// T17: builds a server secret rotation: a fresh 32-byte sync secret
+    /// sealed for each of `recipients` under the secret box's own strings
+    /// (Security Lead S1), in parts like [`Self::create`]'s, each to be
+    /// signed by `rotator` in its own `SecretRotation` record. `epoch` 0
+    /// replaces the secret the server was created with (no `prev`); each
+    /// later one names the rotation it replaces. Whom to seal for is the
+    /// caller's: the members at the record, minus the removed (S2).
+    pub fn create_secret<'a>(
+        server: ServerId,
+        rotator: PublicKey,
+        epoch: u64,
+        prev: Option<RecordId>,
+        recipients: impl IntoIterator<Item = &'a PublicKey>,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(Vec<Vec<u8>>, SyncSecret), Error> {
+        let at = (Domain::SyncSecret, server, rotator, ChannelId::from_bytes(NO_CHANNEL));
+        let (parts, key) = Rotation::create_in(at, epoch, prev, recipients, rng)?;
+        Ok((parts, SyncSecret(key.0)))
+    }
+
+    fn create_in<'a>(
+        (domain, server, rotator, channel): (Domain, ServerId, PublicKey, ChannelId),
         epoch: u64,
         prev: Option<RecordId>,
         recipients: impl IntoIterator<Item = &'a PublicKey>,
@@ -593,7 +724,7 @@ impl Rotation {
             }
         }
         header.extend_from_slice(ephemeral.as_bytes());
-        let id = rotation_id(server, rotator, &header);
+        let id = domain_rotation_id(domain, server, rotator, &header);
         let chunks: Vec<_> = points.chunks(WRAPS_PER_PART).collect();
         // At most MAX_PARTS (32), checked through MAX_RECIPIENTS above.
         let count = chunks.len() as u8;
@@ -611,8 +742,8 @@ impl Rotation {
                 // point.
                 let shared = diffie_hellman(*point, &ephemeral_secret)
                     .ok_or(Error::BadMemberKey(*recipient))?;
-                let ad = wrap_ad(server, rotator, &header, *recipient);
-                let cipher = wrap_cipher(&shared, &ephemeral, point, &ad);
+                let ad = wrap_ad(domain, server, rotator, &header, *recipient);
+                let cipher = wrap_cipher(domain, &shared, &ephemeral, point, &ad);
                 let sealed = cipher
                     .encrypt(&XNonce::default(), Payload { msg: key.as_bytes(), aad: &ad })
                     .expect("sealing 32 bytes can't fail");
@@ -644,6 +775,7 @@ impl Rotation {
                 || part.rotation != first.rotation
                 || part.rotator != first.rotator
                 || part.header != first.header
+                || part.domain != first.domain
             {
                 return Err(Error::PartMismatch);
             }
@@ -651,7 +783,8 @@ impl Rotation {
                 return Err(Error::NotCanonical);
             }
         }
-        let Part { rotation, rotator, channel, epoch, prev, ephemeral, ref header, .. } = *first;
+        let Part { rotation, rotator, channel, epoch, prev, ephemeral, ref header, domain, .. } =
+            *first;
         let header = header.clone();
         let mut wraps: Vec<(PublicKey, [u8; WRAPPED_KEY_LEN])> =
             Vec::with_capacity(parts.iter().map(|part| part.wraps.len()).sum());
@@ -673,12 +806,19 @@ impl Rotation {
             ephemeral,
             header,
             wraps,
+            domain,
         })
     }
 
     /// Decodes a rotation that fits in one part.
     pub fn decode(server: ServerId, rotator: PublicKey, body: &[u8]) -> Result<Rotation, Error> {
         Rotation::assemble(server, vec![Part::decode(server, rotator, body)?])
+    }
+
+    /// T17: whether this rotation carries a server sync secret rather than
+    /// a channel key.
+    pub fn is_secret(&self) -> bool {
+        self.domain == Domain::SyncSecret
     }
 
     pub fn id(&self) -> RecordId {
@@ -714,8 +854,25 @@ impl Rotation {
         self.wraps.binary_search_by(|(recipient, _)| recipient.cmp(member)).is_ok()
     }
 
-    /// Opens the epoch key wrapped for `member`.
+    /// Opens the epoch key wrapped for `member`. A secret rotation's box is
+    /// refused here (`WrongChannel`): it never serves as a channel key.
     pub fn unwrap_key(&self, member: &MemberSecret) -> Result<EpochKey, Error> {
+        if self.domain != Domain::ChannelKey {
+            return Err(Error::WrongChannel);
+        }
+        self.open(member).map(EpochKey)
+    }
+
+    /// T17: opens the sync secret sealed for `member`. A channel rotation
+    /// is refused here (`WrongChannel`).
+    pub fn unwrap_secret(&self, member: &MemberSecret) -> Result<SyncSecret, Error> {
+        if self.domain != Domain::SyncSecret {
+            return Err(Error::WrongChannel);
+        }
+        self.open(member).map(SyncSecret)
+    }
+
+    fn open(&self, member: &MemberSecret) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
         let me = member.public();
         let index = self
             .wraps
@@ -725,8 +882,8 @@ impl Rotation {
         let point = x25519_public(&me)?;
         let shared =
             diffie_hellman(self.ephemeral, &member.secret).ok_or(Error::BadEphemeralKey)?;
-        let ad = wrap_ad(self.server, self.rotator, &self.header, me);
-        let cipher = wrap_cipher(&shared, &self.ephemeral, &point, &ad);
+        let ad = wrap_ad(self.domain, self.server, self.rotator, &self.header, me);
+        let cipher = wrap_cipher(self.domain, &shared, &self.ephemeral, &point, &ad);
         let opened = Zeroizing::new(
             cipher
                 .decrypt(&XNonce::default(), Payload { msg: sealed, aad: &ad })
@@ -737,7 +894,7 @@ impl Rotation {
             return Err(Error::UnwrapFailed);
         }
         key.copy_from_slice(&opened);
-        Ok(EpochKey(key))
+        Ok(key)
     }
 
     /// The context a message sent under this rotation's key is bound to.
@@ -752,9 +909,16 @@ impl Rotation {
     }
 }
 
-fn wrap_ad(server: ServerId, rotator: PublicKey, header: &[u8], recipient: PublicKey) -> Vec<u8> {
-    let mut ad = Vec::with_capacity(WRAP_AD.len() + 3 * 32 + header.len());
-    ad.extend_from_slice(WRAP_AD);
+fn wrap_ad(
+    domain: Domain,
+    server: ServerId,
+    rotator: PublicKey,
+    header: &[u8],
+    recipient: PublicKey,
+) -> Vec<u8> {
+    let label = domain.wrap_ad();
+    let mut ad = Vec::with_capacity(label.len() + 3 * 32 + header.len());
+    ad.extend_from_slice(label);
     ad.extend_from_slice(server.as_bytes());
     ad.extend_from_slice(rotator.as_bytes());
     ad.extend_from_slice(header);
@@ -766,6 +930,7 @@ fn wrap_ad(server: ServerId, rotator: PublicKey, header: &[u8], recipient: Publi
 /// ephemeral key and the full header, so the all-zero nonce is never
 /// repeated under one key, even if a rotator's RNG repeats an ephemeral key.
 fn wrap_cipher(
+    domain: Domain,
     shared: &[u8; 32],
     ephemeral: &MontgomeryPoint,
     recipient: &MontgomeryPoint,
@@ -776,7 +941,7 @@ fn wrap_cipher(
     material.extend_from_slice(ephemeral.as_bytes());
     material.extend_from_slice(recipient.as_bytes());
     material.extend_from_slice(ad);
-    let key = Zeroizing::new(blake3::derive_key(WRAP_KDF, &material));
+    let key = Zeroizing::new(blake3::derive_key(domain.wrap_kdf(), &material));
     XChaCha20Poly1305::new(key.as_ref().into())
 }
 

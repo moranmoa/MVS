@@ -282,8 +282,13 @@ const POSITION = /^[0-9A-Za-z]{0,31}[1-9A-Za-z]$/;
 /** A non-negative whole number below 2^31, or undefined. */
 const index = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 && (v as number) < 2 ** 31 ? (v as number) : undefined);
 
+/** G-14: at most 256 code points (the core's MAX_CHANNEL_TOPIC). */
+export const CHANNEL_TOPIC_MAX = 256;
+
 export function cleanChannel(c: Channel): Channel {
-  const { position, firstUnreadIndex, unreadCount, ...rest } = c;
+  const { position, firstUnreadIndex, unreadCount, topic: rawTopic, ...rest } = c;
+  // G-14: one line of plain text, cleaned like a name (no controls, bidi or line breaks).
+  const topic = cleanName(rawTopic, CHANNEL_TOPIC_MAX);
   const first = index(firstUnreadIndex);
   const n = index(unreadCount);
   return {
@@ -292,6 +297,7 @@ export function cleanChannel(c: Channel): Channel {
     ...(first !== undefined ? { firstUnreadIndex: first } : {}),
     ...(n !== undefined ? { unreadCount: n } : {}),
     ...(typeof position === 'string' && POSITION.test(position) ? { position } : {}),
+    ...(topic ? { topic } : {}),
     name: cleanName(c.name, CHANNEL_NAME_MAX) || '…',
     adult: c.adult === true,
     isDefault: c.isDefault === true,
@@ -358,10 +364,25 @@ function cleanReactions(raw: unknown): Message['reactions'] {
 }
 
 export function cleanMessage(m: Message): Message {
+  // Core #527: a placeholder carries no text, author (untrusted) or extras.
+  const unreadable = m.unreadable === 'no-key' || m.unreadable === 'untrusted' ? m.unreadable : undefined;
+  if (unreadable) {
+    return {
+      id: id(m.id),
+      channelId: id(m.channelId),
+      index: typeof m.index === 'number' && Number.isInteger(m.index) && m.index >= 0 ? m.index : 0,
+      authorId: unreadable === 'untrusted' ? '' : id(m.authorId),
+      createdAt: typeof m.createdAt === 'number' && Number.isFinite(m.createdAt) ? m.createdAt : 0,
+      body: '',
+      unreadable,
+      mentionsMe: false,
+    };
+  }
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
-  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
+  // An unknown unreadable kind is dropped: the message is shown as a message.
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, unreadable: _unknown, ...rest } = m;
   const mentions = cleanMentions(rawMentions);
   const reactions = cleanReactions(rawReactions);
   return {
@@ -679,6 +700,7 @@ export function guardCore(core: CoreApi): CoreApi {
     moveChannel: wrap(core.moveChannel, (l) => l.map(cleanChannel)),
     createChannel: wrap(core.createChannel, cleanChannel),
     updateChannel: wrap(core.updateChannel, cleanChannel),
+    setChannelTopic: wrap(core.setChannelTopic, cleanChannel),
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),

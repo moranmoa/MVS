@@ -38,6 +38,11 @@ const KV_UPDATE_CHANNEL: &str = "update-channel";
 /// GAP-6r: `[1]` while relay-only is on. Per device, not per identity: it's
 /// about this computer's network.
 const KV_RELAY_ONLY: &str = "relay-only";
+/// G-51: when this device last set a server's icon, per server (u64 LE ms).
+const KV_ICON_SET_PREFIX: &str = "icon-set/";
+/// G-51: at most one icon change per server per 10 minutes from this device:
+/// every icon (up to 8 KiB) stays in the control log.
+const ICON_EVERY_MS: u64 = 10 * 60_000;
 /// Device link: "a new device was added" notices not yet acknowledged
 /// (`ackDeviceNotice`), as JSON `[at, …]` (ms). Re-announced after each
 /// start until acknowledged; the cross-device notice will feed it too.
@@ -380,7 +385,12 @@ struct Inner {
     /// Channels whose current key some members can't read, and since when
     /// (ms), for [`JOIN_KEY_WAIT`]. One entry per channel at most; dropped
     /// once nobody is missing.
-    join_key_wait: HashMap<(ServerId, ChannelId), u64>,
+    /// Who was missing then: a new joiner (someone not in that set) starts
+    /// a wait of its own (dev-identity on #517).
+    join_key_wait: HashMap<(ServerId, ChannelId), (BTreeSet<PublicKey>, u64)>,
+    /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
+    /// once every member posts the cap, so it comes again if it reopens.
+    adult_keys_warned: HashSet<ServerId>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -411,6 +421,7 @@ impl KeyPending {
             mentions: None,
             mentions_me: None,
             reactions: None,
+            unreadable: None,
         }
     }
 }
@@ -617,6 +628,7 @@ impl Core {
             typing: typing::Typing::default(),
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
+            adult_keys_warned: HashSet::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -669,16 +681,28 @@ impl Core {
     /// the commands.
     pub fn lock_keys(&self) {
         let _ = self.leave_call();
+        // Messages held for a key: their text is dropped (zeroized) at lock
+        // and sign-out, never kept past them (lost-message P1, SL C3). Each
+        // one still listed turns `failed` with no text (`message.updated`),
+        // so the UI never shows it as about to be sent (dev-identity on
+        // #517). Before the cipher locks: the index needs the count.
+        let _ = self.run(|inner, ports, events| {
+            let held = std::mem::take(&mut inner.key_pending);
+            inner.join_key_wait.clear();
+            let mut before: HashMap<ChannelId, usize> = HashMap::new();
+            for mut p in held {
+                let earlier = before.entry(p.channel).or_default();
+                let index = inner.message_count(&*ports.cipher, p.server, p.channel).unwrap_or(0) + *earlier;
+                *earlier += 1;
+                p.failed = true;
+                p.body = Zeroizing::new(String::new());
+                events.push(Event::MessageUpdated(p.message(index)));
+            }
+            Ok(())
+        });
         self.ports.cipher.lock();
         self.ports.network.lock();
         self.keys_locked.store(true, Ordering::SeqCst);
-        // Messages held for a key: their text is dropped (zeroized) at lock
-        // and sign-out, never kept past them (lost-message P1, SL C3).
-        {
-            let mut inner = self.lock();
-            inner.key_pending.clear();
-            inner.join_key_wait.clear();
-        }
         // G-91 (Security Lead on #457): the server secrets a restore took
         // from the backup go too; the backup is fetched again after unlock.
         let mut restore = self.restore.lock().expect("not poisoned");
@@ -1584,6 +1608,70 @@ impl Core {
         })
     }
 
+    /// G-51 `setServerIcon(serverId, dataUrl | null)`: a still PNG or WebP
+    /// of at most 8 KiB and 128 px a side (`avatar::icon_from_data_url`),
+    /// or `null` to clear. The owner or an admin; behind `server-meta-v1`;
+    /// at most one change per [`ICON_EVERY_MS`] per server from this device
+    /// (`rate-limited`), since every icon stays in the control log. The
+    /// same icon again signs nothing.
+    pub fn set_server_icon(&self, server_id: &str, data_url: Option<&str>) -> CoreResult<ServerSummary> {
+        let icon = match data_url {
+            None => None,
+            Some(url) => Some(crate::avatar::icon_from_data_url(url).ok_or(ErrorCode::BadRequest)?),
+        };
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            if inner.view(server)?.state.server_icon == icon {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            inner.cap_gate(server, model::SERVER_META_CAP)?;
+            let now = ports.clock.now_ms();
+            let key = format!("{KV_ICON_SET_PREFIX}{}", model::hex_id(server.as_bytes()));
+            // Only setting an image is limited: an admin must be able to
+            // remove an offensive or mistaken icon at once, and a clear is
+            // 2 bytes (Tech Lead on #555).
+            let setting = icon.is_some();
+            let last = inner.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes);
+            if setting && last.is_some_and(|last| now.saturating_sub(last) < ICON_EVERY_MS) {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            inner.publish_control(ports, server, &Action::ServerIcon { icon })?;
+            if setting {
+                inner.db.set(&key, &now.to_le_bytes())?;
+            }
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
+    /// G-51 `setServerDescription(serverId, text)`: trimmed; empty clears
+    /// it; otherwise `authority::server_description_ok` (`\n` only, at most
+    /// 5 lines, 500 code points) or `bad-request`. The owner or an admin;
+    /// behind `server-meta-v1`. The same text again signs nothing. Shown as
+    /// plain text, never Markdown or links.
+    pub fn set_server_description(&self, server_id: &str, text: &str) -> CoreResult<ServerSummary> {
+        let text = text.trim();
+        if !text.is_empty() && !authority::server_description_ok(text) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Admin)?;
+            if inner.view(server)?.state.server_description.as_deref().unwrap_or("") == text {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            inner.cap_gate(server, model::SERVER_META_CAP)?;
+            inner.publish_control(ports, server, &Action::ServerDescription { text: text.to_owned() })?;
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
     /// `leaveServer`: any member but the owner (`not-allowed`; the owner
     /// deletes instead). The `Leave` goes out, so the others re-key; then
     /// the server leaves this device (`server.removed`, `left`). A leaver
@@ -2348,7 +2436,7 @@ impl Core {
                 events.push(Event::MessageAdded(message.clone()));
                 return Ok(message);
             }
-            let sealed = match inner.seal(ports, server, channel, body.as_bytes()) {
+            let sealed = match inner.seal_with(ports, server, channel, body.as_bytes(), false) {
                 Ok(sealed) => sealed,
                 Err(e) if e.code == ErrorCode::NotAllowed && inner.awaiting_key(server)? => {
                     let message = inner.hold_for_key(ports, server, channel, body)?;
@@ -2380,6 +2468,7 @@ impl Core {
         }
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             let sealed = inner.seal(ports, server, channel, body.as_bytes())?;
             let body = [target.as_bytes().as_slice(), &sealed].concat();
             inner.tombstone_or_edit(ports, events, server, channel, target, Kind::MessageEdit, body)
@@ -2403,6 +2492,7 @@ impl Core {
     pub fn delete_message(&self, message_id: &str) -> CoreResult<()> {
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             let body = target.as_bytes().to_vec();
             inner.tombstone_or_edit(
                 ports,
@@ -2431,6 +2521,7 @@ impl Core {
         let emoji = reaction::normalize(emoji).ok_or(ErrorCode::BadRequest)?;
         self.run(|inner, ports, events| {
             let (server, channel, target, _) = inner.find_message(message_id)?;
+            inner.refuse_unreadable(&*ports.cipher, server, channel, target)?;
             // 18+ channels only with an accepted 18+ claim (B7).
             if !inner.visible(server)?.contains(&channel) {
                 return Err(ErrorCode::NotFound.into());
@@ -2643,6 +2734,11 @@ impl Core {
                 inner.load(server)?;
                 inner.seed_announced(&*ports.cipher, server)?;
                 let name_before = inner.view(server)?.state.server_name.clone();
+                // G-51: the icon and description change the summary too.
+                let meta_before = {
+                    let view = inner.view(server)?;
+                    (view.state.server_icon.clone(), view.state.server_description.clone())
+                };
                 let topics_before = inner.view(server)?.state.topics.clone();
                 let mut changed = false;
                 for record in records {
@@ -2655,7 +2751,12 @@ impl Core {
                     inner.close_locally(ports, server, events)?;
                     continue;
                 }
-                if inner.view(server)?.state.server_name != name_before {
+                let meta_changed = {
+                    let view = inner.view(server)?;
+                    view.state.server_name != name_before
+                        || (view.state.server_icon.clone(), view.state.server_description.clone()) != meta_before
+                };
+                if meta_changed {
                     events.push(Event::ServerUpdated(inner.counted_summary(&*ports.cipher, server)?));
                 }
                 // G-14: a topic set or cleared elsewhere. Only
@@ -2664,6 +2765,9 @@ impl Core {
                 // Release N: say this version reads lifecycle records. Never
                 // aborts the other servers; the next round retries.
                 let _ = inner.post_caps(ports, server);
+                // B7-k K2: owners and admins learn when older members would
+                // key an 18+ channel for minors too.
+                let _ = inner.adult_keys_notice(server, me, events);
                 let after = inner.view(server)?;
                 if after.is_kicked(&me) {
                     inner.join_waiting.remove(&server);
@@ -4289,7 +4393,7 @@ impl Inner {
                     i += 1;
                     continue;
                 }
-                match self.seal(ports, server, channel, body.as_bytes()) {
+                match self.seal_with(ports, server, channel, body.as_bytes(), false) {
                     Ok(sealed) => {
                         let held = self.key_pending.remove(i);
                         let record =
@@ -4343,16 +4447,22 @@ impl Inner {
         let cipher = &*ports.cipher;
         cipher.membership_changed(server, &members);
         chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
-        let missing = cipher.missing_readers(server, channel).len();
-        if missing == 0 {
+        let missing: BTreeSet<PublicKey> = cipher.missing_readers(server, channel).into_iter().collect();
+        if missing.is_empty() {
             self.join_key_wait.remove(&(server, channel));
             return Ok(false);
         }
         let now = ports.clock.now_ms();
-        let since = *self.join_key_wait.entry((server, channel)).or_insert(now);
-        if now.saturating_sub(since) < JOIN_KEY_WAIT.as_millis() as u64 {
+        let wait = self.join_key_wait.entry((server, channel)).or_insert_with(|| (missing.clone(), now));
+        // Someone missing who wasn't before (a later joiner): its own wait,
+        // from now. The same set (or fewer) keeps counting from its start.
+        if !missing.is_subset(&wait.0) {
+            *wait = (missing.clone(), now);
+        }
+        if now.saturating_sub(wait.1) < JOIN_KEY_WAIT.as_millis() as u64 {
             return Ok(true);
         }
+        let missing = missing.len();
         tracing::info!(target: "mvs::keys", missing, "join key wait over: sending under the current key");
         Ok(false)
     }
@@ -4373,18 +4483,36 @@ impl Inner {
         channel: ChannelId,
         plaintext: &[u8],
     ) -> CoreResult<Vec<u8>> {
+        self.seal_with(ports, server, channel, plaintext, true)
+    }
+
+    /// [`Self::seal`]; `sync: false` when [`Self::waits_for_join_key`] has
+    /// just given the cipher the members and rotations (dev-identity on
+    /// #517: not twice per send).
+    fn seal_with(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        channel: ChannelId,
+        plaintext: &[u8],
+        sync: bool,
+    ) -> CoreResult<Vec<u8>> {
         let cipher = &*ports.cipher;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
         let view = self.view(server)?;
         let members = view.state.members.clone();
+        let readers = channel_readers(&view, channel);
         let may_rotate = view.state.role(key) >= authority::Role::Moderator;
         let auth_deps = auth_deps(&view);
-        cipher.membership_changed(server, &members);
-        chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        if sync {
+            cipher.membership_changed(server, &members);
+            chat::sync_cipher(cipher, server, self.logs.get(&server).ok_or(ErrorCode::Internal)?);
+        }
         match cipher.encrypt(server, channel, plaintext) {
             Err(CipherError::NoKey | CipherError::RotationRequired) if may_rotate => {
                 // Fail closed: no rotation, no message (`not-allowed`).
-                self.rotate_channel(ports, server, channel, &members, &auth_deps)
+                // B7-k: an 18+ channel's key goes to its adult readers only.
+                self.rotate_channel(ports, server, channel, &readers, &auth_deps)
                     .map_err(|_| CoreError::from(ErrorCode::NotAllowed))?;
                 cipher.encrypt(server, channel, plaintext).map_err(cipher_error)
             }
@@ -4561,9 +4689,15 @@ impl Inner {
         let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
         let server_id = model::hex_id(server.as_bytes());
+        // B7-k: each channel's readers; an 18+ channel's are its adults.
+        let channels = self.known(server)?;
+        let view = self.view(server)?;
+        let readers: HashMap<ChannelId, BTreeSet<PublicKey>> =
+            channels.iter().map(|c| (*c, channel_readers(&view, *c))).collect();
         // Channels a join left stale: re-keyed together, for one token.
         let mut joined = Vec::new();
-        for channel in self.known(server)? {
+        for channel in channels {
+            let members = &readers[&channel];
             // A probe: an empty plaintext, never sent.
             let probe = cipher.encrypt(server, channel, b"");
             if probe != Err(CipherError::RotationRequired) {
@@ -4572,7 +4706,7 @@ impl Inner {
                 // channel for everyone now, so a joiner can write and read
                 // without waiting for a moderator to send first. A failure only
                 // leaves things as they were: the next round tries again.
-                let stale = self.keyed_for.get(&(server, channel)) != Some(&members);
+                let stale = self.keyed_for.get(&(server, channel)) != Some(members);
                 let no_key = probe == Err(CipherError::NoKey);
                 if may_rotate && (no_key || (probe.is_ok() && stale)) && members.len() > 1 {
                     joined.push(channel);
@@ -4588,7 +4722,7 @@ impl Inner {
             // one, and the channel stays blocked by `RotationRequired` until the
             // next sync or send retries.
             let renewed = may_rotate
-                && self.rotate_channel(ports, server, channel, &members, &auth_deps).is_ok();
+                && self.rotate_channel(ports, server, channel, members, &auth_deps).is_ok();
             let kind =
                 if renewed { NoticeKind::EncryptionRenewed } else { NoticeKind::RekeyWaiting };
             events.push(Event::Notice { kind, server_id: server_id.clone() });
@@ -4607,7 +4741,7 @@ impl Inner {
         for channel in joined {
             // Fail closed, as for a kick: a failed rotation is never announced
             // as one, and the UI learns the channel waits.
-            if self.rotate_channel(ports, server, channel, &members, &auth_deps).is_err() {
+            if self.rotate_channel(ports, server, channel, &readers[&channel], &auth_deps).is_err() {
                 let kind = NoticeKind::RekeyWaiting;
                 events.push(Event::Notice { kind, server_id: server_id.clone() });
             }
@@ -4659,6 +4793,22 @@ impl Inner {
             .map_err(|_| ErrorCode::BadRequest.into())
     }
 
+    /// A placeholder (`Message.unreadable`) takes no reaction, edit or
+    /// delete: `bad-request`, as the UI offers none (the PO, dev-ui).
+    fn refuse_unreadable(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+        channel: ChannelId,
+        target: RecordId,
+    ) -> CoreResult<()> {
+        let shown = self.shown(cipher, server, channel)?;
+        if shown.iter().any(|s| s.record.id() == target && s.unreadable.is_some()) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        Ok(())
+    }
+
     /// The channel's shown messages, after giving the cipher what's new.
     fn shown(
         &mut self,
@@ -4667,11 +4817,12 @@ impl Inner {
         channel: ChannelId,
     ) -> CoreResult<Vec<chat::Shown>> {
         let now = self.clock.now_ms();
+        let me = self.me.as_ref().map(Me::key);
         let members = self.view(server)?.state.members.clone();
         cipher.membership_changed(server, &members);
         let log = self.logs.get_mut(&server).ok_or(ErrorCode::Internal)?;
         chat::sync_cipher(cipher, server, log);
-        Ok(chat::messages(cipher, server, channel, log, now))
+        Ok(chat::messages(cipher, server, channel, log, now, me))
     }
 
     /// G-21: my read marker in `channel`: the last message I read, as
@@ -4707,7 +4858,9 @@ impl Inner {
             let marker = self.read_marker(server, channel)?;
             let shown = self.shown(cipher, server, channel)?;
             let after = |s: &chat::Shown| (s.record.ts(), *s.record.id().as_bytes()) > marker;
-            let unread = |s: &&chat::Shown| after(s) && s.record.author() != me;
+            // Placeholders never count as unread (the PO).
+            let unread =
+                |s: &&chat::Shown| after(s) && s.record.author() != me && s.unreadable.is_none();
             let count = shown.iter().filter(unread).count() as u64;
             json.unread_count = Some(count);
             json.first_unread_index = shown.iter().position(|s| unread(&s)).map(|i| i as u64);
@@ -5033,6 +5186,27 @@ impl Inner {
     /// The release that adds a cap: my latest profile post in `server` lacks
     /// one of [`model::CAPS`] (posted by an older version), so post it
     /// again, once.
+    /// B7-k K2 (Security Lead on #544): to an owner or admin of a server
+    /// with an 18+ channel, `notice: adult-keys-outdated` once while some
+    /// member's latest profile post lacks `adult-keys-v1` (such a member, if
+    /// a moderator, re-keys 18+ channels for every member). Sent again only
+    /// after the list has been empty.
+    fn adult_keys_notice(&mut self, server: ServerId, me: PublicKey, events: &mut Events) -> CoreResult<()> {
+        let view = self.view(server)?;
+        let outdated = view.state.role(me) >= authority::Role::Admin
+            && view.state.channels.values().any(|c| c.adult)
+            && !view.lacking(model::ADULT_KEYS_CAP, me).is_empty();
+        if !outdated {
+            self.adult_keys_warned.remove(&server);
+        } else if self.adult_keys_warned.insert(server) {
+            events.push(Event::Notice {
+                kind: NoticeKind::AdultKeysOutdated,
+                server_id: model::hex_id(server.as_bytes()),
+            });
+        }
+        Ok(())
+    }
+
     fn post_caps(&mut self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         let Some(me) = self.me.as_ref() else { return Ok(()) };
         let (key, name) = (me.key(), me.profile.display_name.clone());
@@ -5445,6 +5619,8 @@ impl ServerView<'_> {
             unread: false,
             mentions: 0,
             closed: self.state.closed.is_some(),
+            icon_data_url: self.state.server_icon.as_ref().map(crate::avatar::icon_data_url),
+            description: self.state.server_description.clone(),
             id,
         }
     }
@@ -5504,6 +5680,17 @@ impl ServerView<'_> {
     }
 }
 
+/// B7-k: who a channel's key is for, as the cipher counts it: the
+/// members, and for an 18+ channel only those with an accepted 18+ claim.
+fn channel_readers(view: &ServerView, channel: ChannelId) -> BTreeSet<PublicKey> {
+    let members = view.state.members.iter().copied();
+    if view.state.channels.get(&channel).is_some_and(|c| c.adult) {
+        members.filter(|m| view.state.adults.contains(m)).collect()
+    } else {
+        members.collect()
+    }
+}
+
 /// Control heads a channel record relies on, at most `MAX_AUTH_DEPS`.
 fn auth_deps(view: &ServerView) -> Vec<RecordId> {
     let heads = view.deps(None);
@@ -5512,7 +5699,8 @@ fn auth_deps(view: &ServerView) -> Vec<RecordId> {
 
 /// What `message.updated` compares: the edit, the deletion, the send state
 /// and (G-26) the reactions shown.
-type Announced = (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>);
+type Announced =
+    (Option<u64>, bool, Option<SendState>, Vec<(String, Vec<PublicKey>)>, Option<chat::Unreadable>);
 
 /// Where my messages' send states come from: the network's live state and
 /// the last one stored, so a restart doesn't lose it.
@@ -5522,7 +5710,8 @@ struct Status<'a> {
 }
 
 fn announced(s: &chat::Shown, me: Option<PublicKey>, st: &Status) -> Announced {
-    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone())
+    // A placeholder that opens later changes: `message.updated` (the PO).
+    (s.edited_at, s.deleted, send_state(s, me, st), s.reactions.clone(), s.unreadable)
 }
 
 /// B6, on my own messages only: `pending` until it left this device,
@@ -5573,20 +5762,28 @@ fn message_json(
         .filter(|key| members.contains(*key))
         .map(|key| model::hex_id(key.as_bytes()))
         .collect();
+    let unreadable = s.unreadable.map(|why| match why {
+        chat::Unreadable::NoKey => Unreadable::NoKey,
+        chat::Unreadable::Untrusted => Unreadable::Untrusted,
+    });
+    // An untrusted placeholder names no author (the PO).
+    let untrusted = unreadable == Some(Unreadable::Untrusted);
     Message {
         id: model::hex_id(s.record.id().as_bytes()),
         channel_id: model::hex_id(channel.as_bytes()),
         index,
-        author_id: model::hex_id(s.record.author().as_bytes()),
+        author_id: if untrusted { String::new() } else { model::hex_id(s.record.author().as_bytes()) },
         body: s.text.clone(),
         created_at: s.record.ts(),
         edited_at: s.edited_at,
         deleted: s.deleted.then_some(true),
-        send_state: send_state(s, me, st),
+        send_state: if untrusted { None } else { send_state(s, me, st) },
         replaces: None,
+        // A placeholder's text is empty: no tokens, so neither of these.
         mentions: (!listed.is_empty()).then_some(listed),
         mentions_me: me.filter(|me| tokens.contains(me)).map(|_| true),
         reactions: reactions_json(&s.reactions, me),
+        unreadable,
     }
 }
 

@@ -9,7 +9,7 @@ const listeners = new Set();
 // Shell events can arrive before the UI has subscribed: `link.open` (an
 // mvs:// invite, e.g. on the first launch) and `core.status` (sent at load).
 // The latest of each is kept for the first subscriber.
-const KEPT = new Set(['link.open', 'core.status']);
+const KEPT = new Set(['link.open', 'link.message', 'core.status']);
 const pending = new Map();
 
 ipcRenderer.on('core:event', (_e, name, payload) => {
@@ -39,17 +39,22 @@ contextBridge.exposeInMainWorld('mvs', {
    * bytes decoded); main drops what is malformed, over the rate cap, or not
    * in a call and unlocked. `onFrame(cb)` gets { callId, from, seq, ts, data }
    * from the core; one listener (a new one replaces it). Returns an unsubscribe.
+   * Not in the demo (T8-04): no core, no calls (SL).
    */
-  voice: Object.freeze({
-    send: (frame) => ipcRenderer.send('voice:frame', frame),
-    onFrame: (callback) => {
-      if (typeof callback !== 'function') return () => {};
-      frameListener = callback;
-      return () => {
-        if (frameListener === callback) frameListener = null;
-      };
-    },
-  }),
+  ...(DEMO
+    ? {}
+    : {
+        voice: Object.freeze({
+          send: (frame) => ipcRenderer.send('voice:frame', frame),
+          onFrame: (callback) => {
+            if (typeof callback !== 'function') return () => {};
+            frameListener = callback;
+            return () => {
+              if (frameListener === callback) frameListener = null;
+            };
+          },
+        }),
+      }),
   /**
    * Calls back with (eventName, payload) for every core event, plus
    * `link.open` { link } when the OS opens an mvs:// invite. Returns an
@@ -100,7 +105,23 @@ contextBridge.exposeInMainWorld('mvs', {
     state: () => ipcRenderer.invoke('lock:state'),
     unlock: (input) => ipcRenderer.invoke('lock:unlock', input),
     now: () => ipcRenderer.invoke('lock:now'),
+    /**
+     * Settings → Privacy (unlocked only). `config()` -> { enabled,
+     * idleMinutes, lockOnSleep, method } or null. `set({ current?, passcode,
+     * idleMinutes, lockOnSleep })` and `clear({ current })` -> { result:
+     * 'ok'|'wrong'|'rate-limited'|'invalid'|'busy'|'locked', retryAfter? }.
+     * The demo (no core) has no settings.
+     */
+    ...(DEMO
+      ? {}
+      : {
+          config: () => ipcRenderer.invoke('lock:config'),
+          set: (input) => ipcRenderer.invoke('lock:set', input),
+          clear: (input) => ipcRenderer.invoke('lock:clear', input),
+        }),
   }),
+  /** The OS (read-only): 'win32' | 'linux' | 'darwin'. */
+  platform: process.platform,
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

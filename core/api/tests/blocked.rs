@@ -70,7 +70,7 @@ fn the_list_keeps_names_after_we_share_no_server() {
     assert_eq!(call(&owner, "listBlocked", json!({})).unwrap(), json!([]));
     call(&owner, "setBlocked", json!({ "userId": bob, "blocked": true })).unwrap();
     let want = vec![row(&bob, &bob_me.short_code, Some("Bob"))];
-    assert_eq!(block_events(&owner), [want.clone()]);
+    assert_eq!(block_events(&owner), std::slice::from_ref(&want));
     assert_eq!(owner.core.list_blocked().unwrap(), want);
 
     // Idempotent: blocking again changes nothing and says nothing.

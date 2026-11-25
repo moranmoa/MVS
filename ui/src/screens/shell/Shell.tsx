@@ -7,7 +7,7 @@ import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
-import { useCore, useCoreEvent, type Id } from '../../core';
+import { useCore, useCoreEvent, type Id, type JoinStatus } from '../../core';
 import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
@@ -58,6 +58,8 @@ export function Shell() {
   // An mvs:// link from the OS (desktop app) opens the join dialog pre-filled.
   // It never joins by itself: that waits for the Join button.
   const [invite, setInvite] = useState<string | undefined>();
+  // G-92: a link pasted on Home whose join already started there.
+  const [inviteStatus, setInviteStatus] = useState<JoinStatus | null>(null);
   // The open dialog as of now, not as of the last render: the subscription
   // below is made once, and a second link can arrive before React re-renders.
   const dialogNow = useRef(dialog);
@@ -69,6 +71,7 @@ export function Shell() {
     if (dialogNow.current === 'join') return;
     dialogNow.current = 'join';
     setInvite(link);
+    setInviteStatus(null);
     setDialog('join');
   });
   // The reminder can show the words again (the panel loads them on demand).
@@ -346,6 +349,12 @@ export function Shell() {
             hasServers={servers.length > 0}
             onCreate={() => setDialog('create')}
             onJoin={() => setDialog('join')}
+            onJoinLink={(link, status) => {
+              dialogNow.current = 'join';
+              setInvite(link);
+              setInviteStatus(status);
+              setDialog('join');
+            }}
           />
         )}
       </main>
@@ -363,14 +372,17 @@ export function Shell() {
       <JoinDialog
         open={dialog === 'join'}
         initialLink={invite}
+        initialStatus={inviteStatus}
         onBackground={(link) => backgroundJoins.current.add(link)}
         onClose={() => {
           setDialog(null);
           setInvite(undefined);
+          setInviteStatus(null);
         }}
         onJoined={(id) => {
           setDialog(null);
           setInvite(undefined);
+          setInviteStatus(null);
           setServerId(id);
         }}
       />

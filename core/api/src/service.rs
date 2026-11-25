@@ -381,6 +381,9 @@ struct Inner {
     typing: typing::Typing,
     /// G-48: delivers report boxes (sync); `None` without a network.
     report_net: Option<Arc<dyn crate::report::ReportNet>>,
+    /// G-48: reports kept per server ([`MAX_STORED_REPORTS`]; lower only in
+    /// tests, feature `test-hooks`).
+    report_store_cap: usize,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -634,6 +637,7 @@ impl Core {
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
             report_net: None,
+            report_store_cap: MAX_STORED_REPORTS,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
             adult_keys_warned: HashSet::new(),
@@ -6549,7 +6553,7 @@ impl Core {
                 at: now,
                 dismissed: false,
             });
-            if inbox.len() > MAX_STORED_REPORTS {
+            if inbox.len() > inner.report_store_cap {
                 // The oldest dismissed one, else the oldest.
                 let pick = inbox.iter().position(|r| r.dismissed).unwrap_or(0);
                 inbox.remove(pick);
@@ -6592,17 +6596,11 @@ impl Core {
         })
     }
 
-    /// G-48 `getReportEvidence(reportId)`: the reported message, on an
-    /// explicit click only. `not-allowed` unless I am staff there, and, for
-    /// the reasons `sexual` and `minor`, unless I have an 18+ claim there
-    /// (Product Owner). `bad-request` when the evidence isn't that message
-    /// (R4). Its text is plain text for the UI to show as such.
-    /// Tests only (the Tech Lead's #515 follow-up): signs `report` as me,
-    /// with none of `reportContent`'s checks, and seals it to `to`, so a
-    /// test can hand a receiver what a modified client would send. Not
-    /// a command: a core can always sign its own reports, and receivers
-    /// check everything (`report_received`).
-    #[doc(hidden)]
+    /// Tests only (the Tech Lead's #515 follow-up; feature `test-hooks`,
+    /// never in a release build): signs `report` as me, with none of
+    /// `reportContent`'s checks, and seals it to `to`, so a test can hand a
+    /// receiver what a modified client would send. Not a command.
+    #[cfg(feature = "test-hooks")]
     pub fn sealed_report_for_tests(&self, report: &Report, to: PublicKey) -> CoreResult<Vec<u8>> {
         let inner = self.lock();
         let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
@@ -6610,6 +6608,18 @@ impl Core {
         groupkeys::seal_box(report.server, &to, &signed, &mut OsRng).map_err(|_| ErrorCode::Internal.into())
     }
 
+    /// Tests only (feature `test-hooks`): how many reports a server's store
+    /// keeps, so the eviction can be tested without a thousand boxes.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_report_store_cap_for_tests(&self, cap: usize) {
+        self.lock().report_store_cap = cap;
+    }
+
+    /// G-48 `getReportEvidence(reportId)`: the reported message, on an
+    /// explicit click only. `not-allowed` unless I am staff there, and, for
+    /// the reasons `sexual` and `minor`, unless I have an 18+ claim there
+    /// (Product Owner). `bad-request` when the evidence isn't that message
+    /// (R4). Its text is plain text for the UI to show as such.
     pub fn get_report_evidence(&self, report_id: &str) -> CoreResult<ReportEvidence> {
         self.run(|inner, ports, _| {
             let (_, server, opened) = inner.find_report(report_id)?;
@@ -6750,7 +6760,12 @@ impl Inner {
             for (hex, rows) in by_server {
                 let Some(server) = model::parse_hex32(&hex).map(ServerId::from_bytes) else { continue };
                 let mut inbox: Vec<InRow> = self.kv_json(&Self::inbox_key(server))?.unwrap_or_default();
-                inbox.extend(rows);
+                // A move cut short by a crash may have copied some already.
+                for row in rows {
+                    if !inbox.iter().any(|r| r.sealed == row.sealed) {
+                        inbox.push(row);
+                    }
+                }
                 self.set_inbox(server, &inbox)?;
             }
             self.db.delete(KV_REPORT_INBOX)?;

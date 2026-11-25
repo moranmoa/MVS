@@ -468,6 +468,10 @@ fn twenty_a_day_per_server() {
 // (`Core::sealed_report_for_tests` signs as that member, with no sender-side
 // check; the Tech Lead's #515 follow-up.)
 
+#[cfg(feature = "test-hooks")]
+mod forged {
+use super::*;
+
 fn server_id(r: &Room) -> records::ServerId {
     records::ServerId::from_bytes(hex::decode(&r.server.id).unwrap().try_into().unwrap())
 }
@@ -565,4 +569,34 @@ fn invalid_evidence_is_kept_and_marked_invalid() {
     // Per-server storage: dismiss finds it by its stored ID.
     r.owner.core.dismiss_report(&listed[1].id).unwrap();
     assert!(r.owner.core.list_reports(&r.server.id).unwrap()[1].dismissed);
+}
+
+/// A server's store keeps at most its cap: the oldest dismissed report
+/// goes first, else the oldest (cap lowered for the test).
+#[test]
+fn the_store_evicts_dismissed_first_then_oldest() {
+    let (world, r, _) = room();
+    r.owner.core.set_report_store_cap_for_tests(3);
+    let about_rude = api::report::Target::Member(key_of(&r.rude_id.id));
+    let give = |n: u8| {
+        advance(&world, 60 * 60 * 1000 + 1); // under the receiver's 10/h
+        let sealed = forged(&world, &r, (&r.plain, &r.plain_id), about_rude, vec![], n);
+        r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &sealed);
+    };
+    for n in 1..=3 {
+        give(n);
+    }
+    let ids = |r: &Room| -> Vec<String> {
+        r.owner.core.list_reports(&r.server.id).unwrap().into_iter().map(|x| x.id).collect()
+    };
+    let first = ids(&r); // newest first: [3, 2, 1]
+    r.owner.core.dismiss_report(&first[1]).unwrap(); // dismiss 2
+    give(4);
+    let after = ids(&r);
+    assert_eq!(after.len(), 3);
+    assert!(!after.contains(&first[1]), "the dismissed one went first");
+    give(5);
+    let last = ids(&r);
+    assert!(!last.contains(&first[2]), "then the oldest");
+}
 }

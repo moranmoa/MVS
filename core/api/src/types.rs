@@ -119,6 +119,12 @@ pub struct ServerSummary {
     /// when there is none (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// A current member wrote a validly signed record of a kind this
+    /// version doesn't know: it runs a newer version, and this one should
+    /// update to keep up with the server (additive). In memory only: false
+    /// again after a restart until it is seen again.
+    #[serde(default)]
+    pub update_needed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

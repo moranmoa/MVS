@@ -391,6 +391,10 @@ struct Inner {
     /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
     /// once every member posts the cap, so it comes again if it reopens.
     adult_keys_warned: HashSet<ServerId>,
+    /// The detector: servers where a current member wrote a record of a
+    /// kind this version doesn't know (`ServerSummary.updateNeeded`). In
+    /// memory only, so a restart (after an update) clears it.
+    update_needed: BTreeSet<ServerId>,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -629,6 +633,7 @@ impl Core {
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
             adult_keys_warned: HashSet::new(),
+            update_needed: BTreeSet::new(),
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -2710,6 +2715,10 @@ impl Core {
         self.run(|inner, ports, events| {
             let Some(me) = inner.me.as_ref() else { return Ok(()) };
             let me = me.key();
+            // The detector: records sync rejected for a kind it doesn't know.
+            for unknown in ports.network.take_unknown_records() {
+                inner.note_unknown_record(&*ports.cipher, unknown, events)?;
+            }
             // Closed servers past their 30 days: purged but for their
             // genesis and close.
             inner.expire_closed(ports, events)?;
@@ -4030,7 +4039,34 @@ impl Inner {
     fn summary(&self, server: ServerId) -> CoreResult<ServerSummary> {
         let me = self.me.as_ref().map(Me::key);
         let secret = self.secret(server)?;
-        Ok(self.view(server)?.summary(me, secret.as_deref()))
+        let mut summary = self.view(server)?.summary(me, secret.as_deref());
+        summary.update_needed = self.update_needed.contains(&server);
+        Ok(summary)
+    }
+
+    /// The detector: a validly signed record of a kind this version doesn't
+    /// know, which sync rejected. Flags the server (`updateNeeded`, one
+    /// `server.updated`) only when it is mine and the author is a current
+    /// member: anyone else's could be a forgery meant to nag. Set once per
+    /// run; never cleared but by a restart.
+    fn note_unknown_record(
+        &mut self,
+        cipher: &dyn GroupCipher,
+        unknown: records::UnknownRecord,
+        events: &mut Events,
+    ) -> CoreResult<()> {
+        let server = unknown.server;
+        if self.update_needed.contains(&server) || !self.db.has_server(server)? {
+            return Ok(());
+        }
+        self.load(server)?;
+        let view = self.view(server)?;
+        if !view.state.members.contains(&unknown.author) || view.is_kicked(&unknown.author) {
+            return Ok(());
+        }
+        self.update_needed.insert(server);
+        events.push(Event::ServerUpdated(self.counted_summary(cipher, server)?));
+        Ok(())
     }
 
     /// The stored identity, opened, and every server opened for sync before
@@ -5610,6 +5646,7 @@ impl ServerView<'_> {
             closed: self.state.closed.is_some(),
             icon_data_url: self.state.server_icon.as_ref().map(crate::avatar::icon_data_url),
             description: self.state.server_description.clone(),
+            update_needed: false,
             id,
         }
     }

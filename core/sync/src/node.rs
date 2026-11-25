@@ -437,6 +437,29 @@ enum Command {
     Shutdown { reply: oneshot::Sender<()> },
 }
 
+impl Command {
+    /// Quiet (RU1, SL on #593): what still runs. Reading local state, and
+    /// local-only changes; never anything that signs, sends, dials or
+    /// subscribes. Everything else is dropped, so its caller fails.
+    fn quiet_ok(&self) -> bool {
+        matches!(
+            self,
+            Command::Heads { .. }
+                | Command::State { .. }
+                | Command::Presence { .. }
+                | Command::Peers { .. }
+                | Command::DirectPeers { .. }
+                | Command::ListenAddrs { .. }
+                | Command::MemberRelayCounts { .. }
+                | Command::Prune { .. }
+                | Command::DropInvite { .. }
+                | Command::DropServerInvites { .. }
+                | Command::ReportSink { .. }
+                | Command::Quiet
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SyncRequest {
     /// The log's handle (`h/<hex>`) for a server opened with its secret;
@@ -1824,6 +1847,9 @@ impl Task {
                         let _ = reply.send(());
                         return;
                     }
+                    // Quiet (RU1): nothing but shutting down; a dropped reply
+                    // makes its caller fail (no put, send or fetch goes out).
+                    Some(command) if self.quiet && !command.quiet_ok() => drop(command),
                     Some(command) => self.on_command(command),
                     None => return,
                 },
@@ -1839,6 +1865,9 @@ impl Task {
                 Some(frame) = voice_frame_rx.recv() => self.voice_out_frame(frame),
                 Some((identity, connection, frame)) = self.voice_in_rx.recv() => self.voice_in_frame(identity, connection, frame),
                 _ = soon.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     // T24: send what the outgoing rate held back.
                     let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
                     for peer in waiting {
@@ -1859,6 +1888,9 @@ impl Task {
                     self.went_offline(gone);
                 }
                 _ = anti_entropy.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     self.pending.expire(Instant::now(), PENDING_TTL);
                     // T23 state outlives a disconnect (a reset relay circuit
                     // must not make us re-probe everything), so it expires here.
@@ -1868,6 +1900,9 @@ impl Task {
                     self.pull_all("round");
                 }
                 _ = discovery.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     self.discover();
                     self.member_relay_fallback();
                     self.redial_remembered();
@@ -3256,6 +3291,12 @@ impl Task {
                     self.swarm.close_connection(*connection_id);
                     return;
                 }
+            }
+            // No protocol event is acted on (SL on #593): a request, even
+            // over our relays' connections, is dropped unanswered (its
+            // stream closes), and no answer of ours leaves.
+            if let SwarmEvent::Behaviour(_) = &event {
+                return;
             }
         }
         // G-81: each connection's kind, for choosing voice paths.

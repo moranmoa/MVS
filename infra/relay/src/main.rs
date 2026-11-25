@@ -497,6 +497,18 @@ async fn run() -> Result<()> {
                     let _ = swarm.behaviour_mut().kademlia.bootstrap();
                 }
             }
+            // Kad also (re)inserts the dialled address when it confirms the
+            // kad protocol on a connection, which can come after identify, and
+            // again on every reconnect. Strip the PEER_RELAYS address whenever
+            // a peer relay's routing entry changes, so clients never get the
+            // Docker gateway in closer-peers answers (#459 follow-up).
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::RoutingUpdated { peer, addresses, .. })) => {
+                if let Some(addrs) = peer_relay_addrs.get(&peer) {
+                    if holds_peer_relay_addr(addresses.iter(), addrs) {
+                        forget_peer_relay_addrs(&mut swarm.behaviour_mut().kademlia, &peer, addrs);
+                    }
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => {
                 match &event {
                     // The peer is now reachable through us. Identify ran before
@@ -617,6 +629,20 @@ fn forget_peer_relay_addrs(kad: &mut kad::Behaviour<kad::store::MemoryStore>, pe
         kad.remove_address(peer, addr);
         kad.remove_address(peer, &bare);
     }
+}
+
+/// Whether a routing entry still holds one of a peer relay's PEER_RELAYS
+/// addresses, in either spelling (kad stores them with /p2p/<id> appended).
+fn holds_peer_relay_addr<'a>(held: impl Iterator<Item = &'a Multiaddr>, addrs: &[Multiaddr]) -> bool {
+    let bare = |a: &Multiaddr| {
+        let mut a = a.clone();
+        if matches!(a.iter().last(), Some(Protocol::P2p(_))) {
+            a.pop();
+        }
+        a
+    };
+    let pinned: Vec<Multiaddr> = addrs.iter().map(bare).collect();
+    held.map(bare).any(|a| pinned.contains(&a))
 }
 
 fn client_provider(mut record: kad::ProviderRecord) -> kad::ProviderRecord {
@@ -746,6 +772,35 @@ mod tests {
             .collect();
         // Kad stores addresses with the peer's /p2p/<id> appended.
         assert_eq!(kept, vec![public.with(Protocol::P2p(other))], "only the public address is left");
+    }
+
+    #[test]
+    fn a_late_kad_reinsert_of_the_peer_relay_address_is_stripped_again() {
+        let me = PeerId::random();
+        let other = PeerId::random();
+        let mut kad = kad::Behaviour::new(me, kad::store::MemoryStore::new(me));
+        let private: Multiaddr = format!("/ip4/172.17.0.1/tcp/4011/p2p/{other}").parse().unwrap();
+        let mut bare = private.clone();
+        bare.pop();
+        let public: Multiaddr = "/ip4/8.8.8.8/tcp/4011".parse().unwrap();
+        let entry = |kad: &mut kad::Behaviour<kad::store::MemoryStore>| -> Vec<Multiaddr> {
+            kad.kbuckets()
+                .flat_map(|b| b.iter().map(|e| (*e.node.key.preimage(), e.node.value.clone())).collect::<Vec<_>>())
+                .filter(|(p, _)| *p == other)
+                .flat_map(|(_, a)| a.iter().cloned().collect::<Vec<_>>())
+                .collect()
+        };
+        // The order seen live: identify first (public address in, nothing to
+        // strip yet), then kad confirms its protocol and adds the dialled one.
+        kad.add_address(&other, public.clone());
+        forget_peer_relay_addrs(&mut kad, &other, std::slice::from_ref(&private));
+        kad.add_address(&other, bare.clone());
+        let held = entry(&mut kad);
+        assert!(holds_peer_relay_addr(held.iter(), std::slice::from_ref(&private)), "the re-insert is noticed");
+        // What the RoutingUpdated handler then does.
+        forget_peer_relay_addrs(&mut kad, &other, std::slice::from_ref(&private));
+        assert_eq!(entry(&mut kad), vec![public.clone().with(Protocol::P2p(other))], "only the public address is left");
+        assert!(!holds_peer_relay_addr([public.with(Protocol::P2p(other))].iter(), &[private]), "a public address is not a match");
     }
 
     #[test]

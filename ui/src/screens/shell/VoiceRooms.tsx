@@ -13,6 +13,7 @@ import { CrownIcon, HeadphonesOffIcon, MicOffIcon, SpeakerIcon } from '../../com
 import { isCoreError, useCore, type Id, type Member, type ServerSummary, type VoiceRoom } from '../../core';
 import { VOICE_ROOM_LIMIT_MAX, VOICE_ROOM_NAME_MAX, VOICE_ROOMS_MAX } from '../../core/sanitize';
 import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, VOLUME_TICKS, VolumeTicks, type CallEngine } from './CallBar';
+import { useVoiceP2p } from '../../voice/useVoiceP2p';
 
 const NO_MEMBERS: Member[] = [];
 const NO_ROOMS: VoiceRoom[] = [];
@@ -31,6 +32,10 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
   const rooms = useStore(store, (s) => s.voiceRooms[serverId] ?? NO_ROOMS);
   const members = useStore(store, (s) => s.members[serverId] ?? NO_MEMBERS);
   const relayOnly = useStore(store, (s) => s.relayOnly);
+  // G-81 B: with calls over the P2P network on, the notice is v3 (new wording, new key).
+  const p2p = useVoiceP2p();
+  // Relay-only turns calls off, except with G-81 B on: then calls go through our relay (the v3 notice says so).
+  const callsBlocked = relayOnly && !p2p;
   const callError = useStore(store, (s) => s.callError);
   const callRoomId = useStore(store, (s) => s.call?.channelId ?? null);
   const { bind, menu } = useContextMenu();
@@ -98,12 +103,12 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
   }, [rooms, callRoomId, intl]);
 
   const capped = rooms.length >= VOICE_ROOMS_MAX;
-  const rootBlocked = relayOnly ? 'call.error.relayOnly' : capped ? 'voiceRooms.capReached' : null;
+  const rootBlocked = callsBlocked ? 'call.error.relayOnly' : capped ? 'voiceRooms.capReached' : null;
 
   const start = (action: Pending, from: HTMLElement | null) => {
     returnTo.current = from;
     // In a call, computers connect directly: say so before the first create or join.
-    if (!ipNoticeSeen()) setPending(action);
+    if (!ipNoticeSeen(p2p)) setPending(action);
     else run(action);
   };
   const run = (action: Pending) => (action.kind === 'create' ? store.createVoiceRoom(serverId) : store.joinCall(action.roomId));
@@ -172,7 +177,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
       {rootBlocked && (
         <p id={reasonId} className="voice-room-reason">
           <FormattedMessage id={rootBlocked} />
-          {relayOnly && (
+          {callsBlocked && (
             <>
               {' '}
               <button type="button" className="link small" onClick={() => store.openSettings('privacy')}>
@@ -189,7 +194,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
           {shown.map((room) => {
             const inRoom = room.roomId === callRoomId || room.members.some((p) => p.userId === myId);
             const full = !inRoom && room.members.length >= room.limit;
-            const blocked = relayOnly || full;
+            const blocked = callsBlocked || full;
             const name = roomName(room);
             const label = [
               intl.formatMessage({ id: 'voiceRooms.roomLabel' }, { name, count: room.members.length, max: room.limit }),
@@ -221,7 +226,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
                     className={`channel voice-room-entry voice-room-row ${inRoom ? 'in-room' : ''}`}
                     aria-label={label}
                     aria-disabled={blocked || inRoom ? true : undefined}
-                    aria-describedby={relayOnly ? reasonId : undefined}
+                    aria-describedby={callsBlocked ? reasonId : undefined}
                     title={full ? intl.formatMessage({ id: 'call.roomFull' }) : undefined}
                     {...bind(menuLabel, () => items(room, blocked, inRoom, row))}
                     onClick={(e) => !blocked && !inRoom && start({ kind: 'join', roomId: room.roomId }, e.currentTarget)}
@@ -333,9 +338,21 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
         describedBy={bodyId}
         className="ip-notice"
       >
-        <p id={bodyId}>
-          <FormattedMessage id="call.ipNotice.body" />
-        </p>
+        {p2p ? (
+          // v3: two paragraphs, both read out (aria-describedby on the wrapper).
+          <div id={bodyId}>
+            <p>
+              <FormattedMessage id="call.ipNotice.bodyP2p" />
+            </p>
+            <p>
+              <FormattedMessage id="call.ipNotice.relay" />
+            </p>
+          </div>
+        ) : (
+          <p id={bodyId}>
+            <FormattedMessage id="call.ipNotice.body" />
+          </p>
+        )}
         <div className="actions">
           {/* v2: to the relay-only switch; neither joins nor remembers (like Cancel). */}
           <button
@@ -365,7 +382,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
             ref={okRef}
             onClick={async () => {
               const action = pending;
-              rememberIpNotice();
+              rememberIpNotice(p2p);
               setPending(null);
               if (action) await run(action);
               document.querySelector<HTMLButtonElement>('.call-bar .call-mute')?.focus();

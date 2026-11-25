@@ -257,7 +257,7 @@ describe('G-48: help lines', () => {
   });
 
   it('cleanAbuseAddress: e-mail or https only', async () => {
-    const { cleanAbuseAddress } = await import('../core/sanitize');
+    const { cleanAbuseAddress } = await import('../app/abuseAddress');
     expect(cleanAbuseAddress('abuse@example.org')).toBe('abuse@example.org');
     expect(cleanAbuseAddress('https://example.org/report')).toBe('https://example.org/report');
     expect(cleanAbuseAddress('http://example.org')).toBe('');

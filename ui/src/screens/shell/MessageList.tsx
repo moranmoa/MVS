@@ -4,8 +4,9 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { createContext, Fragment, memo, useCallback, useContext, useMemo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
-import type { MessageWindow } from '../../app/store';
-import { isCoreError, useCore, type Member, type Message } from '../../core';
+import { useStore, type MessageWindow } from '../../app/store';
+import { messageLink } from '../../app/messageLink';
+import { isCoreError, useCore, type Id, type Member, type Message } from '../../core';
 import { EmojiPicker } from '../../components/EmojiPicker';
 import { isHeld } from '../../core/sanitize';
 import { MENTION, splitMentions } from '../../app/mentions';
@@ -66,6 +67,7 @@ export function DateDivider({ at }: { at: number }) {
 
 export function MessageList({
   win,
+  serverId,
   channelName,
   memberMap,
   myId,
@@ -76,6 +78,8 @@ export function MessageList({
   ...handlers
 }: {
   win: MessageWindow;
+  /** G-30: for "Copy message link". */
+  serverId: Id;
   channelName: string;
   memberMap: Map<string, Member>;
   myId: string;
@@ -97,6 +101,8 @@ export function MessageList({
   const [active, setActive] = useState<number | null>(null);
   const [revealed, setRevealed] = useState<Set<string>>(() => new Set());
   const [flash, setFlash] = useState<number | null>(null);
+  /** G-30: the row a link pointed at, highlighted for a moment. */
+  const [targeted, setTargeted] = useState<number | null>(null);
   const focusPending = useRef(false);
   const count = win.count;
   const flagged = useMemo(() => lookalikeIds([...memberMap.values()]), [memberMap]);
@@ -147,6 +153,17 @@ export function MessageList({
             // the direction marks are added only when it is shown.
             onSelect: async () => store.showFlash((await copyText(plainText(m.body))) ? 'common.copied' : 'menu.copyFailed'),
           },
+          // G-30: only once the message is on the network (not while sending or failed;
+          // held rows have their own short menu above).
+          ...(m.sendState === 'pending' || m.sendState === 'failed'
+            ? []
+            : [
+                {
+                  key: 'copy-link',
+                  label: intl.formatMessage({ id: 'msglink.copy' }),
+                  onSelect: async () => store.showFlash((await copyText(messageLink(serverId, m.channelId, m.id))) ? 'msglink.copied' : 'menu.copyFailed'),
+                },
+              ]),
           {
             key: 'copy-id',
             label: intl.formatMessage({ id: 'menu.copyMessageId' }),
@@ -239,6 +256,22 @@ export function MessageList({
 
   const goToRef = useRef(goTo);
   goToRef.current = goTo;
+  // G-30: a link was opened for this channel: scroll there, highlight, focus the row.
+  const target = useStore(store, (s) => (s.messageTarget?.channelId === win.channelId ? s.messageTarget : null));
+  // The highlight's timer lives outside the effect: clearing the target re-runs
+  // the effect, and its cleanup must not cancel the fade-out.
+  const targetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(targetTimer.current), []);
+  useEffect(() => {
+    if (!target || count === 0) return;
+    store.clearMessageTarget();
+    if (target.index >= count) return store.showFlash('msglink.notFound');
+    goToRef.current(target.index, 'center');
+    setTargeted(target.index);
+    clearTimeout(targetTimer.current);
+    targetTimer.current = setTimeout(() => setTargeted((f) => (f === target.index ? null : f)), 2500);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, count]);
   const jumpToReply = useCallback((index: number) => {
     goToRef.current(index, 'center');
     setFlash(index);
@@ -359,7 +392,7 @@ export function MessageList({
                 key={item.key}
                 data-index={item.index}
                 ref={virtualizer.measureElement}
-                className={`row ${flash === item.index ? 'flash' : ''}`}
+                className={`row ${flash === item.index ? 'flash' : ''} ${targeted === item.index ? 'target' : ''}`}
                 style={{ transform: `translateY(${item.start}px)` }}
                 tabIndex={item.index === tabRow ? 0 : -1}
                 role="article"

@@ -1,0 +1,25 @@
+/* B24a: Settings → About → "Report abuse or illegal content". Theme colours only (AA); no motion. */
+.about-report {
+  margin-block-start: 0.75rem;
+  border-block-start: 1px solid var(--border);
+  padding-block-start: 0.75rem;
+}
+.about-report h4,
+.about-report p {
+  margin: 0;
+}
+.about-address {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.about-address-text {
+  font-family: var(--font-mono);
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius-s);
+  background: var(--bg-input);
+  color: var(--text);
+  overflow-wrap: anywhere;
+  user-select: all;
+}

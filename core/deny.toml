@@ -105,7 +105,8 @@ allow-wildcard-paths = true
 version = 2
 # B10: advisories block CI (the licence job). Each exception names why it
 # is safe and when it goes; a vulnerability is fixed, never listed here.
-# Unmaintained notices only, no known vulnerability:
+# Unmaintained notices only, no known vulnerability. Re-check every entry by
+# 2027-03-01 (or at the libp2p 0.57 / keyring bump, whichever comes first).
 ignore = [
   # paste: a proc-macro (build time only, no runtime code), through
   # libp2p-quic -> if-watch -> netlink-packet-core (Linux). Goes with the

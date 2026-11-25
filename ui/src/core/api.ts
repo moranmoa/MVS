@@ -198,6 +198,14 @@ export interface CoreCommands {
   setTypingIndicator(on: boolean): Promise<null>;
   /** G-91: how far my servers are from coming back after a restore. */
   getServerRestore(): Promise<ServerRestore>;
+  /**
+   * G-30: where a linked message is, from the local store only (no network).
+   * The three ids must agree. Errors: not-found for everything I can't see
+   * (not a member, a hidden or missing channel, a mismatch, not here, unreadable,
+   * still sending), bad-request for an id that isn't 64 hex. The index is a
+   * snapshot: check the id there.
+   */
+  locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -296,6 +304,8 @@ export interface CoreEvents {
   typing: TypingState;
   /** G-91: sent when anything in the restore progress changes. */
   'serverRestore.changed': ServerRestore;
+  /** G-30: an mvs://m/… link from the OS (desktop parses it strictly; ids only). */
+  'link.message': { serverId: Id; channelId: Id; messageId: Id };
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
   /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */

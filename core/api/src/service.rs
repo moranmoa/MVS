@@ -1409,9 +1409,14 @@ impl Core {
                 }
                 let fetched = self.open_and_fetch(server, &secret);
                 tracing::info!(target: "mvs::join", records = fetched.len(), "join: fetched the server's control log");
-                self.run(|inner, ports, events| {
+                let status = self.run(|inner, ports, events| {
                     inner.join(ports, server, invite, &secret, link, fetched, events)
-                })
+                })?;
+                if matches!(status, JoinStatus::Removed { .. }) {
+                    // Final for me: don't stay subscribed to the server.
+                    self.close_candidate(server)?;
+                }
+                Ok(status)
             }
             Ok(InviteLink::V1 { key, server_prefix }) => self.try_join_short(link, &key, &server_prefix),
             Err(_) => Ok(JoinStatus::Invalid { link: link.to_owned() }),
@@ -1487,6 +1492,11 @@ impl Core {
                     if !matches!(status, JoinStatus::Invalid { .. }) {
                         status = joined;
                     }
+                }
+                JoinStatus::Removed { .. } => {
+                    // Final for me: don't stay subscribed to the server.
+                    self.close_candidate(server)?;
+                    return Ok(joined);
                 }
                 _ => return Ok(joined),
             }
@@ -2589,6 +2599,41 @@ impl Core {
         // Messages held for their key are listed after the stored ones.
         let held = inner.key_pending.iter().filter(|p| p.channel == channel).count();
         Ok(inner.message_count(&*self.ports.cipher, server, channel)? + held)
+    }
+
+    /// G-30 `locateMessage(serverId, channelId, messageId)`: the message's
+    /// index in `getMessages` order, as of now (a snapshot: a message synced
+    /// later can shift it). Local and read-only: no peers, no sync.
+    ///
+    /// One answer, `not-found`, for everything I can't see, so a link never
+    /// confirms that something hidden exists (Security Lead, R1): not a
+    /// member, a server or channel I don't have or may not see (an 18+
+    /// channel hidden by B7 §4), IDs that don't agree, a message that isn't
+    /// here or doesn't open, a message still waiting to send (`pending-…`).
+    /// `bad-request` only for an ID that isn't 64 hex. A closed server
+    /// answers as its `getMessages` does (its keys go at the close).
+    pub fn locate_message(&self, server_id: &str, channel_id: &str, message_id: &str) -> CoreResult<MessageLocation> {
+        let not_found = || CoreError::from(ErrorCode::NotFound);
+        // Held messages aren't records: not-found, like any other unknown.
+        if message_id.starts_with(KEY_PENDING_PREFIX) {
+            return Err(not_found());
+        }
+        let hex = |id: &str| model::parse_hex32(id).ok_or_else(|| CoreError::from(ErrorCode::BadRequest));
+        let server = ServerId::from_bytes(hex(server_id)?);
+        let channel = ChannelId::from_bytes(hex(channel_id)?);
+        let message = RecordId::from_bytes(hex(message_id)?);
+        let mut inner = self.lock();
+        let me = inner.me.as_ref().map(Me::key).ok_or_else(not_found)?;
+        if !inner.db.has_server(server)? {
+            return Err(not_found());
+        }
+        inner.load(server)?;
+        if !inner.view(server)?.state.is_member(me) || !inner.visible(server)?.contains(&channel) {
+            return Err(not_found());
+        }
+        let shown = inner.shown(&*self.ports.cipher, server, channel)?;
+        let index = shown.iter().position(|s| s.record.id() == message).ok_or_else(not_found)?;
+        Ok(MessageLocation { index })
     }
 
     /// Messages `start..end` (0-based, end exclusive) of the channel.
@@ -5505,6 +5550,11 @@ impl Inner {
             return Ok(JoinStatus::Closed { link });
         }
         let key = me.key();
+        // Kicked and not let back: say so, before the age gate. Only I learn
+        // it, about my own account; nothing else about the server is told.
+        if view.is_kicked(&key) {
+            return Ok(JoinStatus::Removed { link });
+        }
         // Already a member (this device lost its copy, e.g. a restore on a
         // new computer): no new join, and nothing that would overwrite what
         // the server already holds about me.
@@ -5521,10 +5571,6 @@ impl Inner {
             && age.is_none_or(|age| age < required.min_age())
         {
             return Ok(JoinStatus::AgeBlocked { link, required });
-        }
-        if view.is_kicked(&key) {
-            // TODO(ui): a "you were removed from this server" phase.
-            return Ok(JoinStatus::Invalid { link });
         }
         let sign = |view: &ServerView, deps, action: &Action| {
             authority::sign_control(
@@ -6018,7 +6064,8 @@ fn removal_shown(server: ServerId, me: PublicKey, fetched: &[Record]) -> bool {
 
 fn restore_settles(status: &CoreResult<JoinStatus>, judged: bool) -> bool {
     match status {
-        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. }) => true,
+        // Removed: the log holds an accepted kick of me, which is evidence.
+        Ok(JoinStatus::Joined { .. } | JoinStatus::Closed { .. } | JoinStatus::Removed { .. }) => true,
         Ok(JoinStatus::Invalid { .. }) => judged,
         Ok(JoinStatus::NobodyOnline { .. } | JoinStatus::Searching { .. } | JoinStatus::AgeBlocked { .. }) | Err(_) => false,
     }
@@ -6032,6 +6079,7 @@ fn join_status_name(status: &JoinStatus) -> &'static str {
         JoinStatus::Invalid { .. } => "invalid",
         JoinStatus::AgeBlocked { .. } => "age-blocked",
         JoinStatus::Closed { .. } => "closed",
+        JoinStatus::Removed { .. } => "removed",
     }
 }
 

@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -84,7 +84,9 @@ let coreStatus = { state: 'starting' };
  */
 const STUN_URL = stunFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
 if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
-const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
+/** G-81 B: calls over the P2P network (off by default; voiceP2pFor). */
+const VOICE_P2P = voiceP2pFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL, ...(VOICE_P2P ? { voiceP2p: true } : {}) });
 // G-48 (B24): the build's abuse-report address, for the page's getAppInfo.
 // Text only, never opened; never logged (its domain is private).
 const ABUSE_ADDRESS = abuseAddressFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });

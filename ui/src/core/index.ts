@@ -75,6 +75,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     outdatedMembers: params.has('outdated'),
     closedServer: params.has('closed'),
     stunUrl: params.get('stun') ?? undefined,
+    voiceP2p: params.has('voiceP2p'),
     storage,
   });
 }

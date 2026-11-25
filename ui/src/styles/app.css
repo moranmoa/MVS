@@ -3921,6 +3921,11 @@ input.switch:disabled {
   margin-inline-end: auto;
 }
 
+/* Voice IP notice v3: two paragraphs (direct, relay-only). */
+.ip-notice p + p {
+  margin-block-start: 0.5rem;
+}
+
 /* G-14: the channel topic, after the name in the header: one muted line. */
 .chat-topic {
   min-width: 0;
@@ -4009,4 +4014,36 @@ input.switch:disabled {
    once a link is typed it's LTR. */
 :root[dir='rtl'] .join-paste input:placeholder-shown {
   direction: rtl;
+}
+
+/* G-30: the message a link pointed at: an accent wash and a start-side bar
+   (not colour alone) for 2.5 s, fading out; no fade with reduced motion. */
+.row.target .msg {
+  background: var(--accent-soft);
+  animation: target-fade 2.5s ease-in forwards;
+}
+
+.row.target .msg::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
+@keyframes target-fade {
+  0%,
+  60% {
+    background: var(--accent-soft);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row.target .msg {
+    animation: none;
+  }
 }

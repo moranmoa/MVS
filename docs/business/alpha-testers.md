@@ -9,8 +9,8 @@ Nov 25, 2026 · business agent · builds on `docs/business/plan-1.md` (§1), `do
 | Wave | Who | How many | Starts |
 | --- | --- | --- | --- |
 | 0 | People the owner knows, technical, on at least two networks | 3–5 | 0.5.0 published |
-| 1 | Israeli tech, PC-hardware and Linux communities (with each admin's OK) | 10–15 | Week 2, if wave 0 has no blocker |
-| 2 | Whole gamer friend groups of 4–8 | 3–4 groups (15–25) | Week 4, after one update shipped cleanly |
+| 1 | Israeli tech, PC-hardware and Linux communities (with each admin's OK) | 10–15 | Week 2, if wave 0 has no blocker. Fine on 0.5.0 if the welcome message carries the abuse-report address and the privacy note (product owner) |
+| 2 | Whole gamer friend groups of 4–8 | 3–4 groups (15–25) | Week 4, after one update shipped cleanly **and** B24a (About screen with the abuse address and privacy link) is in the app |
 
 - **Total:** 30–45 people. Hard cap 50, so every report gets read.
 - **Israel only:** recruit only in Israeli channels and send the invite only to people who confirm they live in Israel. The legal drafts in plan-1 §3 assume Israeli law; anywhere else needs the lawyer's check first.
@@ -63,6 +63,8 @@ New survey question 6 (weekly): *"Did joining a server or opening an invite fail
 | **Servers with zero reachable members** | Such a server has no relay once ours are gone (TL 2) | Group leads + diagnostics files from at least one member per group |
 | Relay-only testers and whether they connect | Relay-only users keep our relays first while ours exist (RR6) | Survey + diagnostics files |
 
+**What diagnostics files may hold (product owner condition):** path types and counters only, never an IP address or peer ID. The welcome message and the `#bugs` topic tell testers this, so they know what they share.
+
 **Asks for the dev team (not in this PR):**
 
 - The diagnostics file should contain the path type and the reachability result with no IPs, so testers can share it safely.
@@ -81,7 +83,7 @@ Week 1 starts the day 0.5.0 is published as a pre-release.
 | 2 | Wave 1 invited (go if there's no P0 open). First weekly report |
 | 3 | First signed update, or install over the old version if signing isn't ready |
 | 4 | Wave 2: friend groups, with a 15-minute setup call each |
-| 5 | R1 build to testers if it's ready: reachability data starts |
+| 5 | R1 build to testers if it's ready: reachability data starts (member relays stay off) |
 | 6 | Group interviews (2–3 groups) |
 | 7 | Second release with R1/R2: second round of network data |
 | 8 | End survey. Go/no-go for the open alpha (plan-1 §1.8), plus the network data summary for R5 |
@@ -101,4 +103,4 @@ Week 1 starts the day 0.5.0 is published as a pre-release.
 | 1 | Does the diagnostics file already hold the path type and reachability, with no IPs? | dev-sync, QA | Add both before week 5 |
 | 2 | Testers' server host: whose PC keeps it reachable? | owner | The owner's PC plus two wave-0 testers, so the server is never empty |
 | 3 | GitHub Issues template for testers | QA | One short template, English with a Hebrew hint |
-| 4 | When and how much do we tell testers about relay-in-app (their IP visible to the relaying member)? | product lead | Notice v3 in the app before R2 reaches testers |
+| 4 | ~~When do we tell testers about relay-in-app?~~ **Decided (product owner):** notice v3 ships in the same release that first turns member relays on for testers (R2), with the matching privacy-note line. Member relays stay off for testers until then. | product lead | Done |

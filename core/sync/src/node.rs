@@ -5137,6 +5137,13 @@ impl Task {
     /// beacon and voice; close every connection but our relays'. From here
     /// on the gates in `on_swarm_event`, `on_request`, `on_gossip`,
     /// `append_local`, `pull`, `discover` and the beacon tick keep it quiet.
+    ///
+    /// Why our relays' connections stay (TL on #593): dropping them would
+    /// only start the reconnect and backoff loop (`relay_lost`) for nothing.
+    /// They carry nothing while quiet: any circuit a peer opens to us
+    /// arrives as a new connection, which closes at once; and we offer no
+    /// reservation to anyone, since the member relay is stopped (its gates
+    /// close, so a reservation request finds no hop protocol).
     fn go_quiet(&mut self) {
         if self.quiet {
             return;

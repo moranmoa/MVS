@@ -717,6 +717,7 @@ export function guardCore(core: CoreApi): CoreApi {
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),
     setAgeRestriction: wrap(core.setAgeRestriction, cleanServer),
+    countAgeAffected: wrap(core.countAgeAffected, (r) => ({ count: count(r?.count) })),
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),

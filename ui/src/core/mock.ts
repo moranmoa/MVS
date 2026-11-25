@@ -1233,13 +1233,24 @@ export class MockCore implements CoreApi {
     if (!s) throw err({ code: 'not-found' });
     if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
     if (!['none', '16+', '18+'].includes(ageRestriction)) throw err({ code: 'bad-request' });
+    // As the core: the current value signs nothing.
+    if (ageRestriction === s.summary.ageRestriction) return s.summary;
     // G-52 (PO, #512): an owner under 18 can't make a server 18+.
-    if (ageRestriction === '18+' && this.ageOf(this.identity!.birthDate) < 18) throw err({ code: 'not-allowed' });
+    if (ageRestriction === '18+' && this.ageOf(this.identity!.birthDate) < 18) throw err({ code: 'too-young' });
     this.lifecycleGate(s);
     await this.wait(150);
     s.summary = { ...s.summary, ageRestriction };
     this.emit('server.updated', s.summary);
     return s.summary;
+  }
+
+  /** G-52: the demo's members without an 18+ claim (every third other member). */
+  async countAgeAffected(serverId: Id, ageRestriction: AgeRestriction): Promise<{ count: number }> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
+    if (ageRestriction !== '18+') return { count: 0 };
+    return { count: s.members.filter((m) => m.id !== this.identity?.id).filter((_, i) => i % 3 === 0).length };
   }
 
   async leaveServer(serverId: Id): Promise<void> {

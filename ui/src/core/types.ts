@@ -173,7 +173,9 @@ export interface CoreError {
     | 'nothing-staged'
     | 'disk-full'
     // Server lifecycle (#261): a member's MVS is too old for rename, leave or close; nothing was signed.
-    | 'update-needed';
+    | 'update-needed'
+    /** G-52 (core #590): 18+ chosen by an owner under 18. */
+    | 'too-young';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */
   detail?: CoreDownDetail;
   /** 1-based word positions that were not recognised (restore). */

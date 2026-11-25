@@ -118,12 +118,19 @@ export interface CoreCommands {
    */
   renameServer(serverId: Id, name: string): Promise<ServerSummary>;
   /**
-   * G-52 (draft contract, until dev-identity's core lands): the owner changes
-   * the server's age limit. Returns the updated summary; then server.updated.
-   * not-allowed for anyone but the owner, and for 18+ from an owner under 18;
-   * update-needed when a member's MVS is too old (nothing changes).
+   * G-52 (core design #590): the owner changes the server's age limit and
+   * the core re-keys the channels at once. Returns the updated summary; then
+   * server.updated. The current value is a no-op. Errors: not-allowed (not
+   * the owner), too-young (18+ from an owner under 18), update-needed
+   * (nothing changes), not-found, bad-request.
    */
   setAgeRestriction(serverId: Id, ageRestriction: AgeRestriction): Promise<ServerSummary>;
+  /**
+   * G-52: how many current members (not me) would lose access at this limit:
+   * those without an 18+ claim; 0 for 'none' and '16+'. No names. Owner and
+   * admins only (not-allowed otherwise). Asked when the raise dialog opens.
+   */
+  countAgeAffected(serverId: Id, ageRestriction: AgeRestriction): Promise<{ count: number }>;
   /** Any member but the owner; never `update-needed`. Then `server.removed { reason: 'left' }`. */
   leaveServer(serverId: Id): Promise<void>;
   /** Owner only, for good. Then `server.closed`; 30 days later `server.removed { reason: 'closed' }`. */

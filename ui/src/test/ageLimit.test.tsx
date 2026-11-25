@@ -62,6 +62,8 @@ describe("G-52: the server's age limit", () => {
     await click(saveButton(dialog));
     const raise = screen.getByRole('dialog', { name: 'Limit this server to 18 and over?' });
     await waitFor(() => expect(document.activeElement).toBe(within(raise).getByRole('button', { name: 'Cancel' })));
+    // PO (0.6.0): it says how many members lose access, from the core's count.
+    expect((await within(raise).findByRole('status')).textContent).toMatch(/^\d+ accounts? (is|are) affected\.$/);
     await click(within(raise).getByRole('button', { name: 'Cancel' }));
     expect(set).not.toHaveBeenCalled();
     expect(radio(dialog, '16 and over').checked).toBe(true);
@@ -104,12 +106,12 @@ describe("G-52: the server's age limit", () => {
     expect(within(dialog).getByText("You can choose 18+ only if you're 18 or older.")).toBeTruthy();
   });
 
-  it('the mock core refuses 18+ from an owner under 18, as the core does', async () => {
+  it('the mock core refuses 18+ from an owner under 18 with too-young, as the core does', async () => {
     const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
     (core as unknown as { persisted: { identity: { birthDate: string } } }).persisted.identity.birthDate = '2010-06-01';
     const me = (await core.getIdentity())!.id;
     const server = (await core.listServers()).find((s) => s.ownerId === me)!;
-    await expect(core.setAgeRestriction(server.id, '18+')).rejects.toMatchObject({ code: 'not-allowed' });
+    await expect(core.setAgeRestriction(server.id, '18+')).rejects.toMatchObject({ code: 'too-young' });
   });
 
   it('a member on an old version: update-needed, and the limit is unchanged (§6.6)', async () => {
@@ -119,5 +121,20 @@ describe("G-52: the server's age limit", () => {
     await click(saveButton(dialog));
     await waitFor(() => expect(dialog.querySelector('.update-needed, [role="alert"]')).toBeTruthy());
     expect((await core.listServers()).find((s) => s.id === server.id)!.ageRestriction).toBe(before);
+  });
+});
+
+describe('G-52: the affected count (core #590)', () => {
+  it('0 below 18+; a count, without names, for 18+; owner only', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    const me = (await core.getIdentity())!.id;
+    const servers = await core.listServers();
+    const own = servers.find((s) => s.ownerId === me)!;
+    const other = servers.find((s) => s.ownerId !== me)!;
+    expect(await core.countAgeAffected(own.id, '16+')).toEqual({ count: 0 });
+    const r = await core.countAgeAffected(own.id, '18+');
+    expect(Object.keys(r)).toEqual(['count']);
+    expect(r.count).toBeGreaterThan(0);
+    await expect(core.countAgeAffected(other.id, '18+')).rejects.toMatchObject({ code: 'not-allowed' });
   });
 });

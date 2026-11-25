@@ -212,6 +212,7 @@
   "server.age.ownerMinor": "You can choose 18+ only if you're 18 or older.",
   "server.age.raise.title": "Limit this server to 18 and over?",
   "server.age.raise.body": "Members under 18 can no longer read or write in this server, and they're told why. Messages they already received stay on their devices.",
+  "server.age.raise.count": "{count, plural, one {1 account is affected.} other {# accounts are affected.}}",
   "server.age.raise.confirm": "Limit to 18+",
   "server.age.lower.title": "Open this server to 16- and 17-year-olds too?",
   "server.age.lower.body": "16- and 17-year-olds will be able to join and read this server. Channels marked 18+ stay 18+, and only members 18 and over see them. Check that the regular channels have no adult content.",

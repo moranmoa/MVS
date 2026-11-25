@@ -14,7 +14,7 @@ import { useAppStore } from '../../app/App';
 import { ageOn } from '../../app/age';
 import { useStore } from '../../app/store';
 import { Dialog } from '../../components/common';
-import { useCore, type AgeRestriction, type ServerSummary } from '../../core';
+import { isCoreError, useCore, type AgeRestriction, type ServerSummary } from '../../core';
 import { failureOf, FailureNote, type Failure } from './ServerLifecycle';
 import './ageLimit.css';
 
@@ -51,12 +51,28 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
     const t = setTimeout(() => cancelRef.current?.focus());
     return () => clearTimeout(t);
   }, [confirm]);
+  // PO (0.6.0): raising names how many members lose access (the core's count; no names).
+  const [affected, setAffected] = useState<number | null>(null);
+  useEffect(() => {
+    if (confirm !== 'raise') return;
+    let live = true;
+    setAffected(null);
+    core.countAgeAffected(server.id, '18+').then(
+      (r) => live && setAffected(r.count),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [confirm, core, server.id]);
+  const [tooYoung, setTooYoung] = useState(false);
   const checkId = useId();
 
   const save = async () => {
     setConfirm(null);
     setBusy(true);
     setFailure(null);
+    setTooYoung(false);
     setSaved(false);
     try {
       await core.setAgeRestriction(server.id, age);
@@ -64,7 +80,8 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
     } catch (e) {
       // A bad request here isn't about a name: the general message.
       const f = failureOf(e);
-      setFailure(f.kind === 'bad-name' ? { kind: 'other' } : f);
+      if (isCoreError(e) && e.code === 'too-young') setTooYoung(true);
+      else setFailure(f.kind === 'bad-name' ? { kind: 'other' } : f);
     } finally {
       setBusy(false);
     }
@@ -124,10 +141,18 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
         )}
       </div>
       <FailureNote server={server} failure={failure} />
+      {tooYoung && (
+        <p className="error small" role="alert">
+          <FormattedMessage id="server.age.ownerMinor" />
+        </p>
+      )}
 
       <Dialog open={confirm === 'raise'} onClose={cancel} title={intl.formatMessage({ id: 'server.age.raise.title' })}>
         <p>
           <FormattedMessage id="server.age.raise.body" />
+        </p>
+        <p role="status" className="age-affected">
+          {affected !== null && <FormattedMessage id="server.age.raise.count" values={{ count: affected }} />}
         </p>
         <div className="actions">
           <button type="button" className="danger" onClick={() => void save()}>

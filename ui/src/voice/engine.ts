@@ -508,11 +508,30 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     return c;
   }
 
+  /**
+   * The loopback couldn't negotiate, or an end failed: the limiter goes to
+   * the speakers directly for the rest of the call (as before the loopback),
+   * so nobody boosted goes silent.
+   */
+  function loopbackFailed(c: AudioContext) {
+    if (!playout || c !== ctx || !limiter) return;
+    const dead = playout;
+    playout = null;
+    try {
+      limiter.disconnect();
+    } catch {
+      // already gone
+    }
+    limiter.connect(c.destination);
+    dead.close();
+    applyContextSink(c);
+  }
+
   /** The loopback playout, or null where this env or context can't make one (then the speakers directly). */
   function makePlayout(c: AudioContext): LoopbackPlayout | null {
     if (!env.createLoopbackPeerConnection || typeof c.createMediaStreamDestination !== 'function') return null;
     try {
-      return loopbackPlayout(c, () => env.createLoopbackPeerConnection!(), () => env.createAudioElement());
+      return loopbackPlayout(c, () => env.createLoopbackPeerConnection!(), () => env.createAudioElement(), () => loopbackFailed(c));
     } catch {
       return null;
     }

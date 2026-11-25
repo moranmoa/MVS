@@ -236,6 +236,8 @@ class FakeAnalyser {
 /** One end of the in-renderer loopback pair. Records what it was asked to do. */
 class FakeLoopbackPC {
   static made: FakeLoopbackPC[] = [];
+  /** How the next pairs fail: a rejecting step, or never delivering the track. */
+  static failOn: 'createOffer' | 'setRemoteDescription' | 'noTrack' | null = null;
   calls: string[] = [];
   closed = false;
   localDescription: RTCSessionDescriptionInit | null = null;
@@ -248,6 +250,7 @@ class FakeLoopbackPC {
     this.calls.push('addTrack');
   }
   async createOffer() {
+    if (FakeLoopbackPC.failOn === 'createOffer') throw new Error('createOffer failed');
     return { type: 'offer' as const, sdp: 'v=0 loopback-offer' };
   }
   async createAnswer() {
@@ -260,8 +263,9 @@ class FakeLoopbackPC {
     setTimeout(() => this.onicecandidate?.({ candidate: { candidate: 'candidate:1 1 udp 1 127.0.0.1 9 typ host' } }), 0);
   }
   async setRemoteDescription(d: RTCSessionDescriptionInit) {
+    if (FakeLoopbackPC.failOn === 'setRemoteDescription') throw new Error('setRemoteDescription failed');
     this.calls.push(`remote:${d.type}`);
-    if (d.type === 'offer') setTimeout(() => this.ontrack?.({ track: new FakeTrack(), streams: [new FakeStream()] }), 0);
+    if (d.type === 'offer' && FakeLoopbackPC.failOn !== 'noTrack') setTimeout(() => this.ontrack?.({ track: new FakeTrack(), streams: [new FakeStream()] }), 0);
   }
   async addIceCandidate() {
     this.calls.push('ice');
@@ -785,6 +789,49 @@ describe('voice engine', () => {
     ex.detach();
     expect(FakeLoopbackPC.made.every((pc) => pc.closed)).toBe(true);
     expect(ctx.destinations[0]!.stream.getTracks()[0]!.stopped).toBe(true);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it.each(['createOffer', 'setRemoteDescription', 'noTrack'] as const)(
+    'the loopback fails (%s): boosted audio falls back to the speakers directly, never silent',
+    async (failOn) => {
+      vi.useFakeTimers();
+      FakeLoopbackPC.made = [];
+      FakeLoopbackPC.failOn = failOn;
+      try {
+        const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+        await ex.setOutputDevice('spk1'); // chosen before: the fallback must carry it to the context
+        ex.setPeerVolume(B, 1.7);
+        await ex.attach(cx.state(), A);
+        await ey.attach(cy.state(), B);
+        // A failed negotiation falls back at once; a missing track after LOOPBACK_TRACK_MS.
+        await vi.advanceTimersByTimeAsync(failOn === 'noTrack' ? 2_500 : 100);
+        const ctx = hx.contexts[0] as FakeWebAudioContext;
+        const [limiter] = ctx.limiters;
+        expect(limiter!.out).toEqual([ctx.destination]); // the speakers, as before the loopback
+        expect(FakeLoopbackPC.made.every((pc) => pc.closed)).toBe(true);
+        expect(ctx.gains.some((g) => g.out[0] === limiter && g.gain.value === 1.7)).toBe(true); // B still boosted
+        expect(ctx.sinks.at(-1)).toBe('spk1'); // the chosen output, now on the context
+        ex.dispose();
+        ey.dispose();
+      } finally {
+        FakeLoopbackPC.failOn = null;
+      }
+    },
+  );
+
+  it('a working loopback within 2 s is kept (no fallback)', async () => {
+    vi.useFakeTimers();
+    FakeLoopbackPC.made = [];
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    ex.setPeerVolume(B, 1.7);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await vi.advanceTimersByTimeAsync(5_000);
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.limiters[0]!.out).not.toContain(ctx.destination);
+    expect(FakeLoopbackPC.made.some((pc) => pc.closed)).toBe(false);
     ex.dispose();
     ey.dispose();
   });

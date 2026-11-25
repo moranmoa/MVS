@@ -38,6 +38,7 @@ import type { CallSignal, CallState, Id } from '../core/types';
 import type { VoiceCore } from './adapter';
 import { cleanStunUrl, cleanTurnCredentials, iceServersFor, normalizeFingerprint, soleFingerprint, type TurnCredentials } from './sdp';
 import { quiet, rms, stepSpeaking, type SpeakState } from './speaking';
+import { LOOPBACK_CONFIG, loopbackPlayout, type LoopbackPlayout } from './media/loopback';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'failed';
 
@@ -120,6 +121,13 @@ export interface AudioDevice {
 /** The browser APIs the engine uses; tests pass fakes. */
 export interface VoiceEnv {
   createPeerConnection(config: RTCConfiguration): RTCPeerConnection;
+  /**
+   * One end of the in-renderer loopback pair that plays boosted audio as
+   * WebRTC, so echo cancellation sees it (spike AEC run 2: 27.3 dB; plain Web
+   * Audio playout couldn't be shown to be cancelled). No arguments: always
+   * `iceServers: []`, never signalled, it reaches no one.
+   */
+  createLoopbackPeerConnection?(): RTCPeerConnection;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
   enumerateDevices(): Promise<MediaDeviceInfo[]>;
   /** null where Web Audio is missing: no speaking indicator then. */
@@ -288,6 +296,7 @@ async function selectedPair(pc: RTCPeerConnection): Promise<{ local: CandidateTy
 export function browserEnv(): VoiceEnv {
   return {
     createPeerConnection: (config) => new RTCPeerConnection(config),
+    createLoopbackPeerConnection: () => new RTCPeerConnection(LOOPBACK_CONFIG),
     getUserMedia: (c) => navigator.mediaDevices.getUserMedia(c),
     enumerateDevices: () => navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([]),
     createAudioContext: () => (typeof AudioContext === 'function' ? new AudioContext({ latencyHint: 'interactive' }) : null),
@@ -398,14 +407,20 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   const volumes = new Map<Id, number>();
   /**
    * G-73 playback path. Web Audio: each verified peer's source → its gain →
-   * a shared limiter → the speakers (the <audio> element stays, muted: Chromium
-   * feeds remote WebRTC audio to Web Audio only while an element plays it).
+   * a shared limiter → the loopback pair → an <audio> element on the chosen
+   * output, so the boosted audio is WebRTC playout that echo cancellation
+   * sees (the 0.5.0 "echo above 100%" issue). Without a loopback factory, the
+   * limiter goes to the context's destination as before. The peer's own
+   * <audio> element stays, muted: Chromium feeds remote WebRTC audio to Web
+   * Audio only while an element plays it.
    * Falls back to the element path (volume ≤ 1) where Web Audio or the
    * context's setSinkId is missing or fails. Decided per call.
    */
   let elementOnly = false;
   let limiter: DynamicsCompressorNode | null = null;
   let sinkSet: string | undefined;
+  /** The shared loopback playout behind the limiter: one per call, made with the limiter, closed with the call. */
+  let playout: LoopbackPlayout | null = null;
 
   /** The context for Web Audio playback, or null on the element path. */
   function playbackContext(): AudioContext | null {
@@ -424,15 +439,31 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
         limiter.ratio.value = 20;
         limiter.attack.value = 0.002;
         limiter.release.value = 0.1;
-        limiter.connect(c.destination);
+        playout = makePlayout(c);
+        limiter.connect(playout ? playout.input : c.destination);
       } catch {
         elementOnly = true;
         limiter = null;
         return null;
       }
     }
-    if (outputId !== sinkSet) applyContextSink(c);
+    if (outputId !== sinkSet) {
+      if (playout) {
+        sinkSet = outputId;
+        playout.setSink(outputId);
+      } else applyContextSink(c);
+    }
     return c;
+  }
+
+  /** The loopback playout, or null where this env or context can't make one (then the speakers directly). */
+  function makePlayout(c: AudioContext): LoopbackPlayout | null {
+    if (!env.createLoopbackPeerConnection || typeof c.createMediaStreamDestination !== 'function') return null;
+    try {
+      return loopbackPlayout(c, () => env.createLoopbackPeerConnection!(), () => env.createAudioElement());
+    } catch {
+      return null;
+    }
   }
 
   /** The chosen speaker for the whole context; without setSinkId, back to the element path. */
@@ -1209,6 +1240,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     timer = null;
     if (turnTimer) clearTimeout(turnTimer); // the cache stays; no refreshing outside a call
     turnTimer = null;
+    playout?.close();
+    playout = null;
     void ctx?.close?.().catch(() => {});
     ctx = null;
     limiter = null;
@@ -1263,7 +1296,10 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     async setOutputDevice(deviceId) {
       outputId = deviceId || undefined;
-      if (ctx && !elementOnly && limiter) applyContextSink(ctx);
+      if (playout) {
+        sinkSet = outputId;
+        playout.setSink(outputId);
+      } else if (ctx && !elementOnly && limiter) applyContextSink(ctx);
       if (monitor && 'setSinkId' in monitor) void monitor.setSinkId(deviceId).catch(() => {});
       await Promise.all(
         [...peers.values()].map((p) =>

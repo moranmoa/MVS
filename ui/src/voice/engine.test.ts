@@ -231,6 +231,43 @@ class FakeAnalyser {
   }
 }
 
+/** One end of the in-renderer loopback pair. Records what it was asked to do. */
+class FakeLoopbackPC {
+  static made: FakeLoopbackPC[] = [];
+  calls: string[] = [];
+  closed = false;
+  localDescription: RTCSessionDescriptionInit | null = null;
+  onicecandidate: ((e: { candidate: unknown }) => void) | null = null;
+  ontrack: ((e: { track: FakeTrack; streams: FakeStream[] }) => void) | null = null;
+  constructor(readonly args: unknown[]) {
+    FakeLoopbackPC.made.push(this);
+  }
+  addTrack() {
+    this.calls.push('addTrack');
+  }
+  async createOffer() {
+    return { type: 'offer' as const, sdp: 'v=0 loopback-offer' };
+  }
+  async createAnswer() {
+    return { type: 'answer' as const, sdp: 'v=0 loopback-answer' };
+  }
+  async setLocalDescription(d: RTCSessionDescriptionInit) {
+    this.localDescription = d;
+    this.calls.push(`local:${d.type}`);
+    setTimeout(() => this.onicecandidate?.({ candidate: { candidate: 'candidate:1 1 udp 1 127.0.0.1 9 typ host' } }), 0);
+  }
+  async setRemoteDescription(d: RTCSessionDescriptionInit) {
+    this.calls.push(`remote:${d.type}`);
+    if (d.type === 'offer') setTimeout(() => this.ontrack?.({ track: new FakeTrack(), streams: [new FakeStream()] }), 0);
+  }
+  async addIceCandidate() {
+    this.calls.push('ice');
+  }
+  close() {
+    this.closed = true;
+  }
+}
+
 /** G-73: a node that records what it is connected to. */
 class FakeNode {
   out: unknown[] = [];
@@ -271,6 +308,14 @@ class FakeWebAudioContext {
     const c = Object.assign(new FakeNode(), { threshold: { value: 0 }, knee: { value: 0 }, ratio: { value: 0 }, attack: { value: 0 }, release: { value: 0 } });
     this.limiters.push(c);
     return c;
+  }
+  /** The loopback's stream source. */
+  destinations: (FakeNode & { stream: { getAudioTracks(): { stop(): void }[]; getTracks(): { stop(): void; stopped?: boolean }[] } })[] = [];
+  createMediaStreamDestination() {
+    const track = { stopped: false, stop() { this.stopped = true; } };
+    const d = Object.assign(new FakeNode(), { stream: { getAudioTracks: () => [track], getTracks: () => [track] } });
+    this.destinations.push(d);
+    return d;
   }
   async setSinkId(id: string) {
     if (this.sinkFails && id) throw Object.assign(new Error('no'), { name: 'NotAllowedError' });
@@ -315,7 +360,7 @@ interface Harness {
   changeNetwork: () => void;
 }
 
-function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } } = {}): Harness {
+function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean; loopback?: boolean } } = {}): Harness {
   let onChange: (() => void) | null = null;
   let onNet: (() => void) | null = null;
   const h: Harness = {
@@ -371,8 +416,9 @@ function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } }
       h.contexts.push(c);
       return c as unknown as AudioContext;
     },
+    ...(opts.webAudio?.loopback ? { createLoopbackPeerConnection: (...args: unknown[]) => new FakeLoopbackPC(args) as unknown as RTCPeerConnection } : {}),
     createAudioElement: () => {
-      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
+      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, sinks: [] as string[], setSinkId: async (id: string) => void a.sinks.push(id), play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
       h.audios.push(a);
       return a as unknown as HTMLAudioElement;
     },
@@ -657,6 +703,77 @@ describe('voice engine', () => {
     expect(hx.audios[0]!.volume).toBe(0.4);
     ex.setDeafened(true);
     expect(hx.audios[0]!.muted).toBe(true);
+  });
+
+  it('boosted audio plays through the loopback (WebRTC playout, AEC sees it): gain → limiter → loopback bus, never the speakers directly', async () => {
+    FakeLoopbackPC.made = [];
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    ex.setPeerVolume(B, 1.8);
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    const [limiter] = ctx.limiters;
+    const bus = ctx.gains.find((g) => g.out[0] === ctx.destinations[0]);
+    expect(bus).toBeTruthy();
+    expect(limiter!.out).toEqual([bus]); // the limiter before the bus (no clipping at 200%)
+    expect(ctx.gains.some((g) => g !== bus && g.out[0] === limiter && g.gain.value === 1.8)).toBe(true);
+    expect(limiter!.out).not.toContain(ctx.destination);
+    expect(FakeLoopbackPC.made).toHaveLength(2);
+    expect(FakeLoopbackPC.made.every((pc) => pc.args.length === 0)).toBe(true); // no config to put ICE servers in
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('the loopback pair negotiates only with itself: nothing of it reaches core.sendSignal', async () => {
+    FakeLoopbackPC.made = [];
+    const { cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    const before = cx.sent.length;
+    ex.setPeerVolume(B, 1.5);
+    await flush();
+    await flush();
+    const [a, z] = FakeLoopbackPC.made;
+    expect(a!.calls).toEqual(expect.arrayContaining(['addTrack', 'local:offer', 'remote:answer', 'ice']));
+    expect(z!.calls).toEqual(expect.arrayContaining(['remote:offer', 'local:answer', 'ice']));
+    expect(cx.sent.length).toBe(before); // the boost added no signalling
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('one pair per call, whoever is boosted; the chosen output reaches its element; leaving closes it', async () => {
+    FakeLoopbackPC.made = [];
+    const { hx, cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    ex.setPeerVolume(B, 1.5);
+    ex.setPeerVolume(B, 0.8);
+    ex.setPeerVolume(B, 1.9);
+    expect(FakeLoopbackPC.made).toHaveLength(2);
+    await ex.setOutputDevice('spk1');
+    const el = hx.audios.at(-1) as unknown as { sinks: string[] };
+    expect(el.sinks.at(-1)).toBe('spk1');
+    const ctx = hx.contexts[0] as FakeWebAudioContext;
+    expect(ctx.sinks).toEqual([]); // the context's own output is not used
+    ex.detach();
+    expect(FakeLoopbackPC.made.every((pc) => pc.closed)).toBe(true);
+    expect(ctx.destinations[0]!.stream.getTracks()[0]!.stopped).toBe(true);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('nobody above 100%: no loopback pair at all', async () => {
+    FakeLoopbackPC.made = [];
+    const { cx, cy, ex, ey } = pair([A, B], {}, { webAudio: { loopback: true } });
+    await ex.attach(cx.state(), A);
+    await ey.attach(cy.state(), B);
+    await flush();
+    expect(FakeLoopbackPC.made).toHaveLength(0);
+    ex.dispose();
+    ey.dispose();
   });
 
   it('QA-21: the answerer sends its mic on the offer\'s m-line (sendrecv), so audio flows both ways', async () => {

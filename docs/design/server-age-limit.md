@@ -48,7 +48,7 @@ Status: approved by the Security Lead (#590, answers and residual below); kind c
 - `none` ↔ `16+`: the same people; no re-key and no dialog.
 
 ## Older cores (why the gate)
-- An older core can't decode kind 25. From #589 on, it shows `updateNeeded` (the detector). Until it updates, it keeps keying every channel for all members, so an old moderator could hand a raised server's new keys to minors.
+- An older core can't decode kind 26. From #589 on, it shows `updateNeeded` (the detector). Until it updates, it keeps keying every channel for all members, so an old moderator could hand a raised server's new keys to minors.
 - The `lv:N` gate keeps the owner from raising while a member could still do that. A member who downgrades afterwards is the same residual as B7-k K2. The `adult-keys-outdated` notice logic extends to "a member lacks that level in an 18+ server" and is sent once.
 
 ## Tests (plan)

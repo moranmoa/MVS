@@ -234,6 +234,13 @@ pub struct ReactionCount {
     pub mine: bool,
 }
 
+/// G-30 `locateMessage`: where a message is in `getMessages` order, now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageLocation {
+    pub index: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRange {

@@ -4,7 +4,7 @@
 
 import { useEffect, useId, useState, type FormEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
-import { useCore, type CoreError, type Id, type ReportReason, type ReportTargetInput } from '../../core';
+import { useCore, useCoreEvent, type CoreError, type Id, type ReportReason, type ReportTargetInput } from '../../core';
 import { REPORT_REASONS } from '../../core/types';
 import { cleanAbuseAddress, REPORT_TEXT_MAX } from '../../core/sanitize';
 import { Dialog, Name } from '../../components/common';
@@ -78,6 +78,13 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
   const [text, setText] = useState('');
   const [state, setState] = useState<'idle' | 'sending' | 'sent'>('idle');
   const [error, setError] = useState<string | null>(null);
+  // G-48: where my report is (report.status): staff who have it, and who it still waits for.
+  const [delivery, setDelivery] = useState<{ reportId: Id; delivered: number; pending: number } | null>(null);
+  useCoreEvent(
+    'report.status',
+    (e) => setDelivery((d) => (d && d.reportId === e.reportId ? { ...d, delivered: e.delivered, pending: e.pending } : d)),
+    [],
+  );
   const legend = useId();
   const noteId = useId();
 
@@ -86,6 +93,7 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
     setText('');
     setState('idle');
     setError(null);
+    setDelivery(null);
   }, [request]);
 
   const submit = async (e: FormEvent) => {
@@ -95,7 +103,8 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
     setError(null);
     const note = text.replace(/\s+/g, ' ').trim();
     try {
-      await core.reportContent(request.serverId, request.target, reason, note || undefined);
+      const receipt = await core.reportContent(request.serverId, request.target, reason, note || undefined);
+      setDelivery((d) => (d?.reportId === receipt.reportId ? d : { reportId: receipt.reportId, delivered: 0, pending: receipt.recipients }));
       setState('sent');
     } catch (err) {
       setError(ERRORS[(err as CoreError)?.code] ?? 'error.generic');
@@ -111,6 +120,11 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
           <p className="success" role="status">
             <FormattedMessage id="report.sent" />
           </p>
+          {delivery && (
+            <p className="muted small" role="status">
+              <FormattedMessage id={delivery.pending === 0 && delivery.delivered > 0 ? 'report.status.delivered' : 'report.status.pending'} />
+            </p>
+          )}
           {reason === 'minor' && <MinorHelpLine />}
           {reason === 'self-harm' && <SelfHarmHelpLine />}
           <div className="actions">

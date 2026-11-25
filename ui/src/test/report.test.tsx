@@ -8,6 +8,7 @@ import type { Settings } from '../app/settings';
 import { MockCore } from '../core/mock';
 import { cleanReportEvidence, cleanReportSummary } from '../core/sanitize';
 import type { ReportSummary } from '../core';
+import { defaultNotifyPrefs } from '../app/notify';
 
 const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
@@ -265,5 +266,63 @@ describe('G-48: help lines', () => {
     expect(cleanAbuseAddress('https://user:pw@example.org')).toBe('');
     expect(cleanAbuseAddress('a b@example.org')).toBe('');
     expect(cleanAbuseAddress(undefined)).toBe('');
+  });
+});
+
+describe('G-48 follow-ups', () => {
+  const emitOf = (core: MockCore) => (core as unknown as { emit: (e: string, p: unknown) => void }).emit.bind(core);
+
+  it('a report that reaches me: a desktop notification with no reason or content; none when notifications are off', async () => {
+    const notify = vi.fn(async () => true);
+    (window as { mvs?: unknown }).mvs = { notify };
+    try {
+      const { core } = await setup();
+      const me = (await core.getIdentity())!.id;
+      const server = (await core.listServers()).find((s) => s.ownerId === me)!;
+      await act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id, reason: 'minor', text: 'secret note' }) }));
+      expect(notify).toHaveBeenCalledTimes(1);
+      const n = (notify.mock.calls[0] as unknown as [{ title: string; body: string }])[0];
+      expect(n.title).toBe('New report');
+      expect(n.body).toBe(`A report arrived in \u2068${server.name}\u2069.`);
+      expect(JSON.stringify(n)).not.toMatch(/minor|secret|105/i);
+    } finally {
+      delete (window as { mvs?: unknown }).mvs;
+    }
+  });
+
+  it('desktop notifications off: no report notification', async () => {
+    const notify = vi.fn(async () => true);
+    (window as { mvs?: unknown }).mvs = { notify };
+    try {
+      const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+      render(<App core={core} initialSettings={{ ...en, notify: { ...defaultNotifyPrefs(), desktop: false } }} />);
+      await screen.findByRole('textbox', { name: /^Message / });
+      const server = (await core.listServers())[0]!;
+      await act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id }) }));
+      expect(notify).not.toHaveBeenCalled();
+    } finally {
+      delete (window as { mvs?: unknown }).mvs;
+    }
+  });
+
+  it('the staff badge: open reports on the rail and the Reports tab; dismissing one lowers it', async () => {
+    await setup();
+    const rail = screen.getByRole('navigation', { name: /servers/i });
+    const owned = await within(rail).findByRole('button', { name: /3 open reports/ });
+    expect(owned.parentElement!.querySelector('.rail-reports')).toBeTruthy();
+    const panel = await openReports();
+    expect(screen.getByRole('tab', { name: /Reports/ }).textContent).toContain('3');
+    const first = (await within(panel).findAllByRole('listitem'))[0]!;
+    await click(within(first).getByRole('button', { name: 'Mark as handled' }));
+    await within(rail).findByRole('button', { name: /2 open reports/ });
+  });
+
+  it('the reporter sees where the report is: waiting, then delivered', async () => {
+    await setup();
+    const dialog = await reportFirstOthersMessage();
+    await click(within(dialog).getByRole('radio', { name: 'Spam' }));
+    await click(within(dialog).getByRole('button', { name: 'Send report' }));
+    await within(dialog).findByText('Your report was sent to the owner and admins.');
+    expect(await within(dialog).findByText('Delivered to the owner and admins.')).toBeTruthy();
   });
 });

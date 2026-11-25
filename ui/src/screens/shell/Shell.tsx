@@ -19,6 +19,7 @@ import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
 import { CreateServerDialog, Home, JoinDialog } from './Home';
 import { MemberList } from './MemberList';
+import { useReportNotifications } from './reportsState';
 import { MEMBER_SEARCH_ID } from './MemberSearch';
 import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
@@ -210,6 +211,8 @@ export function Shell() {
     setPhoneView('nav');
   };
   // G-61: a click on a desktop notification opens its channel.
+  // G-48: a report that reaches me as staff (no reason or content in it).
+  useReportNotifications();
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
     setSettingsOpen(false);
     setServerId(sid);

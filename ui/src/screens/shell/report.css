@@ -93,3 +93,22 @@
   font-family: var(--font-mono);
   overflow-wrap: anywhere;
 }
+/* G-48: "reports waiting" on a server I own: a flag at the top corner (the mention badge is at the bottom). */
+.rail-reports {
+  position: absolute;
+  inset-block-start: -0.125rem;
+  inset-inline-end: 0.5rem;
+  display: grid;
+  place-items: center;
+  width: 1.375rem;
+  height: 1.375rem;
+  border-radius: 50%;
+  border: 0.1875rem solid var(--bg-rail);
+  background: var(--warning-bg);
+  color: var(--warning-text);
+  font-size: 0.75rem;
+  pointer-events: none;
+}
+.settings-count {
+  margin-inline-start: 0.5rem;
+}

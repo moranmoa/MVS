@@ -13,6 +13,7 @@ import { SENSITIVE_REASONS } from '../../core/types';
 import { Name } from '../../components/common';
 import { displayName, ProfileCard } from './MemberList';
 import { MinorHelpLine, SelfHarmHelpLine } from './ReportDialog';
+import { notifyReportsChanged } from './reportsState';
 import './report.css';
 
 const NO_MEMBERS: Member[] = [];
@@ -211,6 +212,7 @@ function ReportItem({ report: r, server, onChanged }: { report: ReportSummary; s
             className="link"
             onClick={async () => {
               await core.dismissReport(r.id).catch(() => {});
+              notifyReportsChanged();
               onChanged();
             }}
           >
@@ -220,5 +222,27 @@ function ReportItem({ report: r, server, onChanged }: { report: ReportSummary; s
       </div>
       {kick && <ProfileCard member={kick} server={server} isMe={false} startKick onClose={() => setKick(null)} />}
     </li>
+  );
+}
+
+/** G-48: a small flag for "reports waiting" (drawn here, like the shared icon set). */
+export function ReportFlagIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="1em"
+      height="1em"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.25}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+      className="icon"
+    >
+      <path d="M5 21V4" />
+      <path d="M5 4h11l-2 4 2 4H5" />
+    </svg>
   );
 }

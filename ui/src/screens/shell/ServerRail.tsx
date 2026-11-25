@@ -13,6 +13,8 @@ import { copyText } from '../../app/clipboard';
 import { isMutedKey, mutedUntil, serverMuteKey } from '../../app/mute';
 import { useMutedLabel } from './MuteDialog';
 import { NotifyDialog, type NotifyTarget } from './NotifyDialog';
+import { useOpenReports } from './reportsState';
+import { ReportFlagIcon } from './Reports';
 
 /** How far the mouse moves before a press becomes a drag (G-01). */
 const DRAG_START_PX = 4;
@@ -38,6 +40,8 @@ export function ServerRail({
 }) {
   const store = useAppStore();
   const joined = useStore(store, (s) => s.servers);
+  // G-48: open reports in the servers I own (staff only).
+  const reports = useOpenReports();
   const update = useStore(store, (s) => s.update);
   const core = useCore();
   const intl = useIntl();
@@ -193,6 +197,7 @@ export function ServerRail({
       isServerMuted(s) ? intl.formatMessage({ id: 'notify.muted' }) : null,
       s.mentions > 0 ? intl.formatMessage({ id: 'mentions.label' }, { count: s.mentions }) : null,
       s.unread ? intl.formatMessage({ id: 'unread.label' }) : null,
+      reports[s.id] ? intl.formatMessage({ id: 'reports.badge' }, { count: reports[s.id] }) : null,
     ]
       .filter(Boolean)
       .join(', ');
@@ -251,6 +256,7 @@ export function ServerRail({
               unread={s.unread}
               muted={isServerMuted(s)}
               mentions={s.mentions}
+              reports={reports[s.id] ?? 0}
               serverId={s.id}
               menuProps={arranging ? undefined : bind(intl.formatMessage({ id: 'menu.forServer' }, { name: s.name }), () => serverItems(s))}
             >
@@ -338,6 +344,7 @@ function RailButton({
   unread,
   muted,
   mentions = 0,
+  reports = 0,
   menuProps,
   serverId,
   tip,
@@ -354,6 +361,8 @@ function RailButton({
   /** Muted on this device (G-03): shown quieter. */
   muted?: boolean;
   mentions?: number;
+  /** G-48: open reports here, for staff (shown as a small flag; the count is in the label). */
+  reports?: number;
   menuProps?: HTMLAttributes<HTMLButtonElement>;
   /** Servers only: lets the keyboard reorder find the focused one. */
   serverId?: Id;
@@ -380,6 +389,11 @@ function RailButton({
       {mentions > 0 && (
         <span className="badge rail-badge" aria-hidden="true">
           {mentions > 99 ? '99+' : mentions}
+        </span>
+      )}
+      {reports > 0 && (
+        <span className="rail-reports" aria-hidden="true">
+          <ReportFlagIcon />
         </span>
       )}
     </div>

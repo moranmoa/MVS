@@ -3921,6 +3921,11 @@ input.switch:disabled {
   margin-inline-end: auto;
 }
 
+/* Voice IP notice v3: two paragraphs (direct, relay-only). */
+.ip-notice p + p {
+  margin-block-start: 0.5rem;
+}
+
 /* G-14: the channel topic, after the name in the header: one muted line. */
 .chat-topic {
   min-width: 0;

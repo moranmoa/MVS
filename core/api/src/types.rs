@@ -111,6 +111,14 @@ pub struct ServerSummary {
     /// for 30 days after the close was received (additive).
     #[serde(default)]
     pub closed: bool,
+    /// G-51: the server's icon as a `data:image/(png|webp);base64,` URL;
+    /// absent when there is none (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_data_url: Option<String>,
+    /// G-51: the server's description, up to 5 lines of plain text; absent
+    /// when there is none (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +159,19 @@ pub enum SendState {
     Failed,
 }
 
+/// Why a message is a placeholder (`Message.unreadable`, the PO's rules,
+/// TODO #21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unreadable {
+    /// Sent after my join under a key this device doesn't hold; it may
+    /// open later (`message.updated` with the text).
+    NoKey,
+    /// Under a rotation authority doesn't accept: no author, no reactions,
+    /// never a reply target.
+    Untrusted,
+}
+
 /// `Message` in types.ts. TODO: replies, edits, deletes, mentions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +180,8 @@ pub struct Message {
     pub channel_id: Id,
     /// Position in the channel as shown, oldest first.
     pub index: usize,
+    /// Absent (empty) only on an `untrusted` placeholder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author_id: Id,
     pub body: String,
     pub created_at: Timestamp,
@@ -185,6 +208,11 @@ pub struct Message {
     /// first appeared; absent when there are none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactions: Option<Vec<ReactionCount>>,
+    /// A placeholder (TODO #21): the body is "" and doesn't open here.
+    /// No mentions or reactions; not unread; react, edit and delete on it
+    /// get `bad-request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<Unreadable>,
 }
 
 /// `getSettings`: what the core keeps on this device.
@@ -486,6 +514,11 @@ pub enum NoticeKind {
     /// Rust addition: removed members still hold a channel key and only a
     /// moderator can renew it; the channel can't be written to until then.
     RekeyWaiting,
+    /// B7-k (to owners and admins of a server with an 18+ channel): some
+    /// members run a version that keys 18+ channels for every member, so
+    /// minors there may read what's sent. `getUpdateNeeded(serverId,
+    /// 'adult-keys-v1')` lists them. Sent once until that list is empty.
+    AdultKeysOutdated,
 }
 
 /// `CoreEvents` in api.ts, as `{ "event": name, "payload": ... }`.

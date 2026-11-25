@@ -8,7 +8,8 @@ import { isCoreError } from '../../core';
 import type { Channel, Id, ServerSummary } from '../../core';
 import { Avatar, Badge, Code, Name } from '../../components/common';
 import { BellOffIcon, GearIcon, HashIcon, PlusIcon } from '../../components/icons';
-import { CallBar, useCallEngine } from './CallBar';
+import { CallBar, useSharedCallEngine } from './CallBar';
+import { LockNowButton } from '../../lock/AppLockSection';
 import { VoiceRooms } from './VoiceRooms';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
@@ -16,6 +17,7 @@ import { useCore } from '../../core';
 import { channelMuteKey, isMutedKey, mutedUntil, MUTE_FOREVER } from '../../app/mute';
 import { useMutedLabel } from './MuteDialog';
 import { NotifyDialog, type NotifyTarget } from './NotifyDialog';
+import { TopicDialog } from './TopicDialog';
 
 const NO_CHANNELS: Channel[] = [];
 
@@ -48,11 +50,13 @@ export function ChannelSidebar({
   // A closed server is read-only (#261): no owner controls there.
   const owner = server.ownerId === identity.id && !server.closed;
   const core = useCore();
-  // The one voice engine for my call, shared by the room entry and the call bar.
-  const engine = useCallEngine(identity.id);
+  // The one voice engine for my call, shared by the room entry and the call bar
+  // (it lives above the content: G-78 path B keeps the call while locked).
+  const engine = useSharedCallEngine();
   const { bind, menu } = useContextMenu();
   // G-61: the channel whose notification settings are open.
   const [notifyFor, setNotifyFor] = useState<NotifyTarget | null>(null);
+  const [topicFor, setTopicFor] = useState<Channel | null>(null);
   const phone = useMediaQuery(phoneQuery(useSettings().settings.uiScale));
 
   // G-11 (#323): the owner reorders the channels; everyone sees the core's order.
@@ -147,6 +151,8 @@ export function ChannelSidebar({
       onSelect: () => setNotifyFor({ kind: 'channel', id: c.id, name: c.name }),
     },
     ...(owner ? [{ key: 'rename', label: intl.formatMessage({ id: 'menu.renameChannel' }), onSelect: () => onEditChannel(c) }] : []),
+    // G-14: the owner sets the topic (admins too in the core; the UI has no admin role yet).
+    ...(owner ? [{ key: 'topic', label: intl.formatMessage({ id: 'channel.topic.edit' }), onSelect: () => setTopicFor(c) }] : []),
     { kind: 'separator' },
     {
       key: 'copy-id',
@@ -333,6 +339,7 @@ export function ChannelSidebar({
             <Code value={identity.shortCode} />
           </span>
         </button>
+        <LockNowButton />
         <button
           type="button"
           className="icon-button"
@@ -345,6 +352,7 @@ export function ChannelSidebar({
       </footer>
       {menu}
       {notifyFor && <NotifyDialog target={notifyFor} onClose={() => setNotifyFor(null)} />}
+      {topicFor && <TopicDialog channel={topicFor} canEdit={owner} open editing onClose={() => setTopicFor(null)} />}
     </aside>
   );
 }

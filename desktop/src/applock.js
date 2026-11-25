@@ -84,15 +84,68 @@ function createAppLock({ request, inCall, onChange, now = Date.now, setTimer = s
   const state = () => ({ enabled, locked, pending, path: locked ? path : null, ...(retryAfter ? { retryAfter } : {}) });
   const changed = () => onChange(state());
 
+  let method = 'passcode';
+  /** A lock:set / lock:clear is with the core (Argon2): one at a time. */
+  let changing = false;
+
   function applyConfig(cfg) {
     enabled = cfg.enabled === true;
     if (Number.isInteger(cfg.idleMinutes) && cfg.idleMinutes >= 1 && cfg.idleMinutes <= 60) idleMinutes = cfg.idleMinutes;
     lockOnSleep = cfg.lockOnSleep !== false;
+    method = cfg.method === 'os' ? 'os' : 'passcode';
+    // A delay the core is still running (it survives a restart).
+    if (Number.isFinite(cfg.retryAfter) && cfg.retryAfter > 0) retryAfter = Math.ceil(cfg.retryAfter);
   }
 
-  return {
+  /** The core's AppLockAnswer as main hands it on: { result, retryAfter? }. */
+  function answerOf(res) {
+    const r = res && res.ok;
+    const result = r && ['ok', 'wrong', 'rate-limited'].includes(r.result) ? r.result : 'invalid';
+    const after = r && Number.isFinite(r.retryAfter) && r.retryAfter > 0 ? Math.ceil(r.retryAfter) : null;
+    return { result, ...(after ? { retryAfter: after } : {}) };
+  }
+
+  /** One change at a time, and only while unlocked; refresh after an ok. */
+  async function change(run) {
+    if (locked || pending) return { result: 'locked' };
+    if (changing) return { result: 'busy' };
+    changing = true;
+    try {
+      const answer = answerOf(await run().catch(() => null));
+      if (answer.result === 'ok') await lockApi.refresh();
+      return answer;
+    } finally {
+      changing = false;
+    }
+  }
+
+  const lockApi = {
     get state() {
       return state();
+    },
+    /** The settings for the page (unlocked only): never the verifier or the attempt state. */
+    config() {
+      if (locked || pending) return null;
+      return { enabled, idleMinutes, lockOnSleep, method };
+    },
+    /**
+     * Turn the lock on or change it: { current?, passcode, idleMinutes,
+     * lockOnSleep }. `current` is what the user typed (the core requires it
+     * once a lock is set and counts a wrong one); main never fills it in.
+     * → { result: 'ok'|'wrong'|'rate-limited'|'invalid'|'busy'|'locked', retryAfter? }
+     */
+    async set(input) {
+      if (locked || pending) return { result: 'locked' };
+      const args = cleanSetInput(input);
+      if (!args) return { result: 'invalid' };
+      return change(() => request('setAppLock', args));
+    },
+    /** Turn the lock off: { current } (checked by the core, same counter). */
+    async clear(input) {
+      if (locked || pending) return { result: 'locked' };
+      const current = input && typeof input === 'object' ? cleanPasscode(input.current) : null;
+      if (!current) return { result: 'invalid' };
+      return change(() => request('clearAppLock', { current }));
     },
     /** At start: ask the core; locked (path A) until it says the lock is off. */
     async start() {
@@ -220,6 +273,29 @@ function createAppLock({ request, inCall, onChange, now = Date.now, setTimer = s
       return (pending || path === 'A' ? EVENTS_A : EVENTS_B).has(name);
     },
   };
+  return lockApi;
 }
 
-module.exports = { createAppLock, cleanPasscode, cleanWords, predatesLock, START_TIMEOUT_MS };
+/**
+ * lock:set's input, checked before the core sees it: the passcodes shaped
+ * like an attempt (the core applies the new-passcode rules), idleMinutes a
+ * whole 1–60, lockOnSleep a boolean, nothing else. Null if anything is off.
+ */
+function cleanSetInput(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const known = new Set(['current', 'passcode', 'idleMinutes', 'lockOnSleep']);
+  if (Object.keys(input).some((k) => !known.has(k))) return null;
+  const passcode = cleanPasscode(input.passcode);
+  if (!passcode) return null;
+  let current;
+  if (input.current !== undefined) {
+    current = cleanPasscode(input.current);
+    if (!current) return null;
+  }
+  const { idleMinutes, lockOnSleep } = input;
+  if (!Number.isInteger(idleMinutes) || idleMinutes < 1 || idleMinutes > 60) return null;
+  if (typeof lockOnSleep !== 'boolean') return null;
+  return { ...(current ? { current } : {}), passcode, method: 'passcode', idleMinutes, lockOnSleep };
+}
+
+module.exports = { createAppLock, cleanPasscode, cleanWords, cleanSetInput, predatesLock, START_TIMEOUT_MS };

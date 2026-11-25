@@ -61,6 +61,46 @@ export async function avatarFromFile(file: File): Promise<ImageResult> {
   }
 }
 
+/** G-51: the core takes a still PNG or WebP, at most 8 KiB and 128 px a side. */
+export const SERVER_ICON_SIZE = 128;
+export const SERVER_ICON_MAX_BYTES = 8 * 1024;
+
+/**
+ * G-51 (docs/ux/specs/server-icon-description.md, #587): a server icon from a
+ * picked file. The centre square at 128×128 (an animated image gives its first
+ * frame), WebP at falling quality until it fits 8 KiB, PNG as a fallback.
+ */
+export async function serverIconFrom(file: File): Promise<ImageResult> {
+  if (file.size > MAX_FILE_BYTES) return { ok: false, error: 'too-large' };
+  if (!canScale()) return { ok: false, error: 'unsupported' };
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return { ok: false, error: 'unsupported' };
+  }
+  try {
+    if (bitmap.width * bitmap.height > MAX_PIXELS) return { ok: false, error: 'too-large' };
+    const side = Math.min(bitmap.width, bitmap.height);
+    const canvas = new OffscreenCanvas(SERVER_ICON_SIZE, SERVER_ICON_SIZE);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return { ok: false, error: 'unsupported' };
+    ctx.drawImage(bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, SERVER_ICON_SIZE, SERVER_ICON_SIZE);
+    for (const quality of [0.85, 0.7, 0.55, 0.4, 0.25]) {
+      const blob = await canvas.convertToBlob({ type: 'image/webp', quality });
+      if (blob.type === 'image/webp' && blob.size <= SERVER_ICON_MAX_BYTES) {
+        const src = await readAsDataUrl(blob);
+        if (src.startsWith('data:image/webp;base64,')) return { ok: true, dataUrl: src };
+      }
+    }
+    const png = await canvas.convertToBlob({ type: 'image/png' });
+    if (png.size <= SERVER_ICON_MAX_BYTES) return { ok: true, dataUrl: await readAsDataUrl(png) };
+    return { ok: false, error: 'too-large' };
+  } finally {
+    bitmap.close();
+  }
+}
+
 /**
  * #359: the 48×48 picture others see: WebP (PNG where WebP isn't available),
  * lowering the quality until it's 2,560 bytes or less. Re-encoding through the

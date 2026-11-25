@@ -67,6 +67,10 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
   }, [confirm, core, server.id]);
   const [tooYoung, setTooYoung] = useState(false);
   const checkId = useId();
+  // UX on #591: each dialog is described by its explanation (and the count), read with focus on "Cancel".
+  const raiseBodyId = useId();
+  const raiseCountId = useId();
+  const lowerBodyId = useId();
 
   const save = async () => {
     setConfirm(null);
@@ -147,11 +151,16 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
         </p>
       )}
 
-      <Dialog open={confirm === 'raise'} onClose={cancel} title={intl.formatMessage({ id: 'server.age.raise.title' })}>
-        <p>
+      <Dialog
+        open={confirm === 'raise'}
+        onClose={cancel}
+        title={intl.formatMessage({ id: 'server.age.raise.title' })}
+        describedBy={`${raiseBodyId} ${raiseCountId}`}
+      >
+        <p id={raiseBodyId}>
           <FormattedMessage id="server.age.raise.body" />
         </p>
-        <p role="status" className="age-affected">
+        <p id={raiseCountId} role="status" className="age-affected">
           {affected !== null && <FormattedMessage id="server.age.raise.count" values={{ count: affected }} />}
         </p>
         <div className="actions">
@@ -164,8 +173,8 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
         </div>
       </Dialog>
 
-      <Dialog open={confirm === 'lower'} onClose={cancel} title={intl.formatMessage({ id: 'server.age.lower.title' })}>
-        <p>
+      <Dialog open={confirm === 'lower'} onClose={cancel} title={intl.formatMessage({ id: 'server.age.lower.title' })} describedBy={lowerBodyId}>
+        <p id={lowerBodyId}>
           <FormattedMessage id="server.age.lower.body" />
         </p>
         <label className="checkbox-row">

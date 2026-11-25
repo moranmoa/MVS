@@ -62,6 +62,9 @@ describe("G-52: the server's age limit", () => {
     await click(saveButton(dialog));
     const raise = screen.getByRole('dialog', { name: 'Limit this server to 18 and over?' });
     await waitFor(() => expect(document.activeElement).toBe(within(raise).getByRole('button', { name: 'Cancel' })));
+    // UX on #591: described by the explanation and the count.
+    const ids = raise.getAttribute('aria-describedby')!.split(' ');
+    expect(document.getElementById(ids[0]!)?.textContent).toMatch(/^Members under 18 can no longer read/);
     // PO (0.6.0): it says how many members lose access, from the core's count.
     expect((await within(raise).findByRole('status')).textContent).toMatch(/^\d+ accounts? (is|are) affected\.$/);
     await click(within(raise).getByRole('button', { name: 'Cancel' }));
@@ -87,6 +90,9 @@ describe("G-52: the server's age limit", () => {
     await click(saveButton(dialog));
     const lower = screen.getByRole('dialog', { name: 'Open this server to 16- and 17-year-olds too?' });
     expect(within(lower).getByText(/Channels marked 18\+ stay 18\+/)).toBeTruthy();
+    // UX on #591: the dialog is described by its explanation.
+    expect(lower.getAttribute('aria-describedby')).toBeTruthy();
+    expect(document.getElementById(lower.getAttribute('aria-describedby')!)?.textContent).toMatch(/^16- and 17-year-olds will be able to join/);
     const confirm = within(lower).getByRole('button', { name: 'Open to 16 and over' });
     expect(confirm.getAttribute('aria-disabled')).toBe('true');
     await click(confirm);

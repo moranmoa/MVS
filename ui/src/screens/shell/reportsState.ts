@@ -15,14 +15,22 @@ import { useCore, useCoreEvent, type Id } from '../../core';
 export const REPORTS_CHANGED = 'mvs:reports-changed';
 export const notifyReportsChanged = () => window.dispatchEvent(new Event(REPORTS_CHANGED));
 
-/** G-48: open (not dismissed) reports per server, for the servers I own. Empty elsewhere. */
+/** G-48 (TL on #531): "open Reports for this server", from a menu or a notification; Shell shows them. */
+export const OPEN_REPORTS = 'mvs:open-reports';
+export const openReports = (serverId: Id) => window.dispatchEvent(new CustomEvent(OPEN_REPORTS, { detail: serverId }));
+
+/**
+ * G-48: open (not dismissed) reports per server, for every server where I'm
+ * staff (owner or admin). The UI doesn't know admins: staff are those the
+ * core lets list reports (listReports is not-allowed for anyone else), so a
+ * server is in the result exactly when I'm staff there, with 0 when none wait.
+ */
 export function useOpenReports(): Readonly<Record<Id, number>> {
   const core = useCore();
   const store = useAppStore();
-  const myId = useStore(store, (s) => s.identity?.id);
   const owned = useStore(store, (s) =>
     s.servers
-      .filter((x) => x.ownerId === myId && !x.closed)
+      .filter((x) => !x.closed)
       .map((x) => x.id)
       .join(','),
   );
@@ -39,7 +47,15 @@ export function useOpenReports(): Readonly<Record<Id, number>> {
     (serverId: Id) =>
       core.listReports(serverId).then(
         (l) => live.current && setCounts((c) => ({ ...c, [serverId]: l.filter((r) => !r.dismissed).length })),
-        () => live.current && setCounts((c) => ({ ...c, [serverId]: 0 })),
+        // Not staff there (or the core can't say): not in the result.
+        () =>
+          live.current &&
+          setCounts((c) => {
+            if (!(serverId in c)) return c;
+            const next = { ...c };
+            delete next[serverId];
+            return next;
+          }),
       ),
     [core],
   );
@@ -83,6 +99,12 @@ export function useReportNotifications() {
   const now = useRef({ intl, prefs });
   now.current = { intl, prefs };
   const last = useRef(new Map<Id, number>());
+  // Channels a report notification pointed at (its click opens Reports, not just the channel).
+  const sentFor = useRef(new Map<Id, Id>());
+  useCoreEvent('notify.click', ({ channelId, messageId }) => {
+    const serverId = messageId === null ? sentFor.current.get(channelId) : undefined;
+    if (serverId) openReports(serverId);
+  });
   const waiting = useRef(new Map<Id, { count: number; timer: ReturnType<typeof setTimeout> }>());
   useEffect(() => () => waiting.current.forEach((w) => clearTimeout(w.timer)), []);
 
@@ -100,6 +122,7 @@ export function useReportNotifications() {
       return;
     }
     last.current.set(serverId, Date.now());
+    sentFor.current.set(channel.id, serverId);
     void notify({
       title: server.name,
       body: intl.formatMessage({ id: 'reports.notify.body' }, { server: server.name, count }),

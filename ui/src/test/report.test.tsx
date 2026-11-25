@@ -14,9 +14,9 @@ import { REPORT_NOTIFY_GAP_MS } from '../screens/shell/reportsState';
 const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
 // `prepare` runs before the app starts (the sanitizer wraps the core then).
-async function setup(prepare?: (core: MockCore) => void) {
+async function setup(prepare?: (core: MockCore) => unknown) {
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
-  prepare?.(core);
+  await prepare?.(core);
   render(<App core={core} initialSettings={en} />);
   await screen.findByRole('textbox', { name: /^Message / });
   return { core };
@@ -414,5 +414,71 @@ describe('G-48 (PO on #567): report notifications through a mute, with their own
     expect(withNone.servers.s1).toEqual({ reports: false, level: 'none' });
     expect(withLevel(withNone, 'servers', 's1', null).servers.s1).toEqual({ reports: false });
     expect(withReports(withNone, 's1', true).servers.s1).toEqual({ level: 'none' });
+  });
+});
+
+describe('G-48 (TL on #531): admins, the notification click, no-recipient, ids', () => {
+  const emitOf = (core: MockCore) => (core as unknown as { emit: (e: string, p: unknown) => void }).emit.bind(core);
+  afterEach(() => {
+    delete (window as { mvs?: unknown }).mvs;
+  });
+
+  it('an admin (staff, not the owner): "Reports" in the server menu opens them; a member gets no such item', async () => {
+    let adminOf = '';
+    let memberOf = '';
+    await setup(async (core) => {
+      const me = (await core.getIdentity())!.id;
+      const others = (await core.listServers()).filter((s) => s.ownerId !== me);
+      adminOf = others[0]!.id;
+      memberOf = others[1]?.id ?? '';
+      const real = core.listReports.bind(core);
+      // The core lets staff list reports: here I'm an admin of one server I don't own.
+      core.listReports = vi.fn((id: string) => (id === adminOf ? Promise.resolve([summary({ serverId: adminOf })]) : real(id)));
+    });
+    const rail = screen.getByRole('navigation', { name: /servers/i });
+    const servers = await new MockCore({ demo: true }).listServers();
+    const admin = servers.find((s) => s.id === adminOf)!;
+    fireEvent.contextMenu(await within(rail).findByRole('button', { name: new RegExp('^' + admin.name + '.*1 open report') }));
+    await click(menuItem('Reports (1)'));
+    const dialog = await screen.findByRole('dialog', { name: `Reports – \u2068${admin.name}\u2069` });
+    expect(await within(dialog).findAllByRole('listitem')).toHaveLength(1);
+    if (memberOf) {
+      fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+      const member = servers.find((s) => s.id === memberOf)!;
+      fireEvent.contextMenu(within(rail).getByRole('button', { name: new RegExp('^' + member.name) }));
+      expect(screen.queryByRole('menuitem', { name: /^Reports/ })).toBeNull();
+    }
+  });
+
+  it('a report notification, clicked: the Reports open for that server', async () => {
+    const notify = vi.fn(async () => true);
+    (window as { mvs?: unknown }).mvs = { notify };
+    const { core } = await setup();
+    const me = (await core.getIdentity())!.id;
+    const server = (await core.listServers()).find((s) => s.ownerId === me)!;
+    await act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id }) }));
+    await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    const { channelId } = (notify.mock.calls[0] as unknown as [{ channelId: string }])[0];
+    await act(async () => emitOf(core)('notify.click', { channelId, messageId: null }));
+    expect(await screen.findByRole('dialog', { name: `Reports – \u2068${server.name}\u2069` })).toBeTruthy();
+  });
+
+  it('no-recipient: the abuse address is offered, when the build has one', async () => {
+    await setup((core) => {
+      vi.spyOn(core, 'reportContent').mockRejectedValue({ code: 'no-recipient' });
+      vi.spyOn(core, 'getAppInfo').mockResolvedValue({ version: '1', updateChannel: 'stable', abuseAddress: 'abuse@example.org' } as never);
+    });
+    const dialog = await reportFirstOthersMessage();
+    await click(within(dialog).getByRole('radio', { name: 'Spam' }));
+    await click(within(dialog).getByRole('button', { name: 'Send report' }));
+    await within(dialog).findByRole('alert');
+    expect(within(dialog).getByText('abuse@example.org')).toBeTruthy();
+  });
+
+  it('report ids are rejected, not truncated, when they are not plain ids', () => {
+    expect(cleanReportSummary({ ...summary(), id: 'x'.repeat(129) } as never)).toBeNull();
+    expect(cleanReportSummary({ ...summary(), serverId: 'a b' } as never)).toBeNull();
+    expect(cleanReportSummary({ ...summary(), target: { kind: 'message', messageId: 'm\u202e1', channelId: 'c' } } as never)).toBeNull();
+    expect(cleanReportSummary({ ...summary(), id: 'a'.repeat(64) } as never)?.id).toBe('a'.repeat(64));
   });
 });

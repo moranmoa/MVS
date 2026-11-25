@@ -288,10 +288,20 @@ const reportText = (raw: unknown): string | undefined => {
   return t || undefined;
 };
 
+/**
+ * G-48 (TL on #531): a report's ids are rejected, not truncated, when they
+ * aren't a plain id: 1–128 of letters, digits, '-', '_', ':' or '#' (the
+ * core's are 64 hex; the mock's are named).
+ */
+const REPORT_ID = /^[A-Za-z0-9_:#-]{1,128}$/;
+const reportId = (raw: unknown): string | null => (typeof raw === 'string' && REPORT_ID.test(raw) ? raw : null);
+
 function cleanReportTarget(t: unknown): ReportTarget | null {
   const x = t as Record<string, unknown> | null;
-  if (x?.kind === 'message' && typeof x.messageId === 'string' && typeof x.channelId === 'string') {
-    return { kind: 'message', messageId: id(x.messageId), channelId: id(x.channelId) };
+  if (x?.kind === 'message') {
+    const messageId = reportId(x.messageId);
+    const channelId = reportId(x.channelId);
+    return messageId && channelId ? { kind: 'message', messageId, channelId } : null;
   }
   if (x?.kind === 'member' && typeof x.userId === 'string') return { kind: 'member', userId: cleanHexId(x.userId) };
   return null;
@@ -299,14 +309,16 @@ function cleanReportTarget(t: unknown): ReportTarget | null {
 
 /** G-48: a report for staff, or null when its reason or target isn't one we know. Never evidence. */
 export function cleanReportSummary(r: ReportSummary): ReportSummary | null {
-  if (!r || typeof r !== 'object' || typeof r.id !== 'string') return null;
+  if (!r || typeof r !== 'object') return null;
+  const rid = reportId(r.id);
+  const serverId = reportId(r.serverId);
   const target = cleanReportTarget(r.target);
   const reason = REPORT_REASONS.find((x) => x === r.reason);
-  if (!target || !reason) return null;
+  if (!rid || !serverId || !target || !reason) return null;
   const text = reportText(r.text);
   return {
-    id: id(r.id),
-    serverId: id(r.serverId),
+    id: rid,
+    serverId,
     reporterId: cleanHexId(r.reporterId),
     target,
     reportedId: cleanHexId(r.reportedId),

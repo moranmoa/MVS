@@ -74,6 +74,7 @@ const ERRORS: Partial<Record<CoreError['code'], string>> = {
 
 export function ReportDialog({ request, onClose }: { request: ReportRequest | null; onClose: () => void }) {
   const core = useCore();
+  const abuse = useAbuseAddress();
   const intl = useIntl();
   const [reason, setReason] = useState<ReportReason | null>(null);
   const [text, setText] = useState('');
@@ -173,6 +174,14 @@ export function ReportDialog({ request, onClose }: { request: ReportRequest | nu
             {error && (
               <p className="error" role="alert">
                 <FormattedMessage id={error} />
+              </p>
+            )}
+            {error === 'report.error.noRecipient' && abuse && (
+              <p className="small">
+                <FormattedMessage id="report.abuseLine" />{' '}
+                <bdi dir="ltr" className="report-abuse-address">
+                  {abuse}
+                </bdi>
               </p>
             )}
             <div className="actions">

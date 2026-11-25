@@ -13,7 +13,7 @@ import { copyText } from '../../app/clipboard';
 import { isMutedKey, mutedUntil, serverMuteKey } from '../../app/mute';
 import { useMutedLabel } from './MuteDialog';
 import { NotifyDialog, type NotifyTarget } from './NotifyDialog';
-import { useOpenReports } from './reportsState';
+import { openReports, useOpenReports } from './reportsState';
 import { ReportFlagIcon } from './Reports';
 
 /** How far the mouse moves before a press becomes a drag (G-01). */
@@ -112,6 +112,10 @@ export function ServerRail({
             onSelect: async () => store.showFlash((await copyText(s.inviteLink)) ? 'common.copied' : 'menu.copyFailed'),
           },
           ...(s.ownerId === myId ? [{ key: 'settings', label: intl.formatMessage({ id: 'server.settings.open' }), onSelect: () => onOpenServerSettings(s.id) }] : []),
+          // G-48 (TL on #531): staff (owner or admin) open the reports from here too.
+          ...(s.id in reports
+            ? [{ key: 'reports', label: intl.formatMessage({ id: 'reports.open' }, { count: reports[s.id] }), onSelect: () => openReports(s.id) }]
+            : []),
           { kind: 'separator' },
           ...(s.ownerId !== myId ? [{ key: 'leave', label: intl.formatMessage({ id: 'server.leave' }), danger: true, onSelect: () => onLeaveServer(s.id) }] : []),
         ];

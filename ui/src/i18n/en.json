@@ -237,6 +237,8 @@
   "server.removed.undone": "Removal undone. They can join again with an invite link.",
   "server.removed.showAll": "Show all {count}",
   "reports.empty": "No reports.",
+  "reports.open": "{count, plural, =0 {Reports} other {Reports (#)}}",
+  "reports.dialog.title": "Reports – \u2068{server}\u2069",
   "reports.kind.message": "A message",
   "reports.kind.member": "An account",
   "reports.reported": "Report about \u2068{name}\u2069",

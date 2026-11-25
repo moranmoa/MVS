@@ -19,7 +19,8 @@ import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
 import { CreateServerDialog, Home, JoinDialog } from './Home';
 import { MemberList } from './MemberList';
-import { useReportNotifications } from './reportsState';
+import { OPEN_REPORTS, useReportNotifications } from './reportsState';
+import { ReportsDialog } from './Reports';
 import { MEMBER_SEARCH_ID } from './MemberSearch';
 import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
@@ -249,6 +250,14 @@ export function Shell() {
   // G-61: a click on a desktop notification opens its channel.
   // G-48: a report that reaches me as staff (no reason or content in it).
   useReportNotifications();
+  // G-48 (TL on #531): Reports for staff, admins included (they have no settings gear).
+  const [reportsFor, setReportsFor] = useState<Id | null>(null);
+  useEffect(() => {
+    const open = (e: Event) => setReportsFor((e as CustomEvent<Id>).detail);
+    window.addEventListener(OPEN_REPORTS, open);
+    return () => window.removeEventListener(OPEN_REPORTS, open);
+  }, []);
+  const reportsServer = reportsFor ? servers.find((s) => s.id === reportsFor) : undefined;
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
     setSettingsOpen(false);
     setServerId(sid);
@@ -418,6 +427,7 @@ export function Shell() {
           setServerId(id);
         }}
       />
+      <ReportsDialog server={reportsServer ?? null} onClose={() => setReportsFor(null)} />
       <JoinDialog
         open={dialog === 'join'}
         initialLink={invite}

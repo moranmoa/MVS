@@ -10,7 +10,7 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { useCore, useCoreEvent, type CoreError, type Member, type ReportEvidence, type ReportSummary, type ServerSummary } from '../../core';
 import { SENSITIVE_REASONS } from '../../core/types';
-import { Name } from '../../components/common';
+import { Dialog, Name } from '../../components/common';
 import { displayName, ProfileCard } from './MemberList';
 import { MinorHelpLine, SelfHarmHelpLine } from './ReportDialog';
 import { notifyReportsChanged } from './reportsState';
@@ -244,5 +244,20 @@ export function ReportFlagIcon() {
       <path d="M5 21V4" />
       <path d="M5 4h11l-2 4 2 4H5" />
     </svg>
+  );
+}
+
+/** G-48 (TL on #531): the Reports page in its own dialog, for staff (admins have no settings gear). */
+export function ReportsDialog({ server, onClose }: { server: ServerSummary | null; onClose: () => void }) {
+  const intl = useIntl();
+  return (
+    <Dialog
+      open={!!server}
+      onClose={onClose}
+      title={server ? intl.formatMessage({ id: 'reports.dialog.title' }, { server: server.name }) : ''}
+      className="settings-dialog reports-dialog"
+    >
+      {server && <ReportsPage server={server} />}
+    </Dialog>
   );
 }

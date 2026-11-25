@@ -164,8 +164,11 @@ describe('context menus (B25)', () => {
     await setup();
     const rail = screen.getByRole('navigation', { name: /servers/i });
     const owned = within(rail).getAllByRole('button').find((b) => b.getAttribute('aria-current') === 'page')!;
-    fireEvent.contextMenu(owned);
-    expect(menuItems()).toEqual(['Mark all as read', 'Notifications', 'Copy invite link', 'Server settings', 'Move down']); // first in the rail (G-01)
+    // G-48: staff also get "Reports", once the core has said so (listReports).
+    await waitFor(() => {
+      fireEvent.contextMenu(owned);
+      expect(menuItems()).toEqual(['Mark all as read', 'Notifications', 'Copy invite link', 'Server settings', 'Reports (3)', 'Move down']); // first in the rail (G-01)
+    });
     fireEvent.click(screen.getByRole('menuitem', { name: 'Server settings' }));
     expect(screen.getByRole('tab', { name: 'General' })).toBeTruthy();
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });

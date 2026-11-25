@@ -400,6 +400,29 @@ To pull a bad version, put it in the next body's `revoked` list (edit
 `manifest-body-beta.json` before signing). A manifest cannot revoke its own
 version.
 
+## A required release
+
+The design is in `docs/design/required-update.md`. Use a required release when older versions **must not keep running**, for example after a protocol or key-rule change (B7-k K2, T17).
+
+- **How it works:**
+  - A release is required for every version its signed manifest **revokes**. There's no new manifest field: older clients reject unknown fields and would never update again.
+  - A client whose running version is revoked (from version N on, the first release with this feature) goes **local read-only plus update**. It shows a banner that can't be closed, starts the download at once, and checks again every 15 minutes.
+  - Until it updates, the core **signs nothing and syncs nothing** (RU1). Only update checks and downloads reach the network.
+  - Versions older than N update through the normal banner, and nothing forces them.
+- **To publish one:**
+  1. Build and sign as usual (steps 1–4).
+  2. Build the body with `--require-from <version>`. That fills `revoked` with every published version below `<version>`. The option is in `manifest-body.mjs` (devops); check the body's `revoked` list before signing.
+  3. The release's own version is never revoked, and it must have an artifact for every platform. A revoked client with no artifact for its platform is stranded on "not available yet".
+- **If a required release is bad,** don't try to "un-require" it:
+  - `revoked` only ever grows on clients (a later manifest can't take a revocation back), and a replayed older manifest can't either.
+  - **The fix is a newer good release:** publish N+2 at once, as a normal (or required) release. Every client updates to it, and the required state clears after one restart, because N+2 isn't revoked.
+  - Clients whose N+1 trial failed roll back to the revoked version. They stay read-only ("not available yet") and never fetch N+1 again (its trial failed there), so nobody gets stuck in a restart loop. They take N+2 when it's out.
+- **Before you sign,** check:
+  - the `revoked` list;
+  - an artifact for every platform;
+  - the notes, which users see in the banner;
+  - that the channel matches.
+
 ## Later: 2 of 3 keys
 
 The first key holder signs as above. Each further holder adds their

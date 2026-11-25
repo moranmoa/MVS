@@ -133,4 +133,67 @@ function createPtt({ emit, active, setTimer = setTimeout, clearTimer = clearTime
   };
 }
 
-module.exports = { cleanKey, cleanAccelerator, createPtt, RELEASE_MS };
+/**
+ * G-74 + G-78: the global "toggle mute" shortcut. It is registered with the
+ * OS only while `allowed()` (in a call AND unlocked), and a press reaches the
+ * page only then too, so nobody at a locked computer can unmute a call
+ * behind the lock (path B). `register(accel, onPress)` / `unregister(accel)`
+ * are Electron's globalShortcut; `onPress()` tells the page.
+ */
+function createGlobalMute({ register, unregister, allowed, onPress }) {
+  let accel = null; // what the page chose (checked), or null
+  let status = 'ok'; // what set() answered: 'ok' | 'shortcut-taken'
+  let registered = null; // registered with the OS right now, or null
+
+  const doRegister = () => {
+    if (!accel || registered) return !!registered;
+    let ok = false;
+    try {
+      ok = register(accel, () => {
+        if (allowed()) onPress();
+      });
+    } catch {
+      ok = false;
+    }
+    if (ok) registered = accel;
+    return ok;
+  };
+  const off = () => {
+    if (registered) unregister(registered);
+    registered = null;
+  };
+  const api = {
+    get registered() {
+      return registered;
+    },
+    /** Registered exactly while allowed(). Call after every call or lock change. */
+    sync() {
+      if (allowed() && accel) doRegister();
+      else off();
+    },
+    /**
+     * The page's choice (already cleaned). Outside a call it is only tried
+     * (register, then unregister in the same tick, never live) so the page
+     * can say "taken"; it stays registered only while allowed().
+     */
+    set(next) {
+      if (next === accel) return status;
+      off();
+      accel = next;
+      status = 'ok';
+      if (!accel) return 'ok';
+      if (!doRegister()) status = 'shortcut-taken';
+      api.sync();
+      return status;
+    },
+    /** Sign-out: forget the choice and let go of the OS shortcut. */
+    clear() {
+      off();
+      accel = null;
+      status = 'ok';
+    },
+  };
+  return api;
+}
+
+module.exports = { cleanKey, cleanAccelerator, createPtt, createGlobalMute, RELEASE_MS };

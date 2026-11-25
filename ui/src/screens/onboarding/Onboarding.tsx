@@ -13,6 +13,7 @@ import { LanguagePicker } from '../../components/LanguagePicker';
 import { RecoveryCheck, RecoveryWordsPanel } from './RecoveryWords';
 import { RestoreScreen } from './Restore';
 import { DeviceLinkScreen } from './DeviceLink';
+import { markFirstRun } from '../../app/firstRun';
 
 export type Step =
   | 'language'
@@ -61,6 +62,8 @@ export function resumeStep(identity: Identity | null): Step | null {
 export function Onboarding({ onFinished: finish, initialStep }: { onFinished: () => void; initialStep?: Step | null }) {
   const [step, setStep] = useState<Step>(initialStep ?? 'language');
   const onFinished = () => {
+    // G-92: a new account's first Home says it's ready (not after a restore or a device link).
+    if (!restoring && !linked) markFirstRun();
     storage()?.removeItem(RESUME_KEY);
     storage()?.removeItem(RESTORING_KEY);
     finish();

@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CallSignal, CallState, Id } from '../core/types';
 import type { SignalKind, VoiceCore } from './adapter';
-import { createVoiceEngine, type VoiceEngineOptions, type VoiceEnv, type VoiceError, type VoiceParticipant } from './engine';
+import { candidateCounts, createVoiceEngine, type VoiceEngineOptions, type VoiceEnv, type VoiceError, type VoiceParticipant } from './engine';
 import { cleanTurnCredentials, fingerprints, iceServersFor, normalizeFingerprint, soleFingerprint } from './sdp';
 
 const A: Id = 'a'.repeat(64);
@@ -62,6 +62,14 @@ interface FakeTransceiver {
 /** Every fake connection, so a test can look at them and at who presented what certificate. */
 const allPcs: FakePC[] = [];
 
+/** Real-looking candidate lines, addresses included (the diagnostics must never show them). */
+const DEFAULT_CANDIDATES = [
+  'candidate:1 1 udp 2122260223 192.168.1.23 54321 typ host generation 0',
+  'candidate:2 1 udp 1686052607 203.0.113.7 61000 typ srflx raddr 192.168.1.23 rport 54321 generation 0',
+];
+/** Candidate lines for the next FakePCs (a test sets it before the call starts). */
+let nextCandidates: string[] | null = null;
+
 class FakePC {
   readonly fingerprint = newFingerprint();
   /** What getStats reports as the peer's certificate; by default, the real peer's. */
@@ -87,6 +95,15 @@ class FakePC {
   restarts = 0;
   /** Candidate types of the selected pair, for connectionTypes. */
   pairTypes: [string, string] = ['host', 'host'];
+  /** Extra fields on both candidate stats, and extra stats (G-81 fuzz: hostile values everywhere). */
+  statsExtra: Record<string, unknown> = {};
+  statsMore: Record<string, unknown>[] = [];
+  /** G-81: the candidate lines this side gathers (into its SDP): a host and a srflx, as behind a NAT with STUN. */
+  localCandidates: string[] = [...(nextCandidates ?? DEFAULT_CANDIDATES)];
+  get iceConnectionState(): RTCIceConnectionState {
+    const s = this.connectionState;
+    return s === 'connected' ? 'connected' : s === 'failed' ? 'failed' : s === 'closed' ? 'closed' : 'checking';
+  }
   getConfiguration() {
     return this.config;
   }
@@ -135,7 +152,7 @@ class FakePC {
   }
   private sdp(type: string) {
     const direction = this.bound()?.direction ?? 'inactive';
-    return `v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\na=fingerprint:sha-256 ${this.fingerprint}\r\na=setup:${type === 'offer' ? 'actpass' : 'active'}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=${direction}\r\n`;
+    return `v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\na=fingerprint:sha-256 ${this.fingerprint}\r\na=setup:${type === 'offer' ? 'actpass' : 'active'}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=${direction}\r\n` + this.localCandidates.map((c) => `a=${c}\r\n`).join('');
   }
   async createOffer() {
     // The first transceiver without a mid gets the m-line.
@@ -183,9 +200,10 @@ class FakePC {
     return new Map<string, Record<string, unknown>>([
       ['T1', { id: 'T1', type: 'transport', remoteCertificateId: 'CR', selectedCandidatePairId: 'P' }],
       ['P', { id: 'P', type: 'candidate-pair', localCandidateId: 'L', remoteCandidateId: 'R', state: 'succeeded', nominated: true }],
-      ['L', { id: 'L', type: 'local-candidate', candidateType: this.pairTypes[0], address: '192.0.2.10', port: 5000 }],
-      ['R', { id: 'R', type: 'remote-candidate', candidateType: this.pairTypes[1], address: '198.51.100.20', port: 6000 }],
+      ['L', { id: 'L', type: 'local-candidate', candidateType: this.pairTypes[0], address: '192.0.2.10', port: 5000, ...this.statsExtra }],
+      ['R', { id: 'R', type: 'remote-candidate', candidateType: this.pairTypes[1], address: '198.51.100.20', port: 6000, ...this.statsExtra }],
       ['CR', { id: 'CR', type: 'certificate', fingerprint: remote?.toUpperCase(), fingerprintAlgorithm: 'sha-256' }],
+      ...this.statsMore.map((r, i): [string, Record<string, unknown>] => [`X${i}`, { id: `X${i}`, ...r }]),
     ]);
   }
   close() {
@@ -436,6 +454,7 @@ function record<T>(on: (cb: (p: T) => void) => unknown): T[] {
 afterEach(() => {
   vi.useRealTimers();
   allPcs.length = 0;
+  nextCandidates = null;
 });
 
 // ---- tests -------------------------------------------------------------------
@@ -1535,5 +1554,175 @@ describe('voice engine: ICE restart on a network change', () => {
     expect(h.pcs).toHaveLength(0);
     expect(core.sent).toEqual([]);
     engine.dispose();
+  });
+});
+
+// ---- G-81: diagnostics and stun-unreachable -----------------------------------------
+
+describe('voice engine: G-81 diagnostics', () => {
+  async function call(opts: Omit<VoiceEngineOptions, 'env'> = {}) {
+    vi.useFakeTimers();
+    const p = pair([A, B], opts);
+    const errors = record<VoiceError>((cb) => p.ex.on('error', cb));
+    const errorsY = record<VoiceError>((cb) => p.ey.on('error', cb));
+    await p.ex.attach(p.cx.state(), A);
+    await p.ey.attach(p.cy.state(), B);
+    await vi.advanceTimersByTimeAsync(50);
+    return { ...p, errors, errorsY };
+  }
+
+  /** Every string anywhere in a value: the diagnostics may only hold words from fixed sets. */
+  const strings = (v: unknown): string[] =>
+    typeof v === 'string' ? [v] : v && typeof v === 'object' ? Object.entries(v).flatMap(([k, x]) => [k, ...strings(x)]) : [];
+  const ALLOWED = new Set([
+    ...['host', 'srflx', 'prflx', 'relay', 'unknown'],
+    ...['new', 'checking', 'connecting', 'connected', 'completed', 'failed', 'disconnected', 'closed'],
+    ...['stun', 'stunAnswered', 'gatherWindowS', 'peers', 'state', 'ice', 'gathered', 'pair', 'local', 'remote', 'gatherMs', 'setupMs'],
+    A,
+    B,
+  ]);
+
+  it('counts my candidates by type, from candidate lines only', () => {
+    const sdp =
+      'v=0\r\na=candidate:1 1 udp 1 192.168.1.2 5 typ host\r\na=candidate:2 1 udp 1 abc.local 6 typ host generation 0\r\n' +
+      'a=candidate:3 1 udp 1 203.0.113.9 7 typ srflx raddr 0.0.0.0 rport 0\r\na=candidate:4 1 udp 1 198.51.100.1 8 typ relay raddr x rport 1\r\n' +
+      'a=x-note: typ srflx\r\na=candidate:5 1 udp 1 1.2.3.4 9 typ hostile\r\n';
+    expect(candidateCounts(sdp)).toEqual({ host: 2, srflx: 1, prflx: 0, relay: 1 });
+    expect(candidateCounts('')).toEqual({ host: 0, srflx: 0, prflx: 0, relay: 0 });
+  });
+
+  it('a connected call: STUN answered, the path, candidate counts and timings; no address anywhere', async () => {
+    const { hx, ex, ey, errors, errorsY } = await call();
+    hx.pcs[0]!.pairTypes = ['srflx', 'prflx'];
+    const d = await ex.diagnostics();
+    expect(d.stun).toBe(true);
+    expect(d.stunAnswered).toBe(true);
+    const peer = d.peers[B]!;
+    expect(peer.state).toBe('connected');
+    expect(peer.ice).toBe('connected');
+    expect(peer.pair).toEqual({ local: 'srflx', remote: 'prflx' });
+    expect(peer.gathered).toEqual({ host: 1, srflx: 1, prflx: 0, relay: 0 });
+    expect(peer.setupMs).toEqual(expect.any(Number));
+    expect(peer.gatherMs).toEqual(expect.any(Number));
+    for (const s of strings(d)) expect(ALLOWED.has(s), s).toBe(true);
+    expect(JSON.stringify(d)).not.toMatch(/192\.168|203\.0\.113|198\.51\.100|54321|61000/);
+    expect(errors).toEqual([]);
+    expect(errorsY).toEqual([]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('STUN configured but no srflx gathered: stun-unreachable once per call, and the panel says no answer', async () => {
+    nextCandidates = ['candidate:1 1 udp 2122260223 192.168.1.23 54321 typ host generation 0'];
+    const { hx, ex, ey, errors, errorsY } = await call();
+    expect(errors).toEqual([{ code: 'stun-unreachable' }]);
+    expect(errorsY).toEqual([{ code: 'stun-unreachable' }]);
+    expect((await ex.diagnostics()).stunAnswered).toBe(false);
+    // An ICE restart in the same call gathers again: no second report.
+    hx.changeNetwork();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(hx.pcs[0]!.restarts).toBe(1);
+    expect(errors).toEqual([{ code: 'stun-unreachable' }]);
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('without a STUN server, no srflx is expected: no report, and stun is false', async () => {
+    nextCandidates = ['candidate:1 1 udp 2122260223 192.168.1.23 54321 typ host generation 0'];
+    const { ex, ey, errors } = await call({ stunUrl: null });
+    expect(errors).toEqual([]);
+    const d = await ex.diagnostics();
+    expect(d.stun).toBe(false);
+    expect(d.stunAnswered).toBeNull();
+    ex.dispose();
+    ey.dispose();
+  });
+
+  it('outside a call: no peers', async () => {
+    const h = fakeEnv();
+    const engine = createVoiceEngine(new FakeCore(A, [A, B]), { env: h.env, stunUrl: 'stun:stun.example.test:3478' });
+    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, gatherWindowS: 3, peers: {} });
+    engine.dispose();
+  });
+
+  it('fuzz: whatever the candidate lines and stats hold, the diagnostics hold only fixed words and numbers', async () => {
+    let seed = 7;
+    const rnd = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2 ** 31), Math.floor((seed / 2 ** 31) * n));
+    const pick = <T,>(xs: T[]) => xs[rnd(xs.length)]!;
+    const addr = () =>
+      pick([
+        `${rnd(256)}.${rnd(256)}.${rnd(256)}.${rnd(256)}`,
+        `2001:db8::${rnd(9999).toString(16)}`,
+        `${rnd(1e6).toString(36)}.local`,
+        'relay.example.org',
+        '"><img src=x>',
+      ]);
+    for (let run = 0; run < 25; run++) {
+      nextCandidates = Array.from({ length: 1 + rnd(4) }, (_, i) =>
+        `candidate:${i} 1 ${pick(['udp', 'tcp'])} ${rnd(1e9)} ${addr()} ${rnd(65536)} typ ${pick(['host', 'srflx', 'relay', 'prflx', 'bogus', addr()])} raddr ${addr()} rport ${rnd(65536)}`,
+      );
+      const { hx, ex, ey } = await call();
+      const pc = hx.pcs[0]!;
+      pc.pairTypes = [pick(['host', 'srflx', addr()]), pick(['relay', addr(), 'prflx'])];
+      // SL D2: an address in every field a candidate stat can carry, and in stats of every other kind.
+      const hostile = Object.fromEntries(
+        ['address', 'ip', 'port', 'relatedAddress', 'relatedPort', 'url', 'foundation', 'usernameFragment', 'candidate', 'protocol', 'relayProtocol', 'networkType'].map((k) => [k, addr()]),
+      );
+      pc.statsExtra = hostile;
+      pc.statsMore = [
+        { type: 'local-candidate', candidateType: addr(), ...hostile },
+        { type: 'candidate-pair', state: addr(), nominated: true, localCandidateId: 'X0', remoteCandidateId: 'L', ...hostile },
+        { type: 'transport', iceState: addr(), selectedCandidatePairId: rnd(2) ? 'P' : 'X1', ...hostile },
+      ];
+      const d = await ex.diagnostics();
+      for (const s of strings(d)) expect(ALLOWED.has(s), s).toBe(true);
+      expect(JSON.stringify(d)).not.toMatch(/\d+\.\d+\.\d+\.\d+|[0-9a-f]{1,4}:[0-9a-f]{0,4}:|\.local|example|<img/i);
+      ex.dispose();
+      ey.dispose();
+      vi.useRealTimers();
+      allPcs.length = 0;
+    }
+  });
+
+  it('SL S1: relay-only never starts a call: no RTCPeerConnection, no microphone, offers ignored', async () => {
+    vi.useFakeTimers();
+    const h = fakeEnv();
+    const core = new FakeCore(B, [B, A]);
+    const engine = createVoiceEngine(core, { env: h.env, stunUrl: 'stun:stun.example.test:3478', relayOnly: true });
+    const errors = record<VoiceError>((cb) => engine.on('error', cb));
+    await engine.attach(core.state(), B);
+    core.emitSignal({ from: A, kind: 'offer', payload: `v=0\r\na=fingerprint:sha-256 ${newFingerprint()}\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n`, fingerprintVerified: true });
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.pcs).toHaveLength(0);
+    expect(h.mics).toHaveLength(0);
+    expect(core.sent).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(await engine.diagnostics()).toEqual({ stun: true, stunAnswered: null, gatherWindowS: 3, peers: {} });
+    engine.dispose();
+  });
+});
+
+describe('SL S3: ICE servers only from a plain stun:host:port', () => {
+  it('accepts one host (name, IPv4 or [IPv6]) with an optional port', () => {
+    for (const ok of ['stun:stun.example.test:3478', 'stuns:stun.example.test:5349', 'STUN:stun.example.test', 'stun:198.51.100.7:3478', 'stun:[2001:db8::7]:3478'])
+      expect(iceServersFor(ok), ok).toEqual([{ urls: ok }]);
+  });
+  it('refuses TURN, credentials, ?transport, paths, lists and bad ports', () => {
+    for (const bad of [
+      'turn:turn.example.test:3478',
+      'turns:turn.example.test:5349',
+      'stun:stun.example.test:3478?transport=udp',
+      'stun:user:pass@stun.example.test:3478',
+      'stun:user@stun.example.test',
+      'stun:stun.example.test/path',
+      'stun:a.example.test:3478,stun:b.example.test:3478',
+      'stun:a.example.test:3478 stun:b.example.test:3478',
+      'stun:stun.example.test:0',
+      'stun:stun.example.test:65536',
+      'stun:stun.example.test:3478:1',
+      'stun:',
+      'stun:' + 'a'.repeat(260),
+    ])
+      expect(iceServersFor(bad), bad).toEqual([]);
   });
 });

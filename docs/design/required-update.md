@@ -22,7 +22,11 @@
   - `getAppInfo` gains `updateRequired: { version: string | null } | null`, where `version` is the newer version on offer, if any;
   - a new event `update.required { version }` fires when it turns on.
 - **While required:** the core downloads the newest version at once (it doesn't wait for the 6-hour timer), and `checkForUpdate` keeps working.
-- **No other core command is refused** by the core itself: main is the gate (below), as for the app lock. The network side is unchanged.
+- **RU1 (SL condition): the core signs nothing on its own while required.** Main's gate only stops the page, but an outdated core would still re-key and sign in background sync, which is the very risk behind B7-k. So while `updateRequired` is set, the core:
+  - makes **no automatic signed action**: no re-key or key rotation, no secret rotation, no profile or cap posts, no restore re-joins, no leave sends, no relay serving;
+  - stays **offline for sync**: no dialling, gossip or relaying. **Update checks and downloads are its only network traffic;**
+  - still answers the page's read-only commands from local data.
+  - **Test:** a required core that receives a join, or a member change that would trigger a rotation, signs and sends nothing.
 
 ### Desktop (voice-shell)
 
@@ -33,7 +37,9 @@
   4. **The core stops sync** while required (no dial, no gossip, no relay), so the network side matches the gate. Asking for a manifest is the only outbound traffic.
   5. Notifications, the badge, push-to-talk and links are held.
   6. It holds for the rest of the process. A reload can't leave it; only a restart into a non-revoked version clears it.
-- **During a call:** the block waits for the call to end (as G-78 path B waits). Until then, the call bar shows a one-line notice ("An update is required. It will install when the call ends."). Leaving the call, or the call ending, reloads into the screen.
+- **During a call:** the gate waits for the call to end (as G-78 path B waits), **for at most 30 minutes** (SL). After that, the call ends and the gate applies.
+  - Until then, the call bar shows a one-line notice: "An update is required. It applies when the call ends." After 25 minutes it changes to "…in 5 minutes."
+  - The core's RU1 rules apply **at once**, even during the call. Only the call's own media keeps flowing until it ends.
 - **The app lock comes first:** a locked app shows the lock screen; after unlock, the required screen.
 - **Never bypassable:** the page can't send anything but the four commands, and has no route out of the screen. The window can still close, which quits the app. There's no "later" and no dismiss.
 

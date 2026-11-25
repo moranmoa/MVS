@@ -21,6 +21,7 @@ use crate::backup;
 use crate::devicelink::{self, OneTimeKey, Target};
 use crate::chat;
 use crate::reaction;
+use crate::report::{self, Reason, Report};
 use crate::db::Db;
 use crate::model::{self, GenesisBody, Log, ServerView};
 use crate::ports::{CipherError, DeviceLinkAddr, DeviceLinkError, DeviceLinkInbound, GroupCipher, Network, Ports, Reach, SharedSecrets};
@@ -382,6 +383,8 @@ struct Inner {
     /// this version, for the rest of the process. Inside, the newer version
     /// on offer. While set, the core signs nothing and syncs nothing.
     update_required: Option<Option<String>>,
+    /// G-48: delivers report boxes (sync); `None` without a network.
+    report_net: Option<Arc<dyn crate::report::ReportNet>>,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -631,6 +634,7 @@ impl Core {
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
             update_required: None,
+            report_net: None,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
             adult_keys_warned: HashSet::new(),
@@ -2859,6 +2863,11 @@ impl Core {
                     });
                 }
             }
+            // G-48 (A3, the Tech Lead's #515 review): a leave, kick or
+            // demotion read this round drops the reports I held as staff and
+            // my outbox rows there, with or without a network. Never fails
+            // the round; the next one retries.
+            let _ = inner.prune_reports(ports.clock.now_ms());
             // Messages held for their key: sent now if it came.
             inner.send_key_pending(ports, events)
         })
@@ -6242,6 +6251,543 @@ mod device_notice_tests {
         let stored = super::device_notices(&db).unwrap();
         assert_eq!(stored.len(), 32);
         assert_eq!((stored[0], stored[31]), (8, 39), "the newest are kept");
+    }
+}
+
+// ---- G-48: report to the owners --------------------------------------------
+//
+// Design `docs/design/report-to-owners.md` (Tech Lead's Amendment 1, the
+// security lead's R1–R7, the Product Owner's decisions). Everything on disk
+// is a sealed box: my outbox holds boxes sealed to each recipient, and my
+// inbox holds the boxes sealed to me, opened only when listed. None of it is
+// in the account backup or the logs.
+
+/// My reports waiting for each recipient's ack.
+const KV_REPORT_OUTBOX: &str = "report-outbox";
+/// Reports sealed to me, as staff.
+const KV_REPORT_INBOX: &str = "report-inbox";
+/// Report IDs I received, with their reporter, for dedup and the receiver's
+/// per-reporter cap; kept 31 days.
+const KV_REPORT_SEEN: &str = "report-seen";
+/// Reports I made, for my own caps; kept 30 days.
+const KV_REPORT_SENT: &str = "report-sent";
+/// The reporter's caps per server (before signing).
+const REPORTS_PER_HOUR: usize = 5;
+const REPORTS_PER_DAY: usize = 20;
+/// The receiver's cap per reporter.
+const RECEIVED_PER_REPORTER_HOUR: usize = 10;
+/// Stored reports per server; the oldest dismissed go first, then the oldest.
+const MAX_STORED_REPORTS: usize = 1000;
+/// Received report IDs remembered for dedup, at most (oldest out).
+const MAX_SEEN_REPORTS: usize = 4096;
+const HOUR_MS: u64 = 60 * 60 * 1000;
+const DAY_MS: u64 = 24 * HOUR_MS;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct OutRow {
+    server: String,
+    id: String,
+    to: String,
+    reported: String,
+    at: u64,
+    sealed: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct InRow {
+    server: String,
+    sealed: String,
+    at: u64,
+    dismissed: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SeenRow {
+    id: String,
+    reporter: String,
+    at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SentRow {
+    server: String,
+    target: String,
+    at: u64,
+}
+
+impl Core {
+    /// G-48: the network that carries report boxes.
+    pub fn set_report_net(&self, net: Arc<dyn crate::report::ReportNet>) {
+        self.lock().report_net = Some(net);
+    }
+
+    /// G-48 `reportContent(serverId, target, reason, text?)`: signs a report
+    /// and seals it for the server's owner and admins, minus the reported
+    /// member (for a message, its author) and me. The outbox delivers it.
+    /// Errors, with nothing signed: `bad-request` (reason or text),
+    /// `not-found` (no such message or member here), `not-allowed`
+    /// (myself, or I'm not a member), `rate-limited` (5 an hour, 20 a day
+    /// per server), `already-reported` (the same target within 30 days),
+    /// `no-recipient`.
+    pub fn report_content(
+        &self,
+        server_id: &str,
+        target: &ReportTargetInput,
+        reason: &str,
+        text: Option<&str>,
+    ) -> CoreResult<ReportReceipt> {
+        let reason = Reason::from_name(reason).ok_or(ErrorCode::BadRequest)?;
+        let text = text.unwrap_or("").trim().to_owned();
+        if !report::text_ok(&text) {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            let (me_key, signing) = (me.key(), me.identity.signing_key().clone());
+            {
+                let view = inner.view(server)?;
+                if !view.state.is_member(me_key) || view.is_kicked(&me_key) || view.state.closed.is_some() {
+                    return Err(ErrorCode::NotAllowed.into());
+                }
+            }
+            let (target, reported, evidence) = match target {
+                ReportTargetInput::Message { message_id } => {
+                    let (found, channel, id, record) = inner.find_message(message_id)?;
+                    // Only a full record is evidence, in a channel I can see.
+                    let record = record.ok_or(ErrorCode::NotFound)?;
+                    if found != server || !inner.visible(server)?.contains(&channel) {
+                        return Err(ErrorCode::NotFound.into());
+                    }
+                    (report::Target::Message { channel, record: id }, record.author(), record.encode())
+                }
+                ReportTargetInput::Member { user_id } => {
+                    let member = parse_user(user_id)?;
+                    let view = inner.view(server)?;
+                    if !view.state.is_member(member) && !view.state.removed.contains_key(&member) {
+                        return Err(ErrorCode::NotFound.into());
+                    }
+                    (report::Target::Member(member), member, Vec::new())
+                }
+            };
+            if reported == me_key {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            let now = ports.clock.now_ms();
+            let target_hex = report_target_hex(&target);
+            let mut sent: Vec<SentRow> = inner.kv_json(KV_REPORT_SENT)?.unwrap_or_default();
+            sent.retain(|r| now.saturating_sub(r.at) < report::MAX_AGE_MS);
+            let server_hex = model::hex_id(server.as_bytes());
+            let mine: Vec<&SentRow> = sent.iter().filter(|r| r.server == server_hex).collect();
+            if mine.iter().any(|r| r.target == target_hex) {
+                return Err(ErrorCode::AlreadyReported.into());
+            }
+            let within = |ms: u64| mine.iter().filter(|r| now.saturating_sub(r.at) < ms).count();
+            if within(HOUR_MS) >= REPORTS_PER_HOUR || within(DAY_MS) >= REPORTS_PER_DAY {
+                return Err(ErrorCode::RateLimited.into());
+            }
+            let recipients: Vec<PublicKey> = inner
+                .report_staff(server)?
+                .into_iter()
+                .filter(|k| *k != reported && *k != me_key)
+                .collect();
+            if recipients.is_empty() {
+                return Err(ErrorCode::NoRecipient.into());
+            }
+            let mut nonce = [0u8; 16];
+            OsRng.fill_bytes(&mut nonce);
+            let draft = Report { server, reporter: me_key, target, reason, ts: now, nonce, text: text.clone(), evidence };
+            let signed = draft.sign(&signing).ok_or(ErrorCode::BadRequest)?;
+            let id = model::hex_id(&draft.id());
+            let mut outbox: Vec<OutRow> = inner.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
+            for to in &recipients {
+                let sealed = groupkeys::seal_box(server, to, &signed, &mut OsRng)
+                    .map_err(|_| ErrorCode::Internal)?;
+                outbox.push(OutRow {
+                    server: server_hex.clone(),
+                    id: id.clone(),
+                    to: model::hex_id(to.as_bytes()),
+                    reported: model::hex_id(reported.as_bytes()),
+                    at: now,
+                    sealed: hex::encode(sealed),
+                });
+            }
+            inner.set_kv_json(KV_REPORT_OUTBOX, &outbox)?;
+            sent.push(SentRow { server: server_hex, target: target_hex, at: now });
+            inner.set_kv_json(KV_REPORT_SENT, &sent)?;
+            let count = recipients.len() as u32;
+            events.push(Event::ReportStatus { report_id: id.clone(), delivered: 0, pending: count });
+            Ok(ReportReceipt { report_id: id, recipients: count })
+        })
+    }
+
+    /// G-48: delivers my outbox. Each row's recipient is resolved again
+    /// first (R1): a row whose recipient is no longer the owner or an admin,
+    /// is the reported member, or whose server I left is dropped, and so
+    /// are rows older than 30 days. Delivery runs without the lock.
+    pub fn report_tick(&self) {
+        // RU1: the network is quiet while a required update is pending; the
+        // rows stay and go out once the newer version runs.
+        if self.lock().update_required.is_some() {
+            return;
+        }
+        let Ok((net, due)) = self.run(|inner, ports, _| {
+            inner.prune_reports(ports.clock.now_ms())?;
+            let outbox: Vec<OutRow> = inner.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
+            Ok((inner.report_net.clone(), outbox))
+        }) else {
+            return;
+        };
+        let Some(net) = net else { return };
+        let mut acked: Vec<(String, String)> = Vec::new();
+        for row in &due {
+            let (Some(to), Ok(sealed)) = (model::parse_hex32(&row.to), hex::decode(&row.sealed)) else {
+                continue;
+            };
+            if net.deliver(PublicKey::from_bytes(to), sealed) {
+                acked.push((row.id.clone(), row.to.clone()));
+            }
+        }
+        if acked.is_empty() {
+            return;
+        }
+        let _ = self.run(|inner, _, events| {
+            let mut outbox: Vec<OutRow> = inner.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
+            outbox.retain(|r| !acked.contains(&(r.id.clone(), r.to.clone())));
+            inner.set_kv_json(KV_REPORT_OUTBOX, &outbox)?;
+            let mut ids: Vec<&String> = acked.iter().map(|(id, _)| id).collect();
+            ids.sort();
+            ids.dedup();
+            for id in ids {
+                let delivered = acked.iter().filter(|(a, _)| a == id).count() as u32;
+                let pending = outbox.iter().filter(|r| &r.id == id).count() as u32;
+                events.push(Event::ReportStatus { report_id: id.clone(), delivered, pending });
+            }
+            Ok(())
+        });
+    }
+
+    /// G-48: a box sync acked (R7: the same answer for every box, before
+    /// this runs). Kept only if it opens for me in one of my servers, the
+    /// report verifies and was signed by the identity sync bound the peer
+    /// to, its time is within 30 days back and 10 minutes ahead, I am the
+    /// owner or an admin there, the reporter is a current member, a member
+    /// target is a current or removed member, it is new, and the reporter
+    /// is under 10 an hour. Anything else is dropped quietly.
+    pub fn report_received(&self, from: Option<PublicKey>, sealed: &[u8]) {
+        let _ = self.run(|inner, ports, events| {
+            let now = ports.clock.now_ms();
+            let Some((server, opened)) = inner.open_report(sealed)? else { return Ok(()) };
+            // Its log may not be loaded yet (right after start).
+            inner.load(server)?;
+            let me = inner.me.as_ref().map(Me::key);
+            let fresh = opened.ts <= now.saturating_add(report::MAX_AHEAD_MS)
+                && now.saturating_sub(opened.ts) <= report::MAX_AGE_MS;
+            if from != Some(opened.reporter) || me == Some(opened.reporter) || !fresh {
+                return Ok(());
+            }
+            // Never a report about me, sealed to me by a modified client.
+            let about_me = match opened.target {
+                report::Target::Member(m) => Some(m) == me,
+                report::Target::Message { .. } => {
+                    report::check_evidence(&opened).is_some_and(|r| Some(r.author()) == me)
+                }
+            };
+            if about_me {
+                return Ok(());
+            }
+            {
+                let view = inner.view(server)?;
+                let reporter_in =
+                    view.state.is_member(opened.reporter) && !view.is_kicked(&opened.reporter);
+                let target_ok = match opened.target {
+                    report::Target::Member(m) => {
+                        view.state.is_member(m) || view.state.removed.contains_key(&m)
+                    }
+                    report::Target::Message { .. } => true,
+                };
+                if !reporter_in || !target_ok {
+                    return Ok(());
+                }
+            }
+            if !inner.report_staff(server)?.iter().any(|k| Some(*k) == me) {
+                return Ok(());
+            }
+            let id = model::hex_id(&opened.id());
+            let reporter = model::hex_id(opened.reporter.as_bytes());
+            let mut seen: Vec<SeenRow> = inner.kv_json(KV_REPORT_SEEN)?.unwrap_or_default();
+            seen.retain(|r| now.saturating_sub(r.at) < report::MAX_AGE_MS + DAY_MS);
+            // Bounded by count too (oldest out): beyond it, a replay of the
+            // oldest is still refused by the 30-day `ts` window only.
+            if seen.len() >= MAX_SEEN_REPORTS {
+                seen.drain(..=seen.len() - MAX_SEEN_REPORTS);
+            }
+            let recent = seen
+                .iter()
+                .filter(|r| r.reporter == reporter && now.saturating_sub(r.at) < HOUR_MS)
+                .count();
+            if seen.iter().any(|r| r.id == id) || recent >= RECEIVED_PER_REPORTER_HOUR {
+                return Ok(());
+            }
+            seen.push(SeenRow { id, reporter, at: now });
+            inner.set_kv_json(KV_REPORT_SEEN, &seen)?;
+            let server_hex = model::hex_id(server.as_bytes());
+            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            inbox.push(InRow {
+                server: server_hex.clone(),
+                sealed: hex::encode(sealed),
+                at: now,
+                dismissed: false,
+            });
+            if inbox.iter().filter(|r| r.server == server_hex).count() > MAX_STORED_REPORTS {
+                // The oldest dismissed one here, else the oldest.
+                let pick = inbox
+                    .iter()
+                    .position(|r| r.server == server_hex && r.dismissed)
+                    .or_else(|| inbox.iter().position(|r| r.server == server_hex));
+                if let Some(i) = pick {
+                    inbox.remove(i);
+                }
+            }
+            inner.set_kv_json(KV_REPORT_INBOX, &inbox)?;
+            let summary = inner.report_summary(server, &opened, now, false)?;
+            events.push(Event::ReportReceived { server_id: server_hex, report: summary });
+            Ok(())
+        });
+    }
+
+    /// G-48 `listReports(serverId)`: the reports staff got here, newest
+    /// first, never with evidence. `not-allowed` unless I am the owner or
+    /// an admin now; losing that role deletes them (A3).
+    pub fn list_reports(&self, server_id: &str) -> CoreResult<Vec<ReportSummary>> {
+        let server = parse_server(server_id)?;
+        self.run(|inner, ports, _| {
+            inner.load_mine(server)?;
+            inner.prune_reports(ports.clock.now_ms())?;
+            inner.staff_check(server)?;
+            let server_hex = model::hex_id(server.as_bytes());
+            let inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut out = Vec::new();
+            for row in inbox.iter().rev().filter(|r| r.server == server_hex) {
+                let Ok(sealed) = hex::decode(&row.sealed) else { continue };
+                let Some((_, opened)) = inner.open_report(&sealed)? else { continue };
+                out.push(inner.report_summary(server, &opened, row.at, row.dismissed)?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// G-48 `dismissReport(reportId)`: my own triage, on this device only.
+    pub fn dismiss_report(&self, report_id: &str) -> CoreResult<()> {
+        self.run(|inner, _, _| {
+            let (index, server, _) = inner.find_report(report_id)?;
+            inner.staff_check(server)?;
+            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            inbox[index].dismissed = true;
+            inner.set_kv_json(KV_REPORT_INBOX, &inbox)
+        })
+    }
+
+    /// G-48 `getReportEvidence(reportId)`: the reported message, on an
+    /// explicit click only. `not-allowed` unless I am staff there, and, for
+    /// the reasons `sexual` and `minor`, unless I have an 18+ claim there
+    /// (Product Owner). `bad-request` when the evidence isn't that message
+    /// (R4). Its text is plain text for the UI to show as such.
+    pub fn get_report_evidence(&self, report_id: &str) -> CoreResult<ReportEvidence> {
+        self.run(|inner, ports, _| {
+            let (_, server, opened) = inner.find_report(report_id)?;
+            inner.staff_check(server)?;
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+            if opened.reason.sensitive() && !inner.view(server)?.state.adults.contains(&me) {
+                return Err(ErrorCode::NotAllowed.into());
+            }
+            let record = inner.report_evidence(server, &opened)?.ok_or(ErrorCode::BadRequest)?;
+            let report::Target::Message { channel, .. } = opened.target else {
+                return Err(ErrorCode::NotFound.into());
+            };
+            let text = chat::try_open(&*ports.cipher, server, channel, record.author(), record.body()).ok();
+            Ok(ReportEvidence {
+                author_id: model::hex_id(record.author().as_bytes()),
+                channel_id: model::hex_id(channel.as_bytes()),
+                ts: record.ts(),
+                text,
+            })
+        })
+    }
+}
+
+fn report_target_hex(target: &report::Target) -> String {
+    match target {
+        report::Target::Message { record, .. } => model::hex_id(record.as_bytes()),
+        report::Target::Member(member) => model::hex_id(member.as_bytes()),
+    }
+}
+
+impl Inner {
+    /// A report store's rows. Unreadable bytes are never overwritten: they
+    /// are kept aside under `<key>.unreadable` (the latest only), logged
+    /// without content, and the store starts empty.
+    fn kv_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> CoreResult<Option<T>> {
+        let Some(bytes) = self.db.get(key)? else { return Ok(None) };
+        match serde_json::from_slice(&bytes) {
+            Ok(rows) => Ok(Some(rows)),
+            Err(_) => {
+                tracing::warn!(store = key, len = bytes.len(), "unreadable report store kept aside");
+                self.db.set(&format!("{key}.unreadable"), &bytes)?;
+                self.db.delete(key)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// R4 and the Tech Lead's #515 review: the evidence of a message report,
+    /// if it is that very message (`report::check_evidence`) in a channel
+    /// that exists in `server`.
+    fn report_evidence(&self, server: ServerId, opened: &Report) -> CoreResult<Option<Record>> {
+        let Some(record) = report::check_evidence(opened) else { return Ok(None) };
+        let report::Target::Message { channel, .. } = opened.target else { return Ok(None) };
+        Ok(self.known(server)?.contains(&channel).then_some(record))
+    }
+
+    fn set_kv_json<T: Serialize>(&self, key: &str, value: &T) -> CoreResult<()> {
+        self.db.set(key, &serde_json::to_vec(value).expect("plain rows"))
+    }
+
+    /// The owner and the admins of `server`, current members, not kicked.
+    fn report_staff(&mut self, server: ServerId) -> CoreResult<Vec<PublicKey>> {
+        self.load(server)?;
+        let view = self.view(server)?;
+        let state = &view.state;
+        Ok(state
+            .members
+            .iter()
+            .copied()
+            .filter(|m| !state.kicked.contains(m) && state.role(*m) >= authority::Role::Admin)
+            .collect())
+    }
+
+    /// `not-allowed` unless I am the owner or an admin of `server` now.
+    fn staff_check(&mut self, server: ServerId) -> CoreResult<()> {
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        if !self.report_staff(server)?.contains(&me) {
+            return Err(ErrorCode::NotAllowed.into());
+        }
+        Ok(())
+    }
+
+    /// Opens a box sealed to me in one of my servers and verifies the report
+    /// in it; `None` if it is anything else. Every server is tried, so the
+    /// work doesn't depend on which one it is for (R7).
+    fn open_report(&mut self, sealed: &[u8]) -> CoreResult<Option<(ServerId, Report)>> {
+        let Some(me) = self.me.as_ref() else { return Ok(None) };
+        let secret = MemberSecret::new(me.identity.signing_key());
+        let mut found = None;
+        for server in self.db.servers()? {
+            if let Ok(signed) = secret.open_box(server, sealed) {
+                found = Report::verify(&signed).filter(|r| r.server == server).map(|r| (server, r));
+            }
+        }
+        Ok(found)
+    }
+
+    /// My stored report `report_id`: its inbox index, server and contents.
+    fn find_report(&mut self, report_id: &str) -> CoreResult<(usize, ServerId, Report)> {
+        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+        for (index, row) in inbox.iter().enumerate() {
+            let Ok(sealed) = hex::decode(&row.sealed) else { continue };
+            if let Some((server, opened)) = self.open_report(&sealed)? {
+                if model::hex_id(&opened.id()) == report_id {
+                    return Ok((index, server, opened));
+                }
+            }
+        }
+        Err(ErrorCode::NotFound.into())
+    }
+
+    fn report_summary(
+        &mut self,
+        server: ServerId,
+        opened: &Report,
+        received_at: u64,
+        dismissed: bool,
+    ) -> CoreResult<ReportSummary> {
+        let evidence = self.report_evidence(server, opened)?;
+        let (target, reported) = match opened.target {
+            report::Target::Message { channel, record } => (
+                ReportTarget::Message {
+                    message_id: model::hex_id(record.as_bytes()),
+                    channel_id: model::hex_id(channel.as_bytes()),
+                },
+                evidence.as_ref().map(|r| r.author()),
+            ),
+            report::Target::Member(member) => {
+                (ReportTarget::Member { user_id: model::hex_id(member.as_bytes()) }, Some(member))
+            }
+        };
+        let me = self.me.as_ref().map(Me::key);
+        let adult = match me {
+            Some(me) => self.view(server)?.state.adults.contains(&me),
+            None => false,
+        };
+        Ok(ReportSummary {
+            id: model::hex_id(&opened.id()),
+            server_id: model::hex_id(server.as_bytes()),
+            reporter_id: model::hex_id(opened.reporter.as_bytes()),
+            target,
+            reported_id: reported.map(|k| model::hex_id(k.as_bytes())).unwrap_or_default(),
+            reason: opened.reason.name().to_owned(),
+            text: (!opened.text.is_empty()).then(|| opened.text.clone()),
+            ts: opened.ts,
+            received_at,
+            dismissed,
+            evidence_valid: evidence.is_some(),
+            evidence_withheld: opened.reason.sensitive() && !adult,
+        })
+    }
+
+    /// A3, A2, R1: drops what I may no longer hold. My stored reports of a
+    /// server where I'm not the owner or an admin now (or that I left); my
+    /// outbox rows for a server I left, older than 30 days, or whose
+    /// recipient is no longer staff or is the reported member.
+    fn prune_reports(&mut self, now: u64) -> CoreResult<()> {
+        let me = self.me.as_ref().map(Me::key);
+        let mut staff: HashMap<String, Vec<String>> = HashMap::new();
+        let mut member_of: HashSet<String> = HashSet::new();
+        for server in self.db.servers()? {
+            let list = self.report_staff(server)?;
+            let hex = model::hex_id(server.as_bytes());
+            let view = self.view(server)?;
+            if me.is_some_and(|me| view.state.is_member(me) && !view.is_kicked(&me)) {
+                member_of.insert(hex.clone());
+            }
+            staff.insert(hex, list.iter().map(|k| model::hex_id(k.as_bytes())).collect());
+        }
+        let me_hex = me.map(|k| model::hex_id(k.as_bytes())).unwrap_or_default();
+        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+        let kept: Vec<InRow> = inbox
+            .iter()
+            .filter(|r| staff.get(&r.server).is_some_and(|s| s.contains(&me_hex)))
+            .cloned()
+            .collect();
+        if kept.len() != inbox.len() {
+            self.set_kv_json(KV_REPORT_INBOX, &kept)?;
+        }
+        let outbox: Vec<OutRow> = self.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
+        let kept: Vec<OutRow> = outbox
+            .iter()
+            .filter(|r| {
+                member_of.contains(&r.server)
+                    && now.saturating_sub(r.at) < report::MAX_AGE_MS
+                    && r.to != r.reported
+                    && staff.get(&r.server).is_some_and(|s| s.contains(&r.to))
+            })
+            .cloned()
+            .collect();
+        if kept.len() != outbox.len() {
+            self.set_kv_json(KV_REPORT_OUTBOX, &kept)?;
+        }
+        Ok(())
     }
 }
 

@@ -902,6 +902,26 @@ fn admin_cache() -> &'static std::sync::Mutex<HashMap<RecordId, bool>> {
 mod tests {
     use super::*;
 
+    /// The profile post's size budget (manager, 0.6.0): a 32-emoji name, the
+    /// largest picture, a colour and every cap fit one `Post` with at least
+    /// 256 bytes to spare for the caps of later releases (`lv:N`).
+    #[test]
+    fn a_full_profile_leaves_headroom_in_one_post() {
+        let picture = format!(
+            "data:image/webp;base64,{}",
+            "A".repeat(crate::avatar::AVATAR_SMALL_MAX.div_ceil(3) * 4)
+        );
+        let name = "🙂".repeat(32);
+        let Action::Post { text } = profile_action_with(&name, Some(&picture), Some("#ffffff")) else {
+            unreachable!("a profile is a post")
+        };
+        for cap in CAPS {
+            assert!(text.contains(cap), "every cap is posted");
+        }
+        let room = records::Kind::Post.max_body() - text.len();
+        assert!(room >= 256, "only {room} bytes left for later caps");
+    }
+
     /// G-24: `<@64 lower-case hex>` tokens, in order, each once; anything
     /// else (short, upper-case, unclosed, a name) isn't a mention.
     #[test]

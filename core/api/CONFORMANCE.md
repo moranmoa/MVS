@@ -314,6 +314,10 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - The app then starts at "create or restore". No new event: the UI goes back to onboarding on `ok` (pending requests fail with `core-restarted`).
 
 - `updateProfile` with a new display name (trimmed) posts a new profile post to every server I'm still a member of (not kicked, not left, not closed); the latest one wins for everyone. The same name, or a new bio or avatar only, posts nothing: bio and avatar stay on this device, since the profile post carries the name (and caps) only. A server that refuses the post is skipped; the call still succeeds. Errors as before: `bad-request` for a bad name, bio or avatar, `not-found` with no identity.
+  - **`profile-too-large`** (new code): the name, small picture and colour together don't fit one profile post (4 KiB with the caps).
+    - This happens only with a long name of 4-byte characters (emoji) beside a picture near the 2,560-byte cap. For example, 128 emoji and the largest picture are refused.
+    - Nothing is saved or posted, and the old profile stays. The UI says to shorten the name or use a smaller picture.
+    - The budget: a 32-emoji name, the largest picture, a colour and every cap leave at least 256 bytes for later releases' caps (`lv:N`). A test guards this.
 
 - Age claims and the 30-day rule (decision 18, B13 §3, B7 §9). Each claim is decided from my latest accepted claim in that server:
   - A birth date that raises me from "not adult" to adult posts nothing. It sets `Identity.pendingBirthDate: { date, effectiveAt }` (`effectiveAt` = when found + 30 days). Until then I count as under 18: the core refuses 18+ joins (`age-blocked`), and servers keep my earlier claim.

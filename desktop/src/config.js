@@ -190,6 +190,70 @@ function stunFor({ packaged, resourcesPath, env = process.env, warn = (m) => con
   return value.trim();
 }
 
+/** Longest abuse-report address passed on. */
+const MAX_ABUSE = 200;
+
+/**
+ * G-48 (B24): a plain abuse-report address: printable ASCII with no
+ * spaces, quotes, angle brackets, backslash or backquote, at most 200
+ * characters, and either an e-mail address or an
+ * https:// URL, each with a dotted host. No credentials in the URL.
+ */
+function validAbuseAddress(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_ABUSE) return false;
+  if (!/^[\x21-\x7e]+$/.test(value) || /[<>"'\\`]/.test(value)) return false;
+  if (/^[^@/:]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(value)) return true;
+  return /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)+(:\d{1,5})?(\/[^@]*)?$/i.test(value);
+}
+
+/**
+ * G-48 (B24): where to report abuse to the MVS team, for the page
+ * (main adds it to the getAppInfo answer; the core has no part in it): `abuseAddress` in
+ * mvs-config.json (written at build time from MVS_ABUSE_ADDRESS, #534), or
+ * MVS_ABUSE_ADDRESS in a checkout. Re-checked here rather than trusted (TL on
+ * #534). Null when there is none; a malformed one is ignored with a warning
+ * that never names it. Shown as text only: the shell never opens it.
+ * @param {{ packaged: boolean, resourcesPath?: string, env?: object, warn?: (m: string) => void }} o
+ * @returns {string | null}
+ */
+function abuseAddressFor({ packaged, resourcesPath, env = process.env, warn = (m) => console.warn(m) }) {
+  let value;
+  if (packaged) {
+    const file = path.join(resourcesPath, 'mvs-config.json');
+    if (!fs.existsSync(file)) return null;
+    try {
+      value = JSON.parse(fs.readFileSync(file, 'utf8')).abuseAddress;
+    } catch {
+      return null; // relayFor already warned
+    }
+  } else {
+    value = env.MVS_ABUSE_ADDRESS;
+  }
+  if (value === undefined || value === null || value === '') return null;
+  if (!validAbuseAddress(value)) {
+    warn('ignoring a malformed abuse-report address');
+    return null;
+  }
+  return value;
+}
+
+/**
+ * G-48: the core's getAppInfo answer for the page, with the build's abuse
+ * address added (like stunUrl on core.status). Errors and odd answers pass
+ * through untouched; no address, no field.
+ */
+function withAbuseAddress(res, address) {
+  if (!address || !res || typeof res !== 'object' || !res.ok || typeof res.ok !== 'object' || Array.isArray(res.ok)) return res;
+  return { ...res, ok: { ...res.ok, abuseAddress: address } };
+}
+
+/** The domain of an abuse-report address (for the file log to hide), or null. */
+function abuseHost(value) {
+  if (typeof value !== 'string') return null;
+  const m = /@([^@]+)$/.exec(value) || /^https:\/\/([^/:]+)/i.exec(value);
+  return m ? m[1] : null;
+}
+
 /** The host of a STUN URL (for the file log to hide), or null. */
 function stunHost(url) {
   const m = typeof url === 'string' && /^stuns?:(?:\[([^\]]+)\]|([^:]+))/i.exec(url);
@@ -206,4 +270,22 @@ function logHost(addr) {
   return m ? m[1] : null;
 }
 
-module.exports = { MAX_RELAY, MAX_RELAYS, MAX_BOOTSTRAP, MAX_STUN, validRelay, relayFor, relaysFor, bootstrapFor, logHost, validStun, stunFor, stunHost };
+module.exports = {
+  MAX_RELAY,
+  MAX_RELAYS,
+  MAX_BOOTSTRAP,
+  MAX_STUN,
+  MAX_ABUSE,
+  validRelay,
+  relayFor,
+  relaysFor,
+  bootstrapFor,
+  logHost,
+  validStun,
+  stunFor,
+  stunHost,
+  validAbuseAddress,
+  abuseAddressFor,
+  abuseHost,
+  withAbuseAddress,
+};

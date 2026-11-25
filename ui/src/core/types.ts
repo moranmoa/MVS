@@ -74,6 +74,12 @@ export interface Channel {
   adult: boolean;
   /** The server's first channel (#general): it can be renamed but not deleted. */
   isDefault: boolean;
+  /**
+   * G-14: one line of plain text (at most 256 code points), set by the owner or
+   * an admin; absent when there is none. Visible to every member of the server
+   * (plaintext in the control log), even when an 18+ channel isn't listed to me.
+   */
+  topic?: string;
   unread: boolean;
   mentions: number;
   /**
@@ -200,6 +206,13 @@ export interface Message {
   replyTo?: { id: Id; index: number; authorId: Id; excerpt: string };
   /** Only set on messages written on this device. */
   sendState?: SendState;
+  /**
+   * TODO #21 / core #527: a message here that can't be opened. 'no-key': its
+   * channel key isn't on this computer (it may open later, as message.updated);
+   * 'untrusted': the sender can't be verified (no author). The body is empty,
+   * and it takes no reactions, replies, edits or deletes.
+   */
+  unreadable?: 'no-key' | 'untrusted';
   mentionsMe?: boolean;
   /**
    * G-24 (#330): the users this message mentions who are members now, as

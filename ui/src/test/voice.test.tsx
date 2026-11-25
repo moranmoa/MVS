@@ -16,6 +16,8 @@ import { cleanCall, cleanVoiceRoom, cleanVoiceRooms, guardCore } from '../core/s
 const fakeEngine = vi.hoisted(() => ({
   peerFailed: {} as Record<string, 'failed' | 'refused'>,
   stunUrls: [] as unknown[],
+  /** The engine options (G-81 B: relayOnly and p2p). */
+  options: [] as { relayOnly?: boolean; p2p?: boolean }[],
   picked: [] as string[],
   level: 0.42,
   /** G-82: everyone the fake engine hears as speaking. */
@@ -26,13 +28,14 @@ const fakeEngine = vi.hoisted(() => ({
 }));
 vi.mock('../voice', () => ({
   // A hook: deafen is React state, as in the real one, so the call bar re-renders.
-  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null }) => {
+  useVoiceEngine: (_call: unknown, _me: unknown, options?: { stunUrl?: string | null; relayOnly?: boolean; p2p?: boolean }) => {
     const [deafened, setDeafened] = useState(false);
     const [selfMonitor, setSelfMonitor] = useState(false);
     fakeEngine.selfMonitor = selfMonitor;
     const [volumes, setVolumes] = useState<Record<string, number>>({});
     fakeEngine.deafened = deafened;
     fakeEngine.stunUrls.push(options?.stunUrl);
+    fakeEngine.options.push({ relayOnly: options?.relayOnly, p2p: options?.p2p });
     return {
     ready: true,
     // G-82: with speakingAll, every id the proxy is asked about is speaking.
@@ -492,7 +495,11 @@ describe('voice rooms (0.4.3)', () => {
         const on = await setup({ voiceP2p: true, relayOnly: true }, { ipNoticeSeen: false });
         await waitFor(() => expect(on.entry().getAttribute('aria-disabled')).toBeNull());
         await on.join();
-        expect(await screen.findByRole('dialog', { name: 'Before your first call' })).toBeTruthy();
+        const dialog = await screen.findByRole('dialog', { name: 'Before your first call' });
+        await click(within(dialog).getByRole('button', { name: 'Got it' }));
+        // TL: relay-only + B really joins (the core allows it with 2a), and the engine runs B only.
+        expect(await screen.findByRole('region', { name: 'Voice call' })).toBeTruthy();
+        await waitFor(() => expect(fakeEngine.options.at(-1)).toEqual({ relayOnly: true, p2p: true }));
         cleanup();
         const off = await setup({ relayOnly: true }, { ipNoticeSeen: false });
         await waitFor(() => expect(off.entry().getAttribute('aria-disabled')).toBe('true'));

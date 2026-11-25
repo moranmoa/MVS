@@ -15,6 +15,9 @@ const { spawn } = require('node:child_process');
 const path = require('node:path');
 
 const MAX_OUT_LINE = 1024 * 1024;
+/** G-81: a fire-and-forget line (a voice frame is ~620 B) and how much may wait in the pipe. */
+const MAX_FIRE_LINE = 2 * 1024;
+const MAX_FIRE_BACKLOG = 64 * 1024;
 const MAX_IN_LINE = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const CRASH_LOOP = 5;
@@ -215,6 +218,21 @@ class Sidecar {
       this.pending.set(id, { resolve, timer });
       this.child.stdin.write(line);
     });
+  }
+
+  /**
+   * G-81: a fire-and-forget line ({ cmd, args }, no id, no reply), for the
+   * core's voiceFrame fast path. False (dropped) when the core isn't there,
+   * the line is too long, or the pipe is backed up: a late voice frame is
+   * worth nothing, and it must never queue behind a slow core.
+   */
+  send(cmd, args) {
+    if (!this.child || !this.child.stdin || !this.child.stdin.writable) return false;
+    if (this.child.stdin.writableLength > MAX_FIRE_BACKLOG) return false;
+    const line = `${JSON.stringify({ cmd, args })}\n`;
+    if (Buffer.byteLength(line) > MAX_FIRE_LINE) return false;
+    this.child.stdin.write(line);
+    return true;
   }
 
   /**

@@ -177,6 +177,18 @@ export class Store {
   };
   private listeners = new Set<() => void>();
   private windows = new Map<Id, MessageWindow>();
+  /** Core #527: placeholders seen in events, so their opening can be told apart from an edit. */
+  private placeholders = new Set<Id>();
+  private openedListeners = new Set<(m: Message) => void>();
+
+  /**
+   * PO rule (#527/#558): a no-key placeholder that opens later is new to me:
+   * once, it counts and notifies like a message that just arrived.
+   */
+  onPlaceholderOpened(cb: (m: Message) => void): () => void {
+    this.openedListeners.add(cb);
+    return () => this.openedListeners.delete(cb);
+  }
   private unsubs: (() => void)[] = [];
   /** While my own leaveCall runs: that end of the call isn't news. */
   private leaving = false;
@@ -233,8 +245,24 @@ export class Store {
       on('members.changed', ({ serverId, members }) =>
         this.set({ members: { ...this.state.members, [serverId]: members } }),
       ),
-      on('message.added', (m) => this.windows.get(m.channelId)?.apply(m)),
-      on('message.updated', (m) => this.windows.get(m.channelId)?.apply(m)),
+      on('message.added', (m) => {
+        if (m.unreadable) this.placeholders.add(m.id);
+        this.windows.get(m.channelId)?.apply(m);
+      }),
+      on('message.updated', (m) => {
+        const win = this.windows.get(m.channelId);
+        // Was it a placeholder (from an event, or in a loaded window) before this update?
+        const was = this.placeholders.has(m.id) || win?.get(m.index)?.unreadable !== undefined;
+        if (m.unreadable) this.placeholders.add(m.id);
+        else this.placeholders.delete(m.id);
+        win?.apply(m);
+        if (was && !m.unreadable && !m.deleted) {
+          // It counts as unread now: the core's next counts say so.
+          const serverId = Object.entries(this.state.channels).find(([, list]) => list.some((c) => c.id === m.channelId))?.[0];
+          if (serverId) this.reloadChannels(serverId);
+          this.openedListeners.forEach((cb) => cb(m));
+        }
+      }),
       on('update.ready', (update) => this.set({ update })),
       on('update.installed', (u) => this.set({ updateNote: { kind: 'installed', ...u } })),
       on('call.state', (c) => {

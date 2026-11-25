@@ -7,15 +7,29 @@ import { Dialog, InviteBox } from '../../components/common';
 import { LinkIcon, PlusIcon, ShieldIcon, WifiOffIcon } from '../../components/icons';
 import { useUserTextProps } from '../../app/textDir';
 import { LINK_MAX } from '../../core/sanitize';
+import { takeFirstRun } from '../../app/firstRun';
 
-export function Home({ hasServers, onCreate, onJoin }: { hasServers: boolean; onCreate: () => void; onJoin: () => void }) {
+export function Home({
+  hasServers,
+  onCreate,
+  onJoin,
+  onJoinLink,
+}: {
+  hasServers: boolean;
+  onCreate: () => void;
+  onJoin: () => void;
+  /** G-92: a link pasted on Home that the core took: the join dialog carries on from this status. */
+  onJoinLink?: (link: string, status: JoinStatus) => void;
+}) {
+  // G-92 (UX): the first Home after sign-up says the account is ready.
+  const [firstRun] = useState(() => takeFirstRun());
   return (
     <div className="home">
       <h1>
-        <FormattedMessage id="home.title" />
+        <FormattedMessage id={firstRun ? 'home.firstRun.title' : 'home.title'} />
       </h1>
       <p className="muted">
-        <FormattedMessage id={hasServers ? 'home.subtitleWithServers' : 'home.subtitle'} />
+        <FormattedMessage id={firstRun ? 'home.firstRun.subtitle' : hasServers ? 'home.subtitleWithServers' : 'home.subtitle'} />
       </p>
       <div className="home-cards">
         <button type="button" className="home-card" onClick={onCreate}>
@@ -29,19 +43,80 @@ export function Home({ hasServers, onCreate, onJoin }: { hasServers: boolean; on
             <FormattedMessage id="home.create.body" />
           </span>
         </button>
-        <button type="button" className="home-card" onClick={onJoin}>
-          <span className="home-card-icon">
-            <LinkIcon />
-          </span>
-          <strong>
-            <FormattedMessage id="home.join.title" />
-          </strong>
-          <span className="muted">
-            <FormattedMessage id="home.join.body" />
-          </span>
-        </button>
+        <div className="home-card join-card">
+          <button type="button" className="home-card-open" onClick={onJoin}>
+            <span className="home-card-icon">
+              <LinkIcon />
+            </span>
+            <strong>
+              <FormattedMessage id="home.join.title" />
+            </strong>
+            <span className="muted">
+              <FormattedMessage id="home.join.body" />
+            </span>
+          </button>
+          {onJoinLink && <JoinPaste onJoinLink={onJoinLink} />}
+        </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * G-92: paste an invite link right on Home. The core decides if it's a link
+ * (joinServer); not one → the error under the field; anything else → the join
+ * dialog carries on from that status. The clipboard is never read by itself.
+ */
+function JoinPaste({ onJoinLink }: { onJoinLink: (link: string, status: JoinStatus) => void }) {
+  const core = useCore();
+  const intl = useIntl();
+  const [link, setLink] = useState('');
+  const [invalid, setInvalid] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    const clean = link.trim();
+    if (!clean || busy) return;
+    setBusy(true);
+    try {
+      const status = await core.joinServer(clean);
+      if (status.phase === 'invalid') return setInvalid(true);
+      setLink('');
+      onJoinLink(clean, status);
+    } catch {
+      setInvalid(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form className="join-paste" onSubmit={submit}>
+      <div className="join-paste-row">
+        <input
+          dir="ltr"
+          value={link}
+          maxLength={LINK_MAX}
+          spellCheck={false}
+          placeholder={intl.formatMessage({ id: 'home.join.paste' })}
+          aria-label={intl.formatMessage({ id: 'home.join.paste' })}
+          aria-invalid={invalid || undefined}
+          aria-describedby={invalid ? 'join-paste-error' : undefined}
+          disabled={busy}
+          onChange={(e) => {
+            setLink(e.target.value);
+            setInvalid(false);
+          }}
+        />
+        <button type="submit" className="primary" disabled={busy || !link.trim()}>
+          <FormattedMessage id="home.join.submit" />
+        </button>
+      </div>
+      {invalid && (
+        <p id="join-paste-error" className="error small" role="alert">
+          <FormattedMessage id="join.invalid" />
+        </p>
+      )}
+    </form>
   );
 }
 
@@ -191,13 +266,19 @@ export function CreateServerDialog({
 export function JoinDialog({
   open,
   initialLink,
+  initialStatus,
   onClose,
   onJoined,
+  onBackground,
 }: {
   open: boolean;
   initialLink?: string;
+  /** G-92: the join already started on Home: carry on from its status. */
+  initialStatus?: JoinStatus | null;
   onClose: () => void;
   onJoined: (id: Id) => void;
+  /** B18: closed while nobody was online: the core keeps looking for this link in the background. */
+  onBackground?: (link: string) => void;
 }) {
   const core = useCore();
   const intl = useIntl();
@@ -206,7 +287,8 @@ export function JoinDialog({
 
   useEffect(() => {
     setLink(open ? (initialLink ?? '') : '');
-    setStatus(null);
+    setStatus(open ? (initialStatus ?? null) : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialLink]);
 
   useCoreEvent(
@@ -227,6 +309,7 @@ export function JoinDialog({
 
   const cancel = () => {
     if (status?.phase === 'searching') void core.cancelJoin(link);
+    if (status?.phase === 'nobody-online') onBackground?.(link.trim());
     onClose();
   };
 
@@ -286,6 +369,11 @@ export function JoinDialog({
               <FormattedMessage id="join.ageBlocked" values={{ age: status.required.slice(0, 2) }} />
             </p>
           )}
+          {(status?.phase === 'removed' || status?.phase === 'closed') && (
+            <p className="error" role="alert">
+              <FormattedMessage id={status.phase === 'removed' ? 'join.removed' : 'join.closed'} />
+            </p>
+          )}
           {status?.phase === 'joined' && (
             <p className="success">
               <FormattedMessage id="join.joined" />
@@ -294,17 +382,24 @@ export function JoinDialog({
         </div>
         <div className="actions">
           {status?.phase === 'nobody-online' ? (
-            <button type="button" className="primary" onClick={onClose}>
+            <button type="button" className="primary" onClick={cancel}>
               <FormattedMessage id="join.keepTrying" />
+            </button>
+          ) : status?.phase === 'removed' || status?.phase === 'closed' ? (
+            // G-53 (B11a–d §5א): final, so no "Join"; "Close" only.
+            <button type="button" className="primary" onClick={onClose}>
+              <FormattedMessage id="common.close" />
             </button>
           ) : (
             <button type="submit" className="primary" disabled={busy || !link.trim()}>
               <FormattedMessage id="join.submit" />
             </button>
           )}
-          <button type="button" className="secondary" onClick={cancel}>
-            <FormattedMessage id="common.cancel" />
-          </button>
+          {status?.phase !== 'removed' && status?.phase !== 'closed' && (
+            <button type="button" className="secondary" onClick={cancel}>
+              <FormattedMessage id="common.cancel" />
+            </button>
+          )}
         </div>
       </form>
     </Dialog>

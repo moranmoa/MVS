@@ -18,14 +18,18 @@ const CORE_DIR = join(PROFILE, 'core');
 let app;
 let page;
 
-const until = async (cond, ms = 5_000) => {
+// A reload (path A) destroys the page's context mid-call: a check that throws
+// then just isn't true yet. 15 s: CI runners under load are slow to reload.
+const until = async (cond, ms = 15_000) => {
   const end = Date.now() + ms;
-  while (!(await cond())) {
+  while (!(await cond().catch(() => false))) {
     if (Date.now() > end) return false;
     await new Promise((r) => setTimeout(r, 50));
   }
   return true;
 };
+/** After a reload: the new page answers, with the lock state wanted. */
+const settled = (want) => until(async () => (await page.evaluate(() => document.readyState)) !== 'loading' && want(await lockState()));
 const url = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getURL());
 const lockState = () => page.evaluate(() => window.mvs.lock.state());
 const invoke = (cmd, args = []) => page.evaluate(([c, a]) => window.mvs.invoke(c, a), [cmd, args]);
@@ -88,10 +92,12 @@ test('unlock: bad input and a wrong passcode stay locked; the right one reloads 
   assert.equal(await page.evaluate(() => window.mvs.lock.unlock('2468')), 'invalid');
   assert.equal(await page.evaluate(() => window.mvs.lock.unlock({ passcode: '1357' })), 'wrong');
   assert.equal((await lockState()).locked, true);
-  assert.equal(await page.evaluate(() => window.mvs.lock.unlock({ passcode: '2468' })), 'ok');
+  // Main reloads the page on 'ok', which can destroy this call's context
+  // before its answer gets back: that counts as the reload we want.
+  const answer = await page.evaluate(() => window.mvs.lock.unlock({ passcode: '2468' })).catch(() => 'reloaded');
+  assert.ok(answer === 'ok' || answer === 'reloaded', String(answer));
   assert.ok(await until(async () => !(await url()).includes('locked')), await url());
-  await page.waitForLoadState('domcontentloaded');
-  assert.equal((await lockState()).locked, false);
+  assert.ok(await settled((st) => st.locked === false), 'unlocked after the reload');
   assert.ok((await invoke('listServers')).ok !== undefined);
   // The passcode reached the core, and nothing else carries it.
   assert.ok(sent().some((m) => m.cmd === 'verifyAppLock' && m.args.passcode === '2468'));
@@ -119,10 +125,11 @@ test('Ctrl+L locks; a call keeps the page (path B) with the mic off and only cal
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(await page.evaluate(() => window.__marker), 2, 'reload key still dead');
   // Leaving ends the call: path A, the page reloads into ?locked.
-  assert.ok((await invoke('leaveCall')).ok !== undefined);
+  // The call ending reloads the page (path A), possibly before this answer returns.
+  const left = await invoke('leaveCall').catch(() => ({ ok: 'reloaded' }));
+  assert.ok(left.ok !== undefined, JSON.stringify(left));
   assert.ok(await until(async () => (await url()).endsWith('?locked')), await url());
-  await page.waitForLoadState('domcontentloaded');
-  assert.equal((await lockState()).path, 'A');
+  assert.ok(await settled((st) => st.locked && st.path === 'A'), 'path A after the reload');
   // V-C3: the lock's reloads keep the WebRTC IP policy (no local adapters).
   const policy = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getWebRTCIPHandlingPolicy());
   assert.equal(policy, 'default_public_and_private_interfaces');

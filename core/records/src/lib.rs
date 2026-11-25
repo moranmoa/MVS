@@ -212,7 +212,22 @@ pub enum Kind {
     /// `history u8` (reserved for D30, written as 0), then the topic, UTF-8,
     /// at most [`MAX_CHANNEL_TOPIC_BYTES`]; empty clears it.
     ChannelTopic = 22,
+    /// Sets or clears the server's icon (G-51). Body: `history u8` (reserved
+    /// for D30, written as 0), `type u8` (1 PNG, 2 WebP), then the image,
+    /// at most [`MAX_SERVER_ICON_BYTES`]; no image clears it.
+    ServerIcon = 23,
+    /// Sets or clears the server's description (G-51). Body: `history u8`
+    /// (reserved for D30, written as 0), then the description, UTF-8, at most
+    /// [`MAX_SERVER_DESCRIPTION_BYTES`]; empty clears it.
+    ServerDescription = 24,
 }
+
+/// Largest server icon image, in bytes (G-51).
+pub const MAX_SERVER_ICON_BYTES: usize = 8 * 1024;
+
+/// Longest server description body, in UTF-8 bytes (G-51). The authority
+/// also caps it in code points and lines.
+pub const MAX_SERVER_DESCRIPTION_BYTES: usize = 1500;
 
 /// Longest channel topic body, in UTF-8 bytes (G-14). The authority also
 /// caps it in code points.
@@ -240,7 +255,7 @@ pub const MAX_ROTATION_PARTS: u8 = 32;
 pub const ROTATION_HEADER_LEN: usize = ID_LEN + 2;
 
 impl Kind {
-    const ALL: [Kind; 22] = [
+    const ALL: [Kind; 24] = [
         Kind::Genesis,
         Kind::Grant,
         Kind::Revoke,
@@ -263,6 +278,8 @@ impl Kind {
         Kind::Unban,
         Kind::Reaction,
         Kind::ChannelTopic,
+        Kind::ServerIcon,
+        Kind::ServerDescription,
     ];
 
     const LARGEST_BODY: usize = 16 * 1024;
@@ -299,6 +316,10 @@ impl Kind {
             Kind::Reaction => 256,
             // Channel ID, history byte and the topic.
             Kind::ChannelTopic => ID_LEN + 1 + MAX_CHANNEL_TOPIC_BYTES,
+            // History and type bytes, then the image.
+            Kind::ServerIcon => 2 + MAX_SERVER_ICON_BYTES,
+            // History byte and the description.
+            Kind::ServerDescription => 1 + MAX_SERVER_DESCRIPTION_BYTES,
         }
     }
 
@@ -1049,14 +1070,27 @@ mod tests {
         assert!(!Kind::ChannelTopic.prunable());
         assert!(Kind::ChannelTopic.allowed_in(Scope::Control));
         assert!(!Kind::ChannelTopic.allowed_in(Scope::Channel(ChannelId::from_bytes([1; 32]))));
-        assert_eq!(Kind::from_code(23), None, "older cores still refuse what they don't know");
+    }
+
+    #[test]
+    fn server_icon_and_description_are_control_records_and_later_codes_stay_unknown() {
+        assert_eq!(Kind::from_code(23), Some(Kind::ServerIcon));
+        assert_eq!(Kind::from_code(24), Some(Kind::ServerDescription));
+        assert_eq!(Kind::ServerIcon.max_body(), 2 + 8192);
+        assert_eq!(Kind::ServerDescription.max_body(), 1501);
+        for kind in [Kind::ServerIcon, Kind::ServerDescription] {
+            assert!(!kind.prunable());
+            assert!(kind.allowed_in(Scope::Control));
+            assert!(!kind.allowed_in(Scope::Channel(ChannelId::from_bytes([1; 32]))));
+        }
+        assert_eq!(Kind::from_code(25), None, "older cores still refuse what they don't know");
     }
 
     #[test]
     fn every_kind_has_one_scope_and_a_body_limit() {
         let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
         let codes: Vec<u16> = Kind::ALL.iter().map(|kind| kind.code()).collect();
-        assert_eq!(codes, (1..=22).collect::<Vec<u16>>(), "codes are dense and in order");
+        assert_eq!(codes, (1..=24).collect::<Vec<u16>>(), "codes are dense and in order");
         // The genesis has its own tests: its body must carry the nonce.
         for kind in Kind::ALL.into_iter().filter(|kind| *kind != Kind::Genesis) {
             assert_eq!(Kind::from_code(kind.code()), Some(kind));

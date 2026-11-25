@@ -689,6 +689,10 @@
   "settings.about.stable": "יציב",
   "settings.about.beta": "בטא",
   "settings.about.channelHint": "עדכונים מותקנים תמיד. אפשר רק לבחור אם לקבל אותם מוקדם יותר.",
+  "about.copyVersion": "העתקת פרטי הגרסה",
+  "about.report": "דיווח על פגיעה או תוכן לא חוקי",
+  "about.report.body": "אין שרת מרכזי, ולכן אנחנו לא יכולים למחוק תוכן מהמחשבים של אחרים. על הודעה בשרת כדאי לדווח קודם לבעלי השרת. על תוכן לא חוקי, ובפרט פגיעה בקטינים, אפשר לדווח גם לנו:",
+  "about.report.pending": "הכתובת תופיע בגרסה שמופצת לבודקים.",
   "settings.about.licenses": "האפליקציה בנויה על רכיבי קוד פתוח, ביניהם React, react-intl ו-TanStack Virtual (רישיונות MIT ו-BSD).",
 
   "chat.clipped": "ההודעה ארוכה מדי, ולכן רק חלק ממנה מוצג",

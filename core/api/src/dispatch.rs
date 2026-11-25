@@ -274,6 +274,12 @@ struct MutedArg {
     muted: bool,
 }
 
+/// G-81 `setCallWebrtcPeers`.
+#[derive(Deserialize)]
+struct WebrtcPeersArg {
+    identities: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct DeafenedArg {
     deafened: bool,
@@ -620,6 +626,7 @@ impl Core {
             "joinCall" => ok(self.join_call(&args::<ChannelIdArg>(raw)?.channel_id)),
             "leaveCall" => ok(self.leave_call()),
             "setMuted" => ok(self.set_muted(args::<MutedArg>(raw)?.muted)),
+            "setCallWebrtcPeers" => ok(self.set_call_webrtc_peers(&args::<WebrtcPeersArg>(raw)?.identities)),
             "setDeafened" => ok(self.set_deafened(args::<DeafenedArg>(raw)?.deafened)),
             "sendSignal" => {
                 let a: SignalArgs = args(raw)?;

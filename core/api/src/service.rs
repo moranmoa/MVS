@@ -2184,6 +2184,21 @@ impl Core {
     }
 
     /// `leaveCall`: idempotent.
+    /// G-81 `setCallWebrtcPeers({ identities })`: the call peers the UI has a
+    /// live LAN WebRTC connection to. The core sends voice frames over
+    /// libp2p to every other participant; the UI can only exclude, never
+    /// add targets. At most [`MAX_PARTICIPANTS`]; reset on every new call.
+    pub fn set_call_webrtc_peers(&self, identities: &[String]) -> CoreResult<()> {
+        if identities.len() > crate::voice::MAX_PARTICIPANTS {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let peers: HashSet<PublicKey> = identities.iter().map(|id| parse_user(id)).collect::<CoreResult<_>>()?;
+        self.voice(|calls, ctx, _| {
+            calls.set_webrtc_peers(ctx, peers);
+            Ok(())
+        })
+    }
+
     pub fn leave_call(&self) -> CoreResult<()> {
         if !self.in_call() {
             return Ok(());

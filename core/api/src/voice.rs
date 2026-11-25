@@ -1286,14 +1286,24 @@ impl Calls {
 
     /// G-81 `setCallWebrtcPeers`: the call peers the UI has on LAN WebRTC
     /// (others are ignored). It only excludes: the core picks the targets.
-    pub fn set_webrtc_peers(&mut self, peers: HashSet<PublicKey>) {
-        self.webrtc = peers;
+    pub fn set_webrtc_peers(&mut self, ctx: &mut Ctx, peers: HashSet<PublicKey>) {
+        if self.webrtc != peers {
+            self.webrtc = peers;
+            // `call.state` (the core then hands the node the new targets).
+            if let Some(state) = self.state(ctx.me()) {
+                ctx.events.push(Event::CallState(state));
+            }
+        }
     }
 
-    /// G-81: the node says how my frames reach `peer` now. True if it
-    /// changed (a `call.state` is due).
-    pub fn set_path(&mut self, peer: PublicKey, path: VoicePathKind) -> bool {
-        self.paths.insert(peer, path) != Some(path)
+    /// G-81: the node says how my frames reach `peer` now; a change is a
+    /// `call.state`.
+    pub fn set_path(&mut self, ctx: &mut Ctx, peer: PublicKey, path: VoicePathKind) {
+        if self.mine.is_some() && self.paths.insert(peer, path) != Some(path) {
+            if let Some(state) = self.state(ctx.me()) {
+                ctx.events.push(Event::CallState(state));
+            }
+        }
     }
 
     /// My call: me first, then the others by key.

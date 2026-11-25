@@ -613,20 +613,20 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - One `server.updated` when it turns true, then none for further records. In memory only: never cleared by a timer, only by a restart, so it comes back after one only if such a record is seen again.
 - Server secret rotation (T17, `docs/design/server-secret-rotation.md`; step 2b, draft):
   - **Reading** is always on.
-    - The accepted `SecretRotation` parts are grouped by rotation, and only complete ones count: one author, every part, no gaps.
+    - The accepted `SecretRotation` parts are grouped by (author, rotation), so a part signed under someone else's rotation ID never joins theirs (Security Lead and Tech Lead on #609). Only complete groups count: every part, no gaps.
     - The complete rotation whose last part is latest in linear order wins.
-    - When it sealed a secret for me, I store it (sealed), reopen sync on it, and send `server.updated`: the invite link carries the new secret.
+    - When it sealed a secret for me, I store it (sealed), reopen sync on it, and send `server.updated`: the invite link carries the new secret. The secret it replaces stays, sealed, for 7 days (`PREVIOUS_SECRET_FOR_MS`), for reading the old secret's frozen prefix (Security Lead T17-W1).
     - The secret never appears in a log or an event.
-  - **Writing** waits for the release that requires updating (`WRITE_SECRET_ROTATION`, Tech Lead on #592). Then:
+  - **Writing** stays off (`WRITE_SECRET_ROTATION`) until S3/S4 and S5 are merged, in the release that requires updating (Tech Lead on #592 and #609). A unit test keeps it off until then. Then:
     - a kick rotates at once, from the kicker's core (PO on #557);
-    - the owner's core rotates whenever the current secret is held by someone who is no longer a member (a kick or a leave: S2 `Required`), or misses a member (S2 `Add`);
+    - the owner's core rotates whenever the current secret is held by someone who is no longer a member (a kick or a leave: S2 `Required`), or misses a member who joined through an invite from before the rotation (S2 `Add`). A join through a newer invite rotates nothing, since its link already carries the new secret.
     - a moderator rotates only for their own kick, so moderators don't all rotate at once.
     - A rotation seals a fresh secret for the current members only (S2).
   - `lv:1` joins the posted caps: this core decodes every kind up to level 1.
   - Not yet, still to come in T17:
     - the old secret's read-only frozen prefix (S3/S4, dev-sync);
     - re-issued invites with the owner notice, the backup and the LAN beacon key following the rotation (S5);
-    - the 7-day switch window (Q2).
+    - with no owner online, an admin rotating for a leave after 24 h plus 0–6 h of jitter (Security Lead Q1 on #609, step 2c).
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

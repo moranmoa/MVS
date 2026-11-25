@@ -47,6 +47,13 @@ fn secret_key(server: ServerId) -> String {
     format!("server-secret/{}", hex::encode(server.as_bytes()))
 }
 
+/// T17: the sync secret a rotation replaced, kept until a time.
+fn previous_secret_key(server: ServerId) -> String {
+    format!("server-secret-previous/{}", hex::encode(server.as_bytes()))
+}
+
+const PREVIOUS_SECRET_AD: &[u8] = b"mvs/api/server-secret-previous/v1";
+
 /// T8-02: a short link's invite key k, per invite (S4: sealed like the
 /// server secret).
 fn invite_key_key(server: ServerId, invite: RecordId) -> String {
@@ -182,6 +189,52 @@ impl Db {
         );
         let secret: [u8; 32] = plain.as_slice().try_into().map_err(|_| internal("secret size"))?;
         Ok(Some(Zeroizing::new(secret)))
+    }
+
+    /// T17 (Security Lead T17-W1): the secret a rotation replaced, sealed
+    /// like the current one and bound to the server and `until_ms` by the
+    /// AD, for reading the old secret's frozen prefix until then.
+    pub fn save_previous_server_secret(
+        &self,
+        key: &[u8; 32],
+        server: ServerId,
+        secret: &[u8; 32],
+        until_ms: u64,
+    ) -> Result<(), CoreError> {
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let until = until_ms.to_le_bytes();
+        let aad = [PREVIOUS_SECRET_AD, server.as_bytes().as_slice(), &until].concat();
+        let sealed = XChaCha20Poly1305::new(key.into())
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: secret, aad: &aad })
+            .map_err(internal)?;
+        self.set(&previous_secret_key(server), &[until.as_slice(), &nonce, &sealed].concat())
+    }
+
+    /// The kept previous secret and until when, if any (expired or not:
+    /// the caller compares with its clock). Read by sync's frozen-prefix
+    /// step (T17 S3/S4, next).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn load_previous_server_secret(
+        &self,
+        key: &[u8; 32],
+        server: ServerId,
+    ) -> Result<Option<(Zeroizing<[u8; 32]>, u64)>, CoreError> {
+        let Some(blob) = self.get(&previous_secret_key(server))? else { return Ok(None) };
+        if blob.len() < 8 + NONCE_LEN {
+            return Err(internal("short previous secret"));
+        }
+        let (until, rest) = blob.split_at(8);
+        let (nonce, sealed) = rest.split_at(NONCE_LEN);
+        let aad = [PREVIOUS_SECRET_AD, server.as_bytes().as_slice(), until].concat();
+        let plain = Zeroizing::new(
+            XChaCha20Poly1305::new(key.into())
+                .decrypt(XNonce::from_slice(nonce), Payload { msg: sealed, aad: &aad })
+                .map_err(internal)?,
+        );
+        let secret: [u8; 32] = plain.as_slice().try_into().map_err(|_| internal("secret size"))?;
+        let until = u64::from_le_bytes(until.try_into().expect("8 bytes"));
+        Ok(Some((Zeroizing::new(secret), until)))
     }
 
     /// T8-02 (S4): a short link's invite key, sealed with the identity's
@@ -598,6 +651,23 @@ mod tests {
     use super::*;
     use authority::Action;
     use records::SigningKey;
+
+    /// T17: the kept previous secret opens with its server and expiry only.
+    #[test]
+    fn the_previous_secret_is_sealed_to_its_server_and_expiry() {
+        let db = Db::open(None).unwrap();
+        let (key, server, other) = ([1; 32], ServerId::from_bytes([2; 32]), ServerId::from_bytes([3; 32]));
+        assert!(db.load_previous_server_secret(&key, server).unwrap().is_none());
+        db.save_previous_server_secret(&key, server, &[9; 32], 1_000).unwrap();
+        let (secret, until) = db.load_previous_server_secret(&key, server).unwrap().unwrap();
+        assert_eq!((*secret, until), ([9; 32], 1_000));
+        assert!(db.load_previous_server_secret(&key, other).unwrap().is_none());
+        // A moved expiry no longer opens.
+        let mut blob = db.get(&previous_secret_key(server)).unwrap().unwrap();
+        blob[0] ^= 1;
+        db.set(&previous_secret_key(server), &blob).unwrap();
+        assert!(db.load_previous_server_secret(&key, server).is_err());
+    }
 
     /// A closed server's last purge keeps exactly the records asked for
     /// (its genesis and close); a leave keeps none. The tombstone stays.

@@ -45,9 +45,16 @@ jobs:
           workspaces: core
       - run: cargo test --release --locked
         working-directory: core
+      # T17: the secret rotation tests turn writing on through a test-only
+      # hook (feature `test-hooks`, never in a release build).
+      - name: api test hooks
+        run: cargo test --release --locked -p api --features test-hooks --test secret_rotation
+        working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p api --all-targets --locked --features test-hooks -- -D warnings
         working-directory: core
 
   updater-windows:

@@ -7,7 +7,6 @@ each other and pass along encrypted traffic when a direct connection fails.
 | --- | --- | --- |
 | `relay` | Bootstrap (DHT entry point) and circuit relay | Closed alpha |
 | `caddy` | `wss://` with automatic TLS in front of the relay | When browsers join (`--profile proxy`) |
-| `seeder` | Placeholder for the update seeder; exits with "not built yet" | With the updater, B8 (`--profile seeder`) |
 | `coturn` | TURN relay for voice and the Web client | Phase 2 (`--profile voice`) |
 
 The bootstrap node and the relay are one service: the relay's DHT is what
@@ -15,9 +14,10 @@ clients bootstrap from, and a second container on the same PC would add
 nothing. A second bootstrap node at another provider comes before the open
 alpha (GAP-9).
 
-The seeder stays a placeholder until B8 builds it. A headless sync node is
-deliberately not run as a seeder: until sync pulls are gated on membership
-(GAP-4) it would hand every server's log to anyone who asks.
+There is no update seeder: app updates come from GitHub Releases as signed
+manifests and artifacts (`core/updater`), so no container serves them. A
+headless sync node is deliberately not run either: until sync pulls are gated
+on membership (GAP-4) it would hand every server's log to anyone who asks.
 
 ## Run on this PC
 

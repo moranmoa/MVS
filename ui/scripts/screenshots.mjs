@@ -400,7 +400,7 @@ async function joinRoom(p, ok = 'הבנתי') {
   await p.getByRole('dialog').getByRole('button', { name: ok }).click();
 }
 {
-  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999&voiceP2p', 'x'); // 243: the notice v3 (G-81 B on)
   await p.locator('.voice-room-people li').first().waitFor();
   await shot(p, '245-voice-room-he');
   await p.locator('.voice-room-row').first().click();
@@ -434,7 +434,7 @@ async function joinRoom(p, ok = 'הבנתי') {
   await p.close();
 }
 {
-  const p = await chat('?demo=1&still=1&lang=en&theme=light&update=999999', 'x');
+  const p = await chat('?demo=1&still=1&lang=en&theme=light&update=999999&voiceP2p', 'x'); // 244: the notice v3 (G-81 B on)
   await p.locator('.voice-room-row').first().click();
   await p.getByRole('dialog').waitFor();
   await shot(p, '244-call-ip-notice-en-light');
@@ -1554,6 +1554,20 @@ for (const [query, name, opts, which] of [
   await p.close();
 }
 
+
+// ---- About (B24a: 140, 144) ---------------------------------------------------
+for (const [query, name] of [
+  ['lang=he&theme=light', '140-about-he'],
+  ['lang=he&theme=light&abuse=1', '144-about-abuse-address-he'],
+]) {
+  const p = await chat('?demo=1&still=1&update=999999&' + query, 'x');
+  await p.getByRole('button', { name: 'הגדרות' }).first().click();
+  await p.getByRole('button', { name: 'אודות' }).click();
+  await p.locator('.about-report').waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, name);
+  await p.close();
+}
 await browser.close();
 await server.close();
 

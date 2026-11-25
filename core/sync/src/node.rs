@@ -57,6 +57,7 @@ use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
+use crate::report::{ReportError, ReportLimits, MAX_PENDING as MAX_REPORT_PENDING, MAX_REPORT_BLOB};
 use crate::typing::{TypingError, TypingLimits, MAX_TYPING_BLOB};
 use crate::voice_media::{SendQueue, VoiceFrame};
 use crate::voice::{VoiceError, VoiceLimits, MAX_VOICE_BLOB};
@@ -334,6 +335,9 @@ pub enum NodeEvent {
     /// G-29: a typing signal (`/mvs/typing/1`) from a verified current
     /// member, as [`NodeEvent::VoiceSignal`]. Ephemeral. See `typing`.
     TypingSignal { from: PublicKey, bytes: Vec<u8> },
+    /// G-48: a sealed report box (`/mvs/report/1`) from a verified current
+    /// member, already acked. Opaque here: the api opens it. See `report`.
+    ReportBox { from: PublicKey, bytes: Vec<u8> },
     /// G-81: a voice frame from a participant of my current call, past the
     /// gate, the caps and the sequence checks (`voice_media`).
     VoiceFrame { from: PublicKey, frame: VoiceFrame },
@@ -412,6 +416,8 @@ enum Command {
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
     TypingSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), TypingError>> },
+    ReportSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), ReportError>> },
+    ReportSink { sink: std::sync::mpsc::SyncSender<(PublicKey, Vec<u8>)> },
     VoiceCall { call: Option<VoiceCall> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
@@ -523,6 +529,8 @@ struct Behaviour {
     voice: crate::voice::VoiceBehaviour,
     /// G-29 typing (`/mvs/typing/1`), with verified members only (`typing`).
     typing: crate::typing::TypingBehaviour,
+    /// G-48 report delivery (`/mvs/report/1`), with verified members only (`report`).
+    report: crate::report::ReportBehaviour,
     /// G-81 voice media (`/mvs/voice-media/1`), per chosen connection (`voice_media`).
     voice_media: crate::voice_media::VoiceMedia,
     /// Invite publications between members (`/mvs/invite-pub/1`).
@@ -850,6 +858,9 @@ impl Node {
             pending_stubs: HashMap::new(),
             voice_limits: VoiceLimits::new(),
             typing_limits: TypingLimits::new(),
+            report_limits: ReportLimits::new(),
+            report_pending: HashMap::new(),
+            report_sink: None,
             voice_call: None,
             voice_out: HashMap::new(),
             voice_in: HashMap::new(),
@@ -1110,6 +1121,27 @@ impl Node {
         let (reply, rx) = oneshot::channel();
         self.send(Command::TypingSend { to, bytes, reply }).map_err(|_| TypingError::Stopped)?;
         rx.await.map_err(|_| TypingError::Stopped)?
+    }
+
+    /// G-48: delivers one sealed report box (at most [`MAX_REPORT_BLOB`]
+    /// bytes) to the peer bound to `to` as a current member, and waits for
+    /// its ack. `Ok` only once acked; the api's outbox keeps the row
+    /// otherwise.
+    pub async fn report_send(&self, to: PublicKey, bytes: Vec<u8>) -> Result<(), ReportError> {
+        if bytes.len() > MAX_REPORT_BLOB {
+            return Err(ReportError::TooLarge);
+        }
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ReportSend { to, bytes, reply }).map_err(|_| ReportError::Stopped)?;
+        rx.await.map_err(|_| ReportError::Stopped)?
+    }
+
+    /// G-48: received report boxes go into `sink` instead of the event
+    /// stream (which may drop events when it lags). A box is acked only once
+    /// it is in `sink`; while `sink` is full, boxes go unacked and their
+    /// senders retry, so an acked box is never lost here.
+    pub fn set_report_sink(&self, sink: std::sync::mpsc::SyncSender<(PublicKey, Vec<u8>)>) -> Result<()> {
+        self.send(Command::ReportSink { sink })
     }
 
     /// Serves `publication` under the envelope handle `handle` for
@@ -1390,6 +1422,7 @@ async fn build_swarm(
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
                 typing: crate::typing::behaviour(),
+                report: crate::report::behaviour(),
                 voice_media: crate::voice_media::VoiceMedia::default(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
@@ -1610,6 +1643,14 @@ struct Task {
     voice_limits: VoiceLimits,
     /// G-29: caps on accepted typing signals (their own, not voice's).
     typing_limits: TypingLimits,
+    /// G-48: caps on accepted report boxes (their own).
+    report_limits: ReportLimits,
+    /// G-48: report boxes sent and waiting for their ack.
+    report_pending: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<(), ReportError>>>,
+    /// G-48: where accepted boxes go (the api's bounded queue). A box is acked
+    /// only once it is in there; a full queue leaves it unacked, so the
+    /// sender retries. `None` (tests): emitted as an event and acked.
+    report_sink: Option<std::sync::mpsc::SyncSender<(PublicKey, Vec<u8>)>>,
     /// G-81 voice media: my current call; per target, the substream my
     /// frames go out on; per participant, the one theirs come in on; each
     /// sender's last sequence; the caps; and each open connection's kind.
@@ -1922,6 +1963,8 @@ impl Task {
             Command::TypingSend { to, bytes, reply } => {
                 let _ = reply.send(self.typing_send(to, bytes));
             }
+            Command::ReportSend { to, bytes, reply } => self.report_send(to, bytes, reply),
+            Command::ReportSink { sink } => self.report_sink = Some(sink),
             Command::ServeInvite { server, handle, publication, announce, reply } => {
                 let _ = reply.send(self.serve_invite(server, handle, publication, announce));
             }
@@ -2204,6 +2247,59 @@ impl Task {
         }
         let _ = self.swarm.behaviour_mut().typing.send_response(channel, ());
         self.emit(NodeEvent::TypingSignal { from, bytes });
+    }
+
+    /// G-48: as [`Self::typing_send`], over `/mvs/report/1`; the reply waits
+    /// for the ack (or the failure) in `report_pending`.
+    fn report_send(&mut self, to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), ReportError>>) {
+        if bytes.len() > MAX_REPORT_BLOB {
+            let _ = reply.send(Err(ReportError::TooLarge));
+            return;
+        }
+        if self.report_pending.len() >= MAX_REPORT_PENDING {
+            let _ = reply.send(Err(ReportError::Busy));
+            return;
+        }
+        let Some(peer) = self.member_peer(to) else {
+            let _ = reply.send(Err(ReportError::NotMember));
+            return;
+        };
+        let id = self.swarm.behaviour_mut().report.send_request(&peer, bytes);
+        self.report_pending.insert(id, reply);
+    }
+
+    /// G-48: as [`Self::on_typing`], with report's own caps. The ack goes
+    /// out before the api tries to open the box, so it is the same for every
+    /// box that passes (R7). With a report sink, only once the box is in it:
+    /// a full sink leaves it unacked (the sender retries), whatever it holds.
+    fn on_report(&mut self, peer: PeerId, bytes: Vec<u8>, channel: ResponseChannel<()>) {
+        let Some(from) = self.member_identity(peer) else {
+            debug!(%peer, "report box from a non-member dropped");
+            return;
+        };
+        if !self.report_limits.allow(peer, Instant::now()) {
+            debug!(%peer, "report box over the rate cap dropped");
+            return;
+        }
+        if let Some(sink) = &self.report_sink {
+            match sink.try_send((from, bytes)) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    debug!(%peer, "report inbox full: not acked, the sender retries");
+                    return;
+                }
+                // Closed (shutting down): stays closed, so later boxes stay
+                // unacked too, never acked into nowhere.
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    debug!("report inbox closed: not acked");
+                    return;
+                }
+            }
+            let _ = self.swarm.behaviour_mut().report.send_response(channel, ());
+            return;
+        }
+        let _ = self.swarm.behaviour_mut().report.send_response(channel, ());
+        self.emit(NodeEvent::ReportBox { from, bytes });
     }
 
     /// A voice signal came in: only a current member's, within its rate
@@ -3465,6 +3561,27 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "typing signal not delivered"),
+            SwarmEvent::Behaviour(BehaviourEvent::Report(request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            })) => self.on_report(peer, request, channel),
+            SwarmEvent::Behaviour(BehaviourEvent::Report(request_response::Event::Message {
+                message: request_response::Message::Response { request_id, .. },
+                ..
+            })) => {
+                if let Some(reply) = self.report_pending.remove(&request_id) {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Report(request_response::Event::OutboundFailure {
+                peer, request_id, error, ..
+            })) => {
+                debug!(%peer, %error, "report box not delivered");
+                if let Some(reply) = self.report_pending.remove(&request_id) {
+                    let _ = reply.send(Err(ReportError::NotAcked));
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::InvitePub(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Request { request, channel, .. },

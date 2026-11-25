@@ -3,7 +3,7 @@
 The single source of truth for who does what, in which order, and what blocks the closed alpha.
 Owner: pm (see [`docs/TEAM.md`](TEAM.md)). Updated whenever a PR lands; if this board disagrees with a PR, a review or a chat, **the board wins until it is corrected here**.
 
-Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 include #447, #459, #461, #475–#481, #483–#486, #488, #490–#493, #495; the relays were redeployed from `2852248` with the owner's OK. `main` has every PR up to #457 except the open ones below. **Latest published release: v0.4.5** (pre-release, 2026-11-15). The 0.4.6 draft was never published; **0.4.7 replaces it** (CHANGELOG PR #465, in review) and carries the 0.4.6 line. **Now:** device link, member relays, voice settings (G-72, G-73, G-74, G-84) and the first 0.5.0 items (G-23, G-32, G-33, G-62) are on `main`; relay-down resilience and multi-relay are in flight; the next UI release is 0.5.0 "Conversation". Of the M2 order from #97, the code side is done; **B5 (real networks) and the T4 go-live are the open M2 gates**.
+Last updated: 2026-11-25, pm batch. **0.5.0 is being tagged.** Since the 2026-11-18 batch: G-05, G-06, G-41, G-14, G-92, G-78 (#513), B7-k (#544, #551), B20, the unreadable-message placeholders (#527, #558), the P1 lost message, #560 (clippy) and #562 (`memberSearch`) are done; G-77 and G-51 have their core. **New epic: relay-in-app (#561)**, see "Device link, member relays, relays".
 
 **Contents:** [Rules](#rules) · [Milestones](#milestones) · [Open PRs](#open-prs) · [Board](#board) · [Dependency map and critical path](#dependency-map-and-critical-path) · [Next assignments](#next-assignments) · [File ownership](#file-ownership) · [Risks and blockers](#risks-and-blockers) · [Owner decisions](#owner-decisions)
 
@@ -116,7 +116,8 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | T14 | Sync adapter in `core/api`: `MemberGate` + `SyncNetwork` over `sync::Node` (`mvs-core --relay`); gate rejects keyed by the control-log count | dev-identity (+ dev-sync `ControlLog::count`) | done | #83 #84 #85 | T1, B4-sync | M | M1 |
 | T15 | Encrypted two-user chat through the relay (two `mvs-core` instances, real `GroupCipher`, relay-only path). **All six message commands real in `mvs-core`** (send, get, count, edit, delete, retry) | dev-identity | done | #89 #106 | GAP-5 ✔, T14 ✔ | M | **M1** |
 | T16 | Re-key on kick through `core/api`: a kick rotates the channel key and the kicked member can no longer read new messages (M2 "kick works and re-keys") | dev-identity | done | #100 | T15, B4 | M | M2 |
-| T17 | Rotate the server secret on kick (follow-up next to T16) | dev-identity | todo | – | T16 | S | M2 |
+| T17 | Rotate the server secret on kick (follow-up next to T16) | dev-identity | in progress: design #557 approved (option A, `SecretRotation`; rotate at once). Build: 3 PRs, dev-identity → dev-sync → dev-identity | #557 | T16 | S | M2 |
+| T17-pre | **Required before T17 (product-lead):** a core holding a record it can't read marks the server "צריך לעדכן את MVS כדי להמשיך לסנכרן בשרת הזה". Ships in the same release as the T17 rotation or earlier, as its own small PR, with a release-notes line | dev-identity | todo | – | – | S | with T17 |
 | T18 | **Presence (online/offline)**, an M2 gate: presence from live connections and pings plus an api event (dev-sync), then `core/api` (dev-identity) and UI (dev-ui). Design note first | dev-sync → dev-identity → dev-ui | done (sync #141, api #179; wording #131 #145 #147) | #141 #179 | GAP-4 | M | M2 |
 | T8-01 | "Core unavailable" error screen (product-lead, #117) | dev-ui + dev-voice-shell | done (typed core-unavailable error #191, screen #192, retry + open logs #193; keyring message with QA-20) | #191 #192 #193 | – | S | **M3, P0 before the next pre-release** |
 | T8-02 | Invite link ≤ 60 characters after `mvs://join/`, base58 with a checksum (contract change; product-lead, #117) | dev-sync + dev-identity; sec-lead reviews | done (codec #247, publication #249, sync #255, wired in #263) | #234 #247 #249 #255 #263 | – | M | done |
@@ -148,7 +149,7 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | B6 | Real send states: pending/sent/delivered (receipt ack ש-11), failed + retry; composer cap and no text loss (QA-10); **QA-17** (product-lead decision): one limit of **4,000 code points** in composer, display, sanitizer and core; counter shown from 3,800; fits under the 16 KiB record limit. **sec-lead (#105):** the "delivered" ack goes only to the author, once GAP-4 lands. UX spec in #102 **Core send state (tech-lead, product-lead #97/#102):** `sent` only after a successful push to at least one connection, otherwise `pending`; `delivered` on the first receipt ack (dev-identity in `core/api`, dev-sync for the publish result and ack). Fixes "✓ sent with nobody connected". | dev-sync (ack) + dev-ui (composer) | done (sync #124, api #161 #164, held messages #285–#289; R-P0 fixed) | #124 #161 #164 | B4-sync, T1; QA-10 part can start now | S | M2 |
 | B6-p | **Prune on tombstone** (spec line 619): on delete or edit a correct client prunes the original body, every older version, and any cache or index, keeping only header, hash and signature. Format: sign and hash over BLAKE3(body), pruned stubs, `mvs/record/v2`. Acceptance: product-lead's 5 points. | core-5 (format), then dev-sync (stub storage and serving), dev-identity (prune in `core/api`); sec-lead reviews | done, **accepted** | #136 #140 #149 | B4 | M | **M3 gate (P0 for the closed alpha)**, parallel to the M1/M2 path |
 | B7 | Age end-to-end (**sec-lead, #105:** `AgeClaim` carries only a band or 18+, never a date; the 30-day rule on restore is a soft control): < 16 blocked, 120-year check (QA-04), signed age claims, 18+ channels hidden (ש-12), DOB correction rules, UX-15, UX-23 | core-5 (claims) + dev-ui | in progress (age claims #116, api #156, 30-day rule #306, pending correction #312; 18+ channel keys are B7-k) | #116 #156 #306 #312 | B4 | M | M2 |
-| B7-k | **18+ channel keys** (sec-lead, **P1 before the open alpha**): an 18+ channel's key rotates to members ∩ `State.adults` only; an adult leaving the set is a removal (re-key, as in #100); sends there are refused when you are not in `adults`. A later age raise is signed only after 30 days | dev-identity (`core/api`), dev-crypto if groupkeys needs it | todo | – | B7 (#116, #156), T16 | M | before open alpha |
+| B7-k | **18+ channel keys** (sec-lead, **P1 before the open alpha**): an 18+ channel's key rotates to members ∩ `State.adults` only; an adult leaving the set is a removal (re-key, as in #100); sends there are refused when you are not in `adults`. A later age raise is signed only after 30 days | dev-identity (`core/api`), dev-crypto if groupkeys needs it | done (receiver rule #551; whether release K2 is a required update is an owner decision) | #544 #551 | B7 (#116, #156), T16 | M | before open alpha |
 | B11a | Leave server (owner blocked, ש-19) | dev-ui | done (in the lifecycle work) | #261 #264 | B4 for core | S | M3 |
 | B11b | **B11b+ unified server settings screen** (owner feedback on v0.2.0, P1/M2): name + icon (B11b), invite link + revoke (B11d), members list, "חשבונות שהורחקו" with undo-kick (B11a–d), age restriction / 18+ (B7). Edit / close server (ש-22, ש-23) | dev-ui | done (settings screen #208, rename/leave/close #264) | #208 #264 | B4 | M | M2 |
 | B11c | Channels: create, rename, delete (ש-20), 18+ flag | dev-ui | done | #185 #186 | B4 | M | M2 |
@@ -160,18 +161,19 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | B17 | Mixed-direction text in messages and strings (UX-01 blocker, UX-03, UX-18), built from `docs/ux/specs/B17-mixed-direction.md` (spec approved). Includes **UX-19** on the same message-head line: identity code next to the name, 0.75rem, `--text-muted`, `aria-hidden` on the code, `aria-labelledby` on the article | dev-ui | done, accepted | #24 #50 (spec #22) | – | S–M | M1 |
 | B18 | P2P states in UI: own new server, offline server, background join (UX-07..09, QA-08); **T8-03** (product-lead, #117): §3 solo-server invite card, P1/M2. Pre-join history depends on D30; ux adds an interim note | dev-ui + dev-sync (API contract) | todo (spec approved) | spec #26 | T1 contract for background join | M | M2 |
 | B19 | Recovery-words screen safety: resume after reload (QA-01), reading order, hidden by default (UX-05, UX-06, U1), recovery challenge | dev-ui | done, **accepted** (#28 at `7bad826`: lock after 5 failures, one column at 200 %, screenshots 82 and 84–87; QA-01, QA-18 pass) | #28 (spec #22) | B2-f for the real core (the mock already locks after 5) | S | M1 |
-| B20 | Contrast AA (UX-13) | dev-ui | todo | – | – | S | M3 |
+| B20 | Contrast AA (UX-13) | dev-ui | done | – | – | S | M3 |
 | B16 | Settings export/import, message density, date separators (UX-12) | dev-ui | todo | – | – | M | – |
 | B21 | Accessibility + keyboard (UX-11, UX-20, UX-21, UX-34, UX-37, UX-38); channel list as a drawer below ~700 px (from B12/QA-12, non-blocking) | dev-ui | todo | – | – | M | – |
 | B22 | Flow polish (UX-22..32 part, UX-41..48, QA-05, QA-07, QA-09, QA-11) | dev-ui | todo | – | – | M | – |
-| B24 | About screen: abuse-report address, links to the agreement and privacy notice (business plan §3.3, approved by product-lead in #16) | dev-ui | todo (5.1 decided; spec in #35) | – | 5.1 | S | M3 |
+| B24a | About screen, part a (split by the manager; dev-ui agreed): the version line with "Copy version details"; the abuse-report section shows the build's abuse address as text with Copy, **no mailto** (sec-lead on #552), or the pending text when unset. Spec `docs/ux/specs/B24-about.md` (its mailto/`openExternal` part dropped) | voice-c | in progress | – | #552 | S | M3 |
+| B24b | About screen, part b: the in-app documents view (terms and privacy from plan-1) and the licence list | voice-c | blocked: (1) the owner approves the legal text; (2) a privacy-contact build variable like `MVS_ABUSE_ADDRESS` (#534, #535, #552); (3) the licence list after B9/T22 | – | owner, T22 | M | M3 |
 | UX-10 | `mvs://` links not clickable in WhatsApp/Telegram/Discord → https landing page on `<relay-domain>` | devops + dev-ui | todo (5.1 decided) | – | T4 | S | M3 |
 
 ### UX gaps ([`docs/ux/GAPS.md`](ux/GAPS.md), #320; priorities from product-lead on #320)
 
 **Condition on every UI PR from now on:** AA contrast (G-112, B20) and reduced motion (G-114, B21). A UI PR that breaks either is not accepted.
 
-**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-48 core (report record: design note → sec-lead → core) → G-14 → G-51 · voice-c G-47 → G-53 UI → G-48 UI → G-41 · voice-d G-25 · dev-ui #447 wiring → G-27 → G-05 → G-06 → G-30 · voice-shell G-78 UI. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426).
+**0.5 order (product-lead + manager, 2026-11-18):** dev-updater G-48 core (report record: design note → sec-lead → core) → G-14 → G-51 · voice-c G-47 → G-53 UI → G-48 UI → G-41 · voice-d G-25 · dev-ui #447 wiring → G-27 → G-05 → G-06 → G-30 · voice-shell G-78 UI. Infra on top, unchanged: G-81, G-91. Acceptance criteria: [`docs/reviews/po-acceptance-0.5.md`](reviews/po-acceptance-0.5.md) (#426). **Status 2026-11-25:** G-14, G-41, G-05, G-06, G-78 done; G-51 and G-77 have their core; G-52 needs a core `setAgeRestriction` (dev-identity) before voice-c's UI.
 
 | ID | Title | Owner | Status | PR | Depends on | Size | MS |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -182,20 +184,20 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | G-21c | Unread count cache: `fill_unread` rebuilds the shown list per channel on each `listChannels` call; cache the count per channel, updated on message store and `markRead`. Only when profiling shows it (reviews: tech-lead) | dev-identity | todo | – | #327 | S | P3 |
 | G-PR1 | Profile post: retry only to the servers that refused it (a stored set of server IDs instead of the single pending flag). Today one refusing server makes every server get a fresh ~4 KB profile post every 10 minutes (reviews: tech-lead) | dev-identity | todo (after the 2026-11-17 reset) | – | #359 | S | – |
 | G-24 | @mentions (UI + core format, GAPS §2.5) (reviews: tech-lead, product-lead (+ ux visual), sec-lead (format)) | dev-ui + dev-identity (format) | done | #330 #331 #338 #342 | – | M | 0.4.0 |
-| G-05 | Mention badge in the rail, separate from the new-messages dot (`mentionsMe` exists) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo (dev-ui after G-27; no rail mention badge yet) | – | G-24 | S | 0.4.0 |
+| G-05 | Mention badge in the rail, separate from the new-messages dot (`mentionsMe` exists) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | – | G-24 | S | 0.4.0 |
 | G-61 | Notifications and mute (local + shell, GAPS §2.4) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui + dev-voice-shell | done | #336 | – | M | 0.4.0 |
 | G-17 | Mute a channel (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #335 | G-61 | S | 0.4.0 |
 | G-03 | Mute a server, greyed in the rail (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #335 | G-61 | S | 0.4.0 |
 | G-04 | Mark all as read for a server, from the context menu (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #335 | G-21 | S | 0.4.0 |
 | G-22 | Message context menu: reply, copy, edit, delete (B25 §2, rest of #208) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | #213 | B25 | S | 0.4.0 |
-| G-06 | Tooltip with the full server name in the rail (48-character names) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | todo (dev-ui after G-05; today only a native title, not shown on keyboard focus) | – | – | S | 0.4.0 |
+| G-06 | Tooltip with the full server name in the rail (48-character names) (reviews: tech-lead, product-lead (+ ux visual)) | dev-ui | done | – | – | S | 0.4.0 |
 | **0.4.x** | **In parallel, infrastructure (P0)** | | | | | | |
-| G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d + dev-sync | **replanned** after the owner's "no central servers" decision: no STUN, no TURN (#433 closed). Next: a P2P calls design note (hybrid of libp2p media and direct); two-NAT harness #505 (draft) | #505 | #220, STUN | L | 0.4.x |
+| G-81 | Calls across networks, not only the same network (QUIC/STUN, #243, #220) (reviews: tech-lead, sec-lead (network)) | voice-d + dev-sync | in progress: P2P calls design #509 approved (C2; our relays first; member-first relays wait for the owner). Chain: media pipeline #530, notice v3 #539, wiring #550 (draft). Acceptance: #499 | #509 #530 #539 #550 | #220, STUN | L | 0.4.x |
 | G-91 | Servers come back automatically after a restore (today only via an invite link, #291, #293) (reviews: tech-lead, sec-lead (identity)) | dev-identity (+ dev-sync) | in progress (phase A merged: backup keys #292, restore #317, store #339 #340, mailbox #367; restore progress part 1 #457; phase B buddies in review #461, dev-identity (sync side "BUDDIES on" by dev-sync only after multi-relay part B); restore screen in review #458) | #292 #317 #339 #340 #367 #457 #461 #458 | – | L | 0.4.x |
-| LM-1 | **P1 lost message:** groupkeys sealed under the old key on `RotationNeed::Add`. Fix: option (1), with the security lead's conditions C1–C6 (reviews: tech-lead, sec-lead) | dev-sync | in progress | – | – | S | **P1** |
-| JR-1 | **Join phase "removed"** (product-lead decision on #490): today a removed account gets a "searching" dead end. Core `JoinStatus` `removed` (dev-identity, draft #503); UI `join.removed` (voice-c) | dev-identity → voice-c | in progress | #503 | – | S | **P1, M3 (before the closed alpha)** |
-| UP-1 | **Unreadable-message placeholders** (product-lead decision): post-join with no key → a placeholder; untrusted → a contentless placeholder; pre-join stays hidden behind the existing `fromJoin` line. ux adds two strings to B18/B6 | dev-sync (core) → dev-ui (UI); ux strings | todo | – | – | M | M3 |
-| OE-1 | Desktop `openExternal` refuses IP-literal, `[IPv6]`, `localhost` and `*.localhost` hosts (trailing dot stripped), matching the UI's `safeHref` (#484). sec-lead follow-up | voice-shell | in progress | – | #484 | S | – |
+| LM-1 | **P1 lost message:** groupkeys sealed under the old key on `RotationNeed::Add`. Fix: option (1), with the security lead's conditions C1–C6 (reviews: tech-lead, sec-lead) | dev-sync | done | – | – | S | **P1** |
+| JR-1 | **Join phase "removed"** (product-lead decision on #490): today a removed account gets a "searching" dead end. Core `JoinStatus` `removed` (dev-identity, draft #503); UI `join.removed` (voice-c) | dev-identity → voice-c | done | #503 | – | S | **P1, M3 (before the closed alpha)** |
+| UP-1 | **Unreadable-message placeholders** (product-lead decision): post-join with no key → a placeholder; untrusted → a contentless placeholder; pre-join stays hidden behind the existing `fromJoin` line. ux adds two strings to B18/B6 | dev-sync (core) → dev-ui (UI); ux strings | done | #527 #558 | – | M | M3 |
+| OE-1 | Desktop `openExternal` refuses IP-literal, `[IPv6]`, `localhost` and `*.localhost` hosts (trailing dot stripped), matching the UI's `safeHref` (#484). sec-lead follow-up | voice-shell | done | #493 | #484 | S | – |
 | MR-1 | Member recovery (dev-identity drafts #504, #506) | dev-identity | in progress | #504 #506 | – | M | – |
 | **0.5.0** | **"Conversation" (P1)** | | | | | | |
 | G-23 | Date divider (B16, UX-12) | dev-ui | done | #439 #449 | – | S | 0.5.0 |
@@ -209,19 +211,20 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | G-63 | Notification sound | voice-c | done, accepted | #468 | – | S | 0.5.0 |
 | G-62 | Taskbar unread count | dev-voice-shell | done | #430 #442 | G-61 ✔ | S | 0.5.0 |
 | G-113 | Screen-reader announcement of new messages (B21, UX-38) | voice-c | done, accepted | #470 | – | S | 0.5.0 |
-| G-92 | "What now?" after sign-up (check with T8) | dev-ui | todo | – | – | S | 0.5.0 |
+| G-92 | "What now?" after sign-up (check with T8) | dev-ui | done | – | – | S | 0.5.0 |
 | **0.5.x** | **"Managing a server" (P1)** | | | | | | |
 | G-53 | Removed accounts list + undo-kick UI (core ready, #110) | voice-c | done | #490 | – | S | 0.5.x |
-| G-52 | Age restriction setting (B7 §6; read-only today) | dev-ui | todo | – | – | S | 0.5.x |
-| G-51 | Server icon and description (signed record) | dev-updater | todo (dev-updater 3rd) | – | – | M | 0.5.x |
+| G-52 | Age restriction setting (B7 §6; read-only today) | dev-identity (core `setAgeRestriction`) → voice-c (UI) | todo (core first) | – | – | S | 0.5.x |
+| G-51 | Server icon and description (signed record) | dev-updater | in progress (core done; UI next). **sec-lead rule:** any display of a server outside it (an invite preview, a directory) must apply the server's age restriction | – | – | M | 0.5.x |
 | G-12 | Channel categories (signed record) | dev-records → dev-ui | todo | – | G-11 | L | 0.5.x |
 | G-13 | Collapse categories (local) | dev-ui | todo | – | G-12 | S | 0.5.x |
-| G-14 | Channel topic (signed record) | dev-updater | todo (dev-updater 2nd) | – | – | S | 0.5.x |
+| G-14 | Channel topic (signed record) | dev-updater | done | – | – | S | 0.5.x |
 | G-18 | Write-only-for-owners channel (signed record, channel permissions) | dev-records → dev-ui | todo | – | – | M | 0.5.x |
-| G-47 | Blocked list with unblock (local) | voice-c | in progress (voice-c 1st; core `listBlocked`/`setBlocked` in dev-identity's draft #502) | #502 | – | S | 0.5.x |
+| G-47 | Blocked list with unblock (local) | voice-c | done (core #502) | #502 | – | S | 0.5.x |
+| G-47b | G-47 follow-up: `listBlocked` returns `shortCode` (derived from the user id), and the UI shows the identity code next to each blocked row (UX-19), so two "unknown account" rows can be told apart | dev-identity (core) → voice-c (UI) | done (core #525; the UI shows the code in `Blocked.tsx`) | #525 | G-47 | S | P2 |
 | G-48 | Report to the owners (signed record) | dev-updater (core) → voice-c (UI) | todo (dev-updater 1st: design note → sec-lead → core; then voice-c UI, 3rd) | – | – | M | 0.5.x |
-| G-41 | Search members (30+ member servers) | voice-c | todo (voice-c 4th) | – | – | S | 0.5.x |
-| G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | todo | – | – | S | 0.5.x |
+| G-41 | Search members (30+ member servers) | voice-c | done | – | – | S | 0.5.x |
+| G-77 | Correct the date of birth (B7 §2; #312 only displays it) | dev-identity → dev-ui | in progress (core done; UI next) | – | – | S | 0.5.x |
 | **0.6.0** | **"Voice like Discord" (P1)** | | | | | | |
 | G-16 | Additional voice channels (record + core) | dev-records + dev-identity → dev-ui | built as voice rooms (join to create; dev-ui verifies against GAPS scope) | #355 #369 #371 #375 | – | L | 0.4.3 |
 | G-72 | Microphone/speaker choice and mic test | voice-c | done (parts accepted, #438) | #429 #436 #438 | – | M | 0.6.0 |
@@ -231,7 +234,7 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | G-74 | Push-to-talk (global key) | dev-voice-shell (+ dev-ui) | done (shell #444, UI #450) | #444 #450 | – | M | 0.6.0 |
 | G-64 | Join/leave notification sound | dev-ui | done, accepted | #456 | – | S | 0.6.0 |
 | G-83 | Participant count on room rows (covered by the voice rooms shipped in 0.4.3) | dev-identity → dev-ui | done | #369 #371 #375 | – | S | 0.6.0 |
-| G-78 | Optional app lock (design note first) | dev-voice-shell | in review (design note #466, approved by the tech lead with one change; awaiting the security lead); **the lock UI is voice-shell's** (not dev-ui) | #466 | – | M | – |
+| G-78 | Optional app lock (design note first) | dev-voice-shell | done (v1; v1.1 Windows Hello note #542 merged, the spike waits for the owner's OK) | #466 #513 | – | M | – |
 | **P2** | **P2 backlog, after the closed alpha: see [`docs/ux/GAPS.md`](ux/GAPS.md)** (G-28 files, G-31 search, G-34 link previews, G-15 pins, G-42 roles, G-43, G-44, G-45 DM, G-46, G-55, G-71, G-75, G-76, G-78, G-93, G-02, G-101–G-103, G-111, G-115) | product-lead | todo | – | – | – | – |
 | **Done** | | | | | | | |
 | G-35 | Owners delete any message (in B25) | – | done | #208 | – | – | – |
@@ -254,6 +257,13 @@ Last updated: 2026-11-18, refresh 13 + pm batch (evening): merged since #457 inc
 | RD2 | Relay-down part 2: LAN beacon (derived tags, previous epoch, fixed 8 tags padded, caps, firewall check, TTL 1; sec-lead call on the open question) | dev-sync | in review (#460, dev-sync, changes requested) | #460 | RD1 | M | 0.4.x |
 | HK | Hickory advisories (RUSTSEC-2026-0118/0119): peer-learned DNS names dropped (#416), vendored `libp2p-dns` on hickory 0.26 (#412), gossipsub PRUNE fix (#421, RUSTSEC-2026-0534); open: relay keeps DNS names out of the DHT and drops `/dns*` from identify, advisory watch for the vendored crates | dev-sync, dev-updater, devops | in progress (#423, #424 merged; relay hickory bump and identify change are devops) | #412 #416 #421 #423 #424 | – | S | 0.4.x |
 | EP | Email + password sign-in (design #365, behind `available=false` until 2 bootstraps) | dev-identity, devops (mailer) | deferred (design only) | #365 | MR | L | – |
+| RIA | **Relay-in-app epic** (design #561, approved by tech-lead and sec-lead with amendments): RIA-R1 → RIA-R1b port mapping → RIA-R1c address propagation → RIA-R2 → RIA-R3. Owner questions open: the seed list, serving strangers, the removal date, port-mapping opt-in | dev-sync | in progress (R1 draft #565) | #561 #565 | – | L | – |
+| RIA-R1 | Relay-in-app, stage 1 | dev-sync | in progress | #565 | #561 | M | – |
+| RIA-R1b | Port mapping for home NAT (opt-in pending the owner) | dev-sync | todo | – | RIA-R1 | M | 0.6.0 |
+| NC-1 | **Alpha network counters in the diagnostics file** (#576, point 1): (a) sync counts connections by path type (direct, hole-punched, member relay, our relay) for each of join, sync and call, plus the RIA-R1 reachability verdict (open IP, home NAT mapped or not, CGNAT). Counters only: no addresses, peer IDs or server names. (b) The api/desktop side writes them into the diagnostics file. A test proves no IP, peer ID or server name ever reaches the file. qa checks the path-log format. Needed before alpha week 5 | dev-sync (a) → dev-identity / voice-shell (b); qa | todo | – | RIA-R1 (reachability) | S–M | 0.6.0 |
+| RIA-R1c | Relay address propagation | dev-sync | todo | – | RIA-R1b | S | – |
+| RIA-R2 | Relay-in-app, stage 2 | dev-sync | todo | – | RIA-R1c | M | – |
+| RIA-R3 | Relay-in-app, stage 3 | dev-sync | todo | – | RIA-R2 | M | – |
 
 ### Reviews, QA, security, business
 
@@ -470,6 +480,10 @@ All rows below are **awaiting owner**: the recommendations are written, and the 
 | 5.13 | Light lawyer review before open alpha | Yes (~₪3,000–8,000) | awaiting owner | – | Before open alpha |
 | MR-2c | Member relay 2c (throwaway IDs): accept the linkability, keep the real swarm off relays, or defer. Recommendation (manager, sec-lead): defer (c) and keep #368's honest copy | tech-lead, sec-lead | awaiting owner | MR-2c | Before open alpha |
 | G-81 | Run a TURN media relay for calls with CGNAT/cellular peers (G-81)? | **Decided: no.** The app works without a central server; calls go over the P2P network, no STUN/TURN server (owner, 2026-11-18) | decided | G-81 (#433) | Before 0.5.0 |
+| K2-req | Is the B7-k release (K2) a required update? | – | awaiting owner | B7-k rollout | Next release |
+| G-81-mf | Member-first relays for P2P calls (G-81 C2 uses our relays first) | – | awaiting owner | G-81 | – |
+| RIA-q | Relay-in-app (#561): seed list, serving strangers, removal date, port-mapping opt-in | tech-lead + sec-lead amendments in #561 | awaiting owner | RIA-R1b, RIA-R2, RIA-R3 | Before RIA-R1b |
+| B24-legal | Approve the in-app terms of use and privacy notice text (from business plan 1) | biz + product-lead drafts in plan-1 | awaiting owner | B24b | Before M3 |
 
 (5.6 is the heading for 5.7–5.13 in the plan, not a decision.)
 | GAP-2 | `auth_deps` format: the kick names the kicker's channel heads so backdated messages are voided (technical, tech-lead + sec-lead; owner informed) | tech-lead, sec-lead | B4 | Now |

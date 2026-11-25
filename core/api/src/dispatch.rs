@@ -42,6 +42,24 @@ struct UpdateNeededArgs {
     cap: Option<String>,
 }
 
+/// G-48 `reportContent`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportArgs {
+    server_id: String,
+    target: ReportTargetInput,
+    reason: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// G-48: a report's ID.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportIdArg {
+    report_id: String,
+}
+
 /// G-29.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +151,15 @@ struct MessageIdArg {
 struct EditArg {
     message_id: String,
     body: String,
+}
+
+/// G-30 `locateMessage`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocateArgs {
+    server_id: String,
+    channel_id: String,
+    message_id: String,
 }
 
 #[derive(Deserialize)]
@@ -455,6 +482,10 @@ impl Core {
                 let a: RangeArg = args(raw)?;
                 ok(self.get_messages(&a.channel_id, a.start, a.end))
             }
+            "locateMessage" => {
+                let a: LocateArgs = args(raw)?;
+                ok(self.locate_message(&a.server_id, &a.channel_id, &a.message_id))
+            }
             "sendMessage" => {
                 let a: SendArg = args(raw)?;
                 ok(self.send_message(&a.channel_id, &a.body, a.reply_to_id.as_deref()))
@@ -470,6 +501,14 @@ impl Core {
                 let a: ReactArgs = args(raw)?;
                 ok(self.react(&a.message_id, &a.emoji, a.on))
             }
+            // G-48: reports to the owners and admins.
+            "reportContent" => {
+                let a: ReportArgs = args(raw)?;
+                ok(self.report_content(&a.server_id, &a.target, &a.reason, a.text.as_deref()))
+            }
+            "listReports" => ok(self.list_reports(&args::<ServerArg>(raw)?.server_id)),
+            "dismissReport" => ok(self.dismiss_report(&args::<ReportIdArg>(raw)?.report_id)),
+            "getReportEvidence" => ok(self.get_report_evidence(&args::<ReportIdArg>(raw)?.report_id)),
             // G-29.
             "setTyping" => {
                 let a: TypingArgs = args(raw)?;

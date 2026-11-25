@@ -168,6 +168,62 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the in-app updater (hourly check) narrows the window;
     - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
+- Report to the owners (G-48; design `docs/design/report-to-owners.md`, with the Tech Lead's Amendment 1, the security lead's R1–R7 and the Product Owner's decisions):
+  - `reportContent({ serverId, target, reason, text? })` returns `{ reportId, recipients }`.
+    - `target` is `{ kind: 'message', messageId }` or `{ kind: 'member', userId }`.
+    - `reason` is one of: `spam`, `harassment`, `hate`, `violence`, `sexual`, `minor`, `self-harm`, `illegal`, `impersonation`, `other`.
+    - `text` is optional and trimmed. It follows the topic rule (one line, the strict text rule), up to 280 code points and 1024 bytes.
+    - Errors, with nothing signed:
+      - `bad-request`: the reason or text is wrong;
+      - `not-found`: no such message (in a channel I can see) or member (current or removed) in that server;
+      - `not-allowed`: reporting myself or my own message, or I'm not a member;
+      - `rate-limited`: 5 an hour or 20 a day per server;
+      - `already-reported`: the same target within 30 days;
+      - `no-recipient`: nobody is left to receive it. The UI then points at the abuse address (B24).
+  - **Who gets it:**
+    - Recipients are the server's owner and admins, current and not kicked, minus the reported member and me. For a message, the reported member is its author.
+    - Moderators don't get reports in v1.
+    - Admins added after a report don't get it.
+  - **Delivery:**
+    - A direct, members-only protocol, `/mvs/report/1`. A box goes to each recipient on its own; nothing enters a log, so other members never learn a report exists.
+    - The reporter's outbox retries about every 10 seconds while the recipient is online, and drops a row once it is acked.
+    - At each send, the recipient is resolved again (R1): a row whose recipient is no longer owner or admin, or is the reported member, is dropped, and so are rows older than 30 days or for a server I left.
+    - `report.status { reportId, delivered, pending }` follows progress.
+  - **Staff:**
+    - `listReports(serverId)` lists reports newest first. It is `not-allowed` unless I am owner or admin now, and losing that role, leaving or a kick deletes the reports I hold.
+    - `report.received { serverId, report }` fires on arrival.
+    - `dismissReport(reportId)` is local triage only.
+    - A `ReportSummary` is `{ id, serverId, reporterId, target, reportedId, reason, text?, ts, receivedAt, dismissed, evidenceValid, evidenceWithheld }`. It **never carries evidence**: not in the list, the event, a notification or a preview.
+  - **`getReportEvidence(reportId)`** (an explicit click) returns `{ authorId, channelId, ts, text? }`, the reported message as its author signed it.
+    - `text` is absent when I hold no key for it.
+    - Show it as plain text: never Markdown with live links, never HTML.
+    - Errors:
+      - `bad-request`: the evidence isn't that message (R4: the ID, server, channel, kind `Message` and the author's signature must all check);
+      - `not-allowed`: for `sexual` and `minor`, staff without an 18+ claim (Product Owner). `evidenceWithheld: true` says so in advance.
+    - No API path exports or forwards evidence.
+    - The evidence outlives the author's delete. That's a deliberate retention exception.
+  - **Non-repudiation is intended:** staff hold the reporter's signature. The UI must say "the owner and admins will see that you reported this".
+  - **Wire:**
+    - The signed report is a fixed 1200-byte part, then `ev_len u32` and the evidence (the reported message's own signed record, padded to 0, 2 KiB, 8 KiB or the largest record), then an Ed25519 signature under `mvs/report/v1`.
+    - Each box is X25519 to the recipient's key (from Ed25519, as `groupkeys`), BLAKE3 `derive_key`, then XChaCha20-Poly1305. The associated data is `"mvs/report-box/v1" ‖ ephemeral ‖ recipient ‖ server`, and an all-zero shared secret is refused.
+    - A box is at most 20 KiB.
+    - Sync caps per peer: a burst of 3, then one every 10 s. Across all peers: a burst of 20, then 2 a second.
+    - Sync acks every box that passes those caps before the core tries to open it, so the answer never depends on what the box holds (R7).
+  - **Receiving:**
+    - A box is dropped quietly unless:
+      - it opens for me in one of my servers;
+      - the report verifies;
+      - its signer is the identity sync bound the peer to;
+      - its time is within 30 days back and 10 minutes ahead;
+      - I'm staff there;
+      - the reporter is a current member;
+      - a member target is current or removed;
+      - it's new: report IDs are kept 31 days;
+      - the reporter has sent under 10 an hour.
+    - Each server stores at most 1000 reports.
+  - **Storage:** only sealed boxes are on disk, both the outbox and the reports I received. Neither is in the account backup or the logs. The report commands aren't in the app lock's allow-set (G-78).
+  - **Older peers** don't speak `/mvs/report/1`: the row stays in the outbox until they update or it expires.
+
 - Channel topic (G-14; design `docs/design/channel-topic.md`):
   - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
   - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.
@@ -220,6 +276,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - A restore still waiting is tried again. While no backup is found: backoff, after 1 min, doubling (2, 4, 8, 16, 32) up to once an hour. Once it is found: only the servers still waiting, every 30 s (`REJOIN_EVERY_MS`), with no new backup fetch, so each comes back within 2 minutes of a member of it being reachable. Nothing more once it is done. After a restart mid-restore the backup is searched for again.
     - A server leaves the restore only on a definite answer: back (`Joined`), closed, or refused as no longer mine (`Invalid` with evidence: the log shows an accepted kick or leave of me). Anything else (nobody reachable, a partial answer, age-blocked, any error) waits for the next try, so one bad round never loses a server (Security Lead on #457).
     - Accepted residual (Security Lead on #472): a partial log that has an old leave of mine but not my later rejoin still drops the server. That errs on the safe side, and an invite link brings it back.
+    - Accepted residual (Security Lead on #503), the same for `removed`: a partial log that has my kick but not a later `undoKick` (and my rejoin) says `removed` and drops the server from a restore. It errs on the safe side; a fresh invite after the owner lets me back brings it back.
     - The app lock (`Core::lock_keys`) drops the server secrets a waiting restore holds and pauses it; after `unlock_keys` the backup is fetched again. Otherwise, once found, a newer backup isn't fetched again until the next start or unlock.
   - **Progress (G-91):** `getServerRestore()` returns `ServerRestore { state, found, waiting }`. The event `serverRestore.changed` carries the same, sent only when something in it changed.
     - `state`: `none` (no restore since this start), `searching` (no backup found yet), `waiting` (found; `waiting` servers have nobody reachable yet), or `done` (every server is back, or isn't mine any more).
@@ -521,12 +578,19 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - Both commands: the owner or an admin only (`not-allowed`), `not-found` for a server I'm not in, and `update-needed` while a member's latest profile lacks `server-meta-v1` (`getUpdateNeeded(serverId, 'server-meta-v1')` lists who). Setting what's already set signs nothing.
   - `ServerSummary` gains `iconDataUrl?` and `description?` (additive; absent when unset). Any change, mine or read by sync, fires `server.updated`. It's never unread, a mention or a notice.
   - Plaintext inside the server, like the name: every member, or a modified client, can read them (GAP-22).
+- `JoinStatus` gains `{ phase: 'removed', link }` (the UI string `join.removed`): I was kicked from this server and not let back (`undoKick`). It's final, like `closed`: the join stops, nothing is signed or stored, and the server's subscription is closed again. It comes before the age gate. It tells me only what I already know, that my own account was removed; it carries no server name, ID or member, and someone else with the same link joins as usual. A restore treats it as a definite answer (the log holds the accepted kick). Before, this was `invalid`.
 - Blocked accounts (G-47):
   - `listBlocked()` returns `BlockedUser[]`, `{ userId, shortCode, name? }`, ordered by `userId` (`shortCode` is the identity code, as `Member.shortCode`, so rows without a name can be told apart, G-47b): everyone I blocked, also accounts I share no server with now. `name` is the display name in a server we share, else the one known when I blocked them; it's absent if none was ever known.
   - `setBlocked(userId, blocked: boolean)` returns `null` and is idempotent: setting what's already set changes nothing and fires nothing. My own ID is `bad-request` (from `blockUser` too); an ID that isn't 64 hex is `not-found`.
   - `blockUser(userId)` stays a toggle, for older shells.
   - On a change, from either command: `blocks.changed { blocked: BlockedUser[] }` (the whole new list), and `members.changed` for each server the account is in.
   - Unblocking also drops the kept name. A block stays on this device only; it's never sent.
+- Message links (G-30, `docs/design/g30-message-links.md` §4):
+  - `locateMessage(serverId, channelId, messageId)` returns `{ index }`: the message's place in `getMessages(channelId)` order, as of now. Local and read-only: it never asks peers or starts a sync. It costs one decryption pass over the channel, like `getMessages`.
+  - **One answer for everything I can't see** (Security Lead, R1): `not-found`, identical in every case, so a link never confirms that something hidden exists. That covers: not a member (servers I left or was removed from are purged), no such channel or one `listChannels` doesn't give me (an 18+ channel hidden by B7 §4), IDs that don't agree, a message that isn't here or doesn't open (no placeholders until #21), and a message still waiting to send (`pending-…`).
+  - `bad-request` only for an ID that isn't 64 hex (the UI never sends one).
+  - A deleted message keeps its index (the tombstone). A closed server answers as its `getMessages` does: its keys go at the close, so messages that no longer open are `not-found` there too.
+  - The index is a snapshot: a message with an earlier timestamp can arrive later and shift it. The UI checks the ID at the index and locates again if it moved.
 - 18+ channels, the receiver rule (B7-k, Tech Lead and Security Lead on #544). In a channel that is 18+ in my current fold, a Message, MessageEdit or Reaction counts only if:
   - (a) its author is an adult at the record's causal position: their latest accepted age claim before its `auth_deps` (`Resolver::adult_at`); and
   - (b) if its `auth_deps` don't reach the latest edit that made the channel 18+ (`State.adult_edits`, `Resolver::reaches`), its author is also an adult now.

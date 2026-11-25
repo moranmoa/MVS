@@ -6,21 +6,21 @@ Theme: **no server needed, and safe for the closed alpha.** The standing rules a
 
 | # | Item | Why this place |
 | --- | --- | --- |
-| 1 | Relay-in-app R1 → R2 → R3 (#561) | The owner's top goal: users are the relays, no central server |
+| 1 | Relay-in-app R1 → R1b → R1c → R2 → R3 (#561) | The owner's top goal: users are the relays, no central server |
 | 2 | G-81 P2P calls on by default | Needs 1. Calls across networks are the largest voice gap |
 | 3 | T17-pre, then T17 secret rotation | A kick must close access (M2), and T17-pre ships first |
 | 4 | G-48 reports (core #515 + UI) | A safety basic for a 16+ alpha |
 | 5 | B24a About | Required before the closed alpha: abuse address, agreement, privacy |
-| 6 | G-52 age restriction setting | The owner controls their server's audience |
+| 6 | G-52 age restriction setting (M–L) | The owner controls their server's audience. Needs a new owner-only control kind and T17's rotation, so it comes after 3 |
 | 7 | G-51 server icon UI | Polish; first to slip if 0.6.0 is late |
 
 ## Acceptance criteria
 
 **1. Relay-in-app (R1–R3)**
 - A computer with an open or mapped port relays for members of its servers only, within the daily cap and the disclosure from #387; nobody relays before seeing it.
-- Two members behind ordinary home NAT connect through a third member's app with no project server running (the test turns the owner's relay off).
-- Port mapping (R1b) stays off until the owner decides; when on, it's opt-in and explained.
-- CGNAT and cellular users can use relays but never serve. Metered connections never serve.
+- Two members behind ordinary home NAT connect through a third member's app with no project server running (the test turns the owner's relay off), using a full invite link (R2 invite hints). The third member must be reachable: an open IP, or a home router mapped by R1b, with its address propagated by R1c.
+- Port mapping (R1b) is in 0.6.0 scope, but it stays off until the owner decides; when on, it's opt-in and explained. **If the owner declines R1b,** the test uses a third member with an open IP, and the release notes say home users serve only with an open port.
+- CGNAT and cellular users can use relays but never serve. Metered connections never serve, where the OS reports them as metered.
 - No relay sees content (end-to-end encryption unchanged), and nothing about who relays for whom is published to non-members.
 
 **2. G-81 P2P calls on by default**
@@ -44,7 +44,9 @@ Theme: **no server needed, and safe for the closed alpha.** The standing rules a
 - The real domain never appears in git.
 
 **6. G-52 age restriction setting**
-- Owners can change a server's age restriction in settings; raising it removes members below the new age, after a confirmation that names how many.
+- Owners can change a server's age restriction in settings (a new owner-only control record behind the version gate; SL review).
+- **Raising it:** members without a matching age claim are removed deterministically, with a re-key and the T17 secret rotation, as for a kick. Never silently: the owner first sees a confirmation that says how many, and each removed member sees why ("הגבלת הגיל של השרת עלתה").
+- **Lowering it:** allowed, with no removals. It's the owner's explicit choice. 18+ channels stay 18+.
 - An owner can't set a restriction above their own age (B11c §4.1, G-77).
 - Lowering it never happens automatically (the G-77 decision).
 

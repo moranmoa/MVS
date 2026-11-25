@@ -168,6 +168,62 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the in-app updater (hourly check) narrows the window;
     - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
+- Report to the owners (G-48; design `docs/design/report-to-owners.md`, with the Tech Lead's Amendment 1, the security lead's R1–R7 and the Product Owner's decisions):
+  - `reportContent({ serverId, target, reason, text? })` returns `{ reportId, recipients }`.
+    - `target` is `{ kind: 'message', messageId }` or `{ kind: 'member', userId }`.
+    - `reason` is one of: `spam`, `harassment`, `hate`, `violence`, `sexual`, `minor`, `self-harm`, `illegal`, `impersonation`, `other`.
+    - `text` is optional and trimmed. It follows the topic rule (one line, the strict text rule), up to 280 code points and 1024 bytes.
+    - Errors, with nothing signed:
+      - `bad-request`: the reason or text is wrong;
+      - `not-found`: no such message (in a channel I can see) or member (current or removed) in that server;
+      - `not-allowed`: reporting myself or my own message, or I'm not a member;
+      - `rate-limited`: 5 an hour or 20 a day per server;
+      - `already-reported`: the same target within 30 days;
+      - `no-recipient`: nobody is left to receive it. The UI then points at the abuse address (B24).
+  - **Who gets it:**
+    - Recipients are the server's owner and admins, current and not kicked, minus the reported member and me. For a message, the reported member is its author.
+    - Moderators don't get reports in v1.
+    - Admins added after a report don't get it.
+  - **Delivery:**
+    - A direct, members-only protocol, `/mvs/report/1`. A box goes to each recipient on its own; nothing enters a log, so other members never learn a report exists.
+    - The reporter's outbox retries about every 10 seconds while the recipient is online, and drops a row once it is acked.
+    - At each send, the recipient is resolved again (R1): a row whose recipient is no longer owner or admin, or is the reported member, is dropped, and so are rows older than 30 days or for a server I left.
+    - `report.status { reportId, delivered, pending }` follows progress.
+  - **Staff:**
+    - `listReports(serverId)` lists reports newest first. It is `not-allowed` unless I am owner or admin now, and losing that role, leaving or a kick deletes the reports I hold.
+    - `report.received { serverId, report }` fires on arrival.
+    - `dismissReport(reportId)` is local triage only.
+    - A `ReportSummary` is `{ id, serverId, reporterId, target, reportedId, reason, text?, ts, receivedAt, dismissed, evidenceValid, evidenceWithheld }`. It **never carries evidence**: not in the list, the event, a notification or a preview.
+  - **`getReportEvidence(reportId)`** (an explicit click) returns `{ authorId, channelId, ts, text? }`, the reported message as its author signed it.
+    - `text` is absent when I hold no key for it.
+    - Show it as plain text: never Markdown with live links, never HTML.
+    - Errors:
+      - `bad-request`: the evidence isn't that message (R4: the ID, server, channel, kind `Message` and the author's signature must all check);
+      - `not-allowed`: for `sexual` and `minor`, staff without an 18+ claim (Product Owner). `evidenceWithheld: true` says so in advance.
+    - No API path exports or forwards evidence.
+    - The evidence outlives the author's delete. That's a deliberate retention exception.
+  - **Non-repudiation is intended:** staff hold the reporter's signature. The UI must say "the owner and admins will see that you reported this".
+  - **Wire:**
+    - The signed report is a fixed 1200-byte part, then `ev_len u32` and the evidence (the reported message's own signed record, padded to 0, 2 KiB, 8 KiB or the largest record), then an Ed25519 signature under `mvs/report/v1`.
+    - Each box is X25519 to the recipient's key (from Ed25519, as `groupkeys`), BLAKE3 `derive_key`, then XChaCha20-Poly1305. The associated data is `"mvs/report-box/v1" ‖ ephemeral ‖ recipient ‖ server`, and an all-zero shared secret is refused.
+    - A box is at most 20 KiB.
+    - Sync caps per peer: a burst of 3, then one every 10 s. Across all peers: a burst of 20, then 2 a second.
+    - Sync acks every box that passes those caps before the core tries to open it, so the answer never depends on what the box holds (R7).
+  - **Receiving:**
+    - A box is dropped quietly unless:
+      - it opens for me in one of my servers;
+      - the report verifies;
+      - its signer is the identity sync bound the peer to;
+      - its time is within 30 days back and 10 minutes ahead;
+      - I'm staff there;
+      - the reporter is a current member;
+      - a member target is current or removed;
+      - it's new: report IDs are kept 31 days;
+      - the reporter has sent under 10 an hour.
+    - Each server stores at most 1000 reports.
+  - **Storage:** only sealed boxes are on disk, both the outbox and the reports I received. Neither is in the account backup or the logs. The report commands aren't in the app lock's allow-set (G-78).
+  - **Older peers** don't speak `/mvs/report/1`: the row stays in the outbox until they update or it expires.
+
 - Channel topic (G-14; design `docs/design/channel-topic.md`):
   - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
   - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.

@@ -1164,6 +1164,10 @@ async fn a_forged_dial_back_answer_is_never_believed() {
     // B claims to have reached A at A's own listen address, or at a victim's.
     let own = a.listen_addrs().await.unwrap().into_iter().find(|l| l.to_string().contains("/tcp/") && !l.to_string().contains("p2p-circuit")).unwrap();
     b.test_dialback_lie(own).unwrap();
+    // No hole punch either: a punched connection is excluded by the node,
+    // but this test is about an answer with no connection behind it.
+    a.test_no_hole_punch().unwrap();
+    b.test_no_hole_punch().unwrap();
     a.set_member_relay(true, 1024, true).unwrap();
     voice_meet(&a, &b, voice_id(56), voice_id(57), true).await;
     assert_eq!(reachable_within(&a, Duration::from_secs(20)).await, None, "a forged answer was believed");

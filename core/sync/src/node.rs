@@ -148,6 +148,9 @@ const MAX_PENDING_INCOMING: u32 = 64;
 /// add one more for a moment. One more for a moment: R1's dial-back probe,
 /// which the helper closes as soon as it has answered.
 const MAX_CONNECTIONS_PER_PEER: u32 = 4;
+/// R1: how long a dial-back answer and its probe wait before they count,
+/// so a hole punch's event (which would disqualify it) lands first.
+const PROBE_SETTLE: Duration = Duration::from_secs(2);
 /// Direct incoming connections from one IP address (IPv6: one /64). PeerIds are free to
 /// make, so the per-peer cap alone doesn't stop one machine taking every
 /// incoming slot. Relayed connections all come from the relay and aren't counted.
@@ -880,6 +883,7 @@ impl Node {
             dialback_lie: None,
             observed_by: HashMap::new(),
             recent_inbound: HashMap::new(),
+            punched: HashSet::new(),
             member_relay_want: (false, 0, false),
             dialback_wait: crate::dialback::FIRST_RETRY,
             pending_reached: HashMap::new(),
@@ -1700,7 +1704,9 @@ struct Task {
     /// When a direct inbound connection from each peer last arrived, and on
     /// which local address (port): a
     /// helper's "reached" counts only with one (TL on #565).
-    recent_inbound: HashMap<PeerId, (Instant, Multiaddr)>,
+    recent_inbound: HashMap<PeerId, (Instant, Multiaddr, ConnectionId)>,
+    /// Connections a DCUtR hole punch made: never a dial-back probe.
+    punched: HashSet<ConnectionId>,
     /// What the core asked of the member relay (on, daily cap, preferred):
     /// it serves only while confirmed reachable (TL on #565).
     member_relay_want: (bool, u32, bool),
@@ -3232,13 +3238,10 @@ impl Task {
                     match endpoint {
                         ConnectedPoint::Listener { send_back_addr, local_addr } => {
                             self.inbound_direct.insert(*connection_id, (*peer_id, send_back_addr.clone()));
-                            self.recent_inbound.insert(*peer_id, (Instant::now(), local_addr.clone()));
-                            // A held "reached" from this helper, on this port.
-                            if let Some((addr, at)) = self.pending_reached.remove(peer_id) {
-                                if at.elapsed() < Duration::from_secs(10) && crate::dialback::same_port(&addr, local_addr) {
-                                    self.confirm_reachable(addr);
-                                }
-                            }
+                            // A possible dial-back probe; `dialback_tick` decides
+                            // (never here: a hole punch looks the same at first).
+                            self.recent_inbound
+                                .insert(*peer_id, (Instant::now(), local_addr.clone(), *connection_id));
                         }
                         ConnectedPoint::Dialer { address, .. } => {
                             self.outbound_direct.insert(*connection_id, (*peer_id, address.clone()));
@@ -3259,6 +3262,7 @@ impl Task {
                 self.voice_dirty = true;
                 self.inbound_direct.remove(connection_id);
                 self.outbound_direct.remove(connection_id);
+                self.punched.remove(connection_id);
             }
             SwarmEvent::OutgoingConnectionError { connection_id, .. } => {
                 if let Some((channel, _, _)) = self.dialbacks.remove(connection_id) {
@@ -3727,7 +3731,13 @@ impl Task {
                 // flips the link to direct and parks the relayed one (#206).
                 // A failure leaves the relayed connection as it is.
                 match result {
-                    Ok(_) => info!(peer = %remote_peer_id, "hole punch succeeded"),
+                    Ok(connection) => {
+                        info!(peer = %remote_peer_id, "hole punch succeeded");
+                        // R1: never a dial-back probe (SL on #565).
+                        if self.punched.len() < 1024 {
+                            self.punched.insert(connection);
+                        }
+                    }
                     Err(err) => debug!(peer = %remote_peer_id, %err, "hole punch failed: staying relayed"),
                 }
             }
@@ -5160,8 +5170,9 @@ impl Task {
                 let _ = self.swarm.behaviour_mut().dialback.send_response(channel, crate::dialback::Answer::NotReached);
             }
         }
-        self.recent_inbound.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(60));
-        self.pending_reached.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(10));
+        self.recent_inbound.retain(|_, (at, _, _)| now.duration_since(*at) < Duration::from_secs(60));
+        self.settle_dialback_answers();
+        self.pending_reached.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(15));
         let (done, keep): (Vec<_>, Vec<_>) =
             self.dialback_probes.drain(..).partition(|(_, at)| now.duration_since(*at) >= Duration::from_secs(5));
         self.dialback_probes = keep;
@@ -5288,17 +5299,34 @@ impl Task {
             debug!("dial-back answer not believed: not an address of mine");
             return;
         }
-        // And its probe came in after I asked, on that port and transport.
+        // Held, never confirmed at once: `dialback_tick` confirms after
+        // [`PROBE_SETTLE`] if its probe came in after I asked, on that port
+        // and transport, and wasn't a hole punch (a DCUtR connection looks
+        // like a probe until its event lands: SL on #565).
+        self.pending_reached.insert(peer, (addr, Instant::now()));
+    }
+
+    /// Every second: a held answer whose probe arrived and settled confirms.
+    fn settle_dialback_answers(&mut self) {
         let asked = self.dialback_asked;
-        let arrived = self.recent_inbound.get(&peer).is_some_and(|(at, local)| {
-            asked.is_some_and(|asked| *at >= asked) && crate::dialback::same_port(&addr, local)
-        });
-        if !arrived {
-            // Its answer may have overtaken the probe itself: held 10 s.
-            self.pending_reached.insert(peer, (addr, Instant::now()));
-            return;
+        let ready: Vec<(PeerId, Multiaddr)> = self
+            .pending_reached
+            .iter()
+            .filter(|(_, (_, at))| at.elapsed() >= PROBE_SETTLE)
+            .filter(|(peer, (addr, _))| {
+                self.recent_inbound.get(peer).is_some_and(|(at, local, conn)| {
+                    asked.is_some_and(|asked| *at >= asked)
+                        && crate::dialback::same_port(addr, local)
+                        && !self.punched.contains(conn)
+                        && at.elapsed() >= PROBE_SETTLE
+                })
+            })
+            .map(|(peer, (addr, _))| (*peer, addr.clone()))
+            .collect();
+        if let Some((peer, addr)) = ready.into_iter().next() {
+            self.pending_reached.remove(&peer);
+            self.confirm_reachable(addr);
         }
-        self.confirm_reachable(addr);
     }
 
     /// R1: a believed dial-back. The relay may now serve and be offered.

@@ -103,6 +103,8 @@ export interface MockOptions {
   restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
+  /** B24 (?abuse=1): the build carries an abuse-report address (a placeholder, never a real one). */
+  abuseAddress?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
   outdatedMembers?: boolean;
   /** The demo server "Minecraft IL" starts closed by its owner (read-only). */
@@ -1736,7 +1738,12 @@ export class MockCore implements CoreApi {
   }
 
   async getAppInfo(): Promise<AppInfo> {
-    return { version: '0.1.0-alpha', updateChannel: this.releaseChannel, relayOnly: this.relayOnly };
+    return {
+      version: '0.1.0-alpha',
+      updateChannel: this.releaseChannel,
+      relayOnly: this.relayOnly,
+      ...(this.options.abuseAddress ? { abuseAddress: 'abuse@example.org' } : {}),
+    };
   }
 
   /** Relay-only (#272): on ends my call; every room then says so (the core: at the next sync round). */

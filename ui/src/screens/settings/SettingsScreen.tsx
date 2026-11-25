@@ -14,6 +14,7 @@ import { defaultNotifyPrefs, shellNotify, type NotifyPrefs } from '../../app/not
 import { MemberRelaySetting } from './MemberRelay';
 import { DevicesSection } from './Devices';
 import { VoiceSection } from './Voice';
+import { AbuseReportSection, CopyVersionButton } from './AboutReport';
 import { AppLockSection } from '../../lock/AppLockSection';
 import { BlockedList } from './Blocked';
 
@@ -640,7 +641,8 @@ function AboutSection() {
         <strong>
           <FormattedMessage id="app.name" />
         </strong>{' '}
-        <FormattedMessage id="settings.about.version" values={{ version: <span dir="ltr">{info.version}</span> }} />
+        <FormattedMessage id="settings.about.version" values={{ version: <span dir="ltr">{info.version}</span> }} />{' '}
+        <CopyVersionButton version={info.version} />
       </p>
       <p className="muted">
         <FormattedMessage id="settings.about.alpha" />
@@ -667,6 +669,7 @@ function AboutSection() {
       <p className="muted small">
         <FormattedMessage id="settings.about.channelHint" />
       </p>
+      <AbuseReportSection info={info} />
       <p className="muted small">
         <FormattedMessage id="settings.about.licenses" />
       </p>

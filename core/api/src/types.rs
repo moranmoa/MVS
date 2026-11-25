@@ -366,6 +366,10 @@ pub enum ErrorCode {
     /// owner can't leave, and its restriction is never lifted for me).
     /// `servers` names them. Nothing changed.
     OwnsRestrictedServer,
+    /// `updateProfile`: the name, picture and colour together don't fit one
+    /// profile post (a long name of 4-byte characters beside the largest
+    /// picture). Nothing was saved or posted; the old profile stays.
+    ProfileTooLarge,
     /// Rust addition: malformed command JSON or arguments.
     BadRequest,
     /// Rust addition: in the contract, not done by this core yet.

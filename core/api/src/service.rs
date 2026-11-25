@@ -1221,7 +1221,7 @@ impl Core {
                 unreachable!("a profile is a post")
             };
             if text.len() > records::Kind::Post.max_body() {
-                return Err(ErrorCode::BadRequest.into());
+                return Err(ErrorCode::ProfileTooLarge.into());
             }
             let changed =
                 me.profile.display_name != name || me.profile.avatar_small != small || me.profile.color != color;

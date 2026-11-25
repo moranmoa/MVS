@@ -179,9 +179,11 @@ class Sidecar {
       this.log(`core ${which} closed: ${(e && e.code) || 'error'}`);
       if (this.child === child) this.failAll('core-restarted');
     };
-    child.stdin?.on('error', pipeError('input'));
-    child.stdout?.on('error', pipeError('output'));
-    child.stderr?.on('error', pipeError('log'));
+    // (Only on real streams: test fakes may hand over plain objects.)
+    const onError = (stream, which) => typeof stream?.on === 'function' && stream.on('error', pipeError(which));
+    onError(child.stdin, 'input');
+    onError(child.stdout, 'output');
+    onError(child.stderr, 'log');
     // A spawn failure (not found, not executable) may come without an exit.
     child.on('error', (e) => {
       this.log(`core failed to start: ${e.code || e.message}`);
@@ -217,7 +219,8 @@ class Sidecar {
   /** Can we write to the core right now (running, its input still open)? */
   writable() {
     const stdin = this.child && this.child.stdin;
-    return !!stdin && stdin.writable && !stdin.destroyed;
+    // Closed only when the stream says so (test fakes may lack these flags).
+    return !!stdin && typeof stdin.write === 'function' && stdin.writable !== false && stdin.destroyed !== true;
   }
 
   /** Resolves with { ok } or { error: { code, positions? } }; never rejects. */

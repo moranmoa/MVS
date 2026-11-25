@@ -13,7 +13,7 @@ Status: draft for Security Lead and Tech Lead review; no code until then. Author
 ## The record
 | | |
 | --- | --- |
-| Kind | `ServerAgeLimit = 25`, control scope only. **TL:** T17's `SecretRotation` also needs a code; whichever merges first takes 25. |
+| Kind | `ServerAgeLimit = 26`, control scope only. The codes are fixed, whichever merges first (Tech Lead on #590): T17's `SecretRotation` is 25, this one is 26. |
 | Body | `min u8`: 0, 16 or 18. Anything else doesn't parse. |
 | `max_body` | 1 |
 | Authority | The author is the **owner** (not admins), privileged, so a kick or revoke voids it like other privileged actions. For `18`, the owner must be in `State.adults` at the record (the PO's owner rule from #512); otherwise it isn't accepted. |
@@ -26,7 +26,10 @@ Status: draft for Security Lead and Tech Lead review; no code until then. Author
 - `setAgeRestriction(serverId, 'none' | '16+' | '18+')` returns the updated `ServerSummary`.
   - Owner only, else `not-allowed`. A server I'm not in is `not-found`.
   - `18+` while my effective age is under 18: `too-young`.
-  - Gated with `update-needed` while any member's latest profile lacks `lv:1` (the first level cap, per the frozen-caps rule on #555). `getUpdateNeeded(serverId, 'lv:1')` lists who.
+  - Gated with `update-needed` while any member's latest profile lacks the level of the release that ships kind 26.
+    - `lv:N` is per release: "this core decodes every kind introduced up to level N" (Tech Lead on #590).
+    - So the gate is `lv:1` if G-52 ships with or before T17, else `lv:2`.
+    - `getUpdateNeeded(serverId, 'lv:N')` lists who.
   - The UI confirms before calling (spec §2, §3). The core doesn't take a "confirmed" flag: an extra argument wouldn't stop a modified client.
 - `countAgeAffected(serverId, '18+')` returns `{ count }` for the raise dialog: current members other than me who aren't in `State.adults`. No names. For `none` and `16+` it is 0, because the app's minimum is 16.
 - Everywhere that reads `genesis.age_restriction` reads the effective limit instead: `ServerSummary.ageRestriction`, the join preview, `AgeBlocked`, `age_losses`, `apply_lowered_age`, and `purge_server`'s `required`.
@@ -46,7 +49,7 @@ Status: draft for Security Lead and Tech Lead review; no code until then. Author
 
 ## Older cores (why the gate)
 - An older core can't decode kind 25. From #589 on, it shows `updateNeeded` (the detector). Until it updates, it keeps keying every channel for all members, so an old moderator could hand a raised server's new keys to minors.
-- The `lv:1` gate keeps the owner from raising while a member could still do that. A member who downgrades afterwards is the same residual as B7-k K2. The `adult-keys-outdated` notice logic extends to "a member lacks `lv:1` in an 18+ server" and is sent once.
+- The `lv:N` gate keeps the owner from raising while a member could still do that. A member who downgrades afterwards is the same residual as B7-k K2. The `adult-keys-outdated` notice logic extends to "a member lacks that level in an 18+ server" and is sent once.
 
 ## Tests (plan)
 - **authority:** owner only; an 18 by a non-adult owner isn't accepted; the latest wins; kick/revoke voiding; a bad body doesn't parse.
@@ -59,4 +62,4 @@ Status: draft for Security Lead and Tech Lead review; no code until then. Author
 ## Questions for review
 1. **SL:** is the server-wide receiver rule (step 2) needed, or is the key change (step 1) enough? I propose both, to match B7-k.
 2. **SL/PO:** should a raise also rotate at once from the owner's own core, rather than at the next moderator sync? I propose yes: the owner's `setAgeRestriction` runs the re-key in the same call.
-3. **TL:** kind 25 vs T17, and `lv:1` as the first level cap (posted from this release on).
+3. **TL, answered on #590:** kind 26 (T17 keeps 25). The gate is the level of the release that ships this kind.

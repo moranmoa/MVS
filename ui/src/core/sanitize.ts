@@ -429,6 +429,9 @@ const cleanRange = (r: MessageRange): MessageRange => ({ ...r, messages: r.messa
  * bearer credential: the link is never logged, only shown, copied and passed
  * to joinServer.
  */
+/** G-30: a core id (64 lower-case hex), or the demo core's short ids (letters, digits, - and #). */
+const isLinkId = (v: unknown): v is string => typeof v === 'string' && (/^[0-9a-f]{64}$/.test(v) || /^[a-z0-9][a-z0-9#-]{0,63}$/.test(v));
+
 const INVITE_LINK = /^mvs:\/\/join\/([0-9a-f]{64})\/([0-9a-f]{64})\/([0-9a-f]{64})\/?$/;
 
 /** The canonical invite link, or '' when it is not exactly that format. */
@@ -642,6 +645,13 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       : null,
   'join.status': cleanJoin,
   'link.open': (p) => ({ link: cleanInviteLink(p?.link) }),
+  // G-30: three ids, like notify.click; a missing one drops the event.
+  // G-30: three ids or nothing. Main sends only what deeplink.js parsed as
+  // 64 lower-case hex (SL); the demo core's short ids are the one other shape.
+  'link.message': (p) =>
+    isLinkId(p?.serverId) && isLinkId(p.channelId) && isLinkId(p.messageId)
+      ? { serverId: p.serverId, channelId: p.channelId, messageId: p.messageId }
+      : null,
   'window.state': (p) => ({ maximized: p?.maximized === true, fullScreen: p?.fullScreen === true }),
   'window.closeRequest': () => ({}),
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
@@ -723,6 +733,13 @@ export function guardCore(core: CoreApi): CoreApi {
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
     getSettings: () => core.getSettings().then(cleanCoreSettings),
+    // G-30: an index, nothing else; anything malformed is the core's error.
+    locateMessage: (serverId: Id, channelId: Id, messageId: Id) =>
+      core.locateMessage(serverId, channelId, messageId).then((r) => {
+        const index = r?.index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) throw { code: 'internal' };
+        return { index };
+      }),
     getServerRestore: () =>
       core.getServerRestore().then((r) => {
         const clean = cleanServerRestore(r);

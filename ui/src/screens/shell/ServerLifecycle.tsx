@@ -17,9 +17,9 @@ import { displayName } from './MemberList';
 
 const NO_MEMBERS: Member[] = [];
 
-type Failure = { kind: 'update-needed' } | { kind: 'bad-name' } | { kind: 'other' };
+export type Failure = { kind: 'update-needed' } | { kind: 'bad-name' } | { kind: 'other' };
 
-function failureOf(e: unknown): Failure {
+export function failureOf(e: unknown): Failure {
   if (isCoreError(e) && e.code === 'update-needed') return { kind: 'update-needed' };
   if (isCoreError(e) && e.code === 'bad-request') return { kind: 'bad-name' };
   return { kind: 'other' };
@@ -70,7 +70,7 @@ export function UpdateNeeded({ server }: { server: ServerSummary }) {
   );
 }
 
-function FailureNote({ server, failure }: { server: ServerSummary; failure: Failure | null }) {
+export function FailureNote({ server, failure }: { server: ServerSummary; failure: Failure | null }) {
   if (!failure) return null;
   if (failure.kind === 'update-needed') return <UpdateNeeded server={server} />;
   return (

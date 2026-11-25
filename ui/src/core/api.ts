@@ -117,6 +117,13 @@ export interface CoreCommands {
    * trimmed, 1–100 characters, no bidi or control characters (`bad-request`).
    */
   renameServer(serverId: Id, name: string): Promise<ServerSummary>;
+  /**
+   * G-52 (draft contract, until dev-identity's core lands): the owner changes
+   * the server's age limit. Returns the updated summary; then server.updated.
+   * not-allowed for anyone but the owner, and for 18+ from an owner under 18;
+   * update-needed when a member's MVS is too old (nothing changes).
+   */
+  setAgeRestriction(serverId: Id, ageRestriction: AgeRestriction): Promise<ServerSummary>;
   /** Any member but the owner; never `update-needed`. Then `server.removed { reason: 'left' }`. */
   leaveServer(serverId: Id): Promise<void>;
   /** Owner only, for good. Then `server.closed`; 30 days later `server.removed { reason: 'closed' }`. */

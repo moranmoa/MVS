@@ -31,6 +31,7 @@ const COMMANDS = Object.freeze({
   joinServer: ['link'],
   cancelJoin: ['link'],
   renameServer: ['serverId', 'name'],
+  setAgeRestriction: ['serverId', 'ageRestriction'],
   leaveServer: ['serverId'],
   closeServer: ['serverId'],
   getUpdateNeeded: ['serverId', 'cap'],

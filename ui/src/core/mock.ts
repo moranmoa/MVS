@@ -1228,6 +1228,20 @@ export class MockCore implements CoreApi {
     return s.summary;
   }
 
+  async setAgeRestriction(serverId: Id, ageRestriction: AgeRestriction): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    if (!['none', '16+', '18+'].includes(ageRestriction)) throw err({ code: 'bad-request' });
+    // G-52 (PO, #512): an owner under 18 can't make a server 18+.
+    if (ageRestriction === '18+' && this.ageOf(this.identity!.birthDate) < 18) throw err({ code: 'not-allowed' });
+    this.lifecycleGate(s);
+    await this.wait(150);
+    s.summary = { ...s.summary, ageRestriction };
+    this.emit('server.updated', s.summary);
+    return s.summary;
+  }
+
   async leaveServer(serverId: Id): Promise<void> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });

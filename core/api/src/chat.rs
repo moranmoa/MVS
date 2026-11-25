@@ -327,7 +327,7 @@ pub(crate) fn reactions(
 /// accepted rotation (#21) as text within `message_text_ok`. Otherwise
 /// why not: `Some(_)` for a placeholder's reason, `None` for what is never
 /// shown (malformed, or text over the limit).
-fn try_open(
+pub(crate) fn try_open(
     cipher: &dyn GroupCipher,
     server: ServerId,
     channel: ChannelId,

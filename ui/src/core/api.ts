@@ -14,6 +14,7 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  BlockedUser,
   JoinStatus,
   Member,
   Message,
@@ -92,6 +93,12 @@ export interface CoreCommands {
   /** Owner only. Same name rules as createChannel. */
   updateChannel(channelId: Id, input: { name?: string; adult?: boolean }): Promise<Channel>;
   /**
+   * G-14: set, change or clear (empty) a channel's topic; returns the channel.
+   * Errors: bad-request (over 256 code points / 1024 bytes, a line break, controls),
+   * not-allowed (not the owner or an admin), not-found, update-needed (cap gate).
+   */
+  setChannelTopic(channelId: Id, topic: string): Promise<Channel>;
+  /**
    * G-11 (#323), owner or admin: puts the channel right before `before`, right
    * after `after`, or last. Returns the server's channels in the new order.
    * Rejects not-allowed, not-found, bad-request.
@@ -155,7 +162,15 @@ export interface CoreCommands {
   markRead(channelId: Id): Promise<void>;
 
   // Safety
+  /** A toggle; prefer setBlocked. Fires members.changed and blocks.changed. */
   blockUser(userId: Id): Promise<void>;
+  /** G-47: everyone I blocked, ordered by userId, including people who share no server with me. */
+  listBlocked(): Promise<BlockedUser[]>;
+  /**
+   * G-47: blocks or unblocks. Idempotent: no change fires nothing; otherwise
+   * blocks.changed (and members.changed). `bad-request` for my own id.
+   */
+  setBlocked(userId: Id, blocked: boolean): Promise<null>;
   kickMember(serverId: Id, userId: Id): Promise<void>;
   /** G-53: owner only (`not-allowed` for anyone else): the accounts removed from the server, in no set order. */
   listRemovedMembers(serverId: Id): Promise<RemovedMember[]>;
@@ -183,6 +198,14 @@ export interface CoreCommands {
   setTypingIndicator(on: boolean): Promise<null>;
   /** G-91: how far my servers are from coming back after a restore. */
   getServerRestore(): Promise<ServerRestore>;
+  /**
+   * G-30: where a linked message is, from the local store only (no network).
+   * The three ids must agree. Errors: not-found for everything I can't see
+   * (not a member, a hidden or missing channel, a mismatch, not here, unreadable,
+   * still sending), bad-request for an id that isn't 64 hex. The index is a
+   * snapshot: check the id there.
+   */
+  locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -245,6 +268,8 @@ export interface CoreEvents {
   'channel.added': Channel;
   'channel.removed': { serverId: Id; channelId: Id; name: string };
   'members.changed': { serverId: Id; members: Member[] };
+  /** G-47: the whole list of blocked accounts, after any change. */
+  'blocks.changed': { blocked: BlockedUser[] };
   'message.added': Message;
   'message.updated': Message;
   'join.status': JoinStatus;
@@ -279,6 +304,8 @@ export interface CoreEvents {
   typing: TypingState;
   /** G-91: sent when anything in the restore progress changes. */
   'serverRestore.changed': ServerRestore;
+  /** G-30: an mvs://m/… link from the OS (desktop parses it strictly; ids only). */
+  'link.message': { serverId: Id; channelId: Id; messageId: Id };
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
   /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */

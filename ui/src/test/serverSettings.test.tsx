@@ -79,7 +79,7 @@ describe('context menus (B25)', () => {
     fireEvent.contextMenu(row, { clientX: 10, clientY: 10 });
     expect(screen.getByRole('menu', { name: 'Actions for ⁨#clips⁩' })).toBeTruthy();
     // G-11: the owner's move items have their own group, before Delete.
-    expect(menuItems()).toEqual(['Mark as read', 'Notifications', 'Rename', 'Copy channel ID', 'Move up', 'Move down', 'Delete channel']);
+    expect(menuItems()).toEqual(['Mark as read', 'Notifications', 'Rename', 'Edit topic', 'Copy channel ID', 'Move up', 'Move down', 'Delete channel']);
     expect(within(screen.getByRole('menu')).getAllByRole('separator').length).toBe(3);
     expect(document.activeElement?.textContent).toBe('Mark as read');
 
@@ -93,7 +93,7 @@ describe('context menus (B25)', () => {
     const row = within(channels()).getByRole('button', { name: /^כללי/ });
     // Shift+F10 opens the same menu by the row.
     fireEvent.keyDown(row, { key: 'F10', shiftKey: true });
-    expect(menuItems()).toEqual(['Notifications', 'Rename', 'Copy channel ID', 'Move down']); // first in the list: no Move up
+    expect(menuItems()).toEqual(['Notifications', 'Rename', 'Edit topic', 'Copy channel ID', 'Move down']); // first in the list: no Move up
     fireEvent.keyDown(document.activeElement!, { key: 'ArrowUp' });
     expect(document.activeElement?.textContent).toBe('Move down');
     fireEvent.keyDown(document.activeElement!, { key: 'ArrowDown' });
@@ -234,7 +234,7 @@ describe('message menu (B25 §2)', () => {
     const row = await waitFor(() => rowOf('menu test שלום'));
     expect(row.getAttribute('aria-haspopup')).toBe('menu');
     fireEvent.contextMenu(row);
-    expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID', 'Edit', 'Delete']);
+    expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message link', 'Copy message ID', 'Edit', 'Delete']);
 
     let copied = '';
     Object.assign(window, { mvs: { copyText: async (t: string) => ((copied = t), true) } });
@@ -256,14 +256,14 @@ describe('message menu (B25 §2)', () => {
     // server's rows can linger for a moment: retry until this server's menu shows.
     await waitFor(() => {
       fireEvent.contextMenu(others()[0]);
-      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID', 'Delete']);
+      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message link', 'Copy message ID', 'Delete']);
     });
     fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
 
     await openOtherServer(channels);
     await waitFor(() => {
       fireEvent.contextMenu(others()[0]);
-      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message ID']);
+      expect(menuItems()).toEqual(['Reply', 'Add reaction', 'Copy text', 'Copy message link', 'Copy message ID']);
     });
   });
 });

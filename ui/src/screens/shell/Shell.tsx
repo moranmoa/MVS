@@ -7,7 +7,7 @@ import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
-import { useCore, useCoreEvent, type Id } from '../../core';
+import { useCore, useCoreEvent, type Id, type JoinStatus } from '../../core';
 import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
@@ -58,6 +58,8 @@ export function Shell() {
   // An mvs:// link from the OS (desktop app) opens the join dialog pre-filled.
   // It never joins by itself: that waits for the Join button.
   const [invite, setInvite] = useState<string | undefined>();
+  // G-92: a link pasted on Home whose join already started there.
+  const [inviteStatus, setInviteStatus] = useState<JoinStatus | null>(null);
   // The open dialog as of now, not as of the last render: the subscription
   // below is made once, and a second link can arrive before React re-renders.
   const dialogNow = useRef(dialog);
@@ -69,6 +71,7 @@ export function Shell() {
     if (dialogNow.current === 'join') return;
     dialogNow.current = 'join';
     setInvite(link);
+    setInviteStatus(null);
     setDialog('join');
   });
   // The reminder can show the words again (the panel loads them on demand).
@@ -206,6 +209,42 @@ export function Shell() {
     setPhoneMembers(false);
     setPhoneView('nav');
   };
+  // G-30: an mvs://m/… link (main parsed it strictly). It only navigates: the
+  // right server and channel, then the message list scrolls and highlights.
+  const [linkNotMember, setLinkNotMember] = useState(false);
+  const linkSeq = useRef(0);
+  useCoreEvent('link.message', ({ serverId: sid, channelId: cid, messageId }) => {
+    // Never over the join dialog (the same rule as invites, #80).
+    if (dialogNow.current === 'join') return;
+    const seq = ++linkSeq.current;
+    // Not in my server list: the one case the UI tells apart, from its own data.
+    if (!store.getState().servers.some((s) => s.id === sid)) return setLinkNotMember(true);
+    /** The index is a snapshot (a sync can shift it): check the id there, and locate once more if it moved. */
+    const locate = async (): Promise<number | null> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { index } = await core.locateMessage(sid, cid, messageId);
+        const range = await core.getMessages(cid, index, index + 1);
+        if (range.messages[0]?.id === messageId) return index;
+      }
+      return null;
+    };
+    const open = (index: number | null) => {
+      if (seq !== linkSeq.current) return; // a newer link won
+      setSettingsOpen(false);
+      setServerId(sid);
+      // Not found looks the same whether the channel is hidden from me or doesn't
+      // exist (SL R1): only a channel in my list opens.
+      const known = (store.getState().channels[sid] ?? []).some((c) => c.id === cid);
+      if (index !== null || known) {
+        setChannelByServer((m) => ({ ...m, [sid]: cid }));
+        goPhone('chat');
+      }
+      if (index !== null) store.goToMessage(cid, index);
+      else store.showFlash('msglink.notFound');
+    };
+    // Every error is "not found": the core answers the same for all I can't see.
+    locate().then(open, () => open(null));
+  });
   // G-61: a click on a desktop notification opens its channel.
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
     setSettingsOpen(false);
@@ -346,11 +385,27 @@ export function Shell() {
             hasServers={servers.length > 0}
             onCreate={() => setDialog('create')}
             onJoin={() => setDialog('join')}
+            onJoinLink={(link, status) => {
+              dialogNow.current = 'join';
+              setInvite(link);
+              setInviteStatus(status);
+              setDialog('join');
+            }}
           />
         )}
       </main>
       {showMembers && <MemberList server={server} onClose={phone ? toggleMembers : undefined} />}
 
+      <Dialog open={linkNotMember} onClose={() => setLinkNotMember(false)} title={<FormattedMessage id="msglink.notMember.title" />} className="msglink-dialog">
+        <p>
+          <FormattedMessage id="msglink.notMember.body" />
+        </p>
+        <div className="actions">
+          <button type="button" className="primary" onClick={() => setLinkNotMember(false)} autoFocus>
+            <FormattedMessage id="msglink.ok" />
+          </button>
+        </div>
+      </Dialog>
       <CreateServerDialog
         open={dialog === 'create'}
         onClose={() => setDialog(null)}
@@ -363,14 +418,17 @@ export function Shell() {
       <JoinDialog
         open={dialog === 'join'}
         initialLink={invite}
+        initialStatus={inviteStatus}
         onBackground={(link) => backgroundJoins.current.add(link)}
         onClose={() => {
           setDialog(null);
           setInvite(undefined);
+          setInviteStatus(null);
         }}
         onJoined={(id) => {
           setDialog(null);
           setInvite(undefined);
+          setInviteStatus(null);
           setServerId(id);
         }}
       />

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! request:  { "cmd": "createServer", "args": { "name": "...", "ageRestriction": "none" } }
-//! response: { "ok": <result> }  or  { "error": { "code": "not-allowed", "positions"?: [...] } }
+//! response: { "ok": <result> }  or  { "error": { "code": "not-allowed", "positions"?: [...], "servers"?: [...] } }
 //! event:    { "event": "server.added", "payload": <ServerSummary> }   (via EventSink)
 //! ```
 //!
@@ -72,6 +72,23 @@ struct RenameServerArgs {
     name: String,
 }
 
+/// G-51 `setServerIcon`: `dataUrl` null (or absent) clears it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerIconArgs {
+    server_id: String,
+    #[serde(default)]
+    data_url: Option<String>,
+}
+
+/// G-51 `setServerDescription`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerDescriptionArgs {
+    server_id: String,
+    description: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditVoiceRoomArgs {
@@ -116,6 +133,15 @@ struct MessageIdArg {
 struct EditArg {
     message_id: String,
     body: String,
+}
+
+/// G-30 `locateMessage`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocateArgs {
+    server_id: String,
+    channel_id: String,
+    message_id: String,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +290,12 @@ struct SignalArgs {
 #[serde(rename_all = "camelCase")]
 struct UserArg {
     user_id: String,
+}
+
+/// G-77: a birth date, `YYYY-MM-DD`.
+#[derive(Deserialize)]
+struct DateArg {
+    date: String,
 }
 
 #[derive(Deserialize)]
@@ -432,6 +464,10 @@ impl Core {
                 let a: RangeArg = args(raw)?;
                 ok(self.get_messages(&a.channel_id, a.start, a.end))
             }
+            "locateMessage" => {
+                let a: LocateArgs = args(raw)?;
+                ok(self.locate_message(&a.server_id, &a.channel_id, &a.message_id))
+            }
             "sendMessage" => {
                 let a: SendArg = args(raw)?;
                 ok(self.send_message(&a.channel_id, &a.body, a.reply_to_id.as_deref()))
@@ -464,6 +500,9 @@ impl Core {
 
             "markRead" => ok(self.mark_read(&args::<ChannelIdArg>(raw)?.channel_id)),
             "blockUser" => ok(self.block_user(&args::<UserArg>(raw)?.user_id)),
+            "previewBirthDateCorrection" => ok(self.preview_birth_date_correction(&args::<DateArg>(raw)?.date)),
+            "correctBirthDate" => ok(self.correct_birth_date(&args::<DateArg>(raw)?.date)),
+            "cancelBirthDateCorrection" => ok(self.cancel_birth_date_correction()),
             "setBlocked" => {
                 let a: SetBlockedArgs = args(raw)?;
                 ok(self.set_blocked(&a.user_id, a.blocked))
@@ -473,6 +512,14 @@ impl Core {
             "renameServer" => {
                 let a: RenameServerArgs = args(raw)?;
                 ok(self.rename_server(&a.server_id, &a.name))
+            }
+            "setServerIcon" => {
+                let a: ServerIconArgs = args(raw)?;
+                ok(self.set_server_icon(&a.server_id, a.data_url.as_deref()))
+            }
+            "setServerDescription" => {
+                let a: ServerDescriptionArgs = args(raw)?;
+                ok(self.set_server_description(&a.server_id, &a.description))
             }
             "leaveServer" => ok(self.leave_server(&args::<ServerArg>(raw)?.server_id)),
             "closeServer" => ok(self.close_server(&args::<ServerArg>(raw)?.server_id)),

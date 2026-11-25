@@ -56,9 +56,18 @@ pub(crate) const QUEUE_FRAMES: usize = 16;
 pub(crate) const MAX_HELD_INBOUND: usize = 2;
 /// A substream with no frame for this long is dropped (an abandoned call).
 pub(crate) const IDLE: Duration = Duration::from_secs(30);
+/// A writer with nothing to send for this long sends a keep-alive (a
+/// muted sender sends no frames, A4), so the reader's [`IDLE`] cutoff
+/// only ends dead substreams.
+pub(crate) const KEEPALIVE: Duration = Duration::from_secs(10);
+/// The keep-alive: call ID all zero, empty. Never forwarded.
+const KEEPALIVE_CALL: [u8; 16] = [0; 16];
+/// A reader closes its substream after this many frames over its cap in a
+/// row (a sustained flood, SL B2).
+const FLOOD_CLOSE: u32 = 120;
 
 /// One voice frame.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VoiceFrame {
     pub call_id: [u8; 16],
     pub seq: u32,
@@ -66,6 +75,17 @@ pub struct VoiceFrame {
     pub ts: u32,
     /// Opus, at most [`MAX_OPUS`] bytes; empty for a DTX gap.
     pub opus: Vec<u8>,
+}
+
+/// Never the audio (TL nit 8): a `debug!(?event)` must not log it.
+impl std::fmt::Debug for VoiceFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceFrame")
+            .field("seq", &self.seq)
+            .field("ts", &self.ts)
+            .field("opus_len", &self.opus.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl VoiceFrame {
@@ -144,8 +164,13 @@ impl SendQueue {
 
     /// Ends the writer once what's queued is written (or at once, if its
     /// substream already failed).
+    /// Ends the writer at once: what's still queued is dropped, so no frame
+    /// leaves after a call ends, a relay-only switch or a sign-out (SL 3).
     pub fn close(&self) {
-        self.inner.0.lock().expect("not poisoned").closed = true;
+        let mut state = self.inner.0.lock().expect("not poisoned");
+        state.frames.clear();
+        state.closed = true;
+        drop(state);
         self.inner.1.notify_one();
     }
 
@@ -173,7 +198,14 @@ impl SendQueue {
 /// Writes `queue` to `stream` until the queue closes or a write fails;
 /// then the substream is closed (dropped).
 pub(crate) async fn write_loop(mut stream: Stream, queue: SendQueue) {
-    while let Some(frame) = queue.next().await {
+    let keepalive =
+        VoiceFrame { call_id: KEEPALIVE_CALL, seq: 0, ts: 0, opus: Vec::new() }.encode().expect("empty frame");
+    loop {
+        let frame = match tokio::time::timeout(KEEPALIVE, queue.next()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => keepalive.clone(),
+        };
         if stream.write_all(&frame).await.is_err() || stream.flush().await.is_err() {
             queue.close();
             return;
@@ -190,10 +222,32 @@ pub(crate) async fn read_loop<K: Copy + Send + 'static>(
     connection: ConnectionId,
     mut stream: Stream,
     to: tokio::sync::mpsc::Sender<(K, ConnectionId, VoiceFrame)>,
+    per_sec: u32,
 ) {
+    // Its own cap before the shared queue (TL fix 3): one flooding
+    // participant can't crowd out the others.
+    let mut tokens = f64::from(per_sec);
+    let mut last = std::time::Instant::now();
+    let mut over = 0u32;
     loop {
         match tokio::time::timeout(IDLE, read_frame(&mut stream)).await {
             Ok(Ok(Some(frame))) => {
+                if frame.call_id == KEEPALIVE_CALL {
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                tokens = (tokens + now.duration_since(last).as_secs_f64() * f64::from(per_sec)).min(f64::from(per_sec));
+                last = now;
+                if tokens < 1.0 {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    over += 1;
+                    if over >= FLOOD_CLOSE {
+                        return;
+                    }
+                    continue;
+                }
+                tokens -= 1.0;
+                over = 0;
                 if to.try_send((who, connection, frame)).is_err() {
                     DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -425,9 +479,11 @@ mod tests {
         }
         let first = futures::executor::block_on(queue.next()).unwrap();
         assert_eq!(first, vec![3]);
+        assert_eq!(queue.inner.0.lock().unwrap().frames.len(), QUEUE_FRAMES - 1);
+        // Closing drops what's left: nothing leaves after a call ends.
         queue.close();
-        let rest = std::iter::from_fn(|| futures::executor::block_on(queue.next())).count();
-        assert_eq!(rest, QUEUE_FRAMES - 1);
+        assert_eq!(futures::executor::block_on(queue.next()), None);
+        assert!(queue.is_closed());
     }
 
     #[test]

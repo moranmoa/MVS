@@ -138,7 +138,7 @@ test('valid STUN URLs', () => {
 });
 
 test('anything but a plain STUN URL is refused', () => {
-  for (const bad of ['turn:turn.example.org:3478', 'turns:turn.example.org', 'stun:user:pass@stun.example.org', 'stun:stun.example.org/path', 'stun:stun.example.org?transport=udp', 'stun:stun.example.org#x', 'stun:stun example.org', 'stun:', 'https://stun.example.org', '//stun.example.org', 'stun.example.org:3478', 'stun:' + 'a'.repeat(MAX_STUN), '', 7, null, ['stun:stun.example.org'], {}]) {
+  for (const bad of ['turn:turn.example.org:3478', 'turns:turn.example.org', 'stun:user:pass@stun.example.org', 'stun:stun.example.org/path', 'stun:stun.example.org?transport=udp', 'stun:stun.example.org#x', 'stun:stun example.org', 'stun:a.example.org:3478,stun:b.example.org:3478', 'stun:a.example.org:3478 stun:b.example.org', 'stun:stun.example.org:0', 'stun:stun.example.org:70000', 'stun:stun.example.org:3478:1', 'stun:stun_x.example.org', 'stun:', 'https://stun.example.org', '//stun.example.org', 'stun.example.org:3478', 'stun:' + 'a'.repeat(MAX_STUN), '', 7, null, ['stun:stun.example.org'], {}]) {
     assert.equal(validStun(bad), false, String(bad));
   }
 });
@@ -268,4 +268,17 @@ test('checkout: relay and bootstrap lists take commas and/or newlines, spaces an
   assert.deepEqual(relaysFor({ packaged: false, env: { MVS_RELAYS: `${RELAY},${RELAY}\n${RELAY2}` }, warn }), [RELAY, RELAY2]);
   assert.deepEqual(bootstrapFor({ packaged: false, env: { MVS_BOOTSTRAP: ` ${TCP} ,\n,` }, warn }), [TCP]);
   assert.ok(warnings.every((w) => !/example\.org|12D3KooW/.test(w)), 'warnings never name an address');
+});
+
+// G-81 B: calls over the P2P network, off unless asked for exactly.
+test('voiceP2p: packaged only with "voiceP2p": true; a checkout only with MVS_VOICE_P2P=1', () => {
+  const { voiceP2pFor } = require('../src/config');
+  assert.equal(voiceP2pFor({ packaged: true, resourcesPath: resources(JSON.stringify({ relay: RELAY, voiceP2p: true })) }), true);
+  for (const v of [false, 'true', 1, null]) assert.equal(voiceP2pFor({ packaged: true, resourcesPath: resources(JSON.stringify({ relay: RELAY, voiceP2p: v })) }), false, String(v));
+  assert.equal(voiceP2pFor({ packaged: true, resourcesPath: resources(JSON.stringify({ relay: RELAY })) }), false);
+  assert.equal(voiceP2pFor({ packaged: true, resourcesPath: resources('not json') }), false);
+  assert.equal(voiceP2pFor({ packaged: true, resourcesPath: resources() }), false);
+  assert.equal(voiceP2pFor({ packaged: true, resourcesPath: resources(JSON.stringify({ voiceP2p: true })), env: { MVS_VOICE_P2P: '0' } }), true);
+  assert.equal(voiceP2pFor({ packaged: false, env: { MVS_VOICE_P2P: '1' } }), true);
+  for (const v of [undefined, '', '0', 'true', 'yes']) assert.equal(voiceP2pFor({ packaged: false, env: { MVS_VOICE_P2P: v } }), false, String(v));
 });

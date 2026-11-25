@@ -4,6 +4,7 @@
 //! never decodes pixels: it reads only the size, the type, the header's
 //! declared dimensions and the chunk list.
 
+use authority::image::ImageType;
 use base64::Engine;
 
 /// Bytes of image at most (design: 48×48 WebP, usually 1–2 KB).
@@ -12,6 +13,7 @@ pub const AVATAR_SMALL_MAX: usize = 2_560;
 pub const AVATAR_SIDE_MAX: u32 = 64;
 const WEBP_PREFIX: &str = "data:image/webp;base64,";
 const PNG_PREFIX: &str = "data:image/png;base64,";
+#[cfg(test)]
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 /// A picture another member may see: a WebP or PNG data URL of at most
@@ -31,8 +33,40 @@ pub fn valid_avatar(url: &str) -> bool {
     if bytes.len() > AVATAR_SMALL_MAX {
         return false;
     }
-    let side = if webp { webp_size(&bytes) } else { png_size(&bytes) };
-    side.is_some_and(|(w, h)| (1..=AVATAR_SIDE_MAX).contains(&w) && (1..=AVATAR_SIDE_MAX).contains(&h))
+    // One validator with the server icon (G-51, Security Lead R2 on #547).
+    let kind = if webp { ImageType::Webp } else { ImageType::Png };
+    authority::image::still_size(&bytes, kind, AVATAR_SIDE_MAX).is_some()
+}
+
+/// G-51: a server icon from the UI's data URL, checked in the Security
+/// Lead's order (R2 on #547): the prefix names the type; a length cap on
+/// the base64 text before decoding; strict base64; then the shared
+/// validator, which checks the magic bytes against that type and the size
+/// against [`authority::ICON_SIDE_MAX`]. `None` for anything else.
+pub fn icon_from_data_url(url: &str) -> Option<authority::Icon> {
+    let (data, kind) = match (url.strip_prefix(WEBP_PREFIX), url.strip_prefix(PNG_PREFIX)) {
+        (Some(data), _) => (data, ImageType::Webp),
+        (_, Some(data)) => (data, ImageType::Png),
+        _ => return None,
+    };
+    if data.len() > records::MAX_SERVER_ICON_BYTES.div_ceil(3) * 4 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    if bytes.len() > records::MAX_SERVER_ICON_BYTES {
+        return None;
+    }
+    authority::image::still_size(&bytes, kind, authority::ICON_SIDE_MAX)?;
+    Some(authority::Icon { kind, bytes })
+}
+
+/// G-51: a server icon as the data URL `ServerSummary.iconDataUrl` carries.
+pub fn icon_data_url(icon: &authority::Icon) -> String {
+    let prefix = match icon.kind {
+        ImageType::Webp => WEBP_PREFIX,
+        ImageType::Png => PNG_PREFIX,
+    };
+    format!("{prefix}{}", base64::engine::general_purpose::STANDARD.encode(&icon.bytes))
 }
 
 /// `#rrggbb`.
@@ -40,99 +74,6 @@ pub fn valid_color(color: &str) -> bool {
     color.len() == 7
         && color.starts_with('#')
         && color[1..].bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn be32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn le32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
-}
-
-/// The IHDR's width and height, if a still PNG (no `acTL`: no APNG, A2).
-fn png_size(b: &[u8]) -> Option<(u32, u32)> {
-    if b.get(..8)? != PNG_SIGNATURE || b.get(12..16)? != b"IHDR" {
-        return None;
-    }
-    let size = (be32(b, 16)?, be32(b, 20)?);
-    // Walk the chunks: length, type, data, CRC.
-    let mut at = 8;
-    while at + 8 <= b.len() {
-        let len = be32(b, at)? as usize;
-        let kind = b.get(at + 4..at + 8)?;
-        if kind == b"acTL" {
-            return None;
-        }
-        if kind == b"IEND" {
-            return Some(size);
-        }
-        at = at.checked_add(12)?.checked_add(len)?;
-    }
-    None
-}
-
-/// The canvas size of a still WebP (`VP8 `, `VP8L` or `VP8X` without the
-/// animation flag, and no `ANIM`/`ANMF` chunk: A2). Every declared size must
-/// be within 1..=[`AVATAR_SIDE_MAX`] and all must agree, and there must be
-/// exactly one image chunk (`VP8 ` or `VP8L`): a small `VP8X` can't vouch
-/// for a huge image after it (Security Lead on #359).
-fn webp_size(b: &[u8]) -> Option<(u32, u32)> {
-    if b.get(..4)? != b"RIFF" || b.get(8..12)? != b"WEBP" {
-        return None;
-    }
-    let mut size: Option<(u32, u32)> = None;
-    let mut images = 0;
-    let mut declare = |w: u32, h: u32| -> Option<()> {
-        let fits = (1..=AVATAR_SIDE_MAX).contains(&w) && (1..=AVATAR_SIDE_MAX).contains(&h);
-        if !fits || size.is_some_and(|s| s != (w, h)) {
-            return None;
-        }
-        size = Some((w, h));
-        Some(())
-    };
-    let mut at = 12;
-    while at + 8 <= b.len() {
-        let kind = b.get(at..at + 4)?;
-        let len = le32(b, at + 4)? as usize;
-        let data = b.get(at + 8..(at + 8).checked_add(len)?)?;
-        match kind {
-            b"ANIM" | b"ANMF" => return None,
-            b"VP8X" => {
-                if data.first()? & 0x02 != 0 {
-                    return None; // the animation flag
-                }
-                let w = u32::from_le_bytes([*data.get(4)?, *data.get(5)?, *data.get(6)?, 0]) + 1;
-                let h = u32::from_le_bytes([*data.get(7)?, *data.get(8)?, *data.get(9)?, 0]) + 1;
-                declare(w, h)?;
-            }
-            b"VP8 " => {
-                // Frame tag (3), start code 9d 01 2a, then 14-bit w and h.
-                if data.get(3..6)? != [0x9d, 0x01, 0x2a] {
-                    return None;
-                }
-                let w = u32::from(u16::from_le_bytes([*data.get(6)?, *data.get(7)?]) & 0x3fff);
-                let h = u32::from(u16::from_le_bytes([*data.get(8)?, *data.get(9)?]) & 0x3fff);
-                declare(w, h)?;
-                images += 1;
-            }
-            b"VP8L" => {
-                if *data.first()? != 0x2f {
-                    return None;
-                }
-                let bits = le32(data, 1)?;
-                declare((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)?;
-                images += 1;
-            }
-            _ => {}
-        }
-        // Chunks are padded to an even length.
-        at = at.checked_add(8)?.checked_add(len)?.checked_add(len & 1)?;
-    }
-    if images != 1 {
-        return None;
-    }
-    size
 }
 
 #[cfg(test)]

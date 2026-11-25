@@ -23,6 +23,7 @@ import type {
   CreatedInvite,
   Invite,
   RemovedMember,
+  BlockedUser,
   CoreError,
   Id,
   Identity,
@@ -74,6 +75,8 @@ export interface MockOptions {
    * stay held (`wait`, for screenshots).
    */
   keyPending?: 'arrive' | 'fail' | 'wait';
+  /** Core #527: the first channel's two latest messages are placeholders (no-key, untrusted), for screenshots. */
+  unreadable?: boolean;
   /** B7: the identity has a correction raising its age, waiting its 30 days (#306). */
   pendingDob?: boolean;
   /** signOut is refused by the OS keychain (#304: nothing changes). */
@@ -100,12 +103,16 @@ export interface MockOptions {
   restore?: 'searching' | 'waiting' | 'done';
   /** Start with relay-only on (#272): no direct connections, calls off. */
   relayOnly?: boolean;
+  /** B24 (?abuse=1): the build carries an abuse-report address (a placeholder, never a real one). */
+  abuseAddress?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
   outdatedMembers?: boolean;
   /** The demo server "Minecraft IL" starts closed by its owner (read-only). */
   closedServer?: boolean;
   /** As the desktop shell would: a STUN URL on core.status (#222), given to every listener. */
   stunUrl?: string;
+  /** G-81 B on, as the shell's core.status would say (`?voiceP2p`). */
+  voiceP2p?: boolean;
   /** Add members and messages written the way an attacker would (see SECURITY.md). */
   hostile?: boolean;
   /** `getRecoveryWords()` fails, to show the load error state. */
@@ -238,6 +245,15 @@ export class MockCore implements CoreApi {
       const label = options.deviceLinked;
       this.timers.push(setTimeout(() => this.simulateDeviceAdded(label, Date.now() - 2 * 60_000), 50));
     }
+    if (options.unreadable) {
+      const [server] = this.servers.values();
+      const ch = server?.channels[0];
+      if (ch) {
+        const last = this.count(ch) - 1;
+        this.simulateUnreadable(ch.channel.id, last - 1, 'no-key');
+        this.simulateUnreadable(ch.channel.id, last, 'untrusted');
+      }
+    }
     if (options.typing) {
       const n = Math.min(3, options.typing);
       // Keeps saying so, as a typing peer does, so screenshots never catch it expired.
@@ -288,8 +304,10 @@ export class MockCore implements CoreApi {
     set.add(handler as (p: unknown) => void);
     // Like the shell's core.status, which every listener gets, also late ones.
     const stunUrl = this.options.stunUrl;
-    if (event === 'core.status' && stunUrl !== undefined) {
-      this.timers.push(setTimeout(() => set!.has(handler as (p: unknown) => void) && (handler as (p: unknown) => void)({ state: 'up', stunUrl }), 0));
+    const voiceP2p = this.options.voiceP2p;
+    if (event === 'core.status' && (stunUrl !== undefined || voiceP2p)) {
+      const status = { state: 'up', ...(stunUrl !== undefined ? { stunUrl } : {}), ...(voiceP2p ? { voiceP2p: true } : {}) };
+      this.timers.push(setTimeout(() => set!.has(handler as (p: unknown) => void) && (handler as (p: unknown) => void)(status), 0));
     }
     return () => set!.delete(handler as (p: unknown) => void);
   }
@@ -506,7 +524,7 @@ export class MockCore implements CoreApi {
     const now = Date.now();
     seed.channels.forEach((c, ci) => {
       const ch: ChannelState = {
-        channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0 },
+        channel: { id: c.id, serverId: seed.id, name: c.name, adult: !!c.adult, isDefault: ci === 0, unread: false, mentions: 0, ...(c.topic ? { topic: c.topic } : {}) },
         baseCount: c.count,
         baseStart: now - 3_600_000 - c.count * this.gapMs,
         seedOffset: hashString(c.id),
@@ -616,6 +634,20 @@ export class MockCore implements CoreApi {
     if (h % 17 === 0) msg.editedAt = msg.createdAt + 60_000;
     if (h % 401 === 0) msg.mentionsMe = true;
     return msg;
+  }
+
+  /** Mock only (core #527): turn a message into a placeholder, or open it again (kind null). */
+  simulateUnreadable(channelId: Id, index: number, kind: 'no-key' | 'untrusted' | null): void {
+    const ch = this.channelIndex.get(channelId);
+    if (!ch) return;
+    const m = this.generated(ch, index);
+    if (kind === null) {
+      ch.overrides.delete(index);
+      this.emit('message.updated', m);
+      return;
+    }
+    const { reactions: _r, mentions: _m, replyTo: _t, sendState: _s, ...rest } = m;
+    this.put(ch, { ...rest, body: '', unreadable: kind, ...(kind === 'untrusted' ? { authorId: '' } : {}) }, false);
   }
 
   private messageAt(ch: ChannelState, index: number): Message {
@@ -860,6 +892,26 @@ export class MockCore implements CoreApi {
     return null;
   }
 
+  // ---- G-30: links to a message -------------------------------------------------
+
+  async locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }> {
+    // One answer for all I can't see (SL R1): not a member, a hidden or missing channel, a mismatch.
+    if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
+    const ch = this.channelIndex.get(channelId);
+    if (!ch || ch.channel.serverId !== serverId) throw err({ code: 'not-found' });
+    const at = messageId.lastIndexOf('#');
+    const index = Number(messageId.slice(at + 1));
+    if (at < 0 || messageId.slice(0, at) !== channelId || !Number.isInteger(index) || index < 0 || index >= this.count(ch)) {
+      throw err({ code: 'not-found' });
+    }
+    return { index };
+  }
+
+  /** Mock only: as if the OS opened an mvs://m/… link. */
+  simulateMessageLink(serverId: Id, channelId: Id, messageId: Id): void {
+    this.emit('link.message', { serverId, channelId, messageId });
+  }
+
   // ---- G-91: servers coming back after a restore ---------------------------------
 
   private serverRestore: ServerRestore = { state: 'none', found: 0, waiting: 0 };
@@ -1009,6 +1061,23 @@ export class MockCore implements CoreApi {
     const s = this.ownedServer(ch.channel.serverId);
     const name = input.name === undefined ? ch.channel.name : this.channelName(s, input.name, channelId);
     ch.channel = { ...ch.channel, name, adult: input.adult ?? ch.channel.adult };
+    this.emit('channel.updated', ch.channel);
+    return ch.channel;
+  }
+
+  /** G-14: the core's rules: owner (admins in the real core), one line, 256 code points; empty clears. */
+  async setChannelTopic(channelId: Id, topic: string): Promise<Channel> {
+    await this.wait(200);
+    const ch = this.channelIndex.get(channelId);
+    if (!ch) throw err({ code: 'not-found' });
+    this.ownedServer(ch.channel.serverId);
+    const t = topic.trim();
+    if ([...t].length > 256 || new TextEncoder().encode(t).length > 1024 || /[\u0000-\u001f\u007f\u2028\u2029]/.test(t)) {
+      throw err({ code: 'bad-request' });
+    }
+    if ((ch.channel.topic ?? '') === t) return ch.channel;
+    const { topic: _old, ...rest } = ch.channel;
+    ch.channel = t ? { ...rest, topic: t } : rest;
     this.emit('channel.updated', ch.channel);
     return ch.channel;
   }
@@ -1319,12 +1388,49 @@ export class MockCore implements CoreApi {
 
   // ---- safety --------------------------------------------------------------
 
-  async blockUser(userId: Id): Promise<void> {
+  async blockUser(rawId: Id): Promise<void> {
+    const userId = this.memberIdOf(rawId);
+    const now = this.blockedIds().has(userId);
     for (const s of this.servers.values()) {
       if (!s.members.some((m) => m.id === userId)) continue;
-      s.members = s.members.map((m) => (m.id === userId ? { ...m, blocked: !m.blocked } : m));
+      s.members = s.members.map((m) => (m.id === userId ? { ...m, blocked: !now } : m));
       this.emit('members.changed', { serverId: s.summary.id, members: s.members });
     }
+    this.emit('blocks.changed', { blocked: this.blockedList() });
+  }
+
+  /** G-47: the blocked members of my servers, once each, ordered by id (like the core). */
+  private blockedIds(): Map<Id, string> {
+    const out = new Map<Id, string>();
+    for (const s of this.servers.values()) for (const m of s.members) if (m.blocked && !out.has(m.id)) out.set(m.id, m.displayName);
+    return out;
+  }
+
+  async listBlocked(): Promise<BlockedUser[]> {
+    return this.blockedList();
+  }
+
+  /** Like the core, by 64-hex account id (the sanitizer drops anything else). */
+  private blockedList(): BlockedUser[] {
+    const codes = new Map<Id, string>();
+    for (const s of this.servers.values()) for (const m of s.members) codes.set(m.id, m.shortCode);
+    return [...this.blockedIds()]
+      .map(([id, name]) => [asAccountId(id), name, codes.get(id) ?? ''] as const)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([userId, name, shortCode]) => ({ userId, shortCode, ...(name ? { name } : {}) }));
+  }
+
+  /** A demo member id, given as itself or as its 64-hex account id. */
+  private memberIdOf(id: Id): Id {
+    for (const s of this.servers.values()) for (const m of s.members) if (m.id === id || asAccountId(m.id) === id) return m.id;
+    return id;
+  }
+
+  async setBlocked(rawId: Id, blocked: boolean): Promise<null> {
+    const userId = this.memberIdOf(rawId);
+    if (userId === this.identity?.id) throw err({ code: 'bad-request' });
+    if (this.blockedIds().has(userId) !== blocked) await this.blockUser(userId);
+    return null;
   }
 
   // ---- voice rooms (0.4.3): calls only, no audio in the mock ---------------------
@@ -1632,7 +1738,12 @@ export class MockCore implements CoreApi {
   }
 
   async getAppInfo(): Promise<AppInfo> {
-    return { version: '0.1.0-alpha', updateChannel: this.releaseChannel, relayOnly: this.relayOnly };
+    return {
+      version: '0.1.0-alpha',
+      updateChannel: this.releaseChannel,
+      relayOnly: this.relayOnly,
+      ...(this.options.abuseAddress ? { abuseAddress: 'abuse@example.org' } : {}),
+    };
   }
 
   /** Relay-only (#272): on ends my call; every room then says so (the core: at the next sync round). */

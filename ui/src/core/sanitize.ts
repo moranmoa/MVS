@@ -16,6 +16,7 @@ import type {
   Identity,
   Invite,
   RemovedMember,
+  BlockedUser,
   JoinStatus,
   Member,
   Message,
@@ -248,6 +249,20 @@ export function cleanInvite(i: Invite): Invite {
 }
 
 /**
+ * G-47: a blocked account from the core, or null when its id isn't 64
+ * lower-case hex (SL, as for removed accounts): setBlocked only ever gets a
+ * real account id.
+ */
+export function cleanBlockedUser(b: BlockedUser): BlockedUser | null {
+  if (typeof b?.userId !== 'string' || !/^[0-9a-f]{64}$/.test(b.userId)) return null;
+  const name = cleanName(b.name);
+  const shortCode = cleanCode(b.shortCode);
+  return { userId: b.userId, ...(shortCode ? { shortCode } : {}), ...(name ? { name } : {}) };
+}
+const cleanBlockedList = (l: unknown): BlockedUser[] =>
+  Array.isArray(l) ? l.map(cleanBlockedUser).filter((b): b is BlockedUser => b !== null) : [];
+
+/**
  * G-53: a removed account from the core, or null when its id isn't 64
  * lower-case hex (SL): undoKick is only ever sent a real account id.
  */
@@ -267,8 +282,13 @@ const POSITION = /^[0-9A-Za-z]{0,31}[1-9A-Za-z]$/;
 /** A non-negative whole number below 2^31, or undefined. */
 const index = (v: unknown): number | undefined => (Number.isInteger(v) && (v as number) >= 0 && (v as number) < 2 ** 31 ? (v as number) : undefined);
 
+/** G-14: at most 256 code points (the core's MAX_CHANNEL_TOPIC). */
+export const CHANNEL_TOPIC_MAX = 256;
+
 export function cleanChannel(c: Channel): Channel {
-  const { position, firstUnreadIndex, unreadCount, ...rest } = c;
+  const { position, firstUnreadIndex, unreadCount, topic: rawTopic, ...rest } = c;
+  // G-14: one line of plain text, cleaned like a name (no controls, bidi or line breaks).
+  const topic = cleanName(rawTopic, CHANNEL_TOPIC_MAX);
   const first = index(firstUnreadIndex);
   const n = index(unreadCount);
   return {
@@ -277,6 +297,7 @@ export function cleanChannel(c: Channel): Channel {
     ...(first !== undefined ? { firstUnreadIndex: first } : {}),
     ...(n !== undefined ? { unreadCount: n } : {}),
     ...(typeof position === 'string' && POSITION.test(position) ? { position } : {}),
+    ...(topic ? { topic } : {}),
     name: cleanName(c.name, CHANNEL_NAME_MAX) || '…',
     adult: c.adult === true,
     isDefault: c.isDefault === true,
@@ -343,10 +364,25 @@ function cleanReactions(raw: unknown): Message['reactions'] {
 }
 
 export function cleanMessage(m: Message): Message {
+  // Core #527: a placeholder carries no text, author (untrusted) or extras.
+  const unreadable = m.unreadable === 'no-key' || m.unreadable === 'untrusted' ? m.unreadable : undefined;
+  if (unreadable) {
+    return {
+      id: id(m.id),
+      channelId: id(m.channelId),
+      index: typeof m.index === 'number' && Number.isInteger(m.index) && m.index >= 0 ? m.index : 0,
+      authorId: unreadable === 'untrusted' ? '' : id(m.authorId),
+      createdAt: typeof m.createdAt === 'number' && Number.isFinite(m.createdAt) ? m.createdAt : 0,
+      body: '',
+      unreadable,
+      mentionsMe: false,
+    };
+  }
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
-  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
+  // An unknown unreadable kind is dropped: the message is shown as a message.
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, unreadable: _unknown, ...rest } = m;
   const mentions = cleanMentions(rawMentions);
   const reactions = cleanReactions(rawReactions);
   return {
@@ -393,6 +429,9 @@ const cleanRange = (r: MessageRange): MessageRange => ({ ...r, messages: r.messa
  * bearer credential: the link is never logged, only shown, copied and passed
  * to joinServer.
  */
+/** G-30: a core id (64 lower-case hex), or the demo core's short ids (letters, digits, - and #). */
+const isLinkId = (v: unknown): v is string => typeof v === 'string' && (/^[0-9a-f]{64}$/.test(v) || /^[a-z0-9][a-z0-9#-]{0,63}$/.test(v));
+
 const INVITE_LINK = /^mvs:\/\/join\/([0-9a-f]{64})\/([0-9a-f]{64})\/([0-9a-f]{64})\/?$/;
 
 /** The canonical invite link, or '' when it is not exactly that format. */
@@ -596,6 +635,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'channel.added': cleanChannel,
   'channel.removed': (p) => ({ serverId: p.serverId, channelId: p.channelId, name: cleanName(p.name, CHANNEL_NAME_MAX) || '…' }),
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
+  'blocks.changed': (p) => ({ blocked: cleanBlockedList(p?.blocked) }),
   'message.added': cleanMessage,
   'message.updated': cleanMessage,
   // Only the kinds the UI knows; anything else is dropped.
@@ -605,6 +645,13 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       : null,
   'join.status': cleanJoin,
   'link.open': (p) => ({ link: cleanInviteLink(p?.link) }),
+  // G-30: three ids, like notify.click; a missing one drops the event.
+  // G-30: three ids or nothing. Main sends only what deeplink.js parsed as
+  // 64 lower-case hex (SL); the demo core's short ids are the one other shape.
+  'link.message': (p) =>
+    isLinkId(p?.serverId) && isLinkId(p.channelId) && isLinkId(p.messageId)
+      ? { serverId: p.serverId, channelId: p.channelId, messageId: p.messageId }
+      : null,
   'window.state': (p) => ({ maximized: p?.maximized === true, fullScreen: p?.fullScreen === true }),
   'window.closeRequest': () => ({}),
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
@@ -633,6 +680,8 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       state: s?.state === 'up' || s?.state === 'down' ? s.state : 'starting',
       detail: (['missing', 'start-failed', 'crashed', 'crash-loop', 'keyring'] as const).find((d) => d === s?.detail),
       ...(stunUrl ? { stunUrl } : {}),
+      // G-81 B: on only for an exact true.
+      ...(s?.voiceP2p === true ? { voiceP2p: true } : {}),
     };
   },
   'update.ready': (u) => ({ version: cleanName(u.version, 32), waitingForCall: u.waitingForCall === true }),
@@ -663,12 +712,14 @@ export function guardCore(core: CoreApi): CoreApi {
     moveChannel: wrap(core.moveChannel, (l) => l.map(cleanChannel)),
     createChannel: wrap(core.createChannel, cleanChannel),
     updateChannel: wrap(core.updateChannel, cleanChannel),
+    setChannelTopic: wrap(core.setChannelTopic, cleanChannel),
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
+    listBlocked: wrap(core.listBlocked, cleanBlockedList),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
       Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
     ),
@@ -682,6 +733,13 @@ export function guardCore(core: CoreApi): CoreApi {
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
     getSettings: () => core.getSettings().then(cleanCoreSettings),
+    // G-30: an index, nothing else; anything malformed is the core's error.
+    locateMessage: (serverId: Id, channelId: Id, messageId: Id) =>
+      core.locateMessage(serverId, channelId, messageId).then((r) => {
+        const index = r?.index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) throw { code: 'internal' };
+        return { index };
+      }),
     getServerRestore: () =>
       core.getServerRestore().then((r) => {
         const clean = cleanServerRestore(r);

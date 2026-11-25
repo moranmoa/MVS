@@ -142,6 +142,8 @@ export interface StoreState {
   memberRelay: MemberRelay | null;
   /** Something asked for Settings at a section (e.g. "Change in Settings" under the voice room). */
   settingsRequest: { section: string; at: number } | null;
+  /** G-30: scroll to this message and highlight it (a link was opened). */
+  messageTarget: { channelId: Id; index: number; at: number } | null;
   /** A short confirmation toast (an i18n id), e.g. "Copied" after a menu copy. */
   flash: { id: string; values?: Record<string, string>; at: number } | null;
   /** Bumped when any message window changes, so readers re-render. */
@@ -168,12 +170,25 @@ export class Store {
     memberRelay: null,
     flash: null,
     settingsRequest: null,
+    messageTarget: null,
     serverGone: null,
     mutes: loadMutes(),
     messagesVersion: 0,
   };
   private listeners = new Set<() => void>();
   private windows = new Map<Id, MessageWindow>();
+  /** Core #527: placeholders seen in events, so their opening can be told apart from an edit. */
+  private placeholders = new Set<Id>();
+  private openedListeners = new Set<(m: Message) => void>();
+
+  /**
+   * PO rule (#527/#558): a no-key placeholder that opens later is new to me:
+   * once, it counts and notifies like a message that just arrived.
+   */
+  onPlaceholderOpened(cb: (m: Message) => void): () => void {
+    this.openedListeners.add(cb);
+    return () => this.openedListeners.delete(cb);
+  }
   private unsubs: (() => void)[] = [];
   /** While my own leaveCall runs: that end of the call isn't news. */
   private leaving = false;
@@ -230,8 +245,24 @@ export class Store {
       on('members.changed', ({ serverId, members }) =>
         this.set({ members: { ...this.state.members, [serverId]: members } }),
       ),
-      on('message.added', (m) => this.windows.get(m.channelId)?.apply(m)),
-      on('message.updated', (m) => this.windows.get(m.channelId)?.apply(m)),
+      on('message.added', (m) => {
+        if (m.unreadable) this.placeholders.add(m.id);
+        this.windows.get(m.channelId)?.apply(m);
+      }),
+      on('message.updated', (m) => {
+        const win = this.windows.get(m.channelId);
+        // Was it a placeholder (from an event, or in a loaded window) before this update?
+        const was = this.placeholders.has(m.id) || win?.get(m.index)?.unreadable !== undefined;
+        if (m.unreadable) this.placeholders.add(m.id);
+        else this.placeholders.delete(m.id);
+        win?.apply(m);
+        if (was && !m.unreadable && !m.deleted) {
+          // It counts as unread now: the core's next counts say so.
+          const serverId = Object.entries(this.state.channels).find(([, list]) => list.some((c) => c.id === m.channelId))?.[0];
+          if (serverId) this.reloadChannels(serverId);
+          this.openedListeners.forEach((cb) => cb(m));
+        }
+      }),
       on('update.ready', (update) => this.set({ update })),
       on('update.installed', (u) => this.set({ updateNote: { kind: 'installed', ...u } })),
       on('call.state', (c) => {
@@ -364,6 +395,15 @@ export class Store {
 
   showFlash(id: string, values?: Record<string, string>): void {
     this.set({ flash: { id, values, at: Date.now() } });
+  }
+
+  /** G-30: the message list of that channel scrolls there and highlights it. */
+  goToMessage(channelId: Id, index: number): void {
+    this.set({ messageTarget: { channelId, index, at: Date.now() } });
+  }
+
+  clearMessageTarget(): void {
+    if (this.state.messageTarget) this.set({ messageTarget: null });
   }
 
   openSettings(section: string): void {

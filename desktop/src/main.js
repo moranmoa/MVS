@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -84,7 +84,13 @@ let coreStatus = { state: 'starting' };
  */
 const STUN_URL = stunFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
 if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
-const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
+/** G-81 B: calls over the P2P network (off by default; voiceP2pFor). */
+const VOICE_P2P = voiceP2pFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL, ...(VOICE_P2P ? { voiceP2p: true } : {}) });
+// G-48 (B24): the build's abuse-report address, for the page's getAppInfo.
+// Text only, never opened; never logged (its domain is private).
+const ABUSE_ADDRESS = abuseAddressFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+if (abuseHost(ABUSE_ADDRESS)) fileLog.hide(abuseHost(ABUSE_ADDRESS));
 /** V-C2: the microphone only while we are in a call (security.js). */
 const callGate = sec.createCallGate();
 /**
@@ -93,42 +99,22 @@ const callGate = sec.createCallGate();
  */
 const pushToTalk = ptt.createPtt({ emit: (name) => toPages(name, {}), active: () => callGate.inCall });
 /**
- * G-74: the optional global "toggle mute" accelerator the page chose (checked),
- * or null. It is registered with the OS only during a call.
+ * G-74: the optional global "toggle mute" accelerator the page chose. G-78:
+ * registered with the OS only while in a call AND unlocked, and a press
+ * reaches the page only then (ptt.js createGlobalMute).
  */
-let globalMute = null;
-/** What ptt:set answered for it: 'ok' or 'shortcut-taken'. */
-let globalMuteStatus = 'ok';
-/** The accelerator registered with the OS right now, or null. */
-let globalMuteRegistered = null;
+const globalMute = ptt.createGlobalMute({
+  register: (accel, onPress) => globalShortcut.register(accel, onPress),
+  unregister: (accel) => globalShortcut.unregister(accel),
+  allowed: () => callGate.inCall && lockOpen(),
+  onPress: () => toPages('ptt.toggleMute', {}),
+});
 
-function registerGlobalMute() {
-  if (!globalMute || globalMuteRegistered) return !!globalMuteRegistered;
-  let ok = false;
-  try {
-    // The page hears only that it was pressed, and only during a call.
-    ok = globalShortcut.register(globalMute, () => callGate.inCall && toPages('ptt.toggleMute', {}));
-  } catch {
-    ok = false;
-  }
-  if (ok) globalMuteRegistered = globalMute;
-  return ok;
-}
-
-function unregisterGlobalMute() {
-  if (globalMuteRegistered) globalShortcut.unregister(globalMuteRegistered);
-  globalMuteRegistered = null;
-}
-
-/** After any change to the call: push-to-talk lets go, and the global shortcut follows the call. */
+/** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
 function syncCall() {
   if (!callGate.inCall) appLock.callEnded();
-  if (!callGate.inCall || !lockOpen()) {
-    pushToTalk.reset();
-    unregisterGlobalMute();
-  } else if (globalMute) {
-    registerGlobalMute();
-  }
+  if (!callGate.inCall || !lockOpen()) pushToTalk.reset();
+  globalMute.sync();
 }
 /**
  * G-62: the unread count on the taskbar (Windows: our overlay icon) or the
@@ -172,7 +158,7 @@ function onLockChange(st) {
     // Nothing that shows activity or listens: badge, push-to-talk, global mute.
     unread.set(0);
     pushToTalk.reset();
-    unregisterGlobalMute();
+    globalMute.sync(); // locked: not allowed, so off
     // Path B: the call goes on with my mic off, in the core (and the page
     // turns its track off on lock.state).
     if (st.locked && st.path === 'B' && !(prev && prev.locked && prev.path === 'B')) {
@@ -195,10 +181,10 @@ function onLockChange(st) {
     syncCall();
     // Path B unlock has no reload: hand over a held invite now (path A's
     // reload does it on did-finish-load).
-    if (uiReady && pendingInvite) {
-      const link = pendingInvite;
-      pendingInvite = null;
-      openInvite(link);
+    if (uiReady && pendingLink) {
+      const held = pendingLink;
+      pendingLink = null;
+      openLink(held);
     }
   }
 }
@@ -346,6 +332,9 @@ function serveCoreIpc() {
         clearStorage: async () => {
           // G-62: signed out (the core said ok): no unread count left on the taskbar.
           unread.set(0);
+          // G-74/G-78: no push-to-talk key or global shortcut left behind either.
+          pushToTalk.setKey(null);
+          globalMute.clear();
           await event.sender.session.clearStorageData({
             origin: sec.ORIGIN,
             storages: ['localstorage', 'indexdb', 'cachestorage', 'serviceworkers', 'cookies', 'websql', 'shadercache'],
@@ -361,7 +350,7 @@ function serveCoreIpc() {
     const res = await core.request(req.cmd, req.args);
     callGate.afterCommand(req.cmd, token, res);
     syncCall();
-    return res;
+    return req.cmd === 'getAppInfo' ? withAbuseAddress(res, ABUSE_ADDRESS) : res;
   });
   // The "core unavailable" screen (T8-01): try again now, and open the logs.
   const fromUs = (event) => {
@@ -431,17 +420,8 @@ function serveCoreIpc() {
     const accel = ptt.cleanAccelerator(settings.globalMute ?? null);
     if (key === undefined || accel === undefined) return 'invalid';
     pushToTalk.setKey(key);
-    // The same shortcut again: nothing to do.
-    if (accel === globalMute) return globalMuteStatus;
-    unregisterGlobalMute();
-    globalMute = accel;
-    globalMuteStatus = 'ok';
-    if (!accel) return 'ok';
-    // Try it now so the page can say "taken"; it then stays registered only
-    // during a call (syncCall).
-    if (!registerGlobalMute()) globalMuteStatus = 'shortcut-taken';
-    syncCall();
-    return globalMuteStatus;
+    // Tried now so the page can say "taken"; registered only in a call and unlocked.
+    return globalMute.set(accel);
   });
   // G-78: the lock screen's three calls. The passcode or words go straight
   // to the core (applock.js shapes them); nothing here logs them.
@@ -451,6 +431,20 @@ function serveCoreIpc() {
     return appLock.unlock(input);
   });
   ipcMain.handle('lock:now', (event) => (fromUs(event) ? appLock.lock() : false));
+  // The settings (Settings → Privacy): our own top frame, unlocked only.
+  // setAppLock / clearAppLock are not on the core:invoke allow-list; only
+  // these reach them, one at a time, then main re-reads its config.
+  ipcMain.handle('lock:config', (event) => (fromUs(event) && lockOpen() ? appLock.config() : null));
+  ipcMain.handle('lock:set', async (event, input) => {
+    if (!fromUs(event)) return { result: 'invalid' };
+    if (!lockOpen()) return { result: 'locked' };
+    return appLock.set(input);
+  });
+  ipcMain.handle('lock:clear', async (event, input) => {
+    if (!fromUs(event)) return { result: 'invalid' };
+    if (!lockOpen()) return { result: 'locked' };
+    return appLock.clear(input);
+  });
   ipcMain.handle('badge:set', (event, count) => {
     if (!fromUs(event) || !lockOpen()) return false;
     return unread.set(count);
@@ -558,45 +552,53 @@ function lockDownSession(ses) {
 }
 
 /**
- * An mvs:// invite from the OS. Only a link of the exact invite format gets
- * through (deeplink.js). Main never joins by itself: a link from outside
- * must not reveal who we are to someone's server without a click. It sends
- * the UI a `link.open` event; the UI shows the join screen, pre-filled, and
- * calls joinServer only when the user presses Join.
+ * An mvs:// link from the OS. Only a link of an exact format gets through
+ * (deeplink.js); neither it nor argv is ever logged.
+ * - An invite: main never joins by itself (a link from outside must not
+ *   reveal who we are to someone's server without a click). The UI gets
+ *   `link.open { link }`, shows the join screen pre-filled, and calls
+ *   joinServer only when the user presses Join.
+ * - G-30, a message link: the UI gets `link.message { serverId, channelId,
+ *   messageId }`, the IDs main already parsed, and goes to that message.
  */
-let pendingInvite = null;
+let pendingLink = null;
 let healthReported = false;
 let uiReady = false;
+/** G-30 (SL): the window comes forward for a deep link at most once every 2 s. */
+const linkFocus = deeplink.createFocusThrottle();
 
-function openInvite(raw) {
-  const link = deeplink.parseInviteLink(raw);
-  if (!link) return;
-  const win = BrowserWindow.getAllWindows()[0];
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.focus();
-  }
-  // Held until the UI is up and unlocked (G-78: only the latest one).
-  if (!uiReady || !win || !sec.isInternalUrl(win.webContents.getURL()) || !lockOpen()) {
-    pendingInvite = link;
-    return;
-  }
-  win.webContents.send('core:event', 'link.open', { link });
+function bringForward(win) {
+  if (win.isMinimized()) win.restore();
+  win.focus();
 }
 
-function flushInvite() {
+/** `parsed`: deeplink.parseLink's answer (never a raw string). */
+function openLink(parsed) {
+  if (!parsed) return;
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && linkFocus.allow()) bringForward(win);
+  // Held until the UI is up and unlocked (G-78: one slot, either kind, only the latest).
+  if (!uiReady || !win || !sec.isInternalUrl(win.webContents.getURL()) || !lockOpen()) {
+    pendingLink = parsed;
+    return;
+  }
+  if (parsed.kind === 'invite') win.webContents.send('core:event', 'link.open', { link: parsed.link });
+  else win.webContents.send('core:event', 'link.message', { serverId: parsed.serverId, channelId: parsed.channelId, messageId: parsed.messageId });
+}
+
+function flushLink() {
   uiReady = true;
-  if (pendingInvite) {
-    const link = pendingInvite;
-    pendingInvite = null;
-    openInvite(link);
+  if (pendingLink) {
+    const held = pendingLink;
+    pendingLink = null;
+    openLink(held);
   }
 }
 
 // macOS delivers links as an event (also before ready).
 app.on('open-url', (event, url) => {
   event.preventDefault();
-  openInvite(url);
+  openLink(deeplink.parseLink(url));
 });
 
 /**
@@ -727,7 +729,7 @@ function createWindow() {
   });
   // Every load (a reload too) gets the current core status.
   win.webContents.on('did-finish-load', () => {
-    flushInvite();
+    flushLink();
     // The page may have missed earlier changes; the preload keeps this for the UI.
     if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('core:event', 'core.status', statusForPage(coreStatus));
     // Commit this version once the UI is up and the core answers (main only, once).
@@ -762,19 +764,22 @@ app.whenReady().then(async () => {
   setInterval(() => appLock.idleTick(powerMonitor.getSystemIdleTime()), 15_000).unref();
   powerMonitor.on('lock-screen', () => appLock.onSleep());
   powerMonitor.on('suspend', () => appLock.onSleep());
-  const first = deeplink.inviteFromArgv(process.argv);
-  if (first) openInvite(first);
+  openLink(deeplink.linkFromArgv(process.argv));
   app.on('activate', () => BrowserWindow.getAllWindows().length === 0 && createWindow());
 });
 
 app.on('second-instance', (_event, argv) => {
+  // A link brings the window forward itself (throttled); so does a malformed
+  // mvs:// argument (SL), which is otherwise ignored. A plain relaunch always does.
+  const link = deeplink.linkFromArgv(argv);
+  if (link) return openLink(link);
   const win = BrowserWindow.getAllWindows()[0];
-  if (win) {
-    if (win.isMinimized()) win.restore();
-    win.focus();
+  if (!win) return;
+  if (deeplink.hasLinkArg(argv)) {
+    if (linkFocus.allow()) bringForward(win);
+    return;
   }
-  const link = deeplink.inviteFromArgv(argv);
-  if (link) openInvite(link);
+  bringForward(win);
 });
 
 app.on('will-quit', () => {

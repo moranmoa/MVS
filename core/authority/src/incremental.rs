@@ -321,7 +321,11 @@ impl Resolver {
                 creates.insert(creates.partition_point(|other| pos[other] < at), id);
             }
         }
-        if matches!(action, Some(Action::ServerEdit { .. })) {
+        // G-51: the icon and description are server meta, like a rename.
+        if matches!(
+            action,
+            Some(Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. })
+        ) {
             let pos = &self.pos;
             let edits = &mut self.server_edits;
             edits.insert(edits.partition_point(|other| pos[other] < at), id);
@@ -425,7 +429,7 @@ impl Resolver {
                 }
                 return Ok(());
             }
-            Action::ServerEdit { .. } => {
+            Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
                 // Changes no roles; whether it counts depends on the author's
                 // role, which must be the same in every pass. The latest in
                 // linear order names the server.
@@ -452,6 +456,23 @@ impl Resolver {
                     self.state.accepted.insert(id);
                 }
                 self.refresh_adult(author);
+                return Ok(());
+            }
+            Action::ChannelTopic { channel, .. } => {
+                // G-14: changes no roles and no channel's status, so no other
+                // record is judged differently. Whether it counts depends on
+                // the author's role, which must be the same in every pass, and
+                // on the channel's ops before it. The latest accepted topic in
+                // linear order counts (`refresh_channel`).
+                if self.owner_unsettled || self.is_unsettled(author, at) {
+                    return Err(Fallback::Other);
+                }
+                if voided {
+                    self.excluded.insert(id);
+                } else if allowed {
+                    self.state.accepted.insert(id);
+                }
+                self.refresh_channel(channel);
                 return Ok(());
             }
             Action::ChannelCreate { .. }
@@ -675,6 +696,9 @@ impl Resolver {
         let general = self.first_create(self.order.len());
         let mut entry: Option<Channel> = None;
         let mut deleted = false;
+        let mut topic: Option<String> = None;
+        // B7-k: as `apply_channel` keeps `State.adult_edits`.
+        let mut adult_edit: Option<RecordId> = None;
         for op in self.channel_ops.get(&channel).into_iter().flatten() {
             if !self.state.accepted.contains(op) {
                 continue;
@@ -688,9 +712,16 @@ impl Resolver {
                         created: *op,
                     };
                     entry = Some(created);
+                    if *adult {
+                        adult_edit = Some(*op);
+                    }
                 }
                 Some(Action::ChannelEdit { adult, name, .. }) => {
                     if let Some(entry) = entry.as_mut() {
+                        // Only plain → 18+, as `apply_channel`.
+                        if *adult && !entry.adult {
+                            adult_edit = Some(*op);
+                        }
                         entry.name = name.clone();
                         entry.adult = *adult;
                     }
@@ -698,6 +729,11 @@ impl Resolver {
                 Some(Action::ChannelDelete { .. }) => {
                     entry = None;
                     deleted = true;
+                    topic = None;
+                    adult_edit = None;
+                }
+                Some(Action::ChannelTopic { topic: text, .. }) => {
+                    topic = (!text.is_empty()).then(|| text.clone());
                 }
                 _ => {}
             }
@@ -705,6 +741,14 @@ impl Resolver {
         match entry {
             Some(entry) => self.state.channels.insert(channel, entry),
             None => self.state.channels.remove(&channel),
+        };
+        match topic {
+            Some(topic) => self.state.topics.insert(channel, topic),
+            None => self.state.topics.remove(&channel),
+        };
+        match adult_edit {
+            Some(edit) => self.state.adult_edits.insert(channel, edit),
+            None => self.state.adult_edits.remove(&channel),
         };
         if deleted {
             self.state.deleted_channels.insert(channel);
@@ -715,13 +759,26 @@ impl Resolver {
 
     /// Recomputes whether `actor` counts as 18+: their latest accepted age
     /// claim in linear order.
-    /// The server's name: the latest accepted rename in linear order.
+    /// The server's name, and (G-51) its icon and description: each the
+    /// latest accepted of its kind in linear order (`server_edits` holds all
+    /// three kinds).
     fn refresh_server_name(&mut self) {
-        let latest = self.server_edits.iter().rev().find(|id| self.state.accepted.contains(*id));
-        self.state.server_name = latest.and_then(|id| match &self.actions[id] {
-            Some(Action::ServerEdit { name }) => Some(name.clone()),
-            _ => None,
-        });
+        let mut name = None;
+        let mut icon = None;
+        let mut description = None;
+        for id in self.server_edits.iter().rev().filter(|id| self.state.accepted.contains(*id)) {
+            match &self.actions[id] {
+                Some(Action::ServerEdit { name: n }) if name.is_none() => name = Some(n.clone()),
+                Some(Action::ServerIcon { icon: i }) if icon.is_none() => icon = Some(i.clone()),
+                Some(Action::ServerDescription { text }) if description.is_none() => {
+                    description = Some((!text.is_empty()).then(|| text.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.state.server_name = name;
+        self.state.server_icon = icon.flatten();
+        self.state.server_description = description.flatten();
     }
 
     /// Whether `id` is a close the reference would accept: the owner's, with
@@ -843,7 +900,7 @@ impl Resolver {
                     }
                     dirty.insert(author);
                 }
-                Action::ServerEdit { .. } => {
+                Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
                     if now {
                         self.state.accepted.insert(id);
                     } else {
@@ -863,6 +920,15 @@ impl Resolver {
                 Action::ChannelCreate { .. }
                 | Action::ChannelEdit { .. }
                 | Action::ChannelDelete { .. } => return Err(Fallback::Other),
+                // G-14: an admin's topic counts or not as their role changed.
+                Action::ChannelTopic { channel, .. } => {
+                    if now {
+                        self.state.accepted.insert(id);
+                    } else {
+                        self.state.accepted.remove(&id);
+                    }
+                    self.refresh_channel(channel);
+                }
                 // The author's membership changed under it.
                 Action::AgeClaim { .. } => {
                     if now {
@@ -1003,6 +1069,35 @@ impl Resolver {
     /// The final pass's state just before position `at`.
     pub(crate) fn view_at(&self, at: usize) -> impl View + '_ {
         self.at(at)
+    }
+
+    /// B7-k, query only (no state changes): whether `actor` counts as 18+
+    /// just before the record whose `auth_deps` are given: their latest
+    /// *accepted* age claim placed before `position_after(auth_deps)` in
+    /// linear order says adult. `Err(missing)` while some dep isn't held,
+    /// like a `Pending` verdict. Positions can shift as records land
+    /// earlier, so callers recompute on each fold and never cache a verdict
+    /// per record.
+    pub fn adult_at(&self, actor: Actor, auth_deps: &[RecordId]) -> Result<bool, Vec<RecordId>> {
+        let at = self.position_after(auth_deps)?;
+        let latest = self.touch.get(&actor).into_iter().flatten().rev().find_map(|id| {
+            let before = self.pos.get(id).is_some_and(|pos| *pos < at);
+            if !before || self.known[id].author() != actor || !self.state.accepted.contains(id) {
+                return None;
+            }
+            match self.actions[id] {
+                Some(Action::AgeClaim { adult }) => Some(adult),
+                _ => None,
+            }
+        });
+        Ok(latest == Some(true))
+    }
+
+    /// B7-k, query only (no state changes): whether the control record
+    /// `ancestor` is among the ancestors of `of` (or one of them). The walk
+    /// stops below `ancestor`'s position in linear order, so it's cheap.
+    pub fn reaches(&self, ancestor: RecordId, of: &[RecordId]) -> bool {
+        self.is_control_ancestor(ancestor, of)
     }
 
     /// The accepted revokes and kicks of `target`, with their record IDs.

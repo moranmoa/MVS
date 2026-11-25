@@ -52,9 +52,24 @@ struct State {
     /// anyone can name a channel in a record, and each `ChannelKeys` may
     /// hold up to 2 MiB on probation (GAP-8).
     known: HashMap<ServerId, BTreeSet<ChannelId>>,
+    /// B7-k: each server's members with an accepted 18+ claim.
+    adults: HashMap<ServerId, BTreeSet<PublicKey>>,
+    /// B7-k: each server's 18+ channels.
+    adult_channels: HashMap<ServerId, BTreeSet<ChannelId>>,
 }
 
 impl State {
+    /// Who may read `channel` now (B7-k): the members, and for an 18+
+    /// channel only those of them with an accepted 18+ claim.
+    fn readers(&self, server: ServerId, channel: ChannelId) -> BTreeSet<PublicKey> {
+        let members = self.members.get(&server).cloned().unwrap_or_default();
+        if !self.adult_channels.get(&server).is_some_and(|c| c.contains(&channel)) {
+            return members;
+        }
+        let adults = self.adults.get(&server);
+        members.into_iter().filter(|m| adults.is_some_and(|a| a.contains(m))).collect()
+    }
+
     /// The keys of a channel authority knows; `Rejected` for any other,
     /// without creating anything.
     fn channel(
@@ -135,6 +150,8 @@ impl GroupCipher for GroupKeysCipher {
         state.members.remove(&server);
         state.accepted.remove(&server);
         state.known.remove(&server);
+        state.adults.remove(&server);
+        state.adult_channels.remove(&server);
     }
 
     /// Records the new member set. It doesn't rotate: service asks
@@ -151,13 +168,23 @@ impl GroupCipher for GroupKeysCipher {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CipherError> {
         let mut state = self.state();
-        let members = state.members.get(&server).cloned().unwrap_or_default();
+        let members = state.readers(server, channel);
         // A channel authority doesn't know has no key to send with.
         let keys = state.channel(server, channel).map_err(|error| match error {
             CipherError::Rejected => CipherError::NoKey,
             other => other,
         })?;
         keys.encrypt(&members, plaintext, &mut OsRng).map_err(cipher_error)
+    }
+
+    fn missing_readers(&self, server: ServerId, channel: ChannelId) -> Vec<PublicKey> {
+        let mut state = self.state();
+        let members = state.readers(server, channel);
+        let Ok(keys) = state.channel(server, channel) else { return Vec::new() };
+        match keys.rotation_need(&members) {
+            groupkeys::RotationNeed::Add { missing } => missing,
+            _ => Vec::new(),
+        }
     }
 
     fn decrypt(
@@ -199,6 +226,12 @@ impl GroupCipher for GroupKeysCipher {
         let mut state = self.state();
         state.channels.retain(|(at, channel), _| *at != server || channels.contains(channel));
         state.known.insert(server, channels.clone());
+    }
+
+    fn set_adults(&self, server: ServerId, adults: &BTreeSet<PublicKey>, adult_channels: &BTreeSet<ChannelId>) {
+        let mut state = self.state();
+        state.adults.insert(server, adults.clone());
+        state.adult_channels.insert(server, adult_channels.clone());
     }
 
     fn set_accepted(&self, server: ServerId, accepted: &BTreeSet<RecordId>) {

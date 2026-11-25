@@ -592,6 +592,16 @@ for (const [name, opts] of [
   await shot(p, '322-server-order-phone-he');
   await p.close();
 }
+// G-05 / G-06 in the rail: the mention count apart from the pip, and the tooltip
+// with the full server name (hover).
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.locator('.rail button[data-server-id]').first().hover();
+  await p.locator('.rail-tip').waitFor();
+  await p.waitForTimeout(150);
+  await shot(p, '323-rail-tooltip-he');
+  await p.close();
+}
 
 // ---- G-11: the owner reorders the channels (330-339) -------------------------
 {
@@ -1160,11 +1170,13 @@ for (const [query, name, opts] of [
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
   const row = p.locator('[role=article]:has(.msg:not(.skeleton))').last();
-  for (const name of ['אגודל למעלה', 'אש', 'פרצוף צוחק עם דמעות צחוק']) {
+  // G-27: the full picker renders only visible rows, so pick through search.
+  for (const name of ['אגודל למעלה', 'אש', 'פרצוף עם דמעות שמחה']) {
     await row.hover();
     await row.getByRole('button', { name: "הוספת אמוג'י" }).first().click();
-    await p.getByRole('dialog').getByRole('button', { name, exact: true }).click();
-    await p.getByRole('dialog').waitFor({ state: 'detached' });
+    await p.getByRole('dialog').getByRole('searchbox').fill(name);
+    await p.getByRole('dialog').getByRole('gridcell', { name, exact: true }).click();
+    await p.getByRole('dialog').waitFor({ state: 'hidden' });
   }
   await row.locator('.reactions').waitFor();
   await p.mouse.move(1, 1);
@@ -1174,6 +1186,47 @@ for (const [query, name, opts] of [
   await p.getByRole('dialog').waitFor();
   await p.waitForTimeout(200);
   await shot(p, '442-emoji-picker-he');
+  await p.close();
+}
+
+// ---- G-27 the full emoji picker (450-453, emoji-picker.md) -------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  const dialog = p.getByRole('dialog', { name: "הכנסת אמוג'י" });
+  // Two picks first, so the recent section shows.
+  for (const name of ['אש', 'לב אדום']) {
+    await p.getByRole('button', { name: "הכנסת אמוג'י" }).click();
+    await dialog.getByRole('searchbox').fill(name);
+    await dialog.getByRole('gridcell', { name, exact: true }).click();
+    await dialog.waitFor({ state: 'hidden' });
+  }
+  await p.getByRole('button', { name: "הכנסת אמוג'י" }).click();
+  await dialog.getByRole('gridcell').nth(4).hover();
+  await p.waitForTimeout(200);
+  await shot(p, '450-emoji-picker-he');
+  await dialog.getByRole('searchbox').fill('לב');
+  await p.waitForTimeout(200);
+  await shot(p, '451-emoji-picker-search-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999', 'x', { colorScheme: 'dark' });
+  const dialog = p.getByRole('dialog', { name: 'Insert emoji' });
+  await p.getByRole('button', { name: 'Insert emoji' }).click();
+  await dialog.getByRole('tab', { name: 'Flags' }).click();
+  await p.waitForTimeout(300);
+  await dialog.getByRole('gridcell').first().waitFor();
+  await shot(p, '452-emoji-picker-flags-en-dark');
+  await p.close();
+}
+{
+  const p = await page('?demo=1&still=1&lang=he&theme=light&update=999999', { width: 375, height: 812, phone: true });
+  await p.getByRole('button', { name: /^כללי/ }).click();
+  await p.getByRole('article').first().waitFor();
+  await p.getByRole('button', { name: "הכנסת אמוג'י" }).click();
+  await p.locator('.emoji-picker.sheet [role=gridcell]').first().waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '453-emoji-picker-sheet-he');
   await p.close();
 }
 
@@ -1365,6 +1418,18 @@ for (const [lang, theme, name, query] of [
   }
 }
 
+// ---- member search (473-474, G-41) -------------------------------------------
+for (const [query, name, text, dark] of [
+  ['lang=he&theme=light', '473-member-search-he', 'ta', false],
+  ['lang=en&theme=dark', '474-member-search-none-en-dark', 'qqqq', true],
+]) {
+  const p = await chat('?demo=1&still=1&update=999999&' + query, 'x', dark ? { colorScheme: 'dark' } : undefined);
+  await p.locator('.member-search-input').fill(text);
+  await p.waitForTimeout(500);
+  await shot(p, name);
+  await p.close();
+}
+
 // ---- removed accounts (187, G-53, B11) ----------------------------------------
 {
   const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
@@ -1407,6 +1472,82 @@ for (const [lang, theme, name, query] of [
   await list.getByText('לא חסמת אף אחד.').waitFor();
   await p.waitForTimeout(5200); // the Undo bar goes away
   await shot(p, '471-blocked-empty-he');
+  await p.close();
+}
+
+// ---- G-14 channel topic (500-503, UX on #546) ----------------------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.locator('.chat-topic').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '500-topic-header-he');
+  await p.locator('.chat-topic').click();
+  await p.getByRole('dialog', { name: 'נושא הערוץ' }).waitFor();
+  await p.waitForTimeout(200);
+  await shot(p, '501-topic-dialog-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999', 'x', { colorScheme: 'dark' });
+  await p.locator('.chat-topic').click();
+  const dialog = p.getByRole('dialog', { name: 'Channel topic' });
+  await dialog.getByRole('button', { name: 'Edit topic' }).click();
+  await dialog.getByRole('textbox').fill('Game night every Thursday at 21:00. Ranked queue opens at 20:30, so join the lobby early. '.repeat(3).slice(0, 230));
+  await p.waitForTimeout(200);
+  await shot(p, '502-topic-edit-counter-en-dark');
+  await p.close();
+}
+{
+  // An owned channel with no topic: "Add a topic" in the header.
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: /^clips/ }).first().click();
+  await p.locator('.chat-topic.add').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '503-topic-add-empty-he');
+  await p.close();
+}
+
+// ---- G-92 Home after sign-up and the inline join field (510-512) ------------------
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  // As if sign-up just finished (Onboarding sets this flag).
+  await p.evaluate(() => localStorage.setItem('mvs.home.firstRun.v1', '1'));
+  await p.getByRole('button', { name: 'בית', exact: true }).first().click();
+  await p.locator('.home h1').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '510-home-first-run-he');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=en&theme=dark&update=999999', 'x', { colorScheme: 'dark' });
+  await p.getByRole('button', { name: 'Home', exact: true }).first().click();
+  await p.getByRole('textbox', { name: 'Paste an invite link' }).fill('mvs://join/0f3a9c2e…');
+  await p.mouse.move(1, 1);
+  await shot(p, '511-home-join-paste-en-dark');
+  await p.close();
+}
+{
+  const p = await chat('?demo=1&still=1&lang=he&theme=light&update=999999', 'x');
+  await p.getByRole('button', { name: 'בית', exact: true }).first().click();
+  const field = p.getByRole('textbox', { name: 'הדבקת קישור הזמנה' });
+  await field.fill('שלום, הנה הקישור');
+  await field.press('Enter');
+  await p.locator('#join-paste-error').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, '512-home-join-invalid-he');
+  await p.close();
+}
+
+// ---- messages that can't be opened here (520-522, core #527) ---------------------
+for (const [query, name, opts, which] of [
+  ['lang=he&theme=light', '520-unreadable-nokey-he', undefined, 'no-key'],
+  ['lang=he&theme=light', '521-unreadable-untrusted-he', undefined, 'untrusted'],
+  ['lang=en&theme=dark', '522-unreadable-both-en-dark', { colorScheme: 'dark' }, null],
+]) {
+  const p = await chat(`?demo=1&still=1&update=999999&unreadable=1&${query}`, 'x', opts);
+  await p.locator(which ? `.msg.unreadable.${which}` : '.msg.unreadable.untrusted').waitFor();
+  await p.mouse.move(1, 1);
+  await shot(p, name);
   await p.close();
 }
 

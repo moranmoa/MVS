@@ -74,6 +74,7 @@ pub use records::{ChannelId, PublicKey, Record, RecordId, ServerId, Stub};
 use records::{Draft, Kind, RecordError, Scope, SigningKey, GENESIS_NONCE_LEN, MAX_CUT_ENTRIES};
 
 mod channel;
+pub mod image;
 mod incremental;
 pub use channel::{
     check_channel, check_channel_with, check_stub, message_text_ok, privileged_only, witness,
@@ -159,6 +160,15 @@ pub enum Action {
     ChannelDelete {
         channel: ChannelId,
     },
+    /// G-14: the owner or an admin sets a live channel's topic; an empty
+    /// topic clears it. Body: the channel ID, `history u8`, then the topic,
+    /// which follows [`channel_topic_ok`] or is empty. The history byte is
+    /// frozen at 0: older peers refuse anything else, so any future use
+    /// (D30) is a new wire format behind a new cap.
+    ChannelTopic {
+        channel: ChannelId,
+        topic: String,
+    },
     /// The owner lets a kicked key back: it may join again through an invite.
     /// It isn't made a member.
     Unban {
@@ -169,6 +179,19 @@ pub enum Action {
     /// versions can add some. The name follows [`server_name_ok`].
     ServerEdit {
         name: String,
+    },
+    /// G-51: the owner or an admin sets or clears the server's icon. Body:
+    /// `history u8` (0), `type u8` (0 clears; 1 PNG, 2 WebP), then a still
+    /// image ([`image::still_size`], at most `records::MAX_SERVER_ICON_BYTES`
+    /// and [`ICON_SIDE_MAX`] px a side).
+    ServerIcon {
+        icon: Option<Icon>,
+    },
+    /// G-51: the owner or an admin sets the server's description; empty
+    /// clears it. Body: `history u8` (0), then UTF-8 following
+    /// [`server_description_ok`].
+    ServerDescription {
+        text: String,
     },
     /// A member other than the owner leaves the server. It ends their role
     /// and membership; unlike a kick, they may join again. Body: a cut.
@@ -205,8 +228,11 @@ impl Action {
             Action::ChannelCreate { .. } => Kind::ChannelCreate,
             Action::ChannelEdit { .. } => Kind::ChannelEdit,
             Action::ChannelDelete { .. } => Kind::ChannelDelete,
+            Action::ChannelTopic { .. } => Kind::ChannelTopic,
             Action::Unban { .. } => Kind::Unban,
             Action::ServerEdit { .. } => Kind::ServerEdit,
+            Action::ServerIcon { .. } => Kind::ServerIcon,
+            Action::ServerDescription { .. } => Kind::ServerDescription,
             Action::Leave { .. } => Kind::Leave,
             Action::ServerClose => Kind::ServerClose,
         }
@@ -242,12 +268,18 @@ impl Action {
                 [channel.as_bytes().as_slice(), &[0, u8::from(*adult)], name.as_bytes()].concat()
             }
             Action::ChannelDelete { channel } => channel.as_bytes().to_vec(),
+            Action::ChannelTopic { channel, topic } => {
+                [channel.as_bytes().as_slice(), &[0], topic.as_bytes()].concat()
+            }
             Action::AgeClaim { adult } => vec![u8::from(*adult)],
             Action::Unban { target } => target.as_bytes().to_vec(),
             Action::ServerEdit { name } => {
                 let json = serde_json::json!({ "v": 1, "name": name });
                 [vec![0], serde_json::to_vec(&json).expect("a JSON object")].concat()
             }
+            Action::ServerIcon { icon: None } => vec![0, 0],
+            Action::ServerIcon { icon: Some(icon) } => [vec![0, icon.kind.byte()], icon.bytes.clone()].concat(),
+            Action::ServerDescription { text } => [vec![0], text.as_bytes().to_vec()].concat(),
             Action::Leave { cut } => {
                 let mut body = Vec::new();
                 cut.encode(&mut body);
@@ -316,6 +348,19 @@ impl Action {
             Kind::ChannelDelete => Some(Action::ChannelDelete {
                 channel: ChannelId::from_bytes(body.try_into().ok()?),
             }),
+            Kind::ChannelTopic => {
+                let (channel, rest) = body.split_first_chunk::<32>()?;
+                let [history, topic @ ..] = rest else { return None };
+                // No history mode is defined before D30.
+                if *history != 0 {
+                    return None;
+                }
+                // Already in wire form: `channel_topic` leaves it unchanged.
+                let topic = String::from_utf8(topic.to_vec())
+                    .ok()
+                    .filter(|t| channel_topic(t).as_deref() == Some(t.as_str()))?;
+                Some(Action::ChannelTopic { channel: ChannelId::from_bytes(*channel), topic })
+            }
             Kind::Unban => Some(Action::Unban { target: key(body)? }),
             Kind::ServerEdit => {
                 // No history mode is defined before D30.
@@ -326,6 +371,30 @@ impl Action {
                 let edit: ServerEditBody = serde_json::from_slice(json).ok()?;
                 (edit.v == 1 && server_name_ok(&edit.name))
                     .then_some(Action::ServerEdit { name: edit.name })
+            }
+            // G-51. No history mode is defined before D30.
+            Kind::ServerIcon => {
+                let [0, kind, image @ ..] = body else { return None };
+                let icon = match (*kind, image.is_empty()) {
+                    (0, true) => None,
+                    (kind, false) => {
+                        let kind = image::ImageType::from_byte(kind)?;
+                        if image.len() > records::MAX_SERVER_ICON_BYTES {
+                            return None;
+                        }
+                        image::still_size(image, kind, ICON_SIDE_MAX)?;
+                        Some(Icon { kind, bytes: image.to_vec() })
+                    }
+                    _ => return None,
+                };
+                Some(Action::ServerIcon { icon })
+            }
+            Kind::ServerDescription => {
+                let [0, text @ ..] = body else { return None };
+                let text = String::from_utf8(text.to_vec())
+                    .ok()
+                    .filter(|t| t.is_empty() || server_description_ok(t))?;
+                Some(Action::ServerDescription { text })
             }
             Kind::Leave => Some(Action::Leave { cut: Cut::parse(body)? }),
             Kind::ServerClose => body.is_empty().then_some(Action::ServerClose),
@@ -353,8 +422,11 @@ impl Action {
             | Action::ChannelCreate { .. }
             | Action::ChannelEdit { .. }
             | Action::ChannelDelete { .. }
+            | Action::ChannelTopic { .. }
             | Action::AgeClaim { .. }
             | Action::ServerEdit { .. }
+            | Action::ServerIcon { .. }
+            | Action::ServerDescription { .. }
             | Action::Leave { .. }
             | Action::ServerClose => None,
         }
@@ -374,7 +446,8 @@ impl Action {
         match self {
             Action::ChannelCreate { channel, .. }
             | Action::ChannelEdit { channel, .. }
-            | Action::ChannelDelete { channel } => Some(*channel),
+            | Action::ChannelDelete { channel }
+            | Action::ChannelTopic { channel, .. } => Some(*channel),
             _ => None,
         }
     }
@@ -397,7 +470,10 @@ impl Action {
                     | Action::ChannelCreate { .. }
                     | Action::ChannelEdit { .. }
                     | Action::ChannelDelete { .. }
+                    | Action::ChannelTopic { .. }
                     | Action::ServerEdit { .. }
+                    | Action::ServerIcon { .. }
+                    | Action::ServerDescription { .. }
                     | Action::ServerClose
             )
     }
@@ -480,6 +556,80 @@ pub const MAX_CHANNEL_NAME: usize = 32;
 /// and [`display_text_ok`].
 pub fn channel_name_ok(name: &str) -> bool {
     (1..=MAX_CHANNEL_NAME).contains(&name.chars().count()) && display_text_ok(name)
+}
+
+/// Most Unicode code points in a channel topic (G-14). The body also caps it
+/// at `records::MAX_CHANNEL_TOPIC_BYTES` bytes.
+pub const MAX_CHANNEL_TOPIC: usize = 256;
+
+/// Whether `topic` can be a channel's topic: one line, trimmed, 1 to
+/// [`MAX_CHANNEL_TOPIC`] code points and at most
+/// `records::MAX_CHANNEL_TOPIC_BYTES` bytes, and the strict
+/// [`display_text_ok`]. Trimmed means by `str::trim`, Unicode White_Space
+/// (`char::is_whitespace`), the one definition [`channel_topic`] uses too.
+/// One line: control characters are refused by `display_text_ok`, and the
+/// line and paragraph separators U+2028 and U+2029 here. An empty topic
+/// (clearing it) is checked by the caller.
+pub fn channel_topic_ok(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic.trim() == topic
+        && topic.len() <= records::MAX_CHANNEL_TOPIC_BYTES
+        && topic.chars().count() <= MAX_CHANNEL_TOPIC
+        && !topic.contains(['\u{2028}', '\u{2029}'])
+        && display_text_ok(topic)
+}
+
+/// What a user's topic becomes on the wire: trimmed the way
+/// [`channel_topic_ok`] checks it, `Some("")` to clear it, or `None` when
+/// it can't be a topic. The API and the parser share this one rule.
+pub fn channel_topic(raw: &str) -> Option<String> {
+    let topic = raw.trim();
+    (topic.is_empty() || channel_topic_ok(topic)).then(|| topic.to_owned())
+}
+
+/// G-51: the longest side of a server icon, in pixels.
+pub const ICON_SIDE_MAX: u32 = 128;
+
+/// G-51: a server icon, a still PNG or WebP checked by
+/// [`image::still_size`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Icon {
+    pub kind: image::ImageType,
+    pub bytes: Vec<u8>,
+}
+
+/// G-51: most Unicode code points in a server description. The body also
+/// caps it at `records::MAX_SERVER_DESCRIPTION_BYTES` bytes.
+pub const MAX_SERVER_DESCRIPTION: usize = 500;
+/// G-51: most lines in a server description.
+pub const MAX_SERVER_DESCRIPTION_LINES: usize = 5;
+
+/// G-51 (Tech Lead and Security Lead on #547): whether `text` can be a
+/// server's description, shared by the API and the parser:
+/// - 1 to [`MAX_SERVER_DESCRIPTION`] code points and at most
+///   `records::MAX_SERVER_DESCRIPTION_BYTES` bytes, trimmed;
+/// - lines split by `\n` only, at most [`MAX_SERVER_DESCRIPTION_LINES`];
+///   no `\r` or U+2028/2029 (the strict rule refuses them);
+/// - no leading or trailing blank line, and at most one empty line in a
+///   row;
+/// - every line passes the strict [`display_text_ok`], with no trailing
+///   whitespace (Tech Lead on #553: one encoding per description).
+///
+/// An empty description (clearing it) is checked by the caller.
+pub fn server_description_ok(text: &str) -> bool {
+    if text.is_empty()
+        || text.trim() != text
+        || text.len() > records::MAX_SERVER_DESCRIPTION_BYTES
+        || text.chars().count() > MAX_SERVER_DESCRIPTION
+    {
+        return false;
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    lines.len() <= MAX_SERVER_DESCRIPTION_LINES
+        && lines.windows(2).all(|w| !(w[0].is_empty() && w[1].is_empty()))
+        && lines.iter().all(|line| {
+            line.trim_end() == *line && display_text_ok(line) && !line.contains(['\u{2028}', '\u{2029}'])
+        })
 }
 
 /// Most Unicode code points in a server name, the same limit as
@@ -746,8 +896,24 @@ pub struct State {
     pub adults: BTreeSet<Actor>,
     /// Created channels by ID.
     pub channels: BTreeMap<ChannelId, Channel>,
+    /// G-14: live channels' topics, the latest accepted in linear order;
+    /// a cleared or never-set topic is absent.
+    pub topics: BTreeMap<ChannelId, String>,
+    /// B7-k: per live channel, the latest accepted plain → 18+ transition in
+    /// linear order: an 18+ `ChannelCreate`, or a `ChannelEdit` that turned it 18+
+    /// (renaming an 18+ channel doesn't move it). A channel turned plain
+    /// keeps its entry (the next 18+ edit replaces it); a deleted channel's
+    /// goes. `core/api` drops 18+ channel records whose deps don't reach it
+    /// unless their author is an adult now.
+    pub adult_edits: BTreeMap<ChannelId, RecordId>,
     /// Deleted channels: their IDs aren't created again.
     pub deleted_channels: BTreeSet<ChannelId>,
+    /// G-51: the latest accepted icon in linear order; `None` when cleared or
+    /// never set.
+    pub server_icon: Option<Icon>,
+    /// G-51: the latest accepted description in linear order; `None` when
+    /// cleared or never set.
+    pub server_description: Option<String>,
     /// The latest accepted rename in linear order; `None` keeps the genesis
     /// name.
     pub server_name: Option<String>,
@@ -931,10 +1097,18 @@ fn permitted(view: &impl View, record: &Record, action: &Action) -> bool {
             author_role == Role::Owner
                 && view.channel(*channel) == ChannelStatus::Live { general: false }
         }
+        // G-14: the owner or an admin sets a live channel's topic.
+        Action::ChannelTopic { channel, .. } => {
+            author_role >= Role::Admin
+                && matches!(view.channel(*channel), ChannelStatus::Live { .. })
+        }
         // A member claims their own age.
         Action::AgeClaim { .. } => view.is_member(author),
         // Renaming is the owner's or an admin's.
-        Action::ServerEdit { .. } => author_role >= Role::Admin,
+        // G-51: the icon and description too.
+        Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+            author_role >= Role::Admin
+        }
         // A member leaves, but the owner can't (no ownership transfer in v1),
         // and a kicked key can't (refused above), so a ban survives.
         Action::Leave { .. } => view.is_member(author) && author_role != Role::Owner,
@@ -1005,8 +1179,11 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
         | Action::ChannelCreate { .. }
         | Action::ChannelEdit { .. }
         | Action::ChannelDelete { .. }
+        | Action::ChannelTopic { .. }
         | Action::AgeClaim { .. }
         | Action::ServerEdit { .. }
+        | Action::ServerIcon { .. }
+        | Action::ServerDescription { .. }
         | Action::ServerClose => None,
     }
 }
@@ -1016,6 +1193,10 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
 fn apply_server(state: &mut State, record: &Record, action: &Action) {
     match action {
         Action::ServerEdit { name } => state.server_name = Some(name.clone()),
+        Action::ServerIcon { icon } => state.server_icon = icon.clone(),
+        Action::ServerDescription { text } => {
+            state.server_description = (!text.is_empty()).then(|| text.clone());
+        }
         Action::ServerClose => state.closed = Some(record.id()),
         _ => {}
     }
@@ -1041,9 +1222,18 @@ fn apply_channel(state: &mut State, record: &Record, action: &Action) {
             let entry =
                 Channel { name: name.clone(), adult: *adult, general, created: record.id() };
             state.channels.insert(*channel, entry);
+            if *adult {
+                state.adult_edits.insert(*channel, record.id());
+            }
         }
         Action::ChannelEdit { channel, adult, name } => {
             if let Some(entry) = state.channels.get_mut(channel) {
+                // Only a plain → 18+ transition is recorded: renaming a
+                // channel that's already 18+ doesn't move it (Security Lead
+                // on #551).
+                if *adult && !entry.adult {
+                    state.adult_edits.insert(*channel, record.id());
+                }
                 entry.name = name.clone();
                 entry.adult = *adult;
             }
@@ -1051,6 +1241,16 @@ fn apply_channel(state: &mut State, record: &Record, action: &Action) {
         Action::ChannelDelete { channel } => {
             state.channels.remove(channel);
             state.deleted_channels.insert(*channel);
+            state.topics.remove(channel);
+            state.adult_edits.remove(channel);
+        }
+        // G-14: the latest accepted topic in linear order counts.
+        Action::ChannelTopic { channel, topic } => {
+            if topic.is_empty() {
+                state.topics.remove(channel);
+            } else {
+                state.topics.insert(*channel, topic.clone());
+            }
         }
         _ => {}
     }
@@ -1376,8 +1576,11 @@ impl<'a> Graph<'a> {
                 | Action::ChannelCreate { .. }
                 | Action::ChannelEdit { .. }
                 | Action::ChannelDelete { .. }
+                | Action::ChannelTopic { .. }
                 | Action::AgeClaim { .. }
                 | Action::ServerEdit { .. }
+                | Action::ServerIcon { .. }
+                | Action::ServerDescription { .. }
                 | Action::ServerClose => continue,
                 Action::RevokeInvite { invite } => {
                     pass.voided.extend(self.voids_of(i));

@@ -4,7 +4,9 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { isCoreError, useCore, type Id, type Member, type Message, type ServerSummary } from '../../core';
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
-import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
+import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
+import { EmojiPicker } from '../../components/EmojiPicker';
+import { TopicDialog } from './TopicDialog';
 import { useUserTextProps } from '../../app/textDir';
 import { mentionQuery, toDisplay, toTokens } from '../../app/mentions';
 import { applyEdit, dismissHint, hintDue, insideOpenFence, shortcutMarker, wrapEdit } from '../../markdown/composer';
@@ -44,6 +46,8 @@ export function ChatView({
   const [editing, setEditing] = useState<Message | null>(null);
   const [toDelete, setToDelete] = useState<Message | null>(null);
   const [stickToken, setStickToken] = useState(0);
+  // G-14: the topic dialog (view; the owner can edit).
+  const [topicOpen, setTopicOpen] = useState(false);
 
   const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const nobodyOnline = members.length > 0 && members.every((m) => m.id === myId || m.presence === 'offline');
@@ -140,13 +144,35 @@ export function ChatView({
         )}
         <HashIcon />
         <h2 className="chat-title" tabIndex={-1}>
-          <bdi>{channelName}</bdi>
+          {/* G-14 (UX): on a phone the topic isn't in the header; the name opens it. */}
+          {onBack && channel?.topic ? (
+            <button type="button" className="chat-title-button" onClick={() => setTopicOpen(true)} aria-label={intl.formatMessage({ id: 'channel.topic.button' }, { topic: channel.topic })}>
+              <bdi>{channelName}</bdi>
+            </button>
+          ) : (
+            <bdi>{channelName}</bdi>
+          )}
         </h2>
         {channel?.adult && (
           <span className="adult-tag" title={intl.formatMessage({ id: 'channel.adult' })}>
             18+
           </span>
         )}
+        {!onBack &&
+          (channel?.topic ? (
+            <button type="button" className="chat-topic" onClick={() => setTopicOpen(true)} aria-label={intl.formatMessage({ id: 'channel.topic.button' }, { topic: channel.topic })}>
+              {/* An English topic keeps its direction in the Hebrew UI. */}
+              <bdi dir="auto">{channel.topic}</bdi>
+            </button>
+          ) : (
+            isOwner &&
+            channel &&
+            !server.closed && (
+              <button type="button" className="chat-topic add" onClick={() => setTopicOpen(true)}>
+                <FormattedMessage id="channel.topic.add" />
+              </button>
+            )
+          ))}
         <span className="spacer" />
         <button
           type="button"
@@ -159,6 +185,7 @@ export function ChatView({
           <UsersIcon />
         </button>
       </header>
+      {channel && <TopicDialog channel={channel} canEdit={isOwner && !server.closed} open={topicOpen} onClose={() => setTopicOpen(false)} />}
       {nobodyOnline && (
         <div className="offline-banner" role="status">
           <WifiOffIcon />
@@ -320,6 +347,24 @@ function Composer({
   // Where the space after the last picked mention ends: punctuation typed right there replaces that space.
   const afterMention = useRef(-1);
   const [suggest, setSuggest] = useState<{ start: number; query: string; index: number } | null>(null);
+  // G-27: the emoji picker inserts where the cursor was when it opened.
+  const [emojiOpen, setEmojiOpen] = useState(false);
+  const emojiButton = useRef<HTMLButtonElement>(null);
+  const caret = useRef<[number, number] | null>(null);
+  const insertEmoji = (emoji: string, keep: boolean) => {
+    const [from, to] = caret.current ?? [text.length, text.length];
+    const at = from + emoji.length;
+    setText(text.slice(0, from) + emoji + text.slice(to));
+    setFailed(null);
+    caret.current = [at, at];
+    // G-29: an inserted emoji is typing too (not while editing a sent message).
+    if (!editing) onTyping(true);
+    if (keep) return;
+    requestAnimationFrame(() => {
+      ref.current?.focus();
+      ref.current?.setSelectionRange(at, at);
+    });
+  };
   const matches = suggest
     ? members
         .filter((m) => m.id !== myId && m.displayName && m.displayName.toLowerCase().includes(suggest.query.toLowerCase()))
@@ -467,6 +512,22 @@ function Composer({
           void submit();
         }}
       >
+        <button
+          ref={emojiButton}
+          type="button"
+          className="icon-button emoji-open"
+          aria-label={intl.formatMessage({ id: 'emoji.insert' })}
+          title={intl.formatMessage({ id: 'emoji.insert' })}
+          aria-haspopup="dialog"
+          aria-expanded={emojiOpen}
+          onClick={() => {
+            const el = ref.current;
+            caret.current = el ? [el.selectionStart ?? text.length, el.selectionEnd ?? text.length] : null;
+            setEmojiOpen(true);
+          }}
+        >
+          <SmileIcon />
+        </button>
         <textarea
           ref={ref}
           {...textProps}
@@ -533,6 +594,7 @@ function Composer({
             }
           }}
         />
+        <EmojiPicker mode="composer" open={emojiOpen} anchor={emojiButton} onClose={() => setEmojiOpen(false)} onPick={insertEmoji} />
         <button type="submit" className="icon-button send" aria-label={intl.formatMessage({ id: 'chat.send' })} disabled={!text.trim() || tooLong}>
           <SendIcon />
         </button>

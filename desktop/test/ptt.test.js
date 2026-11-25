@@ -2,7 +2,82 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { cleanKey, cleanAccelerator, createPtt, RELEASE_MS } = require('../src/ptt');
+const { cleanKey, cleanAccelerator, createPtt, createGlobalMute, RELEASE_MS } = require('../src/ptt');
+
+/** createGlobalMute with a fake OS: what is registered right now, and the presses the page got. */
+function globalMuteHarness({ taken = false } = {}) {
+  const os = new Map();
+  const st = { inCall: false, unlocked: true };
+  const presses = [];
+  const gm = createGlobalMute({
+    register: (accel, cb) => {
+      if (taken || os.has(accel)) return false;
+      os.set(accel, cb);
+      return true;
+    },
+    unregister: (accel) => os.delete(accel),
+    allowed: () => st.inCall && st.unlocked,
+    onPress: () => presses.push(1),
+  });
+  return { gm, os, st, presses };
+}
+
+test('G-78 global mute: registered only in a call and unlocked; lock, leave and sign-out let go', () => {
+  const { gm, os, st, presses } = globalMuteHarness();
+  const KEY = 'CommandOrControl+Shift+M';
+  // Chosen outside a call (signed in, idle): tried, never left registered.
+  assert.equal(gm.set(KEY), 'ok');
+  assert.equal(os.size, 0, 'idle: not registered');
+  // In a call, unlocked: registered.
+  st.inCall = true;
+  gm.sync();
+  assert.deepEqual([...os.keys()], [KEY]);
+  os.get(KEY)();
+  assert.equal(presses.length, 1);
+  // Lock (path B: still in the call): unregistered.
+  st.unlocked = false;
+  gm.sync();
+  assert.equal(os.size, 0, 'locked in a call: not registered');
+  // Unlock while still in the call: registered again.
+  st.unlocked = true;
+  gm.sync();
+  assert.deepEqual([...os.keys()], [KEY]);
+  // A press that arrives while locked (a race) never reaches the page.
+  const cb = os.get(KEY);
+  st.unlocked = false;
+  cb();
+  assert.equal(presses.length, 1);
+  st.unlocked = true;
+  // Leave: unregistered.
+  st.inCall = false;
+  gm.sync();
+  assert.equal(os.size, 0, 'left the call: not registered');
+  // Path A (locked, not in a call) stays off; a new call while locked stays off.
+  st.unlocked = false;
+  st.inCall = true;
+  gm.sync();
+  assert.equal(os.size, 0);
+  // Sign-out: the choice is forgotten; a later call registers nothing.
+  st.unlocked = true;
+  gm.sync();
+  assert.equal(os.size, 1);
+  gm.clear();
+  assert.equal(os.size, 0);
+  gm.sync();
+  assert.equal(os.size, 0, 'after sign-out: nothing');
+});
+
+test('G-74 global mute: a taken shortcut says so; null turns it off', () => {
+  const taken = globalMuteHarness({ taken: true });
+  assert.equal(taken.gm.set('Control+Alt+0'), 'shortcut-taken');
+  assert.equal(taken.gm.set('Control+Alt+0'), 'shortcut-taken', 'the same again: same answer');
+  const { gm, os, st } = globalMuteHarness();
+  st.inCall = true;
+  assert.equal(gm.set('F13'), 'ok');
+  assert.equal(os.size, 1);
+  assert.equal(gm.set(null), 'ok');
+  assert.equal(os.size, 0);
+});
 
 test('cleanKey takes listed KeyboardEvent.code values only', () => {
   for (const ok of ['KeyV', 'Digit0', 'F13', 'F24', 'ControlLeft', 'AltRight', 'Backquote', 'Space', 'CapsLock', 'Numpad5', 'NumpadEnter', 'ArrowUp']) {

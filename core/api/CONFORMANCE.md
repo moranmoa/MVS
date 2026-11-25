@@ -644,6 +644,9 @@ plus a relaunch through the launcher.
   - a version that failed its trial here is never fetched again;
   - **RU1:** the core signs nothing and syncs nothing. Every command that would sign answers `update-required` (a new `ErrorCode`), with nothing signed. The sync round, re-keys, rotations, re-joins, profile posts and the report outbox don't run, and the node goes quiet (no gossip, pulls, dials or relaying). Local reads still answer.
 - `checkForUpdate` keeps working; it's what the banner's Try again calls.
+- **Residuals, accepted by the SL on #599:**
+  - **Unreadable or missing `policy.json`:** it fails open. The version isn't required until the next accepted check (within minutes), and in that window an outdated core could run one sync round. Fail-closed would lock people out over a corrupt file, and only local file access can cause it. Network-side refusal is the backstop.
+  - **Startup:** the node starts just before the core reads `policy.json` and quiets it, so for a moment it may serve and store records. The core signs and publishes nothing in that window. Follow-up: start the node quiet.
 
 **Rules the core keeps:**
 - The first check runs once the UI is up (the first `markHealthy`, so the

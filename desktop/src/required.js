@@ -54,8 +54,19 @@ const READ_ONLY = Object.freeze(
   ]),
 );
 
-/** The update itself. */
-const UPDATE = Object.freeze(new Set(['getAppInfo', 'restartToUpdate']));
+/**
+ * The update itself. `checkForUpdate` (the banner's Retry) is dev-updater's
+ * coming core command: allowed here already, reachable once commands.js lists it.
+ */
+const UPDATE = Object.freeze(new Set(['getAppInfo', 'restartToUpdate', 'checkForUpdate']));
+/** Update commands the core doesn't have yet (the classification test allows these). */
+const PENDING_CORE = Object.freeze(new Set(['checkForUpdate']));
+
+/**
+ * While a required update waits for a call to end (TL): only the call's own
+ * commands pass, besides reads and the update. No sends, joins or kicks.
+ */
+const CALL = Object.freeze(new Set(['setMuted', 'setDeafened', 'sendSignal', 'leaveCall']));
 
 /**
  * Everything else: writes, signed actions and the network. Listed so the
@@ -125,7 +136,9 @@ function createRequiredGate({ inCall, endCall, onChange = () => {}, now = Date.n
   let timer = null;
 
   const active = () => !!required && (capped || !inCall());
-  const state = () => ({ required: !!required, version: required ? required.version : null, active: active(), callEndsAt });
+  /** 'none' | 'call' (required, waiting for the call to end) | 'gated'. */
+  const phase = () => (!required ? 'none' : active() ? 'gated' : 'call');
+  const state = () => ({ required: !!required, version: required ? required.version : null, active: active(), phase: phase(), callEndsAt });
   const changed = () => onChange(state());
 
   const startCap = () => {
@@ -175,12 +188,18 @@ function createRequiredGate({ inCall, endCall, onChange = () => {}, now = Date.n
     get active() {
       return active();
     },
-    /** May the page send this core command now? */
+    /**
+     * May the page send this core command now? Not required: anything. While
+     * waiting for a call to end: reads, the update and the call's own
+     * commands. Gated: reads and the update.
+     */
     allows(cmd) {
-      if (!active()) return true;
-      return READ_ONLY.has(cmd) || UPDATE.has(cmd);
+      const p = phase();
+      if (p === 'none') return true;
+      if (READ_ONLY.has(cmd) || UPDATE.has(cmd)) return true;
+      return p === 'call' && CALL.has(cmd);
     },
   };
 }
 
-module.exports = { READ_ONLY, UPDATE, NOT_READ_ONLY, CALL_CAP_MS, cleanRequired, createRequiredGate };
+module.exports = { READ_ONLY, UPDATE, PENDING_CORE, CALL, NOT_READ_ONLY, CALL_CAP_MS, cleanRequired, createRequiredGate };

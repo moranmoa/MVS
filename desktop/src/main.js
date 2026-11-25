@@ -458,6 +458,8 @@ function serveCoreIpc() {
   // G-78: the lock screen's three calls. The passcode or words go straight
   // to the core (applock.js shapes them); nothing here logs them.
   ipcMain.handle('lock:state', (event) => (fromUs(event) ? lockPayload() : null));
+  // Required updates (#577): the gate's state, for a page that asks (TL).
+  ipcMain.handle('update:gate', (event) => (fromUs(event) ? requiredGate.state : null));
   ipcMain.handle('lock:unlock', async (event, input) => {
     if (!fromUs(event)) return 'invalid';
     return appLock.unlock(input);
@@ -764,6 +766,9 @@ function createWindow() {
     flushLink();
     // The page may have missed earlier changes; the preload keeps this for the UI.
     if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('core:event', 'core.status', statusForPage(coreStatus));
+    // Required updates (#577, TL): every load (cold start, reload, the lock's
+    // reload) gets the gate's state, so the banner never goes missing.
+    if (sec.isInternalUrl(win.webContents.getURL()) && requiredGate.state.required) win.webContents.send('core:event', 'update.gate', requiredGate.state);
     // Commit this version once the UI is up and the core answers (main only, once).
     if (!healthReported) {
       healthReported = true;

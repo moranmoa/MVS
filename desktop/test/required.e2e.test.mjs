@@ -69,4 +69,11 @@ test('a reload stays read-only', async () => {
   await page.reload();
   await page.waitForLoadState('domcontentloaded');
   assert.ok(await until(async () => (await invoke('sendMessage', ['c1', 'hi'])).error?.code === 'update-required'));
+  // The banner's state is there for the new page too (TL): asked, and kept for the first listener.
+  const gate = await page.evaluate(() => window.mvs.updateGate());
+  assert.equal(gate.required, true);
+  assert.equal(gate.phase, 'gated');
+  assert.equal(gate.version, '9.9.9');
+  // (update.gate is also re-sent on every load; the page's own core bridge
+  // subscribes first and takes it, so this test checks the getter.)
 });

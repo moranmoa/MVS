@@ -37,6 +37,7 @@
 import type { CallPath, CallSignal, CallState, Id } from '../core/types';
 import { BITRATE_DIRECT, BITRATE_RELAYED, browserMediaEnv, MediaSession, type MediaEnv } from './media/session';
 import { bridgeTransport, voiceBridge, type MediaTransport } from './media/transport';
+import { LOOPBACK_CONFIG, loopbackPlayout, type LoopbackPlayout } from './media/loopback';
 import type { VoiceCore } from './adapter';
 import { cleanStunUrl, cleanTurnCredentials, iceServersFor, normalizeFingerprint, soleFingerprint, type TurnCredentials } from './sdp';
 import { quiet, rms, stepSpeaking, type SpeakState } from './speaking';
@@ -121,7 +122,14 @@ export interface AudioDevice {
 
 /** The browser APIs the engine uses; tests pass fakes. */
 export interface VoiceEnv {
+  /** A connection to another person in the call. Only this one takes ICE servers; the engine never calls it under relay-only. */
   createPeerConnection(config: RTCConfiguration): RTCPeerConnection;
+  /**
+   * G-81 B playout (TL L1-L3, SL): one end of the in-renderer loopback pair
+   * that plays B's audio as WebRTC (so echo cancellation sees it). No
+   * arguments: always `iceServers: []`; it reaches no one, so relay-only allows it.
+   */
+  createLoopbackPeerConnection?(): RTCPeerConnection;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
   enumerateDevices(): Promise<MediaDeviceInfo[]>;
   /** null where Web Audio is missing: no speaking indicator then. */
@@ -299,6 +307,16 @@ async function selectedPair(pc: RTCPeerConnection): Promise<{ local: CandidateTy
   }
 }
 
+/**
+ * A connection to another person in the call: the only place a remote
+ * RTCPeerConnection is made, and the only one that takes ICE servers. It
+ * throws under relay-only (SL, #550): no path may reach a peer directly then.
+ */
+export function remotePeerConnection(env: Pick<VoiceEnv, 'createPeerConnection'>, relayOnly: boolean, config: RTCConfiguration): RTCPeerConnection {
+  if (relayOnly) throw new Error('relay-only: no direct connection to a peer');
+  return env.createPeerConnection(config);
+}
+
 /** G-81 B: the shell's frame channel (#526), or null without it. */
 function defaultTransport(): MediaTransport | null {
   const bridge = voiceBridge();
@@ -308,6 +326,7 @@ function defaultTransport(): MediaTransport | null {
 export function browserEnv(): VoiceEnv {
   return {
     createPeerConnection: (config) => new RTCPeerConnection(config),
+    createLoopbackPeerConnection: () => new RTCPeerConnection(LOOPBACK_CONFIG),
     getUserMedia: (c) => navigator.mediaDevices.getUserMedia(c),
     enumerateDevices: () => navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([]),
     createAudioContext: () => (typeof AudioContext === 'function' ? new AudioContext({ latencyHint: 'interactive' }) : null),
@@ -410,6 +429,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
   let session: MediaSession | null = null;
   let sessionCall: string | null = null;
   const bGains = new Map<Id, GainNode>();
+  /** One shared loopback playout per call (TL L4), made on the first B peer. */
+  let playout: LoopbackPlayout | null = null;
   const bSpeak = new Map<Id, SpeakState>();
   /** What setCallWebrtcPeers last said, to send only changes. */
   let webrtcSent = '';
@@ -721,7 +742,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
 
   // ---- peers -----------------------------------------------------------------
   function createPeer(id: Id, offerer: boolean, attempt = 1): Peer {
-    const pc = env.createPeerConnection({
+    const pc = remotePeerConnection(env, options.relayOnly === true, {
       iceServers: iceServers(),
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
@@ -1259,14 +1280,30 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
       const c = playbackContext();
       if (!c || !limiter) return null;
       g = c.createGain();
-      g.connect(limiter);
+      g.connect(bPlayoutInput(c) ?? limiter);
       bGains.set(id, g);
     }
     g.gain.value = deafened ? 0 : volumes.get(id) ?? 1;
     return g;
   }
 
+  /** The shared loopback playout's input (AEC run 2: 27.3 dB); null without a loopback factory. */
+  function bPlayoutInput(c: AudioContext): AudioNode | null {
+    if (!playout && env.createLoopbackPeerConnection && typeof c.createMediaStreamDestination === 'function') {
+      try {
+        playout = loopbackPlayout(c, () => env.createLoopbackPeerConnection!(), () => env.createAudioElement());
+        playout.setSink(outputId);
+      } catch {
+        playout = null;
+      }
+    }
+    return playout?.input ?? null;
+  }
+
   function stopB() {
+    // The loopback goes with the call (L6: leave, lock path A, sign-out, the flag off all end it here).
+    playout?.close();
+    playout = null;
     session?.stop();
     session = null;
     sessionCall = null;
@@ -1456,6 +1493,7 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
     },
     async setOutputDevice(deviceId) {
       outputId = deviceId || undefined;
+      playout?.setSink(outputId);
       if (ctx && !elementOnly && limiter) applyContextSink(ctx);
       if (monitor && 'setSinkId' in monitor) void monitor.setSinkId(deviceId).catch(() => {});
       await Promise.all(

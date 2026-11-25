@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CallPath, CallSignal, CallState, Id } from '../core/types';
 import type { SignalKind, VoiceCore } from './adapter';
-import { candidateCounts, createVoiceEngine, type VoiceEngineOptions, type VoiceEnv, type VoiceError, type VoiceParticipant } from './engine';
+import { candidateCounts, createVoiceEngine, remotePeerConnection, type VoiceEngineOptions, type VoiceEnv, type VoiceError, type VoiceParticipant } from './engine';
 import { cleanTurnCredentials, fingerprints, iceServersFor, normalizeFingerprint, soleFingerprint } from './sdp';
 import type { MediaEnv } from './media/session';
 import { loopback } from './media/transport';
@@ -233,6 +233,44 @@ class FakeAnalyser {
   }
 }
 
+/** G-81 B playout: one end of the in-renderer loopback pair. Records what it was asked to do. */
+class FakeLoopbackPC {
+  static made: FakeLoopbackPC[] = [];
+  calls: string[] = [];
+  closed = false;
+  localDescription: RTCSessionDescriptionInit | null = null;
+  onicecandidate: ((e: { candidate: unknown }) => void) | null = null;
+  ontrack: ((e: { track: FakeTrack; streams: FakeStream[] }) => void) | null = null;
+  constructor(readonly args: unknown[]) {
+    FakeLoopbackPC.made.push(this);
+  }
+  addTrack() {
+    this.calls.push('addTrack');
+  }
+  async createOffer() {
+    return { type: 'offer' as const, sdp: 'v=0 loopback-offer' };
+  }
+  async createAnswer() {
+    return { type: 'answer' as const, sdp: 'v=0 loopback-answer' };
+  }
+  async setLocalDescription(d: RTCSessionDescriptionInit) {
+    this.localDescription = d;
+    this.calls.push(`local:${d.type}`);
+    // A candidate, as a real end would gather (it must stay in the pair).
+    setTimeout(() => this.onicecandidate?.({ candidate: { candidate: 'candidate:1 1 udp 1 127.0.0.1 9 typ host' } }), 0);
+  }
+  async setRemoteDescription(d: RTCSessionDescriptionInit) {
+    this.calls.push(`remote:${d.type}`);
+    if (d.type === 'offer') setTimeout(() => this.ontrack?.({ track: new FakeTrack(), streams: [new FakeStream()] }), 0);
+  }
+  async addIceCandidate() {
+    this.calls.push('ice');
+  }
+  close() {
+    this.closed = true;
+  }
+}
+
 /** G-73: a node that records what it is connected to. */
 class FakeNode {
   out: unknown[] = [];
@@ -273,6 +311,14 @@ class FakeWebAudioContext {
     const c = Object.assign(new FakeNode(), { threshold: { value: 0 }, knee: { value: 0 }, ratio: { value: 0 }, attack: { value: 0 }, release: { value: 0 } });
     this.limiters.push(c);
     return c;
+  }
+  /** G-81 B playout: the loopback's stream source. */
+  destinations: (FakeNode & { stream: { getAudioTracks(): { stop(): void }[]; getTracks(): { stop(): void; stopped?: boolean }[] } })[] = [];
+  createMediaStreamDestination() {
+    const track = { stopped: false, stop() { this.stopped = true; } };
+    const d = Object.assign(new FakeNode(), { stream: { getAudioTracks: () => [track], getTracks: () => [track] } });
+    this.destinations.push(d);
+    return d;
   }
   // G-81 B playback: a clock and buffer sources (what MediaSession schedules).
   currentTime = 0;
@@ -383,8 +429,9 @@ function fakeEnv(opts: { micError?: string; webAudio?: { sinkFails?: boolean } }
       h.contexts.push(c);
       return c as unknown as AudioContext;
     },
+    createLoopbackPeerConnection: (...args: unknown[]) => new FakeLoopbackPC(args) as unknown as RTCPeerConnection,
     createAudioElement: () => {
-      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
+      const a = { srcObject: null as unknown, paused: true, autoplay: false, muted: false, volume: 1, sinks: [] as string[], setSinkId: async (id: string) => void a.sinks.push(id), play: async () => void (a.paused = false), pause: () => void (a.paused = true) };
       h.audios.push(a);
       return a as unknown as HTMLAudioElement;
     },
@@ -1882,7 +1929,7 @@ describe('voice engine: G-81 C2 (LAN WebRTC, else media over the P2P network)', 
     ey.dispose();
   });
 
-  it('relay-only with B on: the call runs on B, never an RTCPeerConnection, even toward a LAN peer', async () => {
+  it('relay-only with B on: the call runs on B, never a REMOTE RTCPeerConnection, even toward a LAN peer', async () => {
     const { hx, hy, cx, ex, ey, mx } = await call('lan', { relayOnly: true });
     expect(hx.pcs).toHaveLength(0);
     expect(hy.pcs).toHaveLength(0);
@@ -1936,5 +1983,85 @@ describe('voice engine: G-81 C2 (LAN WebRTC, else media over the P2P network)', 
     expect(p.hx.pcs).toHaveLength(1);
     p.ex.dispose();
     p.ey.dispose();
+  });
+});
+
+// ---- G-81 B playout: the in-renderer loopback (AEC run 2: 27.3 dB; TL L1-L4, SL L3/L5/L6) ----
+
+describe('voice engine: G-81 B playout through the loopback pair', () => {
+  const CALL_ID = 'c'.repeat(32);
+
+  async function bCall(o: { relayOnly?: boolean } = {}) {
+    vi.useFakeTimers();
+    FakeLoopbackPC.made = [];
+    const hx = fakeEnv({ webAudio: {} });
+    const cx = new FakeCore(A, [A, B]);
+    cx.callId = CALL_ID;
+    cx.paths[B] = 'circuit';
+    const net = loopback([A, B], {}, (fn) => fn());
+    const quietEnv: MediaEnv = {
+      readTrack: () => ({ read: () => new Promise<AudioData | null>(() => {}), cancel() {} }),
+      createEncoder: () => ({ configure() {}, encode() {}, close() {} }),
+      createDecoder: ({ output }) => ({ configure() {}, decode: () => output({ numberOfFrames: 1920, copyTo: (d) => d.fill(0.1), close() {} }), close() {} }),
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
+    };
+    const ex = createVoiceEngine(cx, { env: hx.env, stunUrl: null, p2p: true, relayOnly: o.relayOnly, media: { transport: () => net[A]!, env: quietEnv } });
+    await ex.attach(cx.state(), A);
+    await vi.advanceTimersByTimeAsync(50);
+    // B speaks: a frame reaches A, so A's per-peer output (and the loopback) is made.
+    for (let seq = 0; seq < 4; seq++) net[B]!.send({ callId: CALL_ID, seq, ts: seq * 1920, data: new Uint8Array([1]) });
+    await vi.advanceTimersByTimeAsync(300);
+    const ctx = hx.contexts[0] as unknown as FakeWebAudioContext;
+    return { hx, cx, ex, ctx };
+  }
+
+  it('B audio plays through one loopback pair: two ends, made by the loopback factory with no arguments (L2, L3)', async () => {
+    const { hx, ctx, ex } = await bCall();
+    expect(FakeLoopbackPC.made).toHaveLength(2);
+    expect(FakeLoopbackPC.made.every((pc) => pc.args.length === 0)).toBe(true); // nothing to put ICE servers in
+    expect(hx.pcs).toHaveLength(0); // no remote connection
+    expect(ctx.destinations).toHaveLength(1);
+    // The peer's gain feeds the loopback bus, not the speakers directly.
+    const bus = ctx.gains.find((g) => g.out[0] === ctx.destinations[0]);
+    expect(bus).toBeTruthy();
+    expect(ctx.gains.some((g) => g.out[0] === bus)).toBe(true); // B's gain → the bus → the loopback's stream
+    expect(ctx.gains.some((g) => g !== bus && g.out[0] === ctx.limiters[0])).toBe(false); // never straight to the speakers
+    ex.dispose();
+  });
+
+  it('the pair negotiates only with itself: no core.sendSignal, its candidates go to the other end (L1, L5)', async () => {
+    const { cx, ex } = await bCall();
+    const [a, z] = FakeLoopbackPC.made;
+    expect(a!.calls).toEqual(expect.arrayContaining(['addTrack', 'local:offer', 'remote:answer', 'ice']));
+    expect(z!.calls).toEqual(expect.arrayContaining(['remote:offer', 'local:answer', 'ice']));
+    expect(cx.sent).toEqual([]); // nothing of the pair reaches the core
+    ex.dispose();
+  });
+
+  it('relay-only + B: never a REMOTE connection, but B still gets the loopback (AEC) playout (L3)', async () => {
+    const { hx, cx, ex } = await bCall({ relayOnly: true });
+    expect(hx.pcs).toHaveLength(0);
+    expect(cx.sent).toEqual([]);
+    expect(FakeLoopbackPC.made).toHaveLength(2);
+    ex.dispose();
+  });
+
+  it('the remote factory throws under relay-only; the loopback one is a different factory (SL L3)', () => {
+    const env = { createPeerConnection: vi.fn(() => ({}) as RTCPeerConnection) };
+    expect(() => remotePeerConnection(env, true, { iceServers: [] })).toThrow(/relay-only/);
+    expect(env.createPeerConnection).not.toHaveBeenCalled();
+    expect(remotePeerConnection(env, false, { iceServers: [] })).toEqual({});
+  });
+
+  it('the chosen output reaches the loopback element; leaving the call closes the pair and stops its track (L4, L6)', async () => {
+    const { hx, ctx, ex } = await bCall();
+    await ex.setOutputDevice('spk1');
+    const el = hx.audios.at(-1) as unknown as { sinks: string[] };
+    expect(el.sinks.at(-1)).toBe('spk1');
+    ex.detach();
+    expect(FakeLoopbackPC.made.every((pc) => pc.closed)).toBe(true);
+    expect(ctx.destinations[0]!.stream.getTracks()[0]!.stopped).toBe(true);
+    ex.dispose();
   });
 });

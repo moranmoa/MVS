@@ -1147,6 +1147,45 @@ async fn a_non_member_is_never_dialled_back() {
     b.shutdown().await.unwrap();
 }
 
+/// TL and SL on #565: a helper that forges "reached" (it dials nothing) is
+/// never believed: not for a stranger's address, and not even for one of
+/// my own, since no probe of its came in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_dial_back_answer_is_never_believed() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-forge-a", &relay, 56, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-forge-b", &relay, 57, true, Arc::new(AcceptAll)).await;
+    a.test_no_direct_dials().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    // B claims to have reached A at A's own listen address, or at a victim's.
+    let own = a.listen_addrs().await.unwrap().into_iter().find(|l| l.to_string().contains("/tcp/") && !l.to_string().contains("p2p-circuit")).unwrap();
+    b.test_dialback_lie(own).unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(56), voice_id(57), true).await;
+    assert_eq!(reachable_within(&a, Duration::from_secs(20)).await, None, "a forged answer was believed");
+    assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// RR2: a relay-only node never asks, never serves, and never offers itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_only_node_never_becomes_a_relay() {
+    let (relay, _relay) = voice_relay();
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let (a, _ea) = bound_node_on_events("r1-ro-a", &relay, 58, true, Arc::new(AcceptAll), listen.clone(), vec![], true).await;
+    let (b, _eb) = bound_node_events("r1-ro-b", &relay, 59, true, Arc::new(AcceptAll)).await;
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(58), voice_id(59), false).await;
+    assert_eq!(reachable_within(&a, Duration::from_secs(10)).await, None, "relay-only asked or was confirmed");
+    assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 /// G-29: `/mvs/typing/1` between members through the relay, with its own
 /// caps (a burst of 3, then one every 2 s), never arriving as voice; a
 /// non-member's is dropped and none go to one; 512 bytes at most.

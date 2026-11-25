@@ -24,7 +24,7 @@
 //! rate per peer and in total, concurrent answers, gossip message size and
 //! topics, connections, and the pending-record buffer.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -416,6 +416,7 @@ enum Command {
     VoiceCall { call: Option<VoiceCall> },
     RelayReachable { reply: oneshot::Sender<Option<Multiaddr>> },
     TestLocalDialback,
+    TestDialbackLie { addr: Multiaddr },
     TestRelayOffers { reply: oneshot::Sender<Vec<PeerId>> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
@@ -876,11 +877,12 @@ impl Node {
             reachable: None,
             dialback_asked: None,
             dialback_local: false,
-            observed_self: VecDeque::new(),
+            dialback_lie: None,
+            observed_by: HashMap::new(),
             recent_inbound: HashMap::new(),
             member_relay_want: (false, 0, false),
             dialback_wait: crate::dialback::FIRST_RETRY,
-            pending_reached: None,
+            pending_reached: HashMap::new(),
             dialback_probes: Vec::new(),
             invites: HashMap::new(),
             invite_limits: InviteLimits::new(),
@@ -1319,6 +1321,13 @@ impl Node {
         self.send(Command::TestLocalDialback)
     }
 
+    /// Tests only: answer every dial-back with `addr`, dialling nothing (a
+    /// forging helper).
+    #[doc(hidden)]
+    pub fn test_dialback_lie(&self, addr: Multiaddr) -> Result<()> {
+        self.send(Command::TestDialbackLie { addr })
+    }
+
     /// Tests only: the members whose relay offers this node holds.
     #[doc(hidden)]
     pub async fn test_relay_offers(&self) -> Result<Vec<PeerId>> {
@@ -1682,12 +1691,16 @@ struct Task {
     dialback_asked: Option<Instant>,
     /// Tests on one machine: loopback and LAN addresses may be dialled back.
     dialback_local: bool,
-    /// Addresses peers observed for us (identify), the newest last, at most
-    /// 16: what a helper's reported address must match (SL on #565).
-    observed_self: VecDeque<Multiaddr>,
-    /// When a direct inbound connection from each peer last arrived: a
+    /// Tests only: answer every dial-back with this address, dialling nothing.
+    dialback_lie: Option<Multiaddr>,
+    /// The IPs peers observed for us (identify), and who observed each: at
+    /// most 16 IPs, 8 observers each. A helper's reported address must be
+    /// one seen by someone other than that helper (SL and TL on #565).
+    observed_by: HashMap<std::net::IpAddr, HashSet<PeerId>>,
+    /// When a direct inbound connection from each peer last arrived, and on
+    /// which local address (port): a
     /// helper's "reached" counts only with one (TL on #565).
-    recent_inbound: HashMap<PeerId, Instant>,
+    recent_inbound: HashMap<PeerId, (Instant, Multiaddr)>,
     /// What the core asked of the member relay (on, daily cap, preferred):
     /// it serves only while confirmed reachable (TL on #565).
     member_relay_want: (bool, u32, bool),
@@ -1698,7 +1711,7 @@ struct Task {
     /// A helper's "reached" for an address of mine whose inbound connection
     /// hasn't shown up yet (its answer can overtake it): confirmed if that
     /// inbound arrives within 10 s.
-    pending_reached: Option<(PeerId, Multiaddr, Instant)>,
+    pending_reached: HashMap<PeerId, (Multiaddr, Instant)>,
     /// Dial-back probes that reached their asker, closed after a few seconds.
     dialback_probes: Vec<(ConnectionId, Instant)>,
     /// T8-02: envelope handle → the server and publication we serve.
@@ -2000,6 +2013,7 @@ impl Task {
                 let _ = reply.send(self.confirmed_public());
             }
             Command::TestLocalDialback => self.dialback_local = true,
+            Command::TestDialbackLie { addr } => self.dialback_lie = Some(addr),
             Command::TestRelayOffers { reply } => {
                 let _ = reply.send(self.relay_offers.keys().copied().collect());
             }
@@ -3216,15 +3230,14 @@ impl Task {
                 // R1: which direct connections each side opened.
                 if !is_relayed(endpoint) {
                     match endpoint {
-                        ConnectedPoint::Listener { send_back_addr, .. } => {
+                        ConnectedPoint::Listener { send_back_addr, local_addr } => {
                             self.inbound_direct.insert(*connection_id, (*peer_id, send_back_addr.clone()));
-                            self.recent_inbound.insert(*peer_id, Instant::now());
-                            let waiting = self.pending_reached.take();
-                            match waiting {
-                                Some((helper, addr, at)) if helper == *peer_id && at.elapsed() < Duration::from_secs(10) => {
+                            self.recent_inbound.insert(*peer_id, (Instant::now(), local_addr.clone()));
+                            // A held "reached" from this helper, on this port.
+                            if let Some((addr, at)) = self.pending_reached.remove(peer_id) {
+                                if at.elapsed() < Duration::from_secs(10) && crate::dialback::same_port(&addr, local_addr) {
                                     self.confirm_reachable(addr);
                                 }
-                                other => self.pending_reached = other,
                             }
                         }
                         ConnectedPoint::Dialer { address, .. } => {
@@ -3256,25 +3269,6 @@ impl Task {
             SwarmEvent::NewListenAddr { .. } | SwarmEvent::ExpiredListenAddr { .. } => {
                 if self.reachable.take().is_some() {
                     self.apply_member_relay();
-                }
-            }
-            SwarmEvent::NewExternalAddrCandidate { address } => {
-                // A new public IP (DHCP renew, another network): the
-                // confirmation was for the old one (TL on #565).
-                let confirmed_ip = self.reachable.as_ref().and_then(|(a, _)| crate::dialback::ip_of(a));
-                let seen_ip = crate::dialback::ip_of(address);
-                if confirmed_ip.is_some()
-                    && seen_ip != confirmed_ip
-                    && crate::dialback::dialable(address, self.dialback_local)
-                {
-                    self.reachable = None;
-                    self.apply_member_relay();
-                }
-                if !self.observed_self.contains(address) {
-                    if self.observed_self.len() >= 16 {
-                        self.observed_self.pop_front();
-                    }
-                    self.observed_self.push_back(address.clone());
                 }
             }
             _ => {}
@@ -3382,6 +3376,7 @@ impl Task {
                 self.queued_pulls.remove(&peer_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                self.note_observed(peer_id, &info.observed_addr);
                 if let Some(i) = self.relays.iter().position(|r| r.peer == peer_id) {
                     // Relay circuit as a fallback for peers that can't reach us
                     // directly (NAT). On a LAN the direct address wins.
@@ -5165,7 +5160,8 @@ impl Task {
                 let _ = self.swarm.behaviour_mut().dialback.send_response(channel, crate::dialback::Answer::NotReached);
             }
         }
-        self.recent_inbound.retain(|_, at| now.duration_since(*at) < Duration::from_secs(60));
+        self.recent_inbound.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(60));
+        self.pending_reached.retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(10));
         let (done, keep): (Vec<_>, Vec<_>) =
             self.dialback_probes.drain(..).partition(|(_, at)| now.duration_since(*at) >= Duration::from_secs(5));
         self.dialback_probes = keep;
@@ -5224,9 +5220,14 @@ impl Task {
         use crate::dialback::Answer;
         let now = Instant::now();
         let allowed = self.member_identity(peer).is_some() && !self.relay_only;
-        if !allowed || !self.dialback_per_asker.allow(peer, now) || !self.dialback_all.allow((), now) {
-            debug!(allowed, "dial-back declined");
+        if !allowed {
+            debug!("dial-back declined");
             let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Declined);
+            return;
+        }
+        if let Some(lie) = self.dialback_lie.clone() {
+            // Tests only: a forged answer, nothing dialled.
+            let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Reached(lie));
             return;
         }
         let local = self.dialback_local;
@@ -5243,6 +5244,11 @@ impl Task {
             let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Declined);
             return;
         };
+        // The caps count real dials only (TL on #565: after the address check).
+        if !self.dialback_per_asker.allow(peer, now) || !self.dialback_all.allow((), now) {
+            let _ = self.swarm.behaviour_mut().dialback.send_response(channel, Answer::Declined);
+            return;
+        }
         let opts = DialOpts::peer_id(peer)
             .addresses(vec![addr.clone()])
             .condition(PeerCondition::Always)
@@ -5268,17 +5274,28 @@ impl Task {
         if self.member_identity(peer).is_none() || !crate::dialback::dialable(&addr, self.dialback_local) {
             return;
         }
-        let observed: Vec<Multiaddr> = self.observed_self.iter().cloned().collect();
+        // Mine: an IP someone *other than this helper* observed for me (a
+        // helper controls what its own identify says), and a port I listen
+        // on (SL and TL on #565).
+        let observed: Vec<std::net::IpAddr> = self
+            .observed_by
+            .iter()
+            .filter(|(_, observers)| observers.iter().any(|o| *o != peer))
+            .map(|(ip, _)| *ip)
+            .collect();
         let listening: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
-        let mine = crate::dialback::own_candidate(&addr, &observed, &listening);
-        if !mine {
+        if !crate::dialback::own_candidate(&addr, &observed, &listening) {
             debug!("dial-back answer not believed: not an address of mine");
             return;
         }
-        let arrived = self.recent_inbound.get(&peer).is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+        // And its probe came in after I asked, on that port and transport.
+        let asked = self.dialback_asked;
+        let arrived = self.recent_inbound.get(&peer).is_some_and(|(at, local)| {
+            asked.is_some_and(|asked| *at >= asked) && crate::dialback::same_port(&addr, local)
+        });
         if !arrived {
-            // Its answer may have overtaken the dial-back connection itself.
-            self.pending_reached = Some((peer, addr, Instant::now()));
+            // Its answer may have overtaken the probe itself: held 10 s.
+            self.pending_reached.insert(peer, (addr, Instant::now()));
             return;
         }
         self.confirm_reachable(addr);
@@ -5288,9 +5305,33 @@ impl Task {
     fn confirm_reachable(&mut self, addr: Multiaddr) {
         info!("relay: confirmed publicly reachable");
         self.reachable = Some((addr, Instant::now()));
-        self.pending_reached = None;
+        self.pending_reached.clear();
         self.dialback_wait = crate::dialback::FIRST_RETRY;
         self.apply_member_relay();
+    }
+
+    /// Identify: `peer` sees us at `observed`. Kept per IP with who saw it
+    /// (at most 16 IPs, 8 observers each). A new global IP of the same
+    /// family as the confirmed one, seen by 2 distinct peers, means our
+    /// public address changed (DHCP renew, another network): the
+    /// confirmation is dropped and re-proven (TL on #565; one peer, or an
+    /// IPv6 sighting of an IPv4 host, never resets it).
+    fn note_observed(&mut self, peer: PeerId, observed: &Multiaddr) {
+        let Some(ip) = crate::dialback::ip_of(observed) else { return };
+        if !self.observed_by.contains_key(&ip) && self.observed_by.len() >= 16 {
+            return;
+        }
+        let observers = self.observed_by.entry(ip).or_default();
+        if observers.len() < 8 {
+            observers.insert(peer);
+        }
+        let seen_by = observers.len();
+        let Some(confirmed) = self.reachable.as_ref().and_then(|(a, _)| crate::dialback::ip_of(a)) else { return };
+        let same_family = confirmed.is_ipv4() == ip.is_ipv4();
+        if same_family && ip != confirmed && seen_by >= 2 && crate::dialback::dialable(observed, self.dialback_local) {
+            self.reachable = None;
+            self.apply_member_relay();
+        }
     }
 }
 

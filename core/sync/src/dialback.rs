@@ -132,10 +132,15 @@ fn split(addr: &Multiaddr) -> Option<(IpAddr, (u8, u16))> {
 /// (identify's observed addresses), its transport and port one I listen
 /// on. A helper naming anyone else's address is ignored, so it can't make
 /// me advertise a victim as my relay.
-pub(crate) fn own_candidate(addr: &Multiaddr, observed: &[Multiaddr], listening: &[Multiaddr]) -> bool {
+pub(crate) fn own_candidate(addr: &Multiaddr, observed_ips: &[IpAddr], listening: &[Multiaddr]) -> bool {
     let Some((ip, transport)) = split(addr) else { return false };
-    observed.iter().any(|o| split(o).is_some_and(|(seen, _)| seen == ip))
-        && listening.iter().any(|l| split(l).is_some_and(|(_, ours)| ours == transport))
+    observed_ips.contains(&ip) && listening.iter().any(|l| split(l).is_some_and(|(_, ours)| ours == transport))
+}
+
+/// Same transport and port (TL on #565: the probe must have come in on
+/// the port the helper says it dialled).
+pub(crate) fn same_port(a: &Multiaddr, b: &Multiaddr) -> bool {
+    matches!((split(a), split(b)), (Some((_, x)), Some((_, y))) if x == y)
 }
 
 /// What the asker asks: dial me back on this port of mine, over QUIC or TCP.
@@ -300,7 +305,10 @@ mod tests {
 
     #[test]
     fn a_reported_address_counts_only_if_it_is_mine() {
-        let observed = [addr("/ip4/8.8.8.8/tcp/51234"), addr("/ip4/8.8.8.8/udp/51234/quic-v1")];
+        let observed: [IpAddr; 1] = ["8.8.8.8".parse().unwrap()];
+        assert!(same_port(&addr("/ip4/127.0.0.1/tcp/4001"), &addr("/ip4/8.8.8.8/tcp/4001")));
+        assert!(!same_port(&addr("/ip4/8.8.8.8/tcp/4001"), &addr("/ip4/8.8.8.8/udp/4001/quic-v1")));
+        assert!(!same_port(&addr("/ip4/8.8.8.8/tcp/4001"), &addr("/ip4/8.8.8.8/tcp/4002")));
         let listening = [addr("/ip4/0.0.0.0/tcp/4001"), addr("/ip4/0.0.0.0/udp/4001/quic-v1")];
         assert!(own_candidate(&addr("/ip4/8.8.8.8/tcp/4001"), &observed, &listening));
         assert!(own_candidate(&addr("/ip4/8.8.8.8/udp/4001/quic-v1"), &observed, &listening));

@@ -1076,6 +1076,10 @@ async fn a_quiet_node_takes_and_serves_nothing() {
     tokio::time::sleep(Duration::from_secs(8)).await;
     assert!(!a.peers().await.unwrap().contains(&b.peer_id()), "a quiet node took a connection");
     assert!(a.append(messages(1).remove(0)).await.is_err(), "a quiet node appended a record");
+    // Nothing signed goes to the relay's mailboxes, or to a member (SL on #593).
+    assert!(a.put_backup(vec![1; 64]).await.is_err(), "a quiet node put a backup");
+    assert!(a.put_notice(vec![1; 64]).await.is_err(), "a quiet node put a notice");
+    assert!(a.report_send(voice_id(61), vec![1; 64]).await.is_err(), "a quiet node sent a report");
     // A record B writes never reaches A.
     b.append(messages(2).remove(0)).await.unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;

@@ -10,6 +10,7 @@ import {
   createVoiceEngine,
   type AudioDevice,
   type VoiceEngine,
+  type VoiceDiagnostics,
   type VoiceEngineOptions,
   type VoiceError,
   type VoiceParticipant,
@@ -53,6 +54,8 @@ export interface VoiceEngineView {
   /** G-72: "השמעה עצמית": my microphone played back to me. Off by default and when the call ends. */
   selfMonitor: boolean;
   setSelfMonitor: (on: boolean) => void;
+  /** G-81: connection diagnostics (types and timings, never addresses); null outside a call. */
+  diagnostics?: () => Promise<VoiceDiagnostics | null>;
 }
 
 export { loadDevices } from './devices';
@@ -113,7 +116,7 @@ export function nextPeerFailed(
  * default) and `options.turnHost` (the configured relay host) turn on TURN
  * credentials from the core (G-81).
  */
-export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<VoiceEngineOptions, 'stunUrl' | 'enableTurn' | 'turnHost'> = {}): VoiceEngineView {
+export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<VoiceEngineOptions, 'stunUrl' | 'enableTurn' | 'turnHost' | 'relayOnly'> = {}): VoiceEngineView {
   const core = useCore();
   const engineRef = useRef<VoiceEngine | null>(null);
   const [ready, setReady] = useState(false);
@@ -138,8 +141,9 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   const stunUrl = options.stunUrl ?? null;
   const enableTurn = options.enableTurn === true;
   const turnHost = options.turnHost ?? null;
+  const relayOnly = options.relayOnly === true;
   useEffect(() => {
-    const engine = createVoiceEngine(fromCoreApi(core), { stunUrl, enableTurn, turnHost });
+    const engine = createVoiceEngine(fromCoreApi(core), { stunUrl, enableTurn, turnHost, relayOnly });
     engineRef.current = engine;
     for (const [id, pct] of Object.entries(volumesRef.current)) engine.setPeerVolume(id, pct / 100);
     // G-72: the remembered devices (a gone one falls back to the default on use).
@@ -189,7 +193,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
       engine.dispose();
       engineRef.current = null;
     };
-  }, [core, stunUrl, enableTurn, turnHost]);
+  }, [core, stunUrl, enableTurn, turnHost, relayOnly]);
 
   const callKey = call && call.participants.length ? call.channelId : null;
   useEffect(() => {
@@ -220,7 +224,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     };
     // Re-attach only when the call itself changes, not on every participant update:
     // the engine follows call.state on its own.
-  }, [callKey, myId, core, stunUrl, enableTurn, turnHost]);
+  }, [callKey, myId, core, stunUrl, enableTurn, turnHost, relayOnly]);
 
   const setMicMuted = useCallback((muted: boolean) => engineRef.current?.setMicMuted(muted), []);
   const setInput = useCallback((id: string) => {
@@ -235,6 +239,7 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
   }, []);
 
   const inputLevel = useCallback(() => engineRef.current?.inputLevel() ?? 0, []);
+  const diagnostics = useCallback(async () => (engineRef.current ? engineRef.current.diagnostics() : null), []);
   const setVolume = useCallback((id: Id, percent: number) => {
     const pct = Math.round(Math.min(200, Math.max(0, percent)));
     engineRef.current?.setPeerVolume(id, pct / 100);
@@ -254,5 +259,5 @@ export function useVoiceEngine(call: CallState | null, myId: Id, options: Pick<V
     engineRef.current?.setDeafened(on);
   }, []);
 
-  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel, deafened, setDeafened, volumes, setVolume, deviceFallback, selfMonitor, setSelfMonitor };
+  return { ready, error, speaking, peerFailed, setMicMuted, inputs, outputs, inputId, outputId, setInput, setOutput, inputLevel, deafened, setDeafened, volumes, setVolume, deviceFallback, selfMonitor, setSelfMonitor, diagnostics };
 }

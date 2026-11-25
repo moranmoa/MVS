@@ -19,6 +19,8 @@ import {
   EditIcon,
   ReplyIcon,
   TrashIcon,
+  LockIcon,
+  ShieldAlertIcon,
   SmilePlusIcon,
 } from '../../components/icons';
 import { textDir, useUiDir } from '../../app/textDir';
@@ -121,7 +123,8 @@ export function MessageList({
     return a ? displayName(a) : '…';
   };
   const messageItems = (m: Message): MenuItem[] =>
-    m.deleted || (memberMap.get(m.authorId)?.blocked && !revealed.has(m.authorId))
+    m.deleted ||
+    m.unreadable || (memberMap.get(m.authorId)?.blocked && !revealed.has(m.authorId))
       ? []
       : isHeld(m)
         ? // Not on the network yet: no id to reply to, edit or delete.
@@ -297,10 +300,10 @@ export function MessageList({
         if (m && !m.deleted) handlers.onReply(m);
         break;
       case 'e':
-        if (m && !m.deleted && m.authorId === myId) handlers.onEdit(m);
+        if (m && !m.deleted && !m.unreadable && m.authorId === myId) handlers.onEdit(m);
         break;
       case 'Delete':
-        if (m && !m.deleted && (m.authorId === myId || isOwner)) handlers.onDelete(m);
+        if (m && !m.deleted && !m.unreadable && (m.authorId === myId || isOwner)) handlers.onDelete(m);
         break;
       default:
         return;
@@ -338,6 +341,8 @@ export function MessageList({
               !!m &&
               !!prev &&
               !prev.deleted &&
+              // A placeholder row has no head: what follows starts its own.
+              !prev.unreadable &&
               !m.replyTo &&
               prev.authorId === m.authorId &&
               m.createdAt - prev.createdAt < GROUP_GAP_MS &&
@@ -527,6 +532,26 @@ const MessageRow = memo(function MessageRow({
         <TrashIcon />
         <span className="muted small">
           <FormattedMessage id="chat.deleted" />
+        </span>
+      </div>
+    );
+  }
+
+  // Core #527: a message that can't be opened here: a muted line, no actions.
+  if (m.unreadable) {
+    return (
+      <div className={`msg unreadable ${m.unreadable}`}>
+        {/* A lock: waiting for its key here; a shield with "!": the sender can't be verified (UX). */}
+        {m.unreadable === 'no-key' ? <LockIcon /> : <ShieldAlertIcon />}
+        <span className="muted small">
+          {/* Screen readers hear only the text (PO); the name is for the eye. */}
+          {m.unreadable === 'no-key' && author && (
+            <span aria-hidden="true">
+              <Name>{name}</Name>
+              {' · '}
+            </span>
+          )}
+          <FormattedMessage id={m.unreadable === 'no-key' ? 'msg.unreadable.noKey' : 'msg.unreadable.untrusted'} />
         </span>
       </div>
     );
@@ -786,7 +811,7 @@ function useNewMessageAnnouncement(
     const fresh: Message[] = [];
     for (let i = before; i < count; i++) {
       const m = win.get(i);
-      if (m && !m.deleted && m.authorId !== myId && !now.current.memberMap.get(m.authorId)?.blocked) fresh.push(m);
+      if (m && !m.deleted && !m.unreadable && m.authorId !== myId && !now.current.memberMap.get(m.authorId)?.blocked) fresh.push(m);
     }
     if (fresh.length === 0) return;
     pending.current = { last: fresh[fresh.length - 1]!, n: (pending.current?.n ?? 0) + fresh.length };

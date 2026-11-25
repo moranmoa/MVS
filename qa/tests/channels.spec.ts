@@ -105,7 +105,7 @@ test.describe('channels', () => {
     await onboard(page);
     await page.getByRole('button', { name: /^הצטרפות בלינק/ }).click();
     await page.getByLabel('לינק הזמנה').fill('mvs://join/qa-channels-member');
-    await page.getByRole('button', { name: 'הצטרפות', exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: 'הצטרפות', exact: true }).click();
     await expect(composer(page)).toBeVisible({ timeout: 10_000 });
 
     await expect(channelButton(page, 'lfg')).toBeVisible();

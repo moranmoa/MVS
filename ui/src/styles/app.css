@@ -170,7 +170,7 @@ button:disabled {
 
 .danger {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .primary.small,
@@ -474,7 +474,8 @@ legend {
 
 .owner-tag {
   background: var(--accent-soft);
-  color: var(--accent);
+  /* B20 (UX-13): accent on accent-soft is under AA on cards in the dark theme. */
+  color: var(--text);
 }
 
 .lookalike-tag {
@@ -990,7 +991,8 @@ legend {
   border: none;
   border-radius: var(--radius-m);
   background: var(--update);
-  color: #fff;
+  /* B20: white on the dark theme's green is 2.75:1; --accent-text is AA on both. */
+  color: var(--accent-text);
   font-size: 0.6875rem;
   font-weight: 700;
   line-height: 1.2;
@@ -1381,7 +1383,8 @@ legend {
 }
 
 .msg.deleted,
-.msg.blocked {
+.msg.blocked,
+.msg.unreadable {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -2441,7 +2444,7 @@ kbd {
 
 .call-leave {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .call-blocked {
@@ -3894,6 +3897,25 @@ input.switch:disabled {
   gap: 0.5rem;
 }
 
+/* G-06: the rail's tooltip (the full server name), beside the button. */
+.rail-tip {
+  position: fixed;
+  z-index: 50;
+  transform: translateY(-50%);
+  max-width: 16rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: var(--radius-s);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
 /* Voice IP notice v2: "Privacy settings" on the start side, Cancel and Got it at the end. */
 .ip-notice .ip-notice-settings {
   margin-inline-end: auto;
@@ -3902,4 +3924,94 @@ input.switch:disabled {
 /* Voice IP notice v3: two paragraphs (direct, relay-only). */
 .ip-notice p + p {
   margin-block-start: 0.5rem;
+}
+
+/* G-14: the channel topic, after the name in the header: one muted line. */
+.chat-topic {
+  min-width: 0;
+  max-width: 40rem;
+  flex: 0 1 auto;
+  overflow: hidden;
+  margin-inline-start: 0.5rem;
+  padding: 0.125rem 0 0.125rem 0.75rem;
+  padding-inline: 0.75rem 0;
+  border: 0;
+  border-inline-start: 1px solid var(--border);
+  border-radius: 0;
+  background: none;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: start;
+}
+
+.chat-topic:hover {
+  color: var(--text);
+}
+
+.chat-topic.add {
+  color: var(--text-faint);
+}
+
+.topic-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.topic-field {
+  width: 100%;
+}
+
+/* G-14 on a phone: the channel name opens the topic. */
+.chat-title-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+/* G-92: the join card on Home: the card opens the dialog; the field joins in place. */
+.home-card.join-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.home-card-open {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 1.75rem 1.25rem 1rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: center;
+}
+
+.join-paste {
+  padding: 0 1.25rem 1.25rem;
+}
+
+.join-paste-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.join-paste-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.join-paste .error {
+  margin: 0.375rem 0 0;
+}
+
+/* G-92 (UX): an empty field shows its Hebrew placeholder in the UI direction;
+   once a link is typed it's LTR. */
+:root[dir='rtl'] .join-paste input:placeholder-shown {
+  direction: rtl;
 }

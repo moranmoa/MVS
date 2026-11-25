@@ -102,5 +102,9 @@ export function cleanTurnCredentials(raw: unknown, host: string | null | undefin
 export function cleanStunUrl(stunUrl: unknown): string | null {
   if (typeof stunUrl !== 'string') return null;
   const url = stunUrl.trim();
-  return url.length <= 256 && /^stuns?:[^\s@/?#]+$/i.test(url) ? url : null;
+  // SL S3: one host (a name, IPv4 or [IPv6]) and an optional port, nothing
+  // else: no TURN, user info, path, query (?transport), fragment or list.
+  const m = /^stuns?:(?:[A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(?::(\d{1,5}))?$/i.exec(url);
+  if (!m || url.length > 256) return null;
+  return m[1] === undefined || (Number(m[1]) >= 1 && Number(m[1]) <= 65535) ? url : null;
 }

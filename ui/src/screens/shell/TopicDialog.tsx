@@ -122,12 +122,12 @@ export function TopicDialog({
           )}
           <div className="actions">
             {topic && (
-              <button type="button" disabled={busy} onClick={() => void save('')}>
+              <button type="button" className="secondary" disabled={busy} onClick={() => void save('')}>
                 <FormattedMessage id="channel.topic.clear" />
               </button>
             )}
             <span className="spacer" />
-            <button type="button" onClick={onClose} disabled={busy}>
+            <button type="button" className="secondary" onClick={onClose} disabled={busy}>
               <FormattedMessage id="common.cancel" />
             </button>
             <button type="submit" className="primary" disabled={busy || tooLong || value.trim() === topic}>
@@ -147,7 +147,7 @@ export function TopicDialog({
           <div className="actions">
             <span className="spacer" />
             {canEdit && (
-              <button type="button" onClick={() => setEditing(true)}>
+              <button type="button" className="secondary" onClick={() => setEditing(true)}>
                 <FormattedMessage id="channel.topic.edit" />
               </button>
             )}

@@ -397,6 +397,7 @@ enum Command {
     ListenAddrs { reply: oneshot::Sender<Vec<Multiaddr>> },
     RelayOnly { on: bool },
     NoDirectDials,
+    Quiet,
     NoHolePunch,
     MemberRelay { on: bool, daily_cap_mb: u32, preferred: bool },
     #[cfg(test)]
@@ -835,6 +836,7 @@ impl Node {
             fallback_at: HashMap::new(),
             fallback_done: HashSet::new(),
             direct_dials: true,
+            quiet: false,
             listen: listen.clone(),
             port_file,
             listener,
@@ -1316,6 +1318,14 @@ impl Node {
         }
     }
 
+    /// Required update (#577 RU1): from now on, for the rest of the process,
+    /// this node signs, syncs and serves nothing (one-way). Only the
+    /// connection to our relays is kept; every other one is closed, and any
+    /// new one closes as soon as it is up.
+    pub fn set_quiet(&self) -> Result<()> {
+        self.send(Command::Quiet)
+    }
+
     fn send(&self, command: Command) -> Result<()> {
         self.commands.send(command).ok().context("node has stopped")
     }
@@ -1595,6 +1605,11 @@ struct Task {
     /// Tests: our own direct dials can be switched off (stands in for a
     /// firewall), to show the other side's turn.
     direct_dials: bool,
+    /// Required update (#577 RU1): quiet for the rest of the process. No
+    /// connection but our relays' is kept (any new one closes at once, so a
+    /// reachable quiet node answers nothing), no gossip in or out, no pulls,
+    /// no dials, no member relay, no beacon.
+    quiet: bool,
     /// The direct listener (`NodeConfig::listen`), removed while relay-only.
     listen: Multiaddr,
     listener: Option<ListenerId>,
@@ -1987,6 +2002,7 @@ impl Task {
             }
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
+            Command::Quiet => self.go_quiet(),
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
             Command::MemberRelay { on, daily_cap_mb, preferred } => {
                 // Relay-only users never relay (design §1), whatever the core says.
@@ -2033,6 +2049,9 @@ impl Task {
     }
 
     fn append_local(&mut self, record: Record) -> Result<()> {
+        if self.quiet {
+            bail!("quiet: a required update is pending");
+        }
         let log = log_of(&record);
         if !self.logs.contains(&log) {
             bail!("log {log} is not open");
@@ -2086,6 +2105,9 @@ impl Task {
     }
 
     fn discover(&mut self) {
+        if self.quiet {
+            return;
+        }
         let mut any = false;
         for i in 0..self.relays.len() {
             let peer = self.relays[i].peer;
@@ -2738,6 +2760,9 @@ impl Task {
     /// Sends our beacon when due. With more open servers than slots, they
     /// take turns.
     fn lan_beacon_tick(&mut self) {
+        if self.quiet {
+            return;
+        }
         let now = Instant::now();
         if !self.beacon_on() || now < self.beacon_next {
             return;
@@ -3097,6 +3122,9 @@ impl Task {
     }
 
     fn pull(&mut self, peer: PeerId, log: &str, cause: &'static str) {
+        if self.quiet {
+            return;
+        }
         let key = (peer, log.to_string());
         // T23 on every path (round, queue, again, more…): a control log an
         // unbound peer answered empty lately isn't asked for again.
@@ -3221,6 +3249,15 @@ impl Task {
     }
 
     fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        // Required update: any new connection but our relays' closes at once.
+        if self.quiet {
+            if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } = &event {
+                if !self.is_our_relay(peer_id) {
+                    self.swarm.close_connection(*connection_id);
+                    return;
+                }
+            }
+        }
         // G-81: each connection's kind, for choosing voice paths.
         match &event {
             SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. } => {
@@ -3723,6 +3760,11 @@ impl Task {
     /// read-only connection. Dropping the channel fails the request on the
     /// other side.
     fn on_request(&mut self, peer: PeerId, request: SyncRequest, channel: ResponseChannel<SyncResponse>) {
+        if self.quiet {
+            // Refused: dropping the channel closes the stream unanswered.
+            drop((peer, request, channel));
+            return;
+        }
         #[cfg(test)]
         {
             self.pulls_received += 1;
@@ -3855,6 +3897,9 @@ impl Task {
     /// stops it here (and counts against the sender once peer scoring is on);
     /// Ignore neither forwards nor blames (a duplicate, or not judgeable yet).
     fn on_gossip(&mut self, from: PeerId, message: &gossipsub::Message) -> MessageAcceptance {
+        if self.quiet {
+            return MessageAcceptance::Ignore;
+        }
         let record = match check_pushed(&self.logs, &self.sealing, message) {
             Ok(record) => record,
             Err(Refuse::Ignore) => return MessageAcceptance::Ignore,
@@ -5083,6 +5128,27 @@ impl Task {
         // circuit): reopen now, not at the next tick (TL nit 7).
         if reroute {
             self.voice_reroute();
+        }
+    }
+}
+
+impl Task {
+    /// Required update (#577 RU1, one-way): stop relaying for members, the
+    /// beacon and voice; close every connection but our relays'. From here
+    /// on the gates in `on_swarm_event`, `on_request`, `on_gossip`,
+    /// `append_local`, `pull`, `discover` and the beacon tick keep it quiet.
+    fn go_quiet(&mut self) {
+        if self.quiet {
+            return;
+        }
+        info!("sync: quiet (a required update is pending)");
+        self.quiet = true;
+        self.swarm.behaviour_mut().member_relay.stop();
+        self.beacon = None;
+        self.set_voice_call(None);
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().filter(|p| !self.is_our_relay(p)).collect();
+        for peer in peers {
+            let _ = self.swarm.disconnect_peer_id(peer);
         }
     }
 }

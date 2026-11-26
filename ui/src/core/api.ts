@@ -140,7 +140,7 @@ export interface CoreCommands {
    * `'reactions-v1'`: reactions (G-26). Any other cap is `bad-request`. Empty
    * when the gate is open.
    */
-  getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]>;
+  getUpdateNeeded(serverId: Id, cap?: 'reactions-v1' | 'server-meta-v1'): Promise<Id[]>;
   /**
    * Invites (#214), moderator and up (`not-allowed` below). `expiresMs` is the last
    * moment a join is accepted (ms since epoch; absent = never, `bad-request` if

@@ -1215,7 +1215,7 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1' | 'server-meta-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
     // As the core: only cap names it knows.

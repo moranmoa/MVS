@@ -401,13 +401,15 @@ export function cleanChannel(c: Channel): Channel {
 }
 
 export function cleanMember(m: Member): Member {
-  const { avatarDataUrl: rawAvatar, color: rawColor, ...m0 } = m;
+  const { avatarDataUrl: rawAvatar, color: rawColor, notAdult: rawNotAdult, ...m0 } = m;
   const avatar = cleanSmallAvatar(rawAvatar);
   const color = cleanHexColor(rawColor);
   m = m0 as Member;
   return {
     ...(avatar ? { avatarDataUrl: avatar } : {}),
     ...(color ? { color } : {}),
+    // G-52: only exactly true is kept.
+    ...(rawNotAdult === true ? { notAdult: true as const } : {}),
     ...m,
     displayName: cleanName(m.displayName),
     shortCode: cleanCode(m.shortCode),
@@ -728,7 +730,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'identity.changed': cleanIdentity,
   'server.added': cleanServer,
   'server.updated': cleanServer,
-  'server.removed': (p) => ({ serverId: id(p.serverId), reason: p.reason === 'left' || p.reason === 'closed' ? p.reason : undefined }),
+  'server.removed': (p) => ({ serverId: id(p.serverId), reason: p.reason === 'left' || p.reason === 'closed' || p.reason === 'age' ? p.reason : undefined }),
   'server.closed': (p) => ({ serverId: id(p.serverId) }),
   'channel.updated': cleanChannel,
   'channel.added': cleanChannel,
@@ -830,6 +832,8 @@ export function guardCore(core: CoreApi): CoreApi {
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),
+    setAgeRestriction: wrap(core.setAgeRestriction, cleanServer),
+    countAgeAffected: wrap(core.countAgeAffected, (r) => ({ count: count(r?.count) })),
     setServerIcon: wrap(core.setServerIcon, cleanServer),
     setServerDescription: wrap(core.setServerDescription, cleanServer),
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),

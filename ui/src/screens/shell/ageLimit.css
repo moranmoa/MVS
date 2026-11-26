@@ -1,0 +1,17 @@
+/* G-52: the server's age limit. Theme colours only (AA); no motion. */
+.age-limit .radio.disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+.checkbox-row {
+  margin-block-start: 0.75rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  cursor: pointer;
+}
+.checkbox-row input {
+  margin-block-start: 0.2rem;
+  flex: none;
+}

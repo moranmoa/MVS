@@ -1230,6 +1230,19 @@ legend {
   white-space: nowrap;
 }
 
+/* G-52: the name with the "no 18+ claim" tag under it. */
+.member-name-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
+  min-inline-size: 0;
+}
+
+.member-name-stack > bdi {
+  max-inline-size: 100%;
+}
+
 .member.offline {
   opacity: 0.55;
 }

@@ -122,6 +122,11 @@ export interface Member {
   isOwner: boolean;
   /** Blocked by me: their messages are collapsed on this device only. */
   blocked?: boolean;
+  /**
+   * G-52 (core #616): in an 18+ server, a member without an 18+ claim. Only in
+   * the owner's and admins' member lists, so they can remove them; absent = nothing to show.
+   */
+  notAdult?: true;
   bio?: string;
   /** #359: the member's small picture (data:image/webp|png), from their profile post. */
   avatarDataUrl?: string;
@@ -189,6 +194,8 @@ export interface CoreError {
     | 'no-recipient'
     /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
     | 'profile-too-large'
+    /** G-52 (core #590): 18+ chosen by an owner under 18. */
+    | 'too-young'
     /** #577: a required update is pending; main refuses everything that writes or connects. */
     | 'update-required';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */

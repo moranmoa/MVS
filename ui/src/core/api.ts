@@ -124,6 +124,20 @@ export interface CoreCommands {
    */
   renameServer(serverId: Id, name: string): Promise<ServerSummary>;
   /**
+   * G-52 (core design #590): the owner changes the server's age limit and
+   * the core re-keys the channels at once. Returns the updated summary; then
+   * server.updated. The current value is a no-op. Errors: not-allowed (not
+   * the owner), too-young (18+ from an owner under 18), update-needed
+   * (nothing changes), not-found, bad-request.
+   */
+  setAgeRestriction(serverId: Id, ageRestriction: AgeRestriction): Promise<ServerSummary>;
+  /**
+   * G-52: how many current members (not me) would lose access at this limit:
+   * those without an 18+ claim; 0 for 'none' and '16+'. No names. Owner and
+   * admins only (not-allowed otherwise). Asked when the raise dialog opens.
+   */
+  countAgeAffected(serverId: Id, ageRestriction: AgeRestriction): Promise<{ count: number }>;
+  /**
    * G-51: set (a PNG/WebP data URL, at most 128 px and 8 KiB) or clear (null) the
    * icon. Errors: bad-request, not-allowed (owner or admin only), not-found,
    * rate-limited (once per 10 minutes from this device; clearing is never
@@ -294,7 +308,7 @@ export interface CoreEvents {
   'server.added': ServerSummary;
   'server.updated': ServerSummary;
   /** `reason` is absent for a kick. */
-  'server.removed': { serverId: Id; reason?: 'left' | 'closed' };
+  'server.removed': { serverId: Id; reason?: 'left' | 'closed' | 'age' };
   /** The owner closed it: it stays listed, read-only (`ServerSummary.closed`). */
   'server.closed': { serverId: Id };
   'channel.updated': Channel;

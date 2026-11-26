@@ -14,6 +14,7 @@ import { Avatar, Dialog, InviteBox, Name } from '../../components/common';
 import { GearIcon, HashIcon, PlusIcon } from '../../components/icons';
 import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
+import { AgeLimitSetting } from './AgeLimit';
 import { ServerMetaForm } from './ServerMeta';
 import { RemovedAccounts } from './RemovedAccounts';
 import { ReportsPage } from './Reports';
@@ -139,25 +140,13 @@ export function ServerSettings({
 }
 
 function GeneralPage({ server }: { server: ServerSummary }) {
-  const age = server.ageRestriction === 'none' ? 'none' : server.ageRestriction.slice(0, 2);
   return (
     <div className="stack">
       <RenameForm server={server} />
       {/* G-51: icon and description (its own save until the page-wide save, after G-52). */}
       <ServerMetaForm server={server} />
-      <dl className="server-facts">
-        <dt>
-          <FormattedMessage id="server.settings.age" />
-        </dt>
-        <dd>
-          <bdi>
-            <FormattedMessage id={`age.${age}`} />
-          </bdi>
-        </dd>
-      </dl>
-      <p className="muted small">
-        <FormattedMessage id="server.settings.ageReadOnly" />
-      </p>
+      {/* G-52: editable, with its own confirmations (AgeLimit.tsx). */}
+      <AgeLimitSetting server={server} />
     </div>
   );
 }

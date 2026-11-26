@@ -31,6 +31,8 @@ const COMMANDS = Object.freeze({
   joinServer: ['link'],
   cancelJoin: ['link'],
   renameServer: ['serverId', 'name'],
+  setAgeRestriction: ['serverId', 'ageRestriction'],
+  countAgeAffected: ['serverId', 'ageRestriction'],
   // G-51 server icon and description
   setServerIcon: ['serverId', 'dataUrl'],
   setServerDescription: ['serverId', 'description'],

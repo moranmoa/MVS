@@ -554,6 +554,9 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - **The form:** a `MessageEdit` with the same text and the original's `ts`. It's sealed for the current readers once the join re-key covers the joiner.
   - **Limits:** at most 50 per channel per Join, and 100 a minute.
   - **Never re-sent:** to a joiner removed meanwhile, or anything from before that window (D30).
+  - **18+ channels turned plain (PO, child safety):** a message written while its channel was 18+ never reaches a joiner who isn't an adult. It stays hidden like pre-join history, with no placeholder.
+    - Where the message sits decides, not its time: for such a joiner, in a channel that was ever 18+ (it has a `State.adult_edits` entry), only messages whose `auth_deps` reach the channel's latest accepted edit back to plain are re-sent. A backdated `Join.ts` (a window of about 10 min) changes nothing.
+    - It fails closed: with no edit back to plain, or concurrent ones none of which has the others in its past, nothing from that channel is re-sent to them.
   - Display, for every core from this one on:
     - **A reader who can open both the original and the edit:** `editedAt` is absent when the texts are equal, so there's no "edited" label, no `message.updated` and no second unread. With a different text it's an ordinary edit, even when its `ts` equals the original's.
     - **A reader who can't open the original (the joiner):** the edit's text shows in the message's place. `editedAt` is absent when the edit's `ts` equals the original's. Unread and mentions count once, as for a new message.

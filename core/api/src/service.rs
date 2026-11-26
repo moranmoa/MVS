@@ -5024,10 +5024,33 @@ impl Inner {
                     touched.insert(of);
                 }
             }
+            // B7-k (Tech Lead, child safety): for a joiner who isn't an adult,
+            // a channel that was ever 18+ re-seals only messages whose deps
+            // reach its latest edit back to plain; none without one. Nothing
+            // from its 18+ time ever reaches them.
+            let adult_joiner = view.state.adults.contains(&joiner);
+            let after_plain = |r: &Record, channel: ChannelId| -> bool {
+                if adult_joiner || !view.state.adult_edits.contains_key(&channel) {
+                    return true;
+                }
+                let plain: Vec<RecordId> = log
+                    .records
+                    .iter()
+                    .filter(|e| view.state.accepted.contains(&e.id()))
+                    .filter(|e| {
+                        matches!(Action::from_record(e), Some(Action::ChannelEdit { channel: c, adult: false, .. }) if c == channel)
+                    })
+                    .map(|e| e.id())
+                    .collect();
+                // The owner signs channel edits in a chain: the latest reaches the rest.
+                let latest = plain.iter().find(|p| plain.iter().all(|o| o == *p || log.resolver.reaches(*o, &[**p])));
+                latest.is_some_and(|edit| log.resolver.reaches(*edit, r.auth_deps()))
+            };
             let mut by_channel: BTreeMap<ChannelId, Vec<(RecordId, u64)>> = BTreeMap::new();
             for r in &log.channel {
                 let Scope::Channel(channel) = r.scope() else { continue };
                 let fits = r.kind() == Kind::Message
+                    && after_plain(r, channel)
                     && r.author() == me
                     && r.ts() >= join_ts.saturating_sub(RESEAL_BEFORE_JOIN_MS)
                     && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS

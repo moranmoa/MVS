@@ -26,7 +26,7 @@ function failureOf(e: unknown): Failure {
 }
 
 /** `update-needed`: who still runs an older MVS, and the two ways out. */
-export function UpdateNeeded({ server }: { server: ServerSummary }) {
+export function UpdateNeeded({ server, cap }: { server: ServerSummary; cap?: 'server-meta-v1' }) {
   const core = useCore();
   const store = useAppStore();
   const members = useStore(store, (s) => s.members[server.id] ?? NO_MEMBERS);
@@ -36,11 +36,11 @@ export function UpdateNeeded({ server }: { server: ServerSummary }) {
   useEffect(() => {
     let live = true;
     // Without the list the alert still says what happened and what to do.
-    core.getUpdateNeeded(server.id).then((ids) => live && setMemberIds(ids), () => {});
+    core.getUpdateNeeded(server.id, cap).then((ids) => live && setMemberIds(ids), () => {});
     return () => {
       live = false;
     };
-  }, [core, server.id]);
+  }, [core, server.id, cap]);
   const names = memberIds.map((id) => members.find((m) => m.id === id)).filter((m): m is Member => !!m);
   return (
     <div className="warning update-needed" role="alert">

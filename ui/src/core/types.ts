@@ -69,6 +69,10 @@ export interface ServerSummary {
    * newer MVS and this computer may miss what it adds. The UI asks to update.
    */
   updateNeeded?: boolean;
+  /** G-51: the server's icon, a still PNG or WebP data URL (at most 128 px, 8 KiB). */
+  iconDataUrl?: string;
+  /** G-51: plain text, up to 5 lines; shown as is (never Markdown or links). */
+  description?: string;
 }
 
 export interface Channel {

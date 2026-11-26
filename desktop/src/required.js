@@ -85,6 +85,8 @@ const NOT_READ_ONLY = Object.freeze(
     'createServer',
     'joinServer',
     'renameServer',
+    'setServerIcon',
+    'setServerDescription',
     'leaveServer',
     'closeServer',
     'createInvite',

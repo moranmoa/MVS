@@ -92,6 +92,8 @@ export interface MockOptions {
   signOutKeyring?: boolean;
   /** updateProfile fails (B11e: the save error state). */
   profileError?: boolean;
+  /** G-51: setServerIcon answers rate-limited (screenshots, tests). */
+  serverIconRateLimited?: boolean;
   /** The first demo voice room starts with 5 people in it (full). */
   roomFull?: boolean;
   /** Voice rooms (0.4.3): how many live rooms each demo server starts with (default 1; 0 = none; up to 10). */
@@ -1215,12 +1217,55 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1' | 'server-meta-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
     // As the core: only cap names it knows.
     if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
+  }
+
+  /** G-51: as the core (owner here; admins too in the core), with its limits. */
+  private lastIconSet = new Map<Id, number>();
+  async setServerIcon(serverId: Id, dataUrl: string | null): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    if (dataUrl !== null) {
+      if (!/^data:image\/(?:png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(dataUrl) || dataUrl.length > 11_000) throw err({ code: 'bad-request' });
+      const last = this.lastIconSet.get(serverId) ?? 0;
+      if (this.options.serverIconRateLimited || Date.now() - last < 10 * 60_000) throw err({ code: 'rate-limited' });
+    }
+    this.lifecycleGate(s);
+    await this.wait(150);
+    if (dataUrl !== null) this.lastIconSet.set(serverId, Date.now());
+    const { iconDataUrl: _old, ...rest } = s.summary;
+    s.summary = dataUrl === null ? rest : { ...rest, iconDataUrl: dataUrl };
+    this.emit('server.updated', s.summary);
+    return s.summary;
+  }
+
+  async setServerDescription(serverId: Id, description: string): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    const text = description.trim();
+    const lines = text.split('\n');
+    if (
+      [...text].length > 500 ||
+      lines.length > 5 ||
+      /[\r\u2028\u2029]/.test(text) ||
+      lines.some((l) => l !== l.trimEnd()) ||
+      /\n\n\n/.test(text)
+    ) {
+      throw err({ code: 'bad-request' });
+    }
+    this.lifecycleGate(s);
+    await this.wait(150);
+    const { description: _old, ...rest } = s.summary;
+    s.summary = text ? { ...rest, description: text } : rest;
+    this.emit('server.updated', s.summary);
+    return s.summary;
   }
 
   async renameServer(serverId: Id, name: string): Promise<ServerSummary> {

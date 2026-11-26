@@ -4654,6 +4654,11 @@ impl Inner {
             .map(|r| (r.id(), r.author(), r.ts()))
             .collect();
         // Every Join first, so one re-seal can count for all it covers.
+        // `applied_at` is this process's first sight: after a restart an
+        // old Join looks freshly applied. That's harmless: a message I sent
+        // after I first applied it reaches it (its `auth_deps` were my heads
+        // then), so `reaches` leaves it out; only messages that truly never
+        // reached the Join qualify, still within `ts ≥ Join.ts − 60 s`.
         for (join, joiner, _) in &joins {
             self.reseal.entry((server, *join)).or_insert_with(|| Reseal {
                 applied_at: now,

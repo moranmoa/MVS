@@ -141,11 +141,12 @@ function createRequiredGate({ inCall, endCall, onChange = () => {} }) {
   const state = () => ({ required: !!required, version: required ? required.version : null, active: active(), phase: phase(), endedCall });
   const changed = () => onChange(state());
 
-  /** A call still running under a required update ends now. */
+  /** A call still running under a required update ends now. True if it ended one. */
   const endRunningCall = () => {
-    if (!required || !inCall()) return;
+    if (!required || !inCall()) return false;
     endedCall = true;
     endCall();
+    return true;
   };
 
   return {
@@ -170,7 +171,8 @@ function createRequiredGate({ inCall, endCall, onChange = () => {} }) {
     },
     /** After any change to the call (main's syncCall): no call may run while required. */
     callChanged() {
-      endRunningCall();
+      // A racing call ended: the page hears it (the banner's "call ended", TL).
+      if (endRunningCall()) changed();
     },
     get active() {
       return active();

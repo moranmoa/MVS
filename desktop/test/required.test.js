@@ -141,11 +141,17 @@ test('not in a call: nothing is ended, and the banner gets no "call ended"', () 
   assert.equal(gate.state.endedCall, false);
 });
 
-test('a new call under a required update is ended at once too', () => {
-  const { gate, st } = harness();
+test('a new call under a required update is ended at once too, and the page hears it', () => {
+  const { gate, st, states } = harness();
   gate.set({ version: '0.6.0' });
+  const before = states.length;
   st.inCall = true; // e.g. a join that raced the gate
   gate.callChanged();
   assert.equal(st.ended, 1);
   assert.equal(gate.state.active, true);
+  assert.equal(states.length, before + 1, 'onChange after ending the racing call (TL)');
+  assert.equal(states.at(-1).endedCall, true);
+  // No call: callChanged() says nothing new.
+  gate.callChanged();
+  assert.equal(states.length, before + 1);
 });

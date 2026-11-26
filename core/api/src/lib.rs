@@ -41,6 +41,7 @@ pub mod update;
 pub mod report;
 pub mod typing;
 mod voice;
+mod voice_media;
 
 pub use access::{KeyBinder, MemberReadGate, MemberStubGate, BINDING_PREFIX};
 pub use dispatch::NOT_YET;
@@ -60,6 +61,7 @@ pub use service::{
 pub use types::*;
 pub use report::ReportNet;
 pub use typing::TypingNet;
+pub use voice_media::VoiceFrames;
 pub use voice::{
     VoiceNet, CLOCK_WINDOW_MS, HELLO_EVERY_MS, HELLO_TIMEOUT_MS, MAX_PARTICIPANTS, MAX_PAYLOAD,
     SIGNAL_PREFIX,

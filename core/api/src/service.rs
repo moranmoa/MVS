@@ -503,6 +503,8 @@ pub struct Core {
     /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
     /// waits, holding no server secrets.
     keys_locked: AtomicBool,
+    /// G-81: the `voiceFrame` fast path's gate (`voice_media`).
+    media: Arc<crate::voice_media::MediaGate>,
     /// G-78: app-lock attempts run one at a time, so the counter can't be
     /// raced past its delay.
     app_lock_gate: Mutex<()>,
@@ -728,6 +730,7 @@ impl Core {
             buddies_checked: Mutex::new(None),
             restore: Mutex::new(RestoreProgress::new(restore_state)),
             keys_locked: AtomicBool::new(false),
+            media: Arc::default(),
             app_lock_gate: Mutex::new(()),
         })
     }
@@ -736,6 +739,9 @@ impl Core {
     /// secret and every channel key, and we leave any call. TODO(app lock):
     /// the commands.
     pub fn lock_keys(&self) {
+        // G-81 (SL on #556): the frame gate shuts first, whatever leaving
+        // the call does, and stays shut until unlock.
+        self.media.shut();
         let _ = self.leave_call();
         // Messages held for a key: their text is dropped (zeroized) at lock
         // and sign-out, never kept past them (lost-message P1, SL C3). Each
@@ -803,6 +809,8 @@ impl Core {
                 None => return Err(ErrorCode::BadRequest.into()),
             }
         }
+        // G-81 (SL on #556): the frame gate shuts first, for good.
+        self.media.shut();
         let _ = self.leave_call();
         self.pending_joins.lock().expect("not poisoned").clear();
         let mut inner = self.lock();
@@ -861,6 +869,10 @@ impl Core {
     pub fn unlock_keys(&self) {
         self.keys_locked.store(false, Ordering::SeqCst);
         unlock_cipher(&self.ports, self.lock().me.as_ref());
+        // Never reopened while a required update holds (RU1).
+        if self.lock().update_required.is_none() {
+            self.media.unshut();
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -884,6 +896,11 @@ impl Core {
             let result = f(&mut inner, &self.ports, &mut events);
             // Member relays: anything the command changed is announced.
             inner.check_member_relay(&self.ports, &mut events);
+            // G-81: my call changed: the frame gate and the node follow, the
+            // gate first (SL on #554).
+            if events.iter().any(|e| matches!(e, Event::CallState(_))) {
+                self.media.apply(inner.calls.media_call());
+            }
             result
         };
         self.emit(events);
@@ -2161,7 +2178,20 @@ impl Core {
 
     /// Voice: sync's voice transport (piece A). Without one, `joinCall`
     /// answers `not-implemented`.
+    /// G-81: the sidecar reader's handle for `voiceFrame` (`voice_media`):
+    /// never takes the core's lock.
+    pub fn voice_frames(&self) -> crate::VoiceFrames {
+        crate::VoiceFrames(self.media.clone())
+    }
+
+    /// G-81 `--voice-p2p` (the shell's flag, off by default): calls run over
+    /// libp2p, so relay-only no longer refuses or ends them.
+    pub fn set_voice_p2p(&self, on: bool) {
+        self.lock().calls.set_voice_p2p(on);
+    }
+
     pub fn set_voice(&self, net: Arc<dyn VoiceNet>) {
+        self.media.set_net(net.clone());
         self.lock().calls.set_net(net);
     }
 
@@ -2227,6 +2257,53 @@ impl Core {
     }
 
     /// `leaveCall`: idempotent.
+    /// G-81: a voice frame the node passed (gate, caps, sequence): out as
+    /// `voice.frame`, only while it is still my call (a frame overtaking
+    /// `leaveCall` is a no-op). Never takes the core's lock.
+    pub fn voice_media_frame(&self, from: PublicKey, frame: sync::VoiceFrame) {
+        if self.media.current() != Some(frame.call_id) {
+            return;
+        }
+        use base64::Engine as _;
+        self.ports.events.emit(&Event::VoiceFrame {
+            call_id: hex::encode(frame.call_id),
+            from: model::hex_id(from.as_bytes()),
+            seq: frame.seq,
+            ts: frame.ts,
+            data: base64::engine::general_purpose::STANDARD.encode(&frame.opus),
+        });
+    }
+
+    /// G-81: how my frames reach `peer` changed (`CallParticipant.path`).
+    pub fn voice_media_path(&self, peer: PublicKey, path: sync::VoicePath) {
+        let kind = match path {
+            sync::VoicePath::Lan => VoicePathKind::Lan,
+            sync::VoicePath::Direct => VoicePathKind::Direct,
+            sync::VoicePath::Circuit => VoicePathKind::Circuit,
+            sync::VoicePath::MemberCircuit => VoicePathKind::MemberCircuit,
+            sync::VoicePath::None => VoicePathKind::None,
+        };
+        let _ = self.voice(|calls, ctx, _| {
+            calls.set_path(ctx, peer, kind);
+            Ok(())
+        });
+    }
+
+    /// G-81 `setCallWebrtcPeers({ identities })`: the call peers the UI has a
+    /// live LAN WebRTC connection to. The core sends voice frames over
+    /// libp2p to every other participant; the UI can only exclude, never
+    /// add targets. At most [`MAX_PARTICIPANTS`]; reset on every new call.
+    pub fn set_call_webrtc_peers(&self, identities: &[String]) -> CoreResult<()> {
+        if identities.len() > crate::voice::MAX_PARTICIPANTS {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let peers: HashSet<PublicKey> = identities.iter().map(|id| parse_user(id)).collect::<CoreResult<_>>()?;
+        self.voice(|calls, ctx, _| {
+            calls.set_webrtc_peers(ctx, peers);
+            Ok(())
+        })
+    }
+
     pub fn leave_call(&self) -> CoreResult<()> {
         if !self.in_call() {
             return Ok(());
@@ -3100,8 +3177,15 @@ impl Core {
     /// `relayOnly` at the next tick. Needs no identity.
     pub fn set_relay_only(&self, on: bool) -> CoreResult<()> {
         if on {
-            self.lock().calls.set_relay_only(true);
-            self.leave_call()?;
+            let mut inner = self.lock();
+            inner.calls.set_relay_only(true);
+            // G-81: with `--voice-p2p` the call goes on, over our relays'
+            // circuits only (the node switches its path).
+            let voice_p2p = inner.calls.voice_p2p();
+            drop(inner);
+            if !voice_p2p {
+                self.leave_call()?;
+            }
         }
         self.run(|inner, ports, _| {
             inner.db.set(KV_RELAY_ONLY, &[u8::from(on)])?;
@@ -7252,6 +7336,8 @@ impl Core {
             changed
         };
         if changed {
+            // RU1: no voice frames either (SL on #556).
+            self.media.shut();
             self.ports.network.set_quiet();
             updates.wake();
             self.emit(vec![Event::UpdateRequired(UpdateRequired { version: now })]);

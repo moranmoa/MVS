@@ -5716,6 +5716,9 @@ fn member_relay_follows_my_role_and_is_forced_off() {
     sign_up(&owner, "Owner");
     let bob = world.peer();
     let bob_id = sign_up(&bob, "Bob").id;
+    // The shell says "not on battery" at start (RR2: on until it does).
+    owner.core.set_on_battery(false).unwrap();
+    bob.core.set_on_battery(false).unwrap();
 
     // No server yet: auto, off, no role, the defaults.
     let r = relay_of(&owner);
@@ -5798,6 +5801,7 @@ fn member_relay_is_off_on_a_metered_network() {
     let world = World::new();
     let owner = world.peer();
     sign_up(&owner, "Owner");
+    owner.core.set_on_battery(false).unwrap();
     owner.core.create_server("Relay", AgeRestriction::None).unwrap();
     owner.core.mark_member_relay_disclosure_seen().unwrap();
     assert!(relay_of(&owner).effective);
@@ -5835,6 +5839,42 @@ fn member_relay_is_off_on_a_metered_network() {
     }
 }
 
+/// RR2 (relay in the app, SL): on battery, member relaying is off with
+/// reason `on-battery`. It fails closed: a core counts as on battery from
+/// start until the shell's first `setOnBattery`, and clearing it restores
+/// the value with one event. Metered, earlier in the order, wins.
+#[test]
+fn member_relay_is_off_on_battery_until_the_shell_says_otherwise() {
+    let world = World::new();
+    let owner = world.peer();
+    sign_up(&owner, "Owner");
+    owner.core.create_server("Relay", AgeRestriction::None).unwrap();
+    owner.core.mark_member_relay_disclosure_seen().unwrap();
+    let r = relay_of(&owner);
+    assert_eq!((r.effective, r.reason), (false, Some(MemberRelayReason::OnBattery)), "not until the shell says");
+    owner.events.take();
+    owner.core.set_on_battery(false).unwrap();
+    let ev = relay_events(&owner);
+    assert_eq!(ev.len(), 1);
+    assert!(ev[0].effective && ev[0].reason.is_none());
+    owner.core.set_on_battery(true).unwrap();
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::OnBattery));
+    owner.core.set_metered(true).unwrap();
+    assert_eq!(relay_of(&owner).reason, Some(MemberRelayReason::Metered));
+    owner.core.set_metered(false).unwrap();
+
+    let wire = |args: &str| -> serde_json::Value {
+        let request = format!(r#"{{"cmd":"setOnBattery","args":{args}}}"#);
+        serde_json::from_str(&owner.core.handle(&request)).unwrap()
+    };
+    let reply = wire(r#"{"onBattery":false}"#);
+    assert_eq!(reply["ok"], serde_json::Value::Null, "{reply}");
+    assert!(relay_of(&owner).effective);
+    for bad in [r#"{"onBattery":"no"}"#, r#"{}"#, r#"{"on_battery":false}"#, r#"{"onBattery":false,"x":1}"#] {
+        assert_eq!(wire(bad)["error"]["code"], "bad-request", "{bad}");
+    }
+}
+
 /// Member relays: a minor (no trusted adult birth date) stays off even with
 /// "on", and even as an owner.
 #[test]
@@ -5863,6 +5903,7 @@ fn member_relay_cap_and_setting_survive_a_restart() {
     {
         let peer = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(PendingGroupKeys));
         sign_up(&peer, "Kept");
+        peer.core.set_on_battery(false).unwrap();
         assert_eq!(relay_of(&peer).daily_cap_mb, 2_048);
         for bad in [0, 255, 51_201] {
             assert_eq!(peer.core.set_member_relay_cap(bad).unwrap_err().code, ErrorCode::BadRequest, "{bad}");
@@ -5879,7 +5920,10 @@ fn member_relay_cap_and_setting_survive_a_restart() {
     let peer = world.peer_with(secrets, Some(db), Arc::new(PendingGroupKeys));
     let r = relay_of(&peer);
     assert_eq!((r.setting, r.daily_cap_mb, r.disclosure_seen), (MemberRelaySetting::On, 51_200, true));
-    assert!(r.effective, "on, for an adult with no server");
+    // RR2: on battery again at every start, until the shell says.
+    assert_eq!((r.effective, r.reason), (false, Some(MemberRelayReason::OnBattery)), "the battery flag survived a restart");
+    peer.core.set_on_battery(false).unwrap();
+    assert!(relay_of(&peer).effective, "on, for an adult with no server");
     drop(peer);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -6075,6 +6119,7 @@ fn the_network_follows_the_member_relay_setting() {
     let net = RelayOnlyNet::new(&world.network);
     let owner = world.peer_on(net.clone(), Arc::new(MemoryStore::new()), None, Arc::new(PendingGroupKeys));
     sign_up(&owner, "Owner");
+    owner.core.set_on_battery(false).unwrap();
     let relays = || net.relays.lock().unwrap().clone();
     assert_eq!(relays(), [(false, 2_048, false)], "told at start");
     owner.core.create_server("Relay", AgeRestriction::None).unwrap();

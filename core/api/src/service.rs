@@ -350,6 +350,10 @@ struct Inner {
     /// Slice 3a: the shell says the network is metered (`setMetered`). In
     /// memory only: the shell sets it at every start.
     metered: bool,
+    /// RR2 (SL): the shell says this device runs on battery (`setOnBattery`).
+    /// In memory only, and fails closed: on battery from every start until
+    /// the shell says otherwise.
+    on_battery: bool,
     /// Device link, the new device: my one link.
     device_link: Option<NewLink>,
     /// Device link, the approving device: by link (the QR's key or the
@@ -693,6 +697,7 @@ impl Core {
             keyring_unavailable: false,
             member_relay: None,
             metered: false,
+            on_battery: true,
             device_link: None,
             approvals: HashMap::new(),
             approving: None,
@@ -3349,6 +3354,17 @@ impl Core {
         })
     }
 
+    /// RR2 (relay in the app, SL): the desktop shell's on-battery flag
+    /// (shell only, never the page). Kept in memory, and on until the shell
+    /// first says otherwise, at every start: forces member relaying off
+    /// with reason `on-battery` while set.
+    pub fn set_on_battery(&self, on_battery: bool) -> CoreResult<()> {
+        self.run(|inner, _, _| {
+            inner.on_battery = on_battery;
+            Ok(())
+        })
+    }
+
     /// The one-time disclosure was shown and acknowledged.
     pub fn mark_member_relay_disclosure_seen(&self) -> CoreResult<()> {
         self.run(|inner, _, _| inner.db.set(KV_MEMBER_RELAY_SEEN, &[1]))
@@ -4648,7 +4664,8 @@ impl Inner {
     /// Member relays (#368, slice 1): the setting, and what it comes to now.
     /// Forced off, whatever the setting, by the first reason that applies:
     /// the global flag (the signed `flags.json`, slice 3b), then a minor, then
-    /// relay-only, then a metered network (the shell's `setMetered`).
+    /// relay-only, then a metered network (the shell's `setMetered`), then
+    /// on battery (the shell's `setOnBattery`; on until it first says).
     fn member_relay_now(&mut self, now: u64) -> CoreResult<MemberRelay> {
         let setting = match self.db.get(KV_MEMBER_RELAY)?.as_deref() {
             Some(b"on") => MemberRelaySetting::On,
@@ -4678,6 +4695,8 @@ impl Inner {
             Some(MemberRelayReason::RelayOnly)
         } else if self.metered {
             Some(MemberRelayReason::Metered)
+        } else if self.on_battery {
+            Some(MemberRelayReason::OnBattery)
         } else {
             None
         };
@@ -4729,8 +4748,13 @@ impl Inner {
                     events.push(Event::MemberRelayChanged(now.clone()));
                 }
                 // Slice 2: the network relays for members only while this
-                // says so (the first check, at start, sets it too).
-                ports.network.set_member_relay(now.effective, now.daily_cap_mb, now.role);
+                // says so (the first check, at start, sets it too). Only
+                // when what it reads changes: a reason swapped for another
+                // (on battery at start, then metered) tells it nothing new.
+                let told = |r: &MemberRelay| (r.effective, r.daily_cap_mb, r.role);
+                if self.member_relay.as_ref().map(told) != Some(told(&now)) {
+                    ports.network.set_member_relay(now.effective, now.daily_cap_mb, now.role);
+                }
                 self.member_relay = Some(now);
             }
             Ok(_) => {}

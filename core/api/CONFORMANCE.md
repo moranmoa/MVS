@@ -452,6 +452,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       2. `minor`: no trusted adult birth date (the age claim's rule: a restored date counts only once it agrees or its 30 days are up).
       3. `relay-only`: relay-only is on.
       4. `metered`: the desktop shell reports a metered connection (`setMetered`, below).
+      5. `on-battery`: the desktop shell reports running on battery (`setOnBattery`, below), and also at every start until the shell first reports (it fails closed).
     - Without an identity, `effective` is false.
     - `dailyCapMb` defaults to 2048.
   - `getMemberRelay()` returns `MemberRelay`.
@@ -459,6 +460,7 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `setMemberRelayCap(mb: number)` returns `MemberRelay`. Values from 256 to 51200 are accepted; anything else is `bad-request`.
   - `markMemberRelayDisclosureSeen()` returns `null`.
   - `setMetered(metered: boolean)` returns `null` (slice 3a). The desktop shell sends it, never the page: it is not in the renderer's allow-list or `CoreCommands`. Kept in memory only; the shell sets it whenever a core comes up, then on every change (it checks at start, every 60 s and when the network changes, and any error counts as not metered). A non-boolean or an extra field is `bad-request`.
+  - `setOnBattery(onBattery: boolean)` returns `null` (relay in the app, RR2). Like `setMetered`, the desktop shell sends it, never the page; it is kept in memory only. It fails closed: from every start the core counts as on battery until the shell first sends it, so the shell sends it whenever a core comes up (`false` on a machine with no battery), then on every change. A non-boolean or an extra field is `bad-request`.
   - Event `memberRelay.changed`, with a `MemberRelay` payload. It fires once whenever any field differs from the last value announced, and never otherwise. That covers:
     - a role read from the log (promote, demote, ownership);
     - a join or leave;

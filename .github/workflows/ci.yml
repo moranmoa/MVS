@@ -50,7 +50,9 @@ jobs:
       # that exists only under cfg(test)/test-util but is used in normal code
       # fails here instead of in the release build.
       - name: binaries build without test features
-        run: cargo check --locked --workspace --bins
+        run: |
+          cargo build --release --locked --workspace
+          cargo clippy --workspace --locked -- -D warnings
         working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy

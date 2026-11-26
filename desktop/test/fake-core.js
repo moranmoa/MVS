@@ -63,6 +63,16 @@ const attempt = (check) => {
   return until ? { result: 'wrong', retryAfter: 30 } : { result: 'wrong' };
 };
 
+// QA MR.1: <data-dir>/fake-emit-memberrelay → one memberRelay.changed 1.5 s
+// after start (while the app is still locked).
+try {
+  if (fs.existsSync(path.join(dataDir, 'fake-emit-memberrelay'))) {
+    setTimeout(() => out({ type: 'event', event: 'memberRelay.changed', payload: { role: true, setting: 'auto', effective: false, disclosureSeen: false } }), 1500);
+  }
+} catch {
+  // no data dir in some unit tests
+}
+
 process.stdin.on('data', (chunk) => {
   buf += chunk;
   let nl;

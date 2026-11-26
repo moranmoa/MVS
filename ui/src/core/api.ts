@@ -31,6 +31,7 @@ import type {
   ServerSummary,
   StorageUsage,
   UpdateChannel,
+  UpdateGate,
   UpdateInfo,
   CoreStatus,
   CallState,
@@ -303,6 +304,8 @@ export interface CoreEvents {
   'update.installed': { version: string; notes: string | null };
   /** Once, after the launcher went back to the previous version. */
   'update.rolledBack': { failed: string; running: string };
+  /** Desktop shell (#577, #626): the required-update gate's state. */
+  'update.gate': UpdateGate;
   /** e.g. after a kick: the server's encryption was renewed. */
   /** rekey-waiting: a message held for its key failed; sending there waits for a moderator's re-key. */
   'notice': { kind: 'encryption-renewed' | 'rekey-waiting'; serverId: Id };

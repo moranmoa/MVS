@@ -70,6 +70,8 @@ export interface MockOptions {
   updateInstalled?: boolean;
   /** Shortly after start: the last update failed and the previous version is back. */
   updateRolledBack?: boolean;
+  /** #622: this long after joining a call, a required update ends it (as main does). */
+  requiredInCallMs?: number;
   /** Act as if in a voice call: restartToUpdate is refused with not-allowed. */
   inCall?: boolean;
   /** As the desktop shell would: report the core down, for the T8-01 screen. */
@@ -1577,6 +1579,15 @@ export class MockCore implements CoreApi {
     this.emitRooms(found.serverId);
     this.call = this.callOf(found.room);
     this.emitCall();
+    if (this.options.requiredInCallMs !== undefined) {
+      // As main does (#626): the gate ends the call, the page hears it, then the leave.
+      this.timers.push(
+        setTimeout(() => {
+          this.emit('update.gate', { required: true, version: '0.6.0', active: true, phase: 'gated', endedCall: true });
+          void this.leaveCall();
+        }, this.options.requiredInCallMs),
+      );
+    }
     return this.call;
   }
 

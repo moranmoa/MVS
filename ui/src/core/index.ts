@@ -55,6 +55,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     updateInstalled: params.has('installed'),
     updateRolledBack: params.has('rolledBack'),
     inCall: params.has('inCall'),
+    requiredInCallMs: params.has('requiredInCall') ? Number(params.get('requiredInCall')) || 0 : undefined,
     coreDown: (params.get('coreDown') as MockOptions['coreDown']) ?? undefined,
     callError: (params.get('callError') as MockOptions['callError']) ?? undefined,
     roomFull: params.has('roomFull'),

@@ -69,6 +69,10 @@ export interface ServerSummary {
    * newer MVS and this computer may miss what it adds. The UI asks to update.
    */
   updateNeeded?: boolean;
+  /** G-51: the server's icon, a still PNG or WebP data URL (at most 128 px, 8 KiB). */
+  iconDataUrl?: string;
+  /** G-51: plain text, up to 5 lines; shown as is (never Markdown or links). */
+  description?: string;
 }
 
 export interface Channel {
@@ -275,6 +279,18 @@ export interface UpdateInfo {
   version: string;
   /** While in a voice call the update waits until the call ends. */
   waitingForCall: boolean;
+}
+
+/**
+ * Desktop shell (#577, #626): the required-update gate, on every change and on
+ * every page load. `endedCall` stays true once the gate ended a call.
+ */
+export interface UpdateGate {
+  required: boolean;
+  version: string | null;
+  active: boolean;
+  phase: 'none' | 'gated';
+  endedCall: boolean;
 }
 
 export type UpdateChannel = 'stable' | 'beta';

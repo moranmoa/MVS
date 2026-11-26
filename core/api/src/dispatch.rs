@@ -107,6 +107,14 @@ struct ServerDescriptionArgs {
     description: String,
 }
 
+/// G-52 `setAgeRestriction` and `countAgeAffected`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgeRestrictionArgs {
+    server_id: String,
+    age_restriction: AgeRestriction,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditVoiceRoomArgs {
@@ -553,6 +561,14 @@ impl Core {
             "setServerDescription" => {
                 let a: ServerDescriptionArgs = args(raw)?;
                 ok(self.set_server_description(&a.server_id, &a.description))
+            }
+            "setAgeRestriction" => {
+                let a: AgeRestrictionArgs = args(raw)?;
+                ok(self.set_age_restriction(&a.server_id, a.age_restriction))
+            }
+            "countAgeAffected" => {
+                let a: AgeRestrictionArgs = args(raw)?;
+                ok(self.count_age_affected(&a.server_id, a.age_restriction))
             }
             "leaveServer" => ok(self.leave_server(&args::<ServerArg>(raw)?.server_id)),
             "closeServer" => ok(self.close_server(&args::<ServerArg>(raw)?.server_id)),

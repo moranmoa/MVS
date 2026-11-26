@@ -506,6 +506,42 @@ impl VoiceNet for SyncNetwork {
 }
 
 impl Network for SyncNetwork {
+    /// NC-1 (a): the node's counters, a cheap copy (atomics; this runs
+    /// under the core lock, TL on #620), in the file's typed vocabulary.
+    fn net_counters(&self) -> crate::netdiag::RawCounters {
+        use crate::netdiag::{NetPath, NetPurpose, Reachability};
+        use sync::netstats as s;
+        let snap = self.node.net_stats();
+        let paths = snap
+            .paths
+            .into_iter()
+            .map(|(purpose, path, n)| {
+                let purpose = match purpose {
+                    s::NetPurpose::Join => NetPurpose::Join,
+                    s::NetPurpose::Sync => NetPurpose::Sync,
+                    s::NetPurpose::Call => NetPurpose::Call,
+                };
+                let path = match path {
+                    s::NetPath::DirectLan => NetPath::DirectLan,
+                    s::NetPath::DirectHolepunch => NetPath::DirectHolepunch,
+                    s::NetPath::DirectPublic => NetPath::DirectPublic,
+                    s::NetPath::OurRelay => NetPath::OurRelay,
+                    s::NetPath::MemberRelay => NetPath::MemberRelay,
+                    s::NetPath::None => NetPath::None,
+                };
+                (purpose, path, n)
+            })
+            .collect();
+        let reachability = match snap.reachability {
+            s::NetReach::Unknown => Reachability::Unknown,
+            s::NetReach::Public => Reachability::Public,
+            s::NetReach::PortMapped => Reachability::PortMapped,
+            s::NetReach::Nat => Reachability::Nat,
+            s::NetReach::CgnatLikely => Reachability::CgnatLikely,
+        };
+        crate::netdiag::RawCounters { paths, reachability }
+    }
+
     fn link_counts(&self) -> Option<(usize, usize)> {
         let peers = self.runtime.block_on(self.node.peers()).ok()?.len();
         Some((peers, self.direct_peers().len()))

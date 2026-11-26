@@ -399,6 +399,7 @@ enum Command {
     NoDirectDials,
     Quiet,
     NoHolePunch,
+    TestBeaconBound { reply: oneshot::Sender<bool> },
     MemberRelay { on: bool, daily_cap_mb: u32, preferred: bool },
     #[cfg(test)]
     Served { peer: PeerId, log: String, reply: oneshot::Sender<usize> },
@@ -920,6 +921,8 @@ impl Node {
             notice_fetch_of: HashMap::new(),
             notice_signer: None,
             beacon: None,
+            beacon_reader: None,
+            beacon_wanted: false,
             beacon_port: crate::lan_beacon::BEACON_PORT,
             beacons,
             beacon_limits: crate::lan_beacon::BeaconLimits::new(),
@@ -1277,10 +1280,19 @@ impl Node {
     /// ([`crate::LAN_BEACON_PORT`] in the app): co-members on this LAN find
     /// us, and we them, with no relay. It sends and reads only while "LAN
     /// allowed" is on, relay-only is off and a server is open. False if the
-    /// socket can't be had (the node works without it).
+    /// socket can't be had (the node works without it). While relay-only,
+    /// the socket isn't bound at all (QA V3.5), only once it is off.
     pub async fn start_lan_beacon(&self, port: u16) -> Result<bool> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::LanBeacon { port, reply })?;
+        Ok(rx.await?)
+    }
+
+    /// Tests only: whether the LAN beacon's socket is bound now.
+    #[doc(hidden)]
+    pub async fn test_beacon_bound(&self) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::TestBeaconBound { reply })?;
         Ok(rx.await?)
     }
 
@@ -1749,6 +1761,11 @@ struct Task {
     /// the port beacons go to, where read beacons arrive, its caps, when the
     /// next is due, which servers take the slots next, and our TCP port.
     beacon: Option<Arc<tokio::net::UdpSocket>>,
+    /// The beacon's reader task, aborted to free the port.
+    beacon_reader: Option<tokio::task::AbortHandle>,
+    /// The core asked for the beacon (`start_lan_beacon`): bound whenever
+    /// relay-only and quiet allow.
+    beacon_wanted: bool,
     beacon_port: u16,
     beacons: mpsc::Sender<(std::net::IpAddr, Vec<u8>)>,
     beacon_limits: crate::lan_beacon::BeaconLimits,
@@ -2059,6 +2076,9 @@ impl Task {
             Command::NoDirectDials => self.direct_dials = false,
             Command::Quiet => self.go_quiet(),
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
+            Command::TestBeaconBound { reply } => {
+                let _ = reply.send(self.beacon.is_some());
+            }
             Command::MemberRelay { on, daily_cap_mb, preferred } => {
                 // Relay-only users never relay (design §1), whatever the core says.
                 let on = on && !self.relay_only;
@@ -2778,14 +2798,20 @@ impl Task {
     }
 
     /// See [`Node::start_lan_beacon`].
+    /// Relay-only or quiet: wanted, but not bound (QA V3.5: relay-only
+    /// promises no direct listener, so not this UDP socket either). It's
+    /// bound once relay-only is turned off.
     fn start_lan_beacon(&mut self, port: u16) -> bool {
-        if self.beacon.is_some() {
+        self.beacon_wanted = true;
+        self.beacon_port = port;
+        if self.beacon.is_some() || self.relay_only || self.quiet {
             return true;
         }
         match crate::lan_beacon::socket(port) {
             Ok(socket) => {
                 let socket = Arc::new(socket);
-                crate::lan_beacon::spawn_reader(socket.clone(), self.beacons.clone());
+                let reader = crate::lan_beacon::spawn_reader(socket.clone(), self.beacons.clone());
+                self.beacon_reader = Some(reader.abort_handle());
                 self.beacon = Some(socket);
                 self.beacon_port = port;
                 self.beacon_next = Instant::now();
@@ -2800,6 +2826,15 @@ impl Task {
 
     /// The beacon runs only with "LAN allowed", not relay-only, direct dials
     /// on, and some server open (Security Lead §B.6).
+    /// Unbinds the beacon's socket: its reader ends (it holds the socket
+    /// too), so the port is free at once. Still wanted, if it was.
+    fn stop_lan_beacon(&mut self) {
+        if let Some(reader) = self.beacon_reader.take() {
+            reader.abort();
+        }
+        self.beacon = None;
+    }
+
     fn beacon_on(&self) -> bool {
         self.beacon.is_some() && self.allow_lan && !self.relay_only && self.direct_dials && !self.secrets.is_empty()
     }
@@ -2937,6 +2972,8 @@ impl Task {
             // Relay-only users never relay for members (design #368 §1); the
             // core turns it on again, if it should be, once this is off.
             self.swarm.behaviour_mut().member_relay.stop();
+            // Nor a LAN beacon socket (QA V3.5): unbound, not just silent.
+            self.stop_lan_beacon();
             // Nor keeps any member's address (Security Lead).
             self.forget_remembered();
             for id in [self.listener.take(), self.quic_listener.take()].into_iter().flatten() {
@@ -2963,6 +3000,11 @@ impl Task {
             match self.swarm.listen_on(self.listen.clone()) {
                 Ok(id) => self.listener = Some(id),
                 Err(err) => warn!(%err, "listening again failed"),
+            }
+            // The LAN beacon again, if the core asked for it.
+            if self.beacon_wanted && !self.quiet {
+                let port = self.beacon_port;
+                self.start_lan_beacon(port);
             }
         }
         info!(on, "relay only");
@@ -5262,7 +5304,7 @@ impl Task {
         info!("sync: quiet (a required update is pending)");
         self.quiet = true;
         self.swarm.behaviour_mut().member_relay.stop();
-        self.beacon = None;
+        self.stop_lan_beacon();
         self.set_voice_call(None);
         let peers: Vec<PeerId> = self.swarm.connected_peers().copied().filter(|p| !self.is_our_relay(p)).collect();
         for peer in peers {

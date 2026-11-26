@@ -69,7 +69,7 @@ fn a_raise_to_18_sends_minors_away_and_marks_who_is_not_adult() {
         .filter(|m| m.not_adult == Some(true))
         .map(|m| m.id)
         .collect();
-    assert_eq!(marked, [minor_id.clone()]);
+    assert_eq!(marked.as_slice(), std::slice::from_ref(&minor_id));
 
     // The minor's core reads the raise and leaves (B7's age notice).
     minor.events.take();

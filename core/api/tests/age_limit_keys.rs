@@ -125,6 +125,8 @@ fn a_raise_keys_minors_out_and_a_lowering_keys_forward_only() {
 
     // (2) Lowered to 16+: a 17-year-old who joins now reads what is sent
     // after it, nothing from the 18+ time, and never the 18+ channel.
+    // LM-2 (#619) re-seals members' recent messages for a joiner: never
+    // one from before the lowering for a joiner who isn't an adult.
     owner.core.set_age_restriction(&server.id, AgeRestriction::Sixteen).unwrap();
     let (teen, teen_cipher, teen_key) = person(&world, "Teen", MINOR);
     teen.core.join_server(&server.invite_link).unwrap();

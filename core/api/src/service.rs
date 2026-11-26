@@ -5106,10 +5106,35 @@ impl Inner {
                     touched.insert(of);
                 }
             }
+            // G-52 (forward-only lowering): for a joiner who isn't an adult,
+            // in a server that was ever 18+, only messages written after the
+            // latest lowering, so their deps reach it; nothing from the 18+
+            // time is ever re-sealed to them.
+            let ever_adult = log.genesis_min >= 18 || view.state.age_raise.is_some();
+            let lowered_at = if ever_adult && !view.state.adults.contains(&joiner) {
+                let lowerings: Vec<RecordId> = log
+                    .records
+                    .iter()
+                    .filter(|r| view.state.accepted.contains(&r.id()))
+                    .filter(|r| matches!(Action::from_record(r), Some(Action::ServerAgeLimit { min }) if min < 18))
+                    .map(|r| r.id())
+                    .collect();
+                // The owner signs them in a chain: the latest reaches the rest.
+                let latest = lowerings.iter().find(|l| lowerings.iter().all(|o| o == *l || log.resolver.reaches(*o, &[**l])));
+                Some(latest.copied())
+            } else {
+                None
+            };
+            let after_lowering = |r: &Record| match lowered_at {
+                None => true,
+                Some(Some(lowering)) => log.resolver.reaches(lowering, r.auth_deps()),
+                Some(None) => false,
+            };
             let mut by_channel: BTreeMap<ChannelId, Vec<(RecordId, u64)>> = BTreeMap::new();
             for r in &log.channel {
                 let Scope::Channel(channel) = r.scope() else { continue };
                 let fits = r.kind() == Kind::Message
+                    && after_lowering(r)
                     && r.author() == me
                     && r.ts() >= join_ts.saturating_sub(RESEAL_BEFORE_JOIN_MS)
                     && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS

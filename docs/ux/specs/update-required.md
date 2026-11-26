@@ -50,12 +50,14 @@ Everything main refuses with `update-required` is disabled in the UI, not hidden
 - **The composer** shows the same text as its placeholder, and it can't be typed in.
 - **Still available:** reading, scrolling, search, copying text, local settings (theme, language, notifications), the app lock, and diagnostics.
 
-## 4. During a call (SL: at most 30 minutes)
+## 4. During a call: it ends at once (TL decision, PO confirmed)
 
-- The call goes on, and only its own media keeps flowing. RU1 applies at once.
-- **The call bar** shows a one-line notice: `update.required.inCall` "צריך לעדכן את MVS. העדכון ייכנס לתוקף כשהשיחה תסתיים." / "An update is required. It applies when the call ends."
-- **After 25 minutes:** `update.required.inCallSoon` "צריך לעדכן את MVS. השיחה תסתיים בעוד 5 דקות." / "An update is required. The call ends in 5 minutes." It's announced once (`role="status"`).
-- **At 30 minutes** the call ends, and the banner (§1) applies. The end-of-call toast says why: `update.required.callEnded` "השיחה הסתיימה כי צריך לעדכן את MVS." / "The call ended because MVS needs an update."
+A required update ends a call **immediately**. The core has already stopped (RU1), so there's no grace period and no countdown. `update.required.inCall` and `update.required.inCallSoon` are removed.
+
+- The call ends, and the banner (§1) applies at once.
+- **A toast says why** (`role="alert"`, shown for 8 s):
+  - `update.required.callEnded`: "השיחה הסתיימה כי צריך לעדכן את MVS. אחרי העדכון אפשר להצטרף שוב." / "Your call ended because MVS needs an update. You can rejoin after updating."
+- Other people in the call see the person leave as usual, with no special message.
 - New calls can't start (§3).
 
 ## 5. Lock and start
@@ -75,8 +77,8 @@ Everything main refuses with `update-required` is disabled in the UI, not hidden
 1. With `updateRequired` set, the app shows its content read-only, with the banner. There's no close and no "later".
 2. Sending, reacting, joining, calls and signing settings are disabled, with the reason on hover and focus. Reading, search and local settings still work.
 3. Downloading leads to ready, and "Update" restarts into the new version. Offline, check-clock, not-available and failed each show their line and buttons.
-4. In a call: the call-bar notice shows, then "…in 5 minutes" at 25 minutes. At 30 minutes the call ends, with its toast.
+4. In a call: when the requirement arrives, the call ends at once, with the `update.required.callEnded` toast, and the banner shows.
 5. When locked, the lock screen comes first, and the banner shows only after unlock.
 6. Reloading the page keeps the read-only state.
 
-**Screenshots:** 560 `560-update-required-downloading-he`, 561 `561-update-required-ready-he`, 562 `562-update-required-offline-en-dark`, 563 `563-update-required-not-available-he`, 564 `564-update-required-in-call-soon-he`, 565 `565-update-required-composer-disabled-he`.
+**Screenshots:** 560 `560-update-required-downloading-he`, 561 `561-update-required-ready-he`, 562 `562-update-required-offline-en-dark`, 563 `563-update-required-not-available-he`, 564 `564-update-required-call-ended-he` (the toast over the banner), 565 `565-update-required-composer-disabled-he`.

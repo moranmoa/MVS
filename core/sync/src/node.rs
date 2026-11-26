@@ -442,6 +442,12 @@ impl Command {
     /// local-only changes; never anything that signs, sends, dials or
     /// subscribes. Everything else is dropped, so its caller fails.
     fn quiet_ok(&self) -> bool {
+        // A test-only variant: naming it unconditionally inside `matches!`
+        // breaks every build without `test-util` (release, desktop).
+        #[cfg(any(test, feature = "test-util"))]
+        if matches!(self, Command::MemberRelayCounts { .. }) {
+            return true;
+        }
         matches!(
             self,
             Command::Heads { .. }
@@ -450,7 +456,6 @@ impl Command {
                 | Command::Peers { .. }
                 | Command::DirectPeers { .. }
                 | Command::ListenAddrs { .. }
-                | Command::MemberRelayCounts { .. }
                 | Command::Prune { .. }
                 | Command::DropInvite { .. }
                 | Command::DropServerInvites { .. }

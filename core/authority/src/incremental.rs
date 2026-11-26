@@ -460,7 +460,9 @@ impl Resolver {
             // G-52: an 18+ limit counts only from an adult owner, and a later
             // age claim can land before it in linear order: re-resolve both.
             Action::ServerAgeLimit { .. } => return Err(Fallback::Other),
-            Action::AgeClaim { .. } if self.age_limit_seen => return Err(Fallback::Other),
+            Action::AgeClaim { .. } if self.age_limit_seen && self.state.owner == Some(author) => {
+                return Err(Fallback::Other)
+            }
             Action::AgeClaim { .. } => {
                 // Changes no roles; whether it counts depends on the author's
                 // membership, which must be the same in every pass.
@@ -961,7 +963,9 @@ impl Resolver {
                 // G-52: whether an age limit counts depends on the owner's age
                 // claims at its position: re-resolve.
                 Action::ServerAgeLimit { .. } => return Err(Fallback::Other),
-                Action::AgeClaim { .. } if self.age_limit_seen => return Err(Fallback::Other),
+                Action::AgeClaim { .. } if self.age_limit_seen && self.state.owner == Some(author) => {
+                    return Err(Fallback::Other)
+                }
                 Action::AgeClaim { .. } => {
                     if now {
                         self.state.accepted.insert(id);
@@ -1112,6 +1116,12 @@ impl Resolver {
     /// per record.
     pub fn adult_at(&self, actor: Actor, auth_deps: &[RecordId]) -> Result<bool, Vec<RecordId>> {
         let at = self.position_after(auth_deps)?;
+        Ok(self.adult_before(actor, at))
+    }
+
+    /// Whether `actor`'s latest accepted age claim before position `at` in
+    /// linear order says adult.
+    fn adult_before(&self, actor: Actor, at: usize) -> bool {
         let latest = self.touch.get(&actor).into_iter().flatten().rev().find_map(|id| {
             let before = self.pos.get(id).is_some_and(|pos| *pos < at);
             if !before || self.known[id].author() != actor || !self.state.accepted.contains(id) {
@@ -1122,7 +1132,7 @@ impl Resolver {
                 _ => None,
             }
         });
-        Ok(latest == Some(true))
+        latest == Some(true)
     }
 
     /// B7-k, query only (no state changes): whether the control record
@@ -1244,18 +1254,7 @@ impl View for AtPosition<'_> {
 
     /// The actor's latest accepted age claim before this position.
     fn is_adult(&self, actor: Actor) -> bool {
-        let r = self.resolver;
-        let latest = r.touch.get(&actor).into_iter().flatten().rev().find_map(|id| {
-            let before = r.pos.get(id).is_some_and(|pos| *pos < self.at);
-            if !before || r.known[id].author() != actor || !r.state.accepted.contains(id) {
-                return None;
-            }
-            match r.actions[id] {
-                Some(Action::AgeClaim { adult }) => Some(adult),
-                _ => None,
-            }
-        });
-        latest == Some(true)
+        self.resolver.adult_before(actor, self.at)
     }
 
     fn owner(&self) -> Option<Actor> {

@@ -482,3 +482,21 @@ describe('G-48 (TL on #531): admins, the notification click, no-recipient, ids',
     expect(cleanReportSummary({ ...summary(), id: 'a'.repeat(64) } as never)?.id).toBe('a'.repeat(64));
   });
 });
+
+describe('G-48 (UX on #605): deleting the reported message asks first', () => {
+  it('"Delete the message" opens a confirmation; only its button deletes', async () => {
+    let del: ReturnType<typeof vi.fn> | undefined;
+    await setup((core) => {
+      vi.spyOn(core, 'listReports').mockResolvedValue([summary({ reason: 'spam' })]);
+      del = vi.fn(async () => {});
+      core.deleteMessage = del as never;
+    });
+    const panel = await openReports();
+    const item = await within(panel).findByRole('listitem');
+    await click(within(item).getByRole('button', { name: 'Delete the message' }));
+    expect(del).not.toHaveBeenCalled();
+    const confirm = within(item).getByRole('alertdialog', { name: 'Delete the message' });
+    await click(within(confirm).getByRole('button', { name: 'Delete the message' }));
+    expect(del).toHaveBeenCalledWith('c-general#5');
+  });
+});

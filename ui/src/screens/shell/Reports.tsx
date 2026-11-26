@@ -75,6 +75,8 @@ function ReportItem({ report: r, server, onChanged }: { report: ReportSummary; s
   const [evidence, setEvidence] = useState<Evidence | null>(null);
   const [kick, setKick] = useState<Member | null>(null);
   const [deleted, setDeleted] = useState(false);
+  // UX on #605: deleting the message asks first, like removing a member.
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const fetchEvidence = async () => {
     if (r.evidenceWithheld) return setEvidence({ state: 'withheld' });
@@ -99,28 +101,14 @@ function ReportItem({ report: r, server, onChanged }: { report: ReportSummary; s
 
   const deleteMessage =
     r.target.kind === 'message' && !deleted ? (
-      <button
-        key="delete"
-        type="button"
-        className="danger small"
-        onClick={async () => {
-          if (r.target.kind !== 'message') return;
-          try {
-            await core.deleteMessage(r.target.messageId);
-            setDeleted(true);
-            store.showFlash('reports.deleted');
-          } catch {
-            store.showFlash('error.generic');
-          }
-        }}
-      >
+      <button key="delete" type="button" className="secondary small danger-outline" onClick={() => setConfirmDelete(true)}>
         <FormattedMessage id="reports.deleteMessage" />
       </button>
     ) : null;
   const reportedMember = byId.get(r.reportedId);
   const kickButton =
     reportedMember && !reportedMember.isOwner ? (
-      <button key="kick" type="button" className="danger small" onClick={() => setKick(reportedMember)}>
+      <button key="kick" type="button" className="secondary small danger-outline" onClick={() => setKick(reportedMember)}>
         <FormattedMessage id="profile.kick" />
       </button>
     ) : null;
@@ -220,6 +208,36 @@ function ReportItem({ report: r, server, onChanged }: { report: ReportSummary; s
           </button>
         )}
       </div>
+      {confirmDelete && r.target.kind === 'message' && (
+        <div className="confirm" role="alertdialog" aria-label={intl.formatMessage({ id: 'reports.deleteMessage' })}>
+          <p>
+            <FormattedMessage id="chat.deleteConfirm" />
+          </p>
+          <div className="actions">
+            <button
+              type="button"
+              className="danger small"
+              autoFocus
+              onClick={async () => {
+                setConfirmDelete(false);
+                if (r.target.kind !== 'message') return;
+                try {
+                  await core.deleteMessage(r.target.messageId);
+                  setDeleted(true);
+                  store.showFlash('reports.deleted');
+                } catch {
+                  store.showFlash('error.generic');
+                }
+              }}
+            >
+              <FormattedMessage id="reports.deleteMessage" />
+            </button>
+            <button type="button" className="secondary small" onClick={() => setConfirmDelete(false)}>
+              <FormattedMessage id="common.cancel" />
+            </button>
+          </div>
+        </div>
+      )}
       {kick && <ProfileCard member={kick} server={server} isMe={false} startKick onClose={() => setKick(null)} />}
     </li>
   );
@@ -241,8 +259,8 @@ export function ReportFlagIcon() {
       focusable="false"
       className="icon"
     >
-      <path d="M5 21V4" />
-      <path d="M5 4h11l-2 4 2 4H5" />
+      <path d="M6 21V3" />
+      <path d="M6 4h12l-3 4.5 3 4.5H6z" fill="currentColor" />
     </svg>
   );
 }

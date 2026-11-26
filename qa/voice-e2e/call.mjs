@@ -129,16 +129,29 @@ page.on('pageerror', (e) => log('pageerror:', e.message));
 await page.waitForFunction(() => typeof window.mvs?.invoke === 'function');
 // G-78 (#513): the shell gates every command until the core says whether the
 // app lock is on (pending), and a fresh profile has it off. Wait for that.
-await page.waitForFunction(
-  async () => {
-    const s = await window.mvs.lock?.state?.().catch(() => null);
-    return !window.mvs.lock || (s && !s.pending && !s.locked);
-  },
-  null,
-  { timeout: 30_000, polling: 250 },
-);
+{
+  // An explicit loop: waitForFunction with an async predicate isn't awaited.
+  // A fresh profile has no lock, but the shell fails closed (lock screen) if
+  // the core hasn't answered getAppLock in time, and asks again once the core
+  // is up. Log every state change, so a late open and a stuck lock differ.
+  const start = Date.now();
+  const end = start + 120_000;
+  let s = null;
+  let last = '';
+  for (;;) {
+    s = await page.evaluate(() => (window.mvs.lock?.state ? window.mvs.lock.state() : { none: true })).catch((e) => ({ error: e.message }));
+    const now = JSON.stringify(s);
+    if (now !== last) console.log(`[${ROLE}] app lock +${((Date.now() - start) / 1000).toFixed(1)} s: ${now}`);
+    last = now;
+    if (s?.none || (s && !s.error && !s.pending && !s.locked)) break;
+    if (Date.now() > end) throw new Error(`the app lock never opened in 120 s: ${now}`);
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
 // Main may reload the page once the lock is decided: wait for it again.
 await page.waitForFunction(() => typeof window.mvs?.invoke === 'function');
+// Diagnostic (QA, 2026-11-26): which core events reach the page after the lock opens.
+await page.evaluate(() => { window.__ev = []; window.mvs.onEvent?.((name) => window.__ev.push(`${Math.round(performance.now() / 1000)}s ${name}`)); });
 
 async function invoke(cmd, ...args) {
   const res = await page.evaluate(([c, a]) => window.mvs.invoke(c, a), [cmd, args]);
@@ -430,6 +443,7 @@ async function mediaProbe(names = Object.keys(PROBES)) {
 
 let ok = true;
 let serverId;
+let memberId; // the owner learns B's id from the rendezvous, for MR.1
 try {
   scenario: {
   log('setting up the account');
@@ -449,7 +463,7 @@ try {
     serverId = server.id;
     put('invite', { link: server.inviteLink, ...(MODE === 'restore' ? { words } : {}) });
     log('server created, invite handed over');
-    await take('joined');
+    memberId = (await take('joined')).id;
   } else {
     const { link, words: ownerWords } = await take('invite');
     if (MODE === 'restore') {
@@ -465,7 +479,7 @@ try {
     });
     if (!ok1) throw new Error('join failed');
     serverId = (await invoke('listServers')).find((s) => s.name === SERVER).id;
-    put('joined');
+    put('joined', { id: (await invoke('getIdentity')).id });
   }
   if (JOIN_ONLY) break scenario;
 
@@ -473,9 +487,28 @@ try {
   // is there; it has to be answered before anything else can be clicked.
   if (ROLE === 'a') {
     await check('MR.1', 'the owner sees the "Relay for your members" disclosure; OK closes it and relaying stays on', async () => {
+      // The disclosure comes once the OWNER's core has the member, which can
+      // be well after B sees the server: wait for that first, then for it.
+      const t0 = Date.now();
+      await until('the member in the owner\'s list', async () => (await invoke('listMembers', serverId)).some((m) => m.id === memberId), 120_000, 1000);
+      const seenAfter = ((Date.now() - t0) / 1000).toFixed(1);
+      // The UI opens it when the core says relaying is (or would be) on:
+      // effective, or `role` (an owner with members), set on the core's tick.
+      const due = await until('the core reports member relaying due', async () => {
+        const r = await invoke('getMemberRelay');
+        return r && (r.effective || r.role) ? r : null;
+      }, 120_000, 1000);
+      const dueAfter = ((Date.now() - t0) / 1000).toFixed(1);
+      log(`the owner had the member ${seenAfter} s, and relaying was due ${dueAfter} s, after B's "joined" (${JSON.stringify(due)})`);
+      log(`events the page got so far: ${JSON.stringify(await page.evaluate(() => (window.__ev ?? []).slice(-40)))}`);
       const dlg = page.locator('dialog.member-relay-disclosure');
-      await dlg.waitFor({ state: 'visible', timeout: 30_000 });
-      await dlg.getByRole('button', { name: /^(OK|אישור)$/ }).click();
+      // Diagnostic (QA, 2026-11-26): how long after "due" the UI shows it.
+      const tDue = Date.now();
+      await dlg.waitFor({ state: 'visible', timeout: 120_000 });
+      const lag = (Date.now() - tDue) / 1000;
+      log(`the disclosure showed ${lag.toFixed(1)} s after the core said relaying was due`);
+      if (lag > 15) throw new Error(`the disclosure showed ${lag.toFixed(1)} s after the core said relaying was due (UI lag)`);
+      await dlg.getByRole('button', { name: /^(OK|הבנתי|אישור)$/ }).click();
       await dlg.waitFor({ state: 'hidden', timeout: 10_000 });
       const mr = await invoke('getMemberRelay').catch(() => null);
       if (mr && (!mr.disclosureSeen || !mr.effective)) throw new Error(JSON.stringify(mr));

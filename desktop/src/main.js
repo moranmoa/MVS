@@ -23,6 +23,7 @@ const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, ab
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
+const required = require('./required');
 const { createNotifier } = require('./notify');
 const ptt = require('./ptt');
 const badge = require('./badge');
@@ -111,7 +112,38 @@ const globalMute = ptt.createGlobalMute({
 });
 
 /** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
+/**
+ * Required updates (#577, required.js): once the core says the running
+ * version is revoked, the page may only read local data and update. It waits
+ * for a call to end, for at most 30 min (then main ends the call).
+ */
+const requiredGate = required.createRequiredGate({
+  inCall: () => callGate.inCall,
+  endCall: () => {
+    callGate.end();
+    syncCall();
+    core?.request('leaveCall', {}).catch(() => {});
+  },
+  onChange: (st) => toPages('update.gate', st),
+});
+
+/** The page's Retry (update:check): main asks the core, rate-limited. */
+const updateCheck = required.createCheckThrottle({
+  run: () => (core ? core.request('checkForUpdate', {}) : Promise.resolve({ error: { code: 'core-unavailable' } })),
+});
+
+/** Asks the core whether this version must update (at every core start). */
+function checkRequired() {
+  if (!core) return;
+  Promise.resolve(core.request('getAppInfo', {}))
+    .then((res) => {
+      if (res && res.ok && res.ok.updateRequired) requiredGate.set(res.ok.updateRequired);
+    })
+    .catch(() => {});
+}
+
 function syncCall() {
+  requiredGate.callChanged();
   if (!callGate.inCall) appLock.callEnded();
   if (!callGate.inCall || !lockOpen()) pushToTalk.reset();
   globalMute.sync();
@@ -232,6 +264,8 @@ function setCoreStatus(status) {
   if (status.state === 'up') appLock.coreUp().catch(() => {});
   // The core keeps the metered flag in memory: tell every core that comes up.
   if (status.state === 'up') sendMetered();
+  // Required updates (#577): a revoked version may only read and update.
+  if (status.state === 'up') checkRequired();
 }
 
 /** Member relays, slice 3a: the metered-connection watch (metered.js). */
@@ -290,6 +324,7 @@ function startCore() {
         voiceFrames.fromCore(payload);
         return;
       }
+      if (name === 'update.required') requiredGate.set(payload);
       callGate.onEvent(name, payload);
       syncCall();
       if (appLock.forwards(name)) toPages(name, payload);
@@ -312,6 +347,8 @@ function serveCoreIpc() {
     if (req.error) return { error: { code: req.error } };
     // G-78: while locked, only what the lock screen (and a call behind it) needs.
     if (!appLock.allows(req.cmd, req.args)) return { error: { code: 'locked' } };
+    // A required update: local read-only plus update (#577).
+    if (!requiredGate.allows(req.cmd)) return { error: { code: 'update-required' } };
     if (!core) return { error: { code: 'core-unavailable', detail: 'missing' } };
     // "Restart to update": the core's applyUpdate (refused during a call),
     // then a relaunch through the launcher, which starts the staged version.
@@ -426,6 +463,11 @@ function serveCoreIpc() {
   // G-78: the lock screen's three calls. The passcode or words go straight
   // to the core (applock.js shapes them); nothing here logs them.
   ipcMain.handle('lock:state', (event) => (fromUs(event) ? lockPayload() : null));
+  // Required updates (#577): the gate's state, for a page that asks (TL).
+  ipcMain.handle('update:gate', (event) => (fromUs(event) ? requiredGate.state : null));
+  // The banner's Retry: main runs the core's update check itself (checkForUpdate
+  // stays main/core only, B8 A2), at most once every 30 s; only a code goes back.
+  ipcMain.handle('update:check', (event) => (fromUs(event) ? updateCheck() : 'invalid'));
   ipcMain.handle('lock:unlock', async (event, input) => {
     if (!fromUs(event)) return 'invalid';
     return appLock.unlock(input);
@@ -732,6 +774,9 @@ function createWindow() {
     flushLink();
     // The page may have missed earlier changes; the preload keeps this for the UI.
     if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('core:event', 'core.status', statusForPage(coreStatus));
+    // Required updates (#577, TL): every load (cold start, reload, the lock's
+    // reload) gets the gate's state, so the banner never goes missing.
+    if (sec.isInternalUrl(win.webContents.getURL()) && requiredGate.state.required) win.webContents.send('core:event', 'update.gate', requiredGate.state);
     // Commit this version once the UI is up and the core answers (main only, once).
     if (!healthReported) {
       healthReported = true;

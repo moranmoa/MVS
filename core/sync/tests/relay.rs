@@ -12,6 +12,7 @@ use libp2p::{
     PeerId, StreamProtocol, SwarmBuilder,
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
+use sync::netstats::{NetPath, NetPurpose};
 use sync::{
     log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ReportError, ServerSecret, TypingError,
     VoiceCall, VoiceError, VoiceFrame, VoicePath,
@@ -231,6 +232,12 @@ async fn a_peer_coming_online_catches_up_within_30_s_of_its_reservation() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     eprintln!("caught up 50 messages {:?} after the reservation", reserved.elapsed());
+    // NC-1: B's pulls were answered over our relay's circuit, and counted.
+    let stats = b.net_stats();
+    assert!(
+        stats.paths.iter().any(|(p, path, n)| *p == NetPurpose::Sync && *path == NetPath::OurRelay && *n > 0),
+        "{stats:?}"
+    );
     assert_eq!(b.state(&log).await.unwrap().hash, a.state(&log).await.unwrap().hash);
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -838,6 +845,10 @@ async fn call_participants_exchange_voice_frames_relayed_and_on_a_lan() {
         let (_, paths) = voice_media(&mut ea, Duration::from_millis(200)).await;
         let want = if lan { VoicePath::Lan } else { VoicePath::Circuit };
         assert_eq!(paths.last(), Some(&want), "paths reported: {paths:?}");
+        // NC-1: the call's media path is counted.
+        let counted = if lan { NetPath::DirectLan } else { NetPath::OurRelay };
+        let stats = a.net_stats();
+        assert!(stats.paths.iter().any(|(p, path, _)| *p == NetPurpose::Call && *path == counted), "{stats:?}");
         if !lan {
             assert!(a.direct_peers().await.unwrap().is_empty(), "the relayed run went direct");
         }

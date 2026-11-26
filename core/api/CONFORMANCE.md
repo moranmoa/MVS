@@ -415,11 +415,24 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - They also go to my own identity, which reaches only my other computers (same recovery words). A hello or bye signed by me counts only when sync bound its sender to me and it has no `to`. It marks me "in a call elsewhere" until its bye or 30 s without a hello, and never appears in a roster. My own envelopes echoed back are replays.
     - A full call's refusal counts only if it comes from someone already in that call, within 10 s of joining.
   - `applyUpdate` answers `not-allowed` during a call.
+  - Voice media over libp2p (G-81 2a part c, #509 §2.3). The core carries Opus frames to the call's peers that the UI has no LAN WebRTC connection with:
+    - `CallState.callId`: 32 lower-case hex. It's random for each call I join, present only while I'm in one, and new on every join.
+    - `CallParticipant.path`: `'lan' | 'direct' | 'circuit' | 'member-circuit' | 'none'`, how my frames reach that participant now, as the node reports it. It's absent until the node reports one, and a change is a `call.state`. It's a display hint; the node picks routes, never the UI.
+    - `setCallWebrtcPeers({ identities: string[] })` returns `null`. It names the participants the UI has a live LAN WebRTC connection with, and the core sends frames to every other participant. The UI can only exclude peers, never add targets.
+      - At most 5 identities; more, or a malformed ID, is `bad-request`.
+      - It resets on every new call. A change is a `call.state`.
+    - `voiceFrame` is a sidecar line `{"cmd":"voiceFrame","args":{"callId","seq","ts","data"}}`. It has no `id` and never gets a reply, even with an `id`.
+      - The sidecar's reader routes it on an exact `cmd` match only (`VoiceFrame` or `voiceFrame ` are ordinary commands, so they get `bad-request`). It never waits for a command, and replies to commands keep their order.
+      - Strict: exactly those four fields. `callId` is 32 lower-case hex, `seq` and `ts` are u32, and `data` is standard base64 of at most 400 bytes (empty means a DTX gap); the length is checked before decoding.
+      - It's sent only while I'm in the call with that `callId`, the keys aren't locked and I'm not signed out. Anything else is dropped silently, counted, and never logged.
+      - The gate closes synchronously on leave, lock, a relay-only switch and sign-out, before the node is told. So a frame that overtakes `leaveCall`, or comes after it, sends nothing.
+    - `voice.frame { callId, from, seq, ts, data }`: a frame from a participant of my current call (`data` as above). Frames of any other call are dropped.
+    - `mvs-core --voice-p2p` (no value; the shell's `voiceP2p` flag): while relay-only is on, `createVoiceRoom` and `joinCall` work, and switching relay-only on doesn't end my call. Media then runs over our relay circuits only, never direct or through a member relay. Without the flag, relay-only refuses calls as below.
 - Relay-only (GAP-6r), per device:
   - `setRelayOnly(on: boolean)` returns `null`. It's stored in the core database and needs no identity. On:
     - the network keeps no direct listener, makes no direct dials, and reaches peers only through relay circuits, and direct connections already open are closed (#274);
     - my call ends at once (a bye to the others, then a `call.state` with `participants: []` and `relayOnly: true`);
-    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off.
+    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off (not with `--voice-p2p`, above).
   - At start, `mvs-core` reads the stored value before the network starts, and the node starts relay-only from the first moment (`NodeConfig.relay_only`: no direct listener, no bootstrap dial, no punching). It fails closed: a database that can't be opened or read, or a value other than off, means on.
   - Shown up front:
     - `AppInfo.relayOnly` from `getAppInfo`;

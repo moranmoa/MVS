@@ -37,11 +37,11 @@ export interface VoiceCore {
 export function fromCoreApi(api: CoreApi): VoiceCore {
   // Not in CoreApi yet (G-81 step 4); bound only when the core has it.
   const turn = (api as Partial<{ getTurnCredentials(): Promise<unknown> }>).getTurnCredentials;
-  // G-81 B, dev-sync 2a: bound only when the core has it.
-  const webrtcPeers = (api as Partial<{ setCallWebrtcPeers(args: { identities: Id[] }): Promise<unknown> }>).setCallWebrtcPeers;
+  // G-81 B (#556): optional on older cores and test doubles.
+  const webrtcPeers = (api as Partial<Pick<CoreApi, 'setCallWebrtcPeers'>>).setCallWebrtcPeers;
   return {
     ...(typeof turn === 'function' ? { getTurnCredentials: () => turn.call(api) } : {}),
-    ...(typeof webrtcPeers === 'function' ? { setCallWebrtcPeers: (identities: Id[]) => webrtcPeers.call(api, { identities }) } : {}),
+    ...(typeof webrtcPeers === 'function' ? { setCallWebrtcPeers: (identities: Id[]) => webrtcPeers.call(api, identities) } : {}),
     joinCall: (channelId) => api.joinCall(channelId),
     leaveCall: () => api.leaveCall(),
     setMuted: (muted) => api.setMuted(muted),

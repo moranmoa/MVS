@@ -72,7 +72,7 @@ const CHECK_EVERY_MS = 30_000;
  * While a required update waits for a call to end (TL): only the call's own
  * commands pass, besides reads and the update. No sends, joins or kicks.
  */
-const CALL = Object.freeze(new Set(['setMuted', 'setDeafened', 'sendSignal', 'leaveCall']));
+const CALL = Object.freeze(new Set(['setMuted', 'setDeafened', 'sendSignal', 'setCallWebrtcPeers', 'leaveCall']));
 
 /**
  * Everything else: writes, signed actions and the network. Listed so the
@@ -115,6 +115,7 @@ const NOT_READ_ONLY = Object.freeze(
     'setMuted',
     'setDeafened',
     'sendSignal',
+    'setCallWebrtcPeers',
     'setMemberRelay',
     'setMemberRelayCap',
     // G-48: a report is a signed record.

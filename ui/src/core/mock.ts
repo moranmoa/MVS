@@ -1681,6 +1681,14 @@ export class MockCore implements CoreApi {
     return null;
   }
 
+  /** G-81 B (#556): the LAN-WebRTC participants; kept so tests can read it. At most 5, or bad-request. */
+  webrtcPeers: Id[] = [];
+  async setCallWebrtcPeers(identities: Id[]): Promise<null> {
+    if (!Array.isArray(identities) || identities.length > 5) throw err({ code: 'bad-request' });
+    this.webrtcPeers = [...identities];
+    return null;
+  }
+
   async kickMember(serverId: Id, userId: Id): Promise<void> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });

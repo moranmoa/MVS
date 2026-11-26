@@ -294,6 +294,7 @@ struct MutedArg {
 
 /// G-81 `setCallWebrtcPeers`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WebrtcPeersArg {
     identities: Vec<String>,
 }

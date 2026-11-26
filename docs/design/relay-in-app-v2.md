@@ -1,6 +1,6 @@
 # Design note: relay-in-app v2 (owner input, 2026-11-26)
 
-Status: proposal by the Tech Lead; the Security Lead decides the privacy points (marked **SL**). It builds on `relay-in-app.md` (R1–R5), `member-relays.md` (RR-R1) and the UX spec `docs/ux/specs/relay-in-app.md` (port mapping PM1–PM11).
+Status: Tech Lead proposal; Security Lead decisions folded in (#639). It builds on `relay-in-app.md` (R1–R5), `member-relays.md` (RR-R1) and the UX spec `docs/ux/specs/relay-in-app.md` (port mapping PM1–PM11).
 
 ## Where main stands today
 - **Our relays come first.** Every app reserves a circuit on our relays (by domain name, from the build-time config) and is reached by peer ID through them.
@@ -25,7 +25,11 @@ The app asks the home router (UPnP-IGD, NAT-PMP, PCP) for one port, so a home co
 - Never on minors' or relay-only devices, nor on battery or metered connections (paused).
 - The mapping is removed when relaying stops or the app quits, and is renewed with a short lease (PM conditions).
 
-**SL decides** whether "On" may imply the mapping or must stay a separate switch (PM1 today says a separate switch, off by default).
+**Decided (SL on #639):**
+- "On" may imply the mapping **only if the disclosure line is shown at that moment**.
+- People who already chose "On" get a **one-time prompt** after the upgrade, and nothing is mapped silently on upgrade.
+- The port is gated exactly like the relay (minor, relay-only, battery, metered, global off).
+- PM1–PM11 otherwise stand.
 
 ## 2. Relays in invite links (owner request: 1–5 relays)
 **Goal:** a joiner can reach the server even when our relays are down, and without DHT luck. Today a joiner finds an invite holder only if the DHT walk happens to connect it to a member.
@@ -44,8 +48,15 @@ The app asks the home router (UPnP-IGD, NAT-PMP, PCP) for one port, so a home co
 - The link carries **at most 3** hints. Five would make a link too long to share easily, and 3 are enough with expiry.
 - Each hint is IPv4 or IPv6:port plus 16 bytes of the relay's peer ID. The noise handshake checks the full ID, so a wrong hint fails closed.
 - **Only links that carry hints expire after 7 days.** An old link still works through our relays (B) after its hints go stale.
-- An owner or admin can create a link without hints (a toggle when creating the invite). **SL decides** whether that's the default for 18+ servers.
-- **Needs:** link format v2 (a new version byte; older apps show "update needed", as today), and the hint source from R1c.
+- **Decided (SL on #639):**
+  - **A relay needs its own opt-in** to appear in invite links ("may appear in invite links"). It's **off by default** and not implied by "On".
+  - **18+ servers:** links are hint-less by default, and creators can't add hints unless the owner allows it.
+  - **Other servers:** the creator's hint toggle is off by default, with a one-line note.
+  - At most 3 hints, R1-proven relays only, a 16-byte ID prefix, and a 7-day expiry.
+- **Needs:**
+  - link format v2: a new version byte, and older apps show "update needed" as today;
+  - **a parser fuzz test for link v2** (SL);
+  - the hint source from R1c.
 
 ## 3. The owner's model: can it work? Yes, mostly as a re-ordering of what's planned
 | Owner's step | Today | What's missing | Where it lands |

@@ -6337,3 +6337,23 @@ fn an_untrusted_message_is_a_placeholder_without_its_author() {
     let ch = listed.iter().find(|c| c.id == channel).unwrap();
     assert_eq!(ch.unread_count, Some(0), "{ch:?}");
 }
+
+/// NC-1 (b): the diagnostics file's network block and rounded fields, as
+/// testers would attach it to a public issue.
+#[test]
+fn diagnostics_carry_only_counts_and_rounded_fields() {
+    let world = World::new();
+    let peer = world.peer();
+    let me = sign_up(&peer, "Tester");
+    let report = peer.core.export_diagnostics().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(v["exportedAtMs"].as_u64().unwrap() % 60_000, 0, "to the minute");
+    assert_eq!(v["storageBytes"].as_u64().unwrap() % (1024 * 1024), 0, "to the MiB");
+    assert_eq!(v["network"]["reachability"], "unknown", "nothing reported yet");
+    for purpose in api::netdiag::PURPOSES {
+        for path in api::netdiag::PATHS {
+            assert_eq!(v["network"]["connections"][purpose][path], 0);
+        }
+    }
+    assert!(!report.contains(&me.id) && !report.contains(&me.short_code) && !report.contains("Tester"), "{report}");
+}

@@ -127,6 +127,18 @@ page.on('console', (m) => {
 });
 page.on('pageerror', (e) => log('pageerror:', e.message));
 await page.waitForFunction(() => typeof window.mvs?.invoke === 'function');
+// G-78 (#513): the shell gates every command until the core says whether the
+// app lock is on (pending), and a fresh profile has it off. Wait for that.
+await page.waitForFunction(
+  async () => {
+    const s = await window.mvs.lock?.state?.().catch(() => null);
+    return !window.mvs.lock || (s && !s.pending && !s.locked);
+  },
+  null,
+  { timeout: 30_000, polling: 250 },
+);
+// Main may reload the page once the lock is decided: wait for it again.
+await page.waitForFunction(() => typeof window.mvs?.invoke === 'function');
 
 async function invoke(cmd, ...args) {
   const res = await page.evaluate(([c, a]) => window.mvs.invoke(c, a), [cmd, args]);

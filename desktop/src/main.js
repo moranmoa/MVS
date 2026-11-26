@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor, voiceP2pArgs } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -114,8 +114,10 @@ const globalMute = ptt.createGlobalMute({
 /** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
 /**
  * Required updates (#577, required.js): once the core says the running
- * version is revoked, the page may only read local data and update. It waits
- * for a call to end, for at most 30 min (then main ends the call).
+ * version is revoked, the page may only read local data and update. A call in
+ * progress ends at once (TL; the core's RU1 has already stopped its voice):
+ * a normal leave for the others, no reload (drafts stay), and update.gate
+ * carries endedCall for the banner (update.required.callEnded).
  */
 const requiredGate = required.createRequiredGate({
   inCall: () => callGate.inCall,
@@ -246,7 +248,7 @@ function toPages(name, payload) {
  * call's audio keeps playing). Never core:invoke, never logged.
  */
 const voiceFrames = voiceframe.createVoiceFrames({
-  canSend: () => callGate.inCall && lockOpen(),
+  canSend: () => voiceframe.sendAllowed({ inCall: callGate.inCall, unlocked: lockOpen(), requiredGate }),
   canReceive: () => callGate.inCall && (lockOpen() || (appLock.state.locked && appLock.state.path === 'B')),
   send: (frame) => (core ? core.send('voiceFrame', frame) : false),
   deliver: (frame) => {
@@ -317,7 +319,8 @@ function startCore() {
     // Without a relay the core runs offline (no invites, no chat with others).
     relays,
     bootstrap,
-    extraArgs: update.coreArgs(UPDATE),
+    // G-81 B: the core learns the flag from the same source as the page (voiceP2pFor); off without it.
+    extraArgs: [...update.coreArgs(UPDATE), ...voiceP2pArgs(VOICE_P2P)],
     onEvent: (name, payload) => {
       // G-81: audio frames take their own channel (voiceframe.js), never the generic one.
       if (name === 'voice.frame') {

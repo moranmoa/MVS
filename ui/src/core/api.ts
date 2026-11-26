@@ -250,6 +250,8 @@ export interface CoreCommands {
   setDeafened(deafened: boolean): Promise<null>;
   /** For the voice engine only (ui/src/voice). Payload at most 12 KiB. */
   sendSignal(to: Id, kind: CallSignal['kind'], payload: string): Promise<null>;
+  /** G-81 B (#556): the participants I have a live LAN WebRTC connection with (at most 5); the core sends B to the rest. */
+  setCallWebrtcPeers(identities: Id[]): Promise<null>;
 
   // App
   getStorageUsage(): Promise<StorageUsage>;

@@ -132,6 +132,8 @@ pub struct SyncNetwork {
     voice: Mutex<Option<Receiver<VoiceSignal>>>,
     /// G-29: typing signals, as voice.
     typing: Mutex<Option<Receiver<VoiceSignal>>>,
+    /// G-81: voice frames and paths, until `deliver_media` takes them.
+    media: Mutex<Option<Receiver<Media>>>,
     /// G-48: report boxes, as voice.
     reports: Mutex<Option<Receiver<VoiceSignal>>>,
     /// T8-02: invite publications members pushed, until the core takes them.
@@ -239,6 +241,9 @@ impl SyncNetwork {
         let waker = hint.clone();
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
         let (typing_tx, typing) = std::sync::mpsc::sync_channel(TYPING_QUEUE);
+        // G-81: voice frames and paths, for `deliver_media` (bounded; a full
+        // queue drops a frame: late audio is useless).
+        let (media_tx, media) = std::sync::mpsc::sync_channel(MEDIA_QUEUE);
         let (report_tx, reports) = std::sync::mpsc::sync_channel(REPORT_QUEUE);
         // G-48: boxes go straight to this queue, acked only once in it.
         node.set_report_sink(report_tx.clone())?;
@@ -260,6 +265,14 @@ impl SyncNetwork {
                     }
                     // Voice: from a verified current member (sync checked);
                     // the core checks the envelope.
+                    NodeEvent::VoiceFrame { from, frame } => {
+                        let _ = media_tx.try_send(Media::Frame(from, frame));
+                        false
+                    }
+                    NodeEvent::VoicePath { identity, path } => {
+                        let _ = media_tx.try_send(Media::Path(identity, path));
+                        false
+                    }
                     NodeEvent::VoiceSignal { from, bytes } => {
                         let _ = voice_tx.try_send((from, bytes));
                         false
@@ -315,6 +328,7 @@ impl SyncNetwork {
             waker,
             voice: Mutex::new(Some(voice)),
             typing: Mutex::new(Some(typing)),
+            media: Mutex::new(Some(media)),
             reports: Mutex::new(Some(reports)),
             invite_pushes,
             link_inbox,
@@ -380,6 +394,33 @@ impl SyncNetwork {
             .filter_map(|s| Record::decode(&s.bytes).ok())
             .filter(|r| log_of(r) == log)
             .collect()
+    }
+}
+
+/// G-81: what the node says about voice media.
+pub enum Media {
+    Frame(PublicKey, sync::VoiceFrame),
+    Path(PublicKey, sync::VoicePath),
+}
+
+/// G-81: frames and paths waiting for the core; frames past it are dropped.
+const MEDIA_QUEUE: usize = 256;
+
+impl SyncNetwork {
+    /// G-81: the frames and paths for [`deliver_media`] (once; `None` after).
+    pub fn take_media(&self) -> Option<Receiver<Media>> {
+        self.media.lock().expect("not poisoned").take()
+    }
+}
+
+/// G-81: hands each voice frame and path change to the core until the node
+/// stops. Its own thread, so frames never wait behind a command.
+pub fn deliver_media(media: Receiver<Media>, core: &Core) {
+    for item in media {
+        match item {
+            Media::Frame(from, frame) => core.voice_media_frame(from, frame),
+            Media::Path(peer, path) => core.voice_media_path(peer, path),
+        }
     }
 }
 
@@ -452,6 +493,15 @@ impl VoiceNet for SyncNetwork {
         if let Err(e) = self.runtime.block_on(self.node.voice_send(to, blob)) {
             tracing::debug!(%e, "voice signal not sent");
         }
+    }
+
+    /// G-81: never waits; the node drops it when its queue is full.
+    fn media_frame(&self, frame: sync::VoiceFrame) {
+        self.node.voice_frame(frame);
+    }
+
+    fn set_media_call(&self, call: Option<sync::VoiceCall>) {
+        let _ = self.node.set_voice_call(call);
     }
 }
 

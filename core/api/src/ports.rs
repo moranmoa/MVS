@@ -92,6 +92,13 @@ impl Clock for FixedClock {
 /// (the Windows ACL). Surface that as a clear error the UI shows, an error
 /// code or a `notice`, never a silently dead sync.
 pub trait Network: Send + Sync {
+    /// NC-1: connection counts by purpose and path, and this device's
+    /// reachability, in sync's own labels (`crate::netdiag` keeps only its
+    /// fixed vocabulary). Nothing until sync implements it (NC-1 (a)).
+    fn net_counters(&self) -> crate::netdiag::RawCounters {
+        crate::netdiag::RawCounters::default()
+    }
+
     /// Offers a record we made or accepted to peers of its server.
     fn publish(&self, record: &Record);
     /// Every record of `server` that reachable peers hold. Empty when nobody

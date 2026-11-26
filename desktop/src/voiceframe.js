@@ -110,4 +110,14 @@ function createVoiceFrames({ canSend, canReceive, send, deliver, now = Date.now 
   };
 }
 
-module.exports = { MAX_PAYLOAD, FRAMES_PER_SEC, BURST, cleanOutgoing, cleanIncoming, createBucket, createVoiceFrames, payloadBytes };
+/**
+ * May a frame from the page go out now? In a call, unlocked (G-78), and the
+ * required-update gate allowing call traffic (#586: only while waiting for
+ * the call to end, never once gated). Explicit, so it doesn't rest on "a
+ * gated phase never has a call" (SL).
+ */
+function sendAllowed({ inCall, unlocked, requiredGate }) {
+  return inCall === true && unlocked === true && !!requiredGate && requiredGate.allows('sendSignal') === true;
+}
+
+module.exports = { MAX_PAYLOAD, FRAMES_PER_SEC, BURST, cleanOutgoing, cleanIncoming, createBucket, createVoiceFrames, payloadBytes, sendAllowed };

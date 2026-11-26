@@ -428,29 +428,59 @@ pub(crate) fn messages(
             let placeholder =
                 |why: Option<Unreadable>| why.filter(|w| *w != Unreadable::NoKey || seen_join);
             let mut why = None;
+            let original = record
+                .as_ref()
+                .map(|record| try_open(cipher, server, channel, record.author(), record.body()));
             if let Some(edit) = replaced.latest_edit.get(&meta.id) {
-                let opened = edit
-                    .body()
-                    .get(32..)
-                    .ok_or(None)
-                    .and_then(|body| try_open(cipher, server, channel, edit.author(), body));
+                let open_edit = |edit: &Record| {
+                    edit.body()
+                        .get(32..)
+                        .ok_or(None)
+                        .and_then(|body| try_open(cipher, server, channel, edit.author(), body))
+                };
+                let mut opened = open_edit(edit);
+                // LM-2: a re-seal (an edit with the original's own `ts`) is
+                // sealed for the readers of its time, so the latest one may
+                // not open for me while another does.
+                if opened.is_err() && edit.ts() == meta.ts && !matches!(original, Some(Ok(_))) {
+                    let others = replaced.edits.get(&meta.id).into_iter().flatten().filter(|id| **id != edit.id());
+                    for other in others.filter_map(|id| log.channel.iter().find(|r| r.id() == *id)) {
+                        if other.ts() == meta.ts {
+                            if let Ok(text) = open_edit(other) {
+                                opened = Ok(text);
+                                break;
+                            }
+                        }
+                    }
+                }
                 match opened {
                     Ok(text) => {
+                        // "Edited" unless the text is the same (an equal-text
+                        // edit is a re-seal, for anyone who can open both),
+                        // or, for a reader who can't open the original (the
+                        // joiner it was re-sealed for), the edit carries the
+                        // original's `ts`. The `ts` alone never hides a
+                        // changed text from someone who had it (SL).
+                        let edited_at = match &original {
+                            Some(Ok(was)) if *was == text => None,
+                            Some(Ok(_)) => Some(edit.ts()),
+                            _ => (edit.ts() != meta.ts).then_some(edit.ts()),
+                        };
                         return Some(Shown {
                             record: meta,
                             text,
-                            edited_at: Some(edit.ts()),
+                            edited_at,
                             deleted: false,
                             reactions: Vec::new(),
                             unreadable: None,
-                        })
+                        });
                     }
                     // An edit that doesn't open: the original, if it does.
                     Err(e) => why = e,
                 }
             }
-            let opened = match &record {
-                Some(record) => try_open(cipher, server, channel, record.author(), record.body()),
+            let opened = match original {
+                Some(opened) => opened,
                 // Pruned: only its edit had a text, and that didn't open.
                 None => Err(why),
             };
@@ -574,6 +604,16 @@ pub(crate) fn prunable(log: &Log, channel: ChannelId) -> Vec<RecordId> {
     let replaced = Replaced::of(log, channel);
     let mut out: Vec<RecordId> = Vec::new();
     for (message, edits) in &replaced.edits {
+        // LM-2: a message whose latest edit carries its own `ts` (re-seals,
+        // so far) keeps its original and those edits: a reader compares
+        // the texts (SL: no silent rewrite), and each joiner may need a
+        // different re-seal. Bounded by the re-seal caps.
+        let ts = log.channel.iter().find(|r| r.id() == *message).map(Record::ts);
+        let resealed = !replaced.deleted.contains(message)
+            && replaced.latest_edit.get(message).is_some_and(|e| Some(e.ts()) == ts);
+        if resealed {
+            continue;
+        }
         out.push(*message);
         let keep = if replaced.deleted.contains(message) {
             None

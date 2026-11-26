@@ -1183,6 +1183,43 @@ async fn a_forged_dial_back_answer_is_never_believed() {
     b.shutdown().await.unwrap();
 }
 
+/// SL on #565: a slow helper stays "waited on", punch gate closed, past
+/// 10 s until its answer settles. A new relayed connection to it at 11 s
+/// (here: the same `try_punch` it triggers) opens nothing, and its honest
+/// answer at 12 s is still taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_helper_keeps_the_punch_gate_closed_until_its_answer_settles() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-slow-a", &relay, 60, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-slow-b", &relay, 61, true, Arc::new(AcceptAll)).await;
+    a.test_no_direct_dials().unwrap();
+    a.test_no_hole_punch().unwrap();
+    b.test_no_hole_punch().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    b.test_dialback_delay(Duration::from_secs(12)).unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(60), voice_id(61), true).await;
+    let start = Instant::now();
+    while !a.test_dialback_waiting(b.peer_id()).await.unwrap() {
+        assert!(start.elapsed() < Duration::from_secs(30), "A never asked B");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let asked = Instant::now();
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    a.test_try_punch(b.peer_id()).unwrap();
+    // Still waiting on B, whose answer is due at 12 s: the gate stays shut.
+    while asked.elapsed() < Duration::from_millis(11_800) {
+        assert!(a.test_dialback_waiting(b.peer_id()).await.unwrap(), "A stopped waiting on B before its answer");
+        assert!(!a.test_punch_open(b.peer_id()).await.unwrap(), "A opened the punch gate with the helper it asked");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    reachable_within(&a, Duration::from_secs(30)).await.expect("the slow helper's answer was never taken");
+    assert!(!a.test_dialback_waiting(b.peer_id()).await.unwrap(), "still waiting after the answer settled");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 /// RR2: a relay-only node never asks, never serves, and never offers itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relay_only_node_never_becomes_a_relay() {

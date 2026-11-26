@@ -32,6 +32,16 @@
 
 **GAP-4b and T23.** Only bound members can use a member relay, and they already know each other through the binding, so this adds no membership leak. The member gate runs before any reservation.
 
+### RR-R1 conformance: reachability by member dial-back (#565)
+
+A node serves and offers its member relay only after a member dialled it back (`/mvs/dialback/1`). What the asker believes, and what it accepts as residual risk:
+
+- **Believed:** a "reached" answer from a bound member it is still waiting on, for an address that is its own (an IP a peer other than that helper observed, a port it listens on). It also needs a non-relayed inbound connection from that helper, first seen after the ask, on that port and transport. That connection must not be hole-punched, and it must have settled for 2 s. No DCUtR event with that helper may have occurred within 30 s.
+- **Gate closed while waiting:** from the ask until its answer settles or is refused, or the request fails (20 s timeout; 40 s backstop), there is no hole punching with that helper. There is one ask per helper at a time. A late answer, after the wait ended, is never believed.
+- **Fail closed:** if the punched-connection set or the punch-event map is full (1024), every answer is refused until they drain.
+- **Accepted residual (SL):** the asker's own outbound dial to the helper can open a NAT mapping. Then a helper's dial-back can get through although strangers couldn't, and the asker believes it is reachable on its own IP. This costs availability only: members may try a relay that doesn't answer them and fall back (§2). No one else's address is ever advertised.
+- **Follow-up (not blocking):** ask only helpers whose direct connection we accepted (we're the Listener), with no outbound dial from us to that IP for 120 s before the ask. Otherwise count the helper as NotReached.
+
 ## 2. Fallback when our relay is down
 
 **Order of paths to a co-member** (the first one that works wins, and is re-checked as described below):

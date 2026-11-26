@@ -57,6 +57,7 @@ use crate::device_link::{Host as LinkHost, LinkError, Request as LinkRequest};
 use crate::presence::Presence;
 use crate::store::MAX_HAVE;
 use crate::invite::InviteLimits;
+use crate::report::{ReportError, ReportLimits, MAX_PENDING as MAX_REPORT_PENDING, MAX_REPORT_BLOB};
 use crate::typing::{TypingError, TypingLimits, MAX_TYPING_BLOB};
 use crate::voice_media::{SendQueue, VoiceFrame};
 use crate::voice::{VoiceError, VoiceLimits, MAX_VOICE_BLOB};
@@ -334,6 +335,9 @@ pub enum NodeEvent {
     /// G-29: a typing signal (`/mvs/typing/1`) from a verified current
     /// member, as [`NodeEvent::VoiceSignal`]. Ephemeral. See `typing`.
     TypingSignal { from: PublicKey, bytes: Vec<u8> },
+    /// G-48: a sealed report box (`/mvs/report/1`) from a verified current
+    /// member, already acked. Opaque here: the api opens it. See `report`.
+    ReportBox { from: PublicKey, bytes: Vec<u8> },
     /// G-81: a voice frame from a participant of my current call, past the
     /// gate, the caps and the sequence checks (`voice_media`).
     VoiceFrame { from: PublicKey, frame: VoiceFrame },
@@ -393,6 +397,7 @@ enum Command {
     ListenAddrs { reply: oneshot::Sender<Vec<Multiaddr>> },
     RelayOnly { on: bool },
     NoDirectDials,
+    Quiet,
     NoHolePunch,
     MemberRelay { on: bool, daily_cap_mb: u32, preferred: bool },
     #[cfg(test)]
@@ -412,6 +417,8 @@ enum Command {
     Prune { id: RecordId, reply: oneshot::Sender<Result<bool>> },
     VoiceSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), VoiceError>> },
     TypingSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), TypingError>> },
+    ReportSend { to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), ReportError>> },
+    ReportSink { sink: std::sync::mpsc::SyncSender<(PublicKey, Vec<u8>)> },
     VoiceCall { call: Option<VoiceCall> },
     ServeInvite { server: ServerId, handle: [u8; 32], publication: Vec<u8>, announce: bool, reply: oneshot::Sender<bool> },
     DropInvite { handle: [u8; 32] },
@@ -428,6 +435,34 @@ enum Command {
     LinkFind { rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>> },
     LinkRequest { peer: PeerId, request: crate::device_link::Request, reply: LinkReply },
     Shutdown { reply: oneshot::Sender<()> },
+}
+
+impl Command {
+    /// Quiet (RU1, SL on #593): what still runs. Reading local state, and
+    /// local-only changes; never anything that signs, sends, dials or
+    /// subscribes. Everything else is dropped, so its caller fails.
+    fn quiet_ok(&self) -> bool {
+        // A test-only variant: naming it unconditionally inside `matches!`
+        // breaks every build without `test-util` (release, desktop).
+        #[cfg(any(test, feature = "test-util"))]
+        if matches!(self, Command::MemberRelayCounts { .. }) {
+            return true;
+        }
+        matches!(
+            self,
+            Command::Heads { .. }
+                | Command::State { .. }
+                | Command::Presence { .. }
+                | Command::Peers { .. }
+                | Command::DirectPeers { .. }
+                | Command::ListenAddrs { .. }
+                | Command::Prune { .. }
+                | Command::DropInvite { .. }
+                | Command::DropServerInvites { .. }
+                | Command::ReportSink { .. }
+                | Command::Quiet
+        )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -523,6 +558,8 @@ struct Behaviour {
     voice: crate::voice::VoiceBehaviour,
     /// G-29 typing (`/mvs/typing/1`), with verified members only (`typing`).
     typing: crate::typing::TypingBehaviour,
+    /// G-48 report delivery (`/mvs/report/1`), with verified members only (`report`).
+    report: crate::report::ReportBehaviour,
     /// G-81 voice media (`/mvs/voice-media/1`), per chosen connection (`voice_media`).
     voice_media: crate::voice_media::VoiceMedia,
     /// Invite publications between members (`/mvs/invite-pub/1`).
@@ -827,6 +864,7 @@ impl Node {
             fallback_at: HashMap::new(),
             fallback_done: HashSet::new(),
             direct_dials: true,
+            quiet: false,
             listen: listen.clone(),
             port_file,
             listener,
@@ -850,6 +888,9 @@ impl Node {
             pending_stubs: HashMap::new(),
             voice_limits: VoiceLimits::new(),
             typing_limits: TypingLimits::new(),
+            report_limits: ReportLimits::new(),
+            report_pending: HashMap::new(),
+            report_sink: None,
             voice_call: None,
             voice_out: HashMap::new(),
             voice_in: HashMap::new(),
@@ -1112,6 +1153,27 @@ impl Node {
         rx.await.map_err(|_| TypingError::Stopped)?
     }
 
+    /// G-48: delivers one sealed report box (at most [`MAX_REPORT_BLOB`]
+    /// bytes) to the peer bound to `to` as a current member, and waits for
+    /// its ack. `Ok` only once acked; the api's outbox keeps the row
+    /// otherwise.
+    pub async fn report_send(&self, to: PublicKey, bytes: Vec<u8>) -> Result<(), ReportError> {
+        if bytes.len() > MAX_REPORT_BLOB {
+            return Err(ReportError::TooLarge);
+        }
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ReportSend { to, bytes, reply }).map_err(|_| ReportError::Stopped)?;
+        rx.await.map_err(|_| ReportError::Stopped)?
+    }
+
+    /// G-48: received report boxes go into `sink` instead of the event
+    /// stream (which may drop events when it lags). A box is acked only once
+    /// it is in `sink`; while `sink` is full, boxes go unacked and their
+    /// senders retry, so an acked box is never lost here.
+    pub fn set_report_sink(&self, sink: std::sync::mpsc::SyncSender<(PublicKey, Vec<u8>)>) -> Result<()> {
+        self.send(Command::ReportSink { sink })
+    }
+
     /// Serves `publication` under the envelope handle `handle` for
     /// `server` (T8-02): answered to anyone who asks for exactly that
     /// handle (`/mvs/invite/1`). The api calls it only for an invite that
@@ -1284,6 +1346,14 @@ impl Node {
         }
     }
 
+    /// Required update (#577 RU1): from now on, for the rest of the process,
+    /// this node signs, syncs and serves nothing (one-way). Only the
+    /// connection to our relays is kept; every other one is closed, and any
+    /// new one closes as soon as it is up.
+    pub fn set_quiet(&self) -> Result<()> {
+        self.send(Command::Quiet)
+    }
+
     fn send(&self, command: Command) -> Result<()> {
         self.commands.send(command).ok().context("node has stopped")
     }
@@ -1390,6 +1460,7 @@ async fn build_swarm(
                 punch: crate::punch::MemberPunch::new(peer_id, allow_lan),
                 voice: crate::voice::behaviour(),
                 typing: crate::typing::behaviour(),
+                report: crate::report::behaviour(),
                 voice_media: crate::voice_media::VoiceMedia::default(),
                 invite_pub: crate::invite::publish_behaviour(),
                 invite_ask: crate::invite::ask_behaviour(),
@@ -1562,6 +1633,11 @@ struct Task {
     /// Tests: our own direct dials can be switched off (stands in for a
     /// firewall), to show the other side's turn.
     direct_dials: bool,
+    /// Required update (#577 RU1): quiet for the rest of the process. No
+    /// connection but our relays' is kept (any new one closes at once, so a
+    /// reachable quiet node answers nothing), no gossip in or out, no pulls,
+    /// no dials, no member relay, no beacon.
+    quiet: bool,
     /// The direct listener (`NodeConfig::listen`), removed while relay-only.
     listen: Multiaddr,
     listener: Option<ListenerId>,
@@ -1610,6 +1686,14 @@ struct Task {
     voice_limits: VoiceLimits,
     /// G-29: caps on accepted typing signals (their own, not voice's).
     typing_limits: TypingLimits,
+    /// G-48: caps on accepted report boxes (their own).
+    report_limits: ReportLimits,
+    /// G-48: report boxes sent and waiting for their ack.
+    report_pending: HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<(), ReportError>>>,
+    /// G-48: where accepted boxes go (the api's bounded queue). A box is acked
+    /// only once it is in there; a full queue leaves it unacked, so the
+    /// sender retries. `None` (tests): emitted as an event and acked.
+    report_sink: Option<std::sync::mpsc::SyncSender<(PublicKey, Vec<u8>)>>,
     /// G-81 voice media: my current call; per target, the substream my
     /// frames go out on; per participant, the one theirs come in on; each
     /// sender's last sequence; the caps; and each open connection's kind.
@@ -1768,6 +1852,9 @@ impl Task {
                         let _ = reply.send(());
                         return;
                     }
+                    // Quiet (RU1): nothing but shutting down; a dropped reply
+                    // makes its caller fail (no put, send or fetch goes out).
+                    Some(command) if self.quiet && !command.quiet_ok() => drop(command),
                     Some(command) => self.on_command(command),
                     None => return,
                 },
@@ -1783,6 +1870,9 @@ impl Task {
                 Some(frame) = voice_frame_rx.recv() => self.voice_out_frame(frame),
                 Some((identity, connection, frame)) = self.voice_in_rx.recv() => self.voice_in_frame(identity, connection, frame),
                 _ = soon.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     // T24: send what the outgoing rate held back.
                     let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
                     for peer in waiting {
@@ -1803,6 +1893,9 @@ impl Task {
                     self.went_offline(gone);
                 }
                 _ = anti_entropy.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     self.pending.expire(Instant::now(), PENDING_TTL);
                     // T23 state outlives a disconnect (a reset relay circuit
                     // must not make us re-probe everything), so it expires here.
@@ -1812,6 +1905,9 @@ impl Task {
                     self.pull_all("round");
                 }
                 _ = discovery.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     self.discover();
                     self.member_relay_fallback();
                     self.redial_remembered();
@@ -1922,6 +2018,8 @@ impl Task {
             Command::TypingSend { to, bytes, reply } => {
                 let _ = reply.send(self.typing_send(to, bytes));
             }
+            Command::ReportSend { to, bytes, reply } => self.report_send(to, bytes, reply),
+            Command::ReportSink { sink } => self.report_sink = Some(sink),
             Command::ServeInvite { server, handle, publication, announce, reply } => {
                 let _ = reply.send(self.serve_invite(server, handle, publication, announce));
             }
@@ -1944,6 +2042,7 @@ impl Task {
             }
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
+            Command::Quiet => self.go_quiet(),
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
             Command::MemberRelay { on, daily_cap_mb, preferred } => {
                 // Relay-only users never relay (design §1), whatever the core says.
@@ -1990,6 +2089,9 @@ impl Task {
     }
 
     fn append_local(&mut self, record: Record) -> Result<()> {
+        if self.quiet {
+            bail!("quiet: a required update is pending");
+        }
         let log = log_of(&record);
         if !self.logs.contains(&log) {
             bail!("log {log} is not open");
@@ -2043,6 +2145,9 @@ impl Task {
     }
 
     fn discover(&mut self) {
+        if self.quiet {
+            return;
+        }
         let mut any = false;
         for i in 0..self.relays.len() {
             let peer = self.relays[i].peer;
@@ -2204,6 +2309,59 @@ impl Task {
         }
         let _ = self.swarm.behaviour_mut().typing.send_response(channel, ());
         self.emit(NodeEvent::TypingSignal { from, bytes });
+    }
+
+    /// G-48: as [`Self::typing_send`], over `/mvs/report/1`; the reply waits
+    /// for the ack (or the failure) in `report_pending`.
+    fn report_send(&mut self, to: PublicKey, bytes: Vec<u8>, reply: oneshot::Sender<Result<(), ReportError>>) {
+        if bytes.len() > MAX_REPORT_BLOB {
+            let _ = reply.send(Err(ReportError::TooLarge));
+            return;
+        }
+        if self.report_pending.len() >= MAX_REPORT_PENDING {
+            let _ = reply.send(Err(ReportError::Busy));
+            return;
+        }
+        let Some(peer) = self.member_peer(to) else {
+            let _ = reply.send(Err(ReportError::NotMember));
+            return;
+        };
+        let id = self.swarm.behaviour_mut().report.send_request(&peer, bytes);
+        self.report_pending.insert(id, reply);
+    }
+
+    /// G-48: as [`Self::on_typing`], with report's own caps. The ack goes
+    /// out before the api tries to open the box, so it is the same for every
+    /// box that passes (R7). With a report sink, only once the box is in it:
+    /// a full sink leaves it unacked (the sender retries), whatever it holds.
+    fn on_report(&mut self, peer: PeerId, bytes: Vec<u8>, channel: ResponseChannel<()>) {
+        let Some(from) = self.member_identity(peer) else {
+            debug!(%peer, "report box from a non-member dropped");
+            return;
+        };
+        if !self.report_limits.allow(peer, Instant::now()) {
+            debug!(%peer, "report box over the rate cap dropped");
+            return;
+        }
+        if let Some(sink) = &self.report_sink {
+            match sink.try_send((from, bytes)) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    debug!(%peer, "report inbox full: not acked, the sender retries");
+                    return;
+                }
+                // Closed (shutting down): stays closed, so later boxes stay
+                // unacked too, never acked into nowhere.
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    debug!("report inbox closed: not acked");
+                    return;
+                }
+            }
+            let _ = self.swarm.behaviour_mut().report.send_response(channel, ());
+            return;
+        }
+        let _ = self.swarm.behaviour_mut().report.send_response(channel, ());
+        self.emit(NodeEvent::ReportBox { from, bytes });
     }
 
     /// A voice signal came in: only a current member's, within its rate
@@ -2642,6 +2800,9 @@ impl Task {
     /// Sends our beacon when due. With more open servers than slots, they
     /// take turns.
     fn lan_beacon_tick(&mut self) {
+        if self.quiet {
+            return;
+        }
         let now = Instant::now();
         if !self.beacon_on() || now < self.beacon_next {
             return;
@@ -3001,6 +3162,9 @@ impl Task {
     }
 
     fn pull(&mut self, peer: PeerId, log: &str, cause: &'static str) {
+        if self.quiet {
+            return;
+        }
         let key = (peer, log.to_string());
         // T23 on every path (round, queue, again, more…): a control log an
         // unbound peer answered empty lately isn't asked for again.
@@ -3125,6 +3289,21 @@ impl Task {
     }
 
     fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        // Required update: any new connection but our relays' closes at once.
+        if self.quiet {
+            if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } = &event {
+                if !self.is_our_relay(peer_id) {
+                    self.swarm.close_connection(*connection_id);
+                    return;
+                }
+            }
+            // No protocol event is acted on (SL on #593): a request, even
+            // over our relays' connections, is dropped unanswered (its
+            // stream closes), and no answer of ours leaves.
+            if let SwarmEvent::Behaviour(_) = &event {
+                return;
+            }
+        }
         // G-81: each connection's kind, for choosing voice paths.
         match &event {
             SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. } => {
@@ -3465,6 +3644,27 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::Typing(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "typing signal not delivered"),
+            SwarmEvent::Behaviour(BehaviourEvent::Report(request_response::Event::Message {
+                peer,
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            })) => self.on_report(peer, request, channel),
+            SwarmEvent::Behaviour(BehaviourEvent::Report(request_response::Event::Message {
+                message: request_response::Message::Response { request_id, .. },
+                ..
+            })) => {
+                if let Some(reply) = self.report_pending.remove(&request_id) {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Report(request_response::Event::OutboundFailure {
+                peer, request_id, error, ..
+            })) => {
+                debug!(%peer, %error, "report box not delivered");
+                if let Some(reply) = self.report_pending.remove(&request_id) {
+                    let _ = reply.send(Err(ReportError::NotAcked));
+                }
+            }
             SwarmEvent::Behaviour(BehaviourEvent::InvitePub(request_response::Event::Message {
                 peer,
                 message: request_response::Message::Request { request, channel, .. },
@@ -3606,6 +3806,11 @@ impl Task {
     /// read-only connection. Dropping the channel fails the request on the
     /// other side.
     fn on_request(&mut self, peer: PeerId, request: SyncRequest, channel: ResponseChannel<SyncResponse>) {
+        if self.quiet {
+            // Refused: dropping the channel closes the stream unanswered.
+            drop((peer, request, channel));
+            return;
+        }
         #[cfg(test)]
         {
             self.pulls_received += 1;
@@ -3738,6 +3943,9 @@ impl Task {
     /// stops it here (and counts against the sender once peer scoring is on);
     /// Ignore neither forwards nor blames (a duplicate, or not judgeable yet).
     fn on_gossip(&mut self, from: PeerId, message: &gossipsub::Message) -> MessageAcceptance {
+        if self.quiet {
+            return MessageAcceptance::Ignore;
+        }
         let record = match check_pushed(&self.logs, &self.sealing, message) {
             Ok(record) => record,
             Err(Refuse::Ignore) => return MessageAcceptance::Ignore,
@@ -4966,6 +5174,34 @@ impl Task {
         // circuit): reopen now, not at the next tick (TL nit 7).
         if reroute {
             self.voice_reroute();
+        }
+    }
+}
+
+impl Task {
+    /// Required update (#577 RU1, one-way): stop relaying for members, the
+    /// beacon and voice; close every connection but our relays'. From here
+    /// on the gates in `on_swarm_event`, `on_request`, `on_gossip`,
+    /// `append_local`, `pull`, `discover` and the beacon tick keep it quiet.
+    ///
+    /// Why our relays' connections stay (TL on #593): dropping them would
+    /// only start the reconnect and backoff loop (`relay_lost`) for nothing.
+    /// They carry nothing while quiet: any circuit a peer opens to us
+    /// arrives as a new connection, which closes at once; and we offer no
+    /// reservation to anyone, since the member relay is stopped (its gates
+    /// close, so a reservation request finds no hop protocol).
+    fn go_quiet(&mut self) {
+        if self.quiet {
+            return;
+        }
+        info!("sync: quiet (a required update is pending)");
+        self.quiet = true;
+        self.swarm.behaviour_mut().member_relay.stop();
+        self.beacon = None;
+        self.set_voice_call(None);
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().filter(|p| !self.is_our_relay(p)).collect();
+        for peer in peers {
+            let _ = self.swarm.disconnect_peer_id(peer);
         }
     }
 }

@@ -2,7 +2,7 @@
 # steps 3-6 of docs/release/RELEASING.md. Run locally, never in CI: it is the
 # only place the update root key is used.
 #
-#   .\.github\scripts\publish-release.ps1 -Tag v0.3.1 [-Channels alpha,beta] [-Key <path>] [-WhatIf]
+#   .\.github\scripts\publish-release.ps1 -Tag v0.3.1 [-Channels alpha,beta] [-Key <path>] [-RequireFrom 0.3.1] [-WhatIf]
 #
 # Channels: both by default, signed in one key-drive session. The app's
 # "stable" setting reads the **alpha** manifest (core/api/src/update.rs:
@@ -37,6 +37,10 @@ param(
   # uploaded by publish-update.ps1. Read while the key drive is connected.
   [string[]]$Roots = @(),
   [int]$RestampAfterHours = 48,
+  # A REQUIRED release (docs/design/required-update.md): revoke every
+  # published version below this one, on each channel (manifest-body.mjs
+  # --require-from). The summary lists what is revoked before you sign.
+  [ValidatePattern('^\d+\.\d+\.\d+$')][string]$RequireFrom,
   [switch]$WhatIf,
   [string]$Repo = 'moranmoa/MVS'
 )
@@ -147,7 +151,12 @@ foreach ($Channel in $Channels) {
   Ok "the $Channel body's artifacts match SHA256SUMS and the files"
 
   $restamped = $false
-  if ($now - [int64]$body.issued_at -gt $RestampAfterHours * 3600) {
+  if ($RequireFrom) {
+    Run "making the $Channel body a required release (below $RequireFrom)" { node (Join-Path $src '.github/scripts/manifest-body.mjs') --restamp $bodyFile --days 14 --require-from $RequireFrom }
+    $body = Get-Content -Raw -Encoding UTF8 $bodyFile | ConvertFrom-Json
+    $restamped = $true
+    Ok "$Channel body revokes $(@($body.revoked).Count) version(s), restamped for 14 days (hashes untouched)"
+  } elseif ($now - [int64]$body.issued_at -gt $RestampAfterHours * 3600) {
     Run "restamping the $Channel body" { node (Join-Path $src '.github/scripts/manifest-body.mjs') --restamp $bodyFile --days 14 }
     $body = Get-Content -Raw -Encoding UTF8 $bodyFile | ConvertFrom-Json
     $restamped = $true

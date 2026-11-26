@@ -53,6 +53,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
 ] }
 
+[features]
+# Test-only hooks: never in a release build. CI runs the tests that need them
+# with `--features test-hooks` (G-48 reports, T17 secret rotation).
+test-hooks = []
+
 [dev-dependencies]
 # MIT. Same version as `sync`, with the features its own relay test uses: an
 # in-process relay for the voice test in `two_peers.rs` (no new crates).

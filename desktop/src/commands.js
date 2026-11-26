@@ -55,6 +55,11 @@ const COMMANDS = Object.freeze({
   kickMember: ['serverId', 'userId'],
   listRemovedMembers: ['serverId'],
   undoKick: ['serverId', 'userId'],
+  // G-48: report to the owners (core #515)
+  reportContent: ['serverId', 'target', 'reason', 'text'],
+  listReports: ['serverId'],
+  dismissReport: ['reportId'],
+  getReportEvidence: ['reportId'],
   // Device link (device-link-slice.md)
   startDeviceLink: [],
   cancelDeviceLink: [],
@@ -68,6 +73,8 @@ const COMMANDS = Object.freeze({
   setTypingIndicator: ['on'],
   // G-91: servers coming back after a restore
   getServerRestore: [],
+  // G-30: where a linked message is (read-only, local)
+  locateMessage: ['serverId', 'channelId', 'messageId'],
   // Voice (#223); voice rooms (0.4.3)
   listVoiceRooms: ['serverId'],
   createVoiceRoom: ['serverId'],
@@ -77,6 +84,8 @@ const COMMANDS = Object.freeze({
   setMuted: ['muted'],
   setDeafened: ['deafened'],
   sendSignal: ['to', 'kind', 'payload'],
+  // G-81 B (#556): the participants with a live LAN WebRTC connection; the core sends B to the rest.
+  setCallWebrtcPeers: ['identities'],
   // App
   getStorageUsage: [],
   setStorageLimit: ['bytes'],

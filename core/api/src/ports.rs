@@ -92,6 +92,13 @@ impl Clock for FixedClock {
 /// (the Windows ACL). Surface that as a clear error the UI shows, an error
 /// code or a `notice`, never a silently dead sync.
 pub trait Network: Send + Sync {
+    /// NC-1: connection counts by purpose and path, and this device's
+    /// reachability, in sync's own labels (`crate::netdiag` keeps only its
+    /// fixed vocabulary). Nothing until sync implements it (NC-1 (a)).
+    fn net_counters(&self) -> crate::netdiag::RawCounters {
+        crate::netdiag::RawCounters::default()
+    }
+
     /// Offers a record we made or accepted to peers of its server.
     fn publish(&self, record: &Record);
     /// Every record of `server` that reachable peers hold. Empty when nobody
@@ -173,6 +180,15 @@ pub trait Network: Send + Sync {
         Vec::new()
     }
 
+    /// The detector: records peers sent that `records::Record::peek_unknown`
+    /// reported (validly signed, of a kind this version doesn't know), since
+    /// the last call. The network never stores, forwards or acks them, and
+    /// reports each (server, author, code) at most once per run. The core
+    /// decides what they mean (`ServerSummary.updateNeeded`).
+    fn take_unknown_records(&self) -> Vec<records::UnknownRecord> {
+        Vec::new()
+    }
+
     /// GAP-4: sync `server` members-only, with its secret, and these
     /// channels (the ones authority knows). Called at load and whenever
     /// the channels change; opening again is harmless.
@@ -197,6 +213,11 @@ pub trait Network: Send + Sync {
     fn set_relay_only(&self, on: bool) {
         let _ = on;
     }
+
+    /// A required update (RU1): the node goes quiet for the rest of the
+    /// process. No dialling, gossip, sync or relaying; update checks (over
+    /// HTTPS, not this network) are the only traffic left.
+    fn set_quiet(&self) {}
 
     /// Member relays (#368, slice 2): relay for bound current members of
     /// servers we share (`MemberRelay.effective`), up to `daily_cap_mb` a
@@ -344,6 +365,8 @@ pub struct LoopbackNetwork {
     buddies: Mutex<HashMap<[u8; 32], HeldBackups>>,
     /// Device link: the one open link (the frozen port's fake guidance).
     link: Mutex<Option<FakeLink>>,
+    /// The detector: what `offer_raw` peeked, for `take_unknown_records`.
+    unknown: Mutex<Vec<records::UnknownRecord>>,
 }
 
 impl LoopbackNetwork {
@@ -361,9 +384,25 @@ impl LoopbackNetwork {
         let buddies = self.buddies.lock().expect("not poisoned");
         buddies.get(member.as_bytes()).map(|held| held.keys().copied().collect()).unwrap_or_default()
     }
+
+    /// Tests: bytes a peer sent, as sync's ingest sees them. A record
+    /// decodes and is published; one of a kind this version doesn't know
+    /// goes to `take_unknown_records` if `peek_unknown` reports it; anything
+    /// else is dropped.
+    pub fn offer_raw(&self, bytes: &[u8]) {
+        if let Ok(record) = Record::decode(bytes) {
+            self.publish(&record);
+        } else if let Some(unknown) = Record::peek_unknown(bytes) {
+            self.unknown.lock().expect("not poisoned").push(unknown);
+        }
+    }
 }
 
 impl Network for LoopbackNetwork {
+    fn take_unknown_records(&self) -> Vec<records::UnknownRecord> {
+        std::mem::take(&mut *self.unknown.lock().expect("not poisoned"))
+    }
+
     fn publish(&self, record: &Record) {
         let mut records = self.records.lock().expect("not poisoned");
         let list = records.entry(record.server()).or_default();
@@ -580,6 +619,29 @@ pub trait GroupCipher: Send + Sync {
         Err(CipherError::Unavailable)
     }
 
+    /// T17: seals a fresh sync secret for `recipients` (the members now,
+    /// minus the removed: SL S2) as the part bodies of one secret rotation,
+    /// each to be signed in its own `SecretRotation` record. `epoch` 0 has
+    /// no `prev`; each later one names the rotation it replaces.
+    fn seal_secret(
+        &self,
+        server: ServerId,
+        epoch: u64,
+        prev: Option<records::RecordId>,
+        recipients: &BTreeSet<PublicKey>,
+    ) -> Result<SealedSecret, CipherError> {
+        let _ = (server, epoch, prev, recipients);
+        Err(CipherError::Unavailable)
+    }
+
+    /// T17: assembles one secret rotation from all its part records (one
+    /// author, every part, no gaps: else `Err`) and opens my box, if I have
+    /// one. Never logs or returns the secret but in [`OpenedSecret`].
+    fn open_secret(&self, server: ServerId, parts: &[Record]) -> Result<OpenedSecret, CipherError> {
+        let _ = (server, parts);
+        Err(CipherError::Unavailable)
+    }
+
     /// The `KeyRotation` records of `server` that authority accepts now
     /// (deny by default: only these can become a channel's key).
     fn set_accepted(&self, server: ServerId, accepted: &BTreeSet<records::RecordId>) {
@@ -647,6 +709,32 @@ pub struct Opened {
     /// False: sealed under a rotation authority doesn't accept; show it as
     /// untrusted, never as a normal message.
     pub accepted: bool,
+}
+
+/// T17: a sealed secret rotation: the part bodies, in order, and the new
+/// secret (zeroized on drop).
+pub type SealedSecret = (Vec<Vec<u8>>, Zeroizing<[u8; 32]>);
+
+/// T17: one assembled secret rotation.
+pub struct OpenedSecret {
+    /// The rotation's ID (every part names it; a later one's `prev`).
+    pub rotation: records::RecordId,
+    pub epoch: u64,
+    /// Whom it was sealed for.
+    pub recipients: BTreeSet<PublicKey>,
+    /// Mine, if I'm a recipient. Never logged or put in an event.
+    pub secret: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for OpenedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedSecret")
+            .field("rotation", &self.rotation)
+            .field("epoch", &self.epoch)
+            .field("recipients", &self.recipients.len())
+            .field("secret", &self.secret.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -4118,3 +4118,52 @@ input.switch:disabled {
     animation: none;
   }
 }
+
+/* G-51: a server's icon fills its rail button (a circle, as the button). */
+.rail-button .server-icon {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
+/* G-51: the icon row on the "כללי" page. */
+.server-icon-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.server-icon-preview {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 5rem;
+  height: 5rem;
+  border-radius: 50%;
+  overflow: hidden;
+  color: #fff;
+  font-weight: 700;
+  font-size: 1.5rem;
+}
+
+.server-icon-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.server-meta textarea {
+  resize: vertical;
+}
+
+/* G-51: the settings title shows the icon too. */
+.server-settings-icon {
+  overflow: hidden;
+}
+
+.server-settings-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}

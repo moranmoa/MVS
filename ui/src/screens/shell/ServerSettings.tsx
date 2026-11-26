@@ -14,6 +14,7 @@ import { Avatar, Dialog, InviteBox, Name } from '../../components/common';
 import { GearIcon, HashIcon, PlusIcon } from '../../components/icons';
 import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
+import { ServerMetaForm } from './ServerMeta';
 import { RemovedAccounts } from './RemovedAccounts';
 import { ReportsPage } from './Reports';
 import { useOpenReports } from './reportsState';
@@ -80,7 +81,7 @@ export function ServerSettings({
       title={
         <span className="server-settings-title" title={server.name}>
           <span className="server-settings-icon" style={{ background: server.color }} aria-hidden="true">
-            <bdi>{server.initials}</bdi>
+            {server.iconDataUrl ? <img src={server.iconDataUrl} alt="" /> : <bdi>{server.initials}</bdi>}
           </span>
           <Name>{server.name}</Name>
         </span>
@@ -142,6 +143,8 @@ function GeneralPage({ server }: { server: ServerSummary }) {
   return (
     <div className="stack">
       <RenameForm server={server} />
+      {/* G-51: icon and description (its own save until the page-wide save, after G-52). */}
+      <ServerMetaForm server={server} />
       <dl className="server-facts">
         <dt>
           <FormattedMessage id="server.settings.age" />

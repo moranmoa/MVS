@@ -123,6 +123,15 @@ export interface CoreCommands {
    * trimmed, 1–100 characters, no bidi or control characters (`bad-request`).
    */
   renameServer(serverId: Id, name: string): Promise<ServerSummary>;
+  /**
+   * G-51: set (a PNG/WebP data URL, at most 128 px and 8 KiB) or clear (null) the
+   * icon. Errors: bad-request, not-allowed (owner or admin only), not-found,
+   * rate-limited (once per 10 minutes from this device; clearing is never
+   * limited), update-needed (a member lacks server-meta-v1).
+   */
+  setServerIcon(serverId: Id, dataUrl: string | null): Promise<ServerSummary>;
+  /** G-51: set or clear (empty) the description: up to 500 code points and 5 lines. Same errors, no rate limit. */
+  setServerDescription(serverId: Id, description: string): Promise<ServerSummary>;
   /** Any member but the owner; never `update-needed`. Then `server.removed { reason: 'left' }`. */
   leaveServer(serverId: Id): Promise<void>;
   /** Owner only, for good. Then `server.closed`; 30 days later `server.removed { reason: 'closed' }`. */
@@ -132,7 +141,7 @@ export interface CoreCommands {
    * `'reactions-v1'`: reactions (G-26). Any other cap is `bad-request`. Empty
    * when the gate is open.
    */
-  getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]>;
+  getUpdateNeeded(serverId: Id, cap?: 'reactions-v1' | 'server-meta-v1'): Promise<Id[]>;
   /**
    * Invites (#214), moderator and up (`not-allowed` below). `expiresMs` is the last
    * moment a join is accepted (ms since epoch; absent = never, `bad-request` if

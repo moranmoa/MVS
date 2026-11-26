@@ -62,6 +62,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     roomFull: params.has('roomFull'),
     voiceRooms: params.has('voiceRooms') ? Math.max(0, Math.min(10, Number(params.get('voiceRooms')) || 0)) : undefined,
     profileError: params.has('profileError'),
+    serverIconRateLimited: params.has('serverIconRateLimited'),
     signOutKeyring: params.has('signOutKeyring'),
     pendingDob: params.has('pendingDob'),
     keyPending: (params.get('keyPending') as MockOptions['keyPending']) ?? undefined,

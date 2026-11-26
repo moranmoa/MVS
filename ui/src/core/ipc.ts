@@ -245,7 +245,11 @@ export async function setUnreadCount(count: number, bridge: DesktopBridge | unde
  * answer in time; show "busy"), `core-unavailable`, `core-restarted`,
  * `too-large`, `bad-request`.
  */
-/** Events whose payload is the whole current value: the latest is replayed to late listeners. */
+/**
+ * Events whose payload is the whole current value: the latest is replayed to
+ * late listeners. Not update.required: main's update.gate already carries
+ * that state (re-sent on every load, and asked with mvs.updateGate()).
+ */
 const STATE_EVENTS = new Set(['core.status', 'memberRelay.changed', 'update.ready']);
 
 export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridge): CoreApi {

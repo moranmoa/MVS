@@ -273,6 +273,8 @@ const voiceFrames = voiceframe.createVoiceFrames({
 function setCoreStatus(status) {
   callGate.onCoreStatus(status);
   syncCall();
+  // A core that went down or restarted: what it said before is stale (TL).
+  if (status.state !== 'up') heldEvents.take();
   coreStatus = status;
   toPages('core.status', statusForPage(status));
   if (status.state === 'up') appLock.coreUp().catch(() => {});
@@ -385,6 +387,8 @@ function serveCoreIpc() {
         clearStorage: async () => {
           // G-62: signed out (the core said ok): no unread count left on the taskbar.
           unread.set(0);
+          // LR-1: nothing held from the signed-out account reaches the next page (TL).
+          heldEvents.take();
           // G-74/G-78: no push-to-talk key or global shortcut left behind either.
           pushToTalk.setKey(null);
           globalMute.clear();

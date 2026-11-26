@@ -2178,6 +2178,18 @@ kbd {
   font-weight: 400;
 }
 
+/* #622: a required update ended the call; the restart button when staged. */
+.call-ended-update {
+  max-inline-size: min(36rem, calc(100vw - 2rem));
+}
+
+.call-ended-update button {
+  flex: none;
+  border-color: currentColor;
+  background: transparent;
+  color: inherit;
+}
+
 .toast-close {
   display: inline-flex;
   min-inline-size: 2rem;

@@ -118,6 +118,8 @@ export interface StoreState {
   notice: { kind: 'encryption-renewed'; serverId: Id; at: number } | null;
   /** Shown once: a new version was installed, or the previous one is back. */
   updateNote: UpdateNote | null;
+  /** #622: a required update ended my call (when), for its toast. */
+  callEndedForUpdate: number | null;
   /** "A new device was added to your account", until answered. */
   deviceNotices: DeviceAdded[];
   /** My current call (voice v1), or null. */
@@ -159,6 +161,7 @@ export class Store {
     update: null,
     notice: null,
     updateNote: null,
+    callEndedForUpdate: null,
     deviceNotices: [],
     call: null,
     callError: null,
@@ -281,6 +284,9 @@ export class Store {
       on('account.deviceAdded', (d) =>
         this.set({ deviceNotices: [...this.state.deviceNotices.filter((x) => x.at !== d.at), d].sort((a, b) => a.at - b.at) }),
       ),
+      // #622: a required update ended my call at once. Only while I'm in one:
+      // the gate is re-sent on every page load with endedCall still true.
+      on('update.gate', (g) => g.endedCall && this.state.call && this.set({ call: null, callEndedForUpdate: Date.now() })),
       on('update.rolledBack', (u) => this.set({ updateNote: { kind: 'rolledBack', ...u } })),
       // rekey-waiting: the failed message's own line says why; no toast (UX, #289).
       on('notice', (n) => n.kind !== 'rekey-waiting' && this.set({ notice: { ...n, kind: n.kind, at: Date.now() } })),
@@ -446,6 +452,10 @@ export class Store {
 
   clearUpdateNote(): void {
     this.set({ updateNote: null });
+  }
+
+  clearCallEndedForUpdate(): void {
+    this.set({ callEndedForUpdate: null });
   }
 
   /**

@@ -152,6 +152,7 @@
   "update.waitingForCall": "Update ready – installs when the call ends",
   "update.installed": "Updated to version \u2068{version}\u2069",
   "update.whatsNew": "What’s new",
+  "update.required.callEnded": "Your call ended because MVS needs an update. You can rejoin after updating.",
   "update.rolledBack": "The update to \u2068{failed}\u2069 didn’t start properly, so version \u2068{running}\u2069 is back.",
 
   "home.title": "Welcome",

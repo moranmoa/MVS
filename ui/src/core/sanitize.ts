@@ -772,6 +772,14 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
     notes: typeof u.notes === 'string' ? cleanText(u.notes, 2000, 30).text : null,
   }),
   'update.rolledBack': (u) => ({ failed: cleanName(u.failed, 32), running: cleanName(u.running, 32) }),
+  // Only exact booleans count; the version is a plain short name or null.
+  'update.gate': (g) => ({
+    required: g?.required === true,
+    version: typeof g?.version === 'string' ? cleanName(g.version, 32) || null : null,
+    active: g?.active === true,
+    phase: g?.phase === 'gated' ? 'gated' : 'none',
+    endedCall: g?.endedCall === true,
+  }),
 };
 
 /** The core as the UI sees it: same API, every peer-supplied value cleaned. */

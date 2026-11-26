@@ -57,6 +57,8 @@ A required update ends a call **immediately**. The core has already stopped (RU1
 - The call ends, and the banner (§1) applies at once.
 - **A toast says why** (`role="alert"`, shown for 8 s):
   - `update.required.callEnded`: "השיחה הסתיימה כי צריך לעדכן את MVS. אחרי העדכון אפשר להצטרף שוב." / "Your call ended because MVS needs an update. You can rejoin after updating."
+  - **If the update is already staged,** the toast carries the button "הפעלה מחדש ועדכון" / "Restart and update" (the same action as the rail pill and #604's `server.syncUpdateNeeded.restart`). The banner's "עדכון" button does the same, so it's still reachable after the toast closes.
+- **Nothing typed is lost:** a draft in the composer, or in any open form, stays as it is. The composer becomes read-only (§3) but keeps the text, and it can still be selected and copied. Drafts aren't saved across a restart today, and the restart only happens when the person presses Update, so nothing is lost without their action.
 - Other people in the call see the person leave as usual, with no special message.
 - New calls can't start (§3).
 
@@ -78,6 +80,7 @@ A required update ends a call **immediately**. The core has already stopped (RU1
 2. Sending, reacting, joining, calls and signing settings are disabled, with the reason on hover and focus. Reading, search and local settings still work.
 3. Downloading leads to ready, and "Update" restarts into the new version. Offline, check-clock, not-available and failed each show their line and buttons.
 4. In a call: when the requirement arrives, the call ends at once, with the `update.required.callEnded` toast, and the banner shows.
+4a. With the update already staged, the call-ended toast shows "הפעלה מחדש ועדכון". A draft typed before the requirement arrived is still in the (read-only) composer and can be copied.
 5. When locked, the lock screen comes first, and the banner shows only after unlock.
 6. Reloading the page keeps the read-only state.
 

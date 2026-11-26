@@ -1336,6 +1336,7 @@ export class MockCore implements CoreApi {
   async countAgeAffected(serverId: Id, ageRestriction: AgeRestriction): Promise<{ count: number }> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
+    // Owner here; admins too in the core (the mock has no admins).
     if (s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
     if (ageRestriction !== '18+') return { count: 0 };
     return { count: s.members.filter((m) => m.id !== this.identity?.id).filter((_, i) => i % 3 === 0).length };

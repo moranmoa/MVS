@@ -29,7 +29,8 @@ Theme: **no server needed, and safe for the closed alpha.** The standing rules a
 - The IP notice v2 (#497) shows before the first direct call.
 
 **3. T17-pre, then T17**
-- T17-pre ships in the same release as T17 or earlier: a core with a record it can't read shows "צריך לעדכן את MVS כדי להמשיך לסנכרן בשרת הזה", and sync resumes after updating.
+- T17-pre ships in the same release as T17 or earlier: a core with a record it can't read shows UX's line from #604: "…צריך לעדכן את MVS כדי להמשיך לקבל ולשלוח הודעות בשרת הזה." / "Update MVS to keep getting and sending messages here.", with "הפעלה מחדש ועדכון" / "Restart and update" when an update is ready. Sync resumes after updating.
+- The line also shows after unlocking when the app was locked during a call (LR-1 path B; QA LOCK-EV-01).
 - After a kick, the kicked identity can't pull new records; up-to-date members keep syncing; members on an older version see "update needed", never a silent failure.
 - The release notes say older versions stop syncing a server after a kick until they update.
 
@@ -54,5 +55,25 @@ Theme: **no server needed, and safe for the closed alpha.** The standing rules a
 - Upload, crop and remove the icon, using the image rules of B11e (scaled down; refused only above 25 MB or 40 MP).
 - The icon shows in the rail and the header for every member, and the letter fallback meets AA contrast.
 
+**8. Required updates (#577, UX #622; UI #632 and #636)**
+- A required update makes the app read-only under a banner with no close: reading, search, copying and local settings still work, and everything that signs or connects is disabled in place, with the reason "צריך לעדכן את MVS כדי לעשות את זה.".
+- **A call ends at once** (TL decision; no 30-minute grace, no countdown). The toast says why, and offers "Restart and update" when the update is staged. Others in the call see a normal leave.
+- Nothing typed is lost: the draft stays in the read-only composer, selectable and copyable. Keeping drafts across a restart isn't required (G-DR1, backlog).
+
 ## Out of 0.6.0
 G-79 tray (P2, after G-81), G-43 ownership transfer, roles in the UI.
+
+## 0.6.x / 0.7: relay health in the server header (owner request, 2026-11-26)
+
+Depends on R1 (#565) and R1b. Owners: dev-sync (core data), dev-ui (header), UX (header spec), SL (privacy review).
+
+- **The count:** the server header shows how many of this server's members can relay right now: member relay on, and reachable as R1 confirmed it. Members behind CGNAT never count, since they can't serve, but they still use relays.
+- **Uptime:** each client's relay table tracks each relay's uptime over the last 24 h, as the share of *this client's own observed time* that the relay was reachable. It's kept locally and never published or synced.
+- **The health colour (owner decision, 95%):**
+  - **Red:** 0–2 relays.
+  - **Green:** 6 or more relays, each at ≥95% uptime over the last 24 h.
+  - **Yellow:** everything else.
+  - **Measuring:** a client with under 24 h of its own observations shows a "measuring" state, at most yellow.
+- **Accessibility (UX):** never colour alone. The colour comes with an icon and text, e.g. the count with an ICU plural and the state. The text is neutral Hebrew, isolated with FSI/PDI, and the contrast is AA.
+- **Privacy (SL):** only the count and the colour. Never who relays, or when anyone is online. Nothing about it is published to the network or to non-members. The UI exposes no per-relay list.
+- **Tests:** the thresholds at 2/3, 5/6 and 94/95%, the measuring state, and CGNAT members excluded from the count. A member-relay switch-off lowers the count within the normal presence delay.

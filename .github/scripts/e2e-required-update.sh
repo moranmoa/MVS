@@ -9,7 +9,7 @@ set -euo pipefail
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-updater() { cargo run --quiet --locked --manifest-path core/Cargo.toml -p updater -- "$@"; }
+updater() { cargo run --quiet --locked --manifest-path core/Cargo.toml -p updater --bin updater -- "$@"; }
 
 # 1. A test root of one throwaway key.
 updater keygen --out "$work/keys" --name e2e >/dev/null

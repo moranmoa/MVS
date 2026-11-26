@@ -245,17 +245,26 @@ export async function setUnreadCount(count: number, bridge: DesktopBridge | unde
  * answer in time; show "busy"), `core-unavailable`, `core-restarted`,
  * `too-large`, `bad-request`.
  */
+/**
+ * Events whose payload is the whole current value: the latest is replayed to
+ * late listeners. Not update.required: main's update.gate already carries
+ * that state (re-sent on every load, and asked with mvs.updateGate()).
+ */
+const STATE_EVENTS = new Set(['core.status', 'memberRelay.changed', 'update.ready']);
+
 export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridge): CoreApi {
   const handlers = new Map<string, Set<(payload: never) => void>>();
   // An mvs:// link (`link.open`, or G-30's `link.message`) can arrive before
   // anything listens for it: on the first launch, or during onboarding before
   // the shell is mounted. The latest of each waits for its first listener.
   const pendingLinks = new Map<string, unknown>();
-  // core.status (T8-01) is a state, not a one-off: the latest one is kept and
+  // State events are values, not one-offs: the latest of each is kept and
   // given to every new listener, so a screen mounted late still knows it.
-  let lastStatus: unknown = null;
+  // core.status (T8-01); memberRelay.changed and update.ready (QA MR.1: main
+  // hands these over after an unlock, possibly before the store subscribes).
+  const latest = new Map<string, unknown>();
   bridge.onEvent((event, payload) => {
-    if (event === 'core.status') lastStatus = payload;
+    if (STATE_EVENTS.has(event)) latest.set(event, payload);
     const set = handlers.get(event);
     if ((event === 'link.open' || event === 'link.message') && !set?.size) {
       pendingLinks.set(event, payload);
@@ -273,11 +282,11 @@ export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridg
       pendingLinks.delete(event as string);
       setTimeout(() => (handler as (payload: unknown) => void)(p), 0);
     }
-    if ((event as string) === 'core.status' && lastStatus !== null) {
-      const p = lastStatus;
+    if (latest.has(event as string)) {
+      const p = latest.get(event as string);
       setTimeout(() => {
         // Only if it is still the latest and the listener is still there.
-        if (p === lastStatus && set.has(handler as (payload: never) => void)) (handler as (payload: unknown) => void)(p);
+        if (p === latest.get(event as string) && set.has(handler as (payload: never) => void)) (handler as (payload: unknown) => void)(p);
       }, 0);
     }
     return () => {

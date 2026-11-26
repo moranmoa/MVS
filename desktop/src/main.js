@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor, voiceP2pArgs } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -30,6 +30,7 @@ const badge = require('./badge');
 const applock = require('./applock');
 const demo = require('./demo');
 const voiceframe = require('./voiceframe');
+const held = require('./held');
 
 /** T8-04: the mock demo (MVS_DEMO), checkout only; null otherwise. */
 const DEMO = demo.demoFor({ packaged: app.isPackaged, env: process.env });
@@ -114,8 +115,10 @@ const globalMute = ptt.createGlobalMute({
 /** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
 /**
  * Required updates (#577, required.js): once the core says the running
- * version is revoked, the page may only read local data and update. It waits
- * for a call to end, for at most 30 min (then main ends the call).
+ * version is revoked, the page may only read local data and update. A call in
+ * progress ends at once (TL; the core's RU1 has already stopped its voice):
+ * a normal leave for the others, no reload (drafts stay), and update.gate
+ * carries endedCall for the banner (update.required.callEnded).
  */
 const requiredGate = required.createRequiredGate({
   inCall: () => callGate.inCall,
@@ -183,6 +186,14 @@ function pageQuery(st) {
   return DEMO ? `?demo=${encodeURIComponent(DEMO)}` : '';
 }
 
+/** State events the core sent while locked (held.js), latest value each. */
+const heldEvents = held.createHeldEvents();
+/** Hands them to the page, once it is open. */
+function deliverHeld() {
+  if (!lockOpen()) return;
+  for (const [name, payload] of heldEvents.take()) toPages(name, payload);
+}
+
 function onLockChange(st) {
   const prev = lastLock;
   lastLock = st;
@@ -197,6 +208,7 @@ function onLockChange(st) {
       core?.request('setMuted', { muted: true }).catch(() => {});
     }
   }
+  let reloading = false;
   for (const win of BrowserWindow.getAllWindows()) {
     const want = pageQuery(st);
     const url = win.webContents.getURL();
@@ -205,11 +217,15 @@ function onLockChange(st) {
     // the page for its state, which drops whatever it held in memory.
     if (!(st.locked && st.path === 'B') && sec.isInternalUrl(url) && has !== want) {
       win.loadURL(`${sec.ORIGIN}/index.html${want}`);
+      reloading = true;
     } else if (sec.isInternalUrl(url)) {
       win.webContents.send('core:event', 'lock.state', lockPayload());
     }
   }
   if (lockOpen()) {
+    // QA MR.1: state events kept while locked. Path A's reload delivers them
+    // on did-finish-load; path B (no reload) now.
+    if (!reloading) deliverHeld();
     syncCall();
     // Path B unlock has no reload: hand over a held invite now (path A's
     // reload does it on did-finish-load).
@@ -259,6 +275,8 @@ const voiceFrames = voiceframe.createVoiceFrames({
 function setCoreStatus(status) {
   callGate.onCoreStatus(status);
   syncCall();
+  // A core that went down or restarted: what it said before is stale (TL).
+  if (status.state !== 'up') heldEvents.take();
   coreStatus = status;
   toPages('core.status', statusForPage(status));
   if (status.state === 'up') appLock.coreUp().catch(() => {});
@@ -317,7 +335,8 @@ function startCore() {
     // Without a relay the core runs offline (no invites, no chat with others).
     relays,
     bootstrap,
-    extraArgs: update.coreArgs(UPDATE),
+    // G-81 B: the core learns the flag from the same source as the page (voiceP2pFor); off without it.
+    extraArgs: [...update.coreArgs(UPDATE), ...voiceP2pArgs(VOICE_P2P)],
     onEvent: (name, payload) => {
       // G-81: audio frames take their own channel (voiceframe.js), never the generic one.
       if (name === 'voice.frame') {
@@ -328,6 +347,8 @@ function startCore() {
       callGate.onEvent(name, payload);
       syncCall();
       if (appLock.forwards(name)) toPages(name, payload);
+      // Locked: keep the latest value of a state event for after unlock (QA MR.1).
+      else heldEvents.hold(name, payload);
     },
     onStatus: setCoreStatus,
     // stderr only (counts and error kinds); stdout is never logged.
@@ -369,6 +390,8 @@ function serveCoreIpc() {
         clearStorage: async () => {
           // G-62: signed out (the core said ok): no unread count left on the taskbar.
           unread.set(0);
+          // LR-1: nothing held from the signed-out account reaches the next page (TL).
+          heldEvents.take();
           // G-74/G-78: no push-to-talk key or global shortcut left behind either.
           pushToTalk.setKey(null);
           globalMute.clear();
@@ -777,6 +800,8 @@ function createWindow() {
     // Required updates (#577, TL): every load (cold start, reload, the lock's
     // reload) gets the gate's state, so the banner never goes missing.
     if (sec.isInternalUrl(win.webContents.getURL()) && requiredGate.state.required) win.webContents.send('core:event', 'update.gate', requiredGate.state);
+    // QA MR.1: state events held while locked, now that an open page is loaded.
+    deliverHeld();
     // Commit this version once the UI is up and the core answers (main only, once).
     if (!healthReported) {
       healthReported = true;

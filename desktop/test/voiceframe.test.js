@@ -135,27 +135,17 @@ test('Sidecar.send: one { cmd, args } line, no id; dropped when down, too long o
   assert.equal(lines.length, 1);
 });
 
-test('sendAllowed: a call, unlocked, and the required-update gate allowing call traffic (#586, SL)', () => {
+test('sendAllowed: a call, unlocked, and no required update (#586, SL; TL: no grace)', () => {
   let inCall = true;
-  let timer = null;
-  const gate = createRequiredGate({
-    inCall: () => inCall,
-    endCall: () => {},
-    setTimer: (fn) => (timer = fn),
-    clearTimer: () => (timer = null),
-  });
+  const gate = createRequiredGate({ inCall: () => inCall, endCall: () => (inCall = false) });
   // No required update: the call and the lock decide.
   assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: gate }), true);
   assert.equal(sendAllowed({ inCall: false, unlocked: true, requiredGate: gate }), false);
   assert.equal(sendAllowed({ inCall: true, unlocked: false, requiredGate: gate }), false, 'G-78 lock');
-  // Required, waiting for the call to end: the call's own traffic still goes.
+  // Required: the call is ended at once, and frames stop, even with a call forced on.
   gate.set({ version: '0.6.0' });
-  assert.equal(gate.state.phase, 'call');
-  assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: gate }), true);
-  // Gated (the 30 min cap ran out), with a call forced on anyway: dropped.
-  timer();
+  assert.equal(inCall, false, 'the call ended');
   assert.equal(gate.state.phase, 'gated');
-  inCall = true;
   assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: gate }), false, 'gated + forced inCall');
   // Fails closed on a missing gate.
   assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: null }), false);

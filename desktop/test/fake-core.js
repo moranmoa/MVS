@@ -63,6 +63,16 @@ const attempt = (check) => {
   return until ? { result: 'wrong', retryAfter: 30 } : { result: 'wrong' };
 };
 
+// QA MR.1: <data-dir>/fake-emit-memberrelay → one memberRelay.changed 1.5 s
+// after start (while the app is still locked).
+try {
+  if (fs.existsSync(path.join(dataDir, 'fake-emit-memberrelay'))) {
+    setTimeout(() => out({ type: 'event', event: 'memberRelay.changed', payload: { role: true, setting: 'auto', effective: false, disclosureSeen: false } }), 1500);
+  }
+} catch {
+  // no data dir in some unit tests
+}
+
 process.stdin.on('data', (chunk) => {
   buf += chunk;
   let nl;
@@ -110,6 +120,10 @@ process.stdin.on('data', (chunk) => {
         out({ type: 'response', id: m.id, ok: call });
         if (m.args.channelId === 'e'.repeat(64)) {
           setTimeout(() => out({ type: 'event', event: 'call.state', payload: { ...call, participants: [] } }), 300);
+        }
+        // Required updates: <data-dir>/fake-required-on-call → the update turns required mid-call.
+        if (fs.existsSync(path.join(dataDir, 'fake-required-on-call'))) {
+          setTimeout(() => out({ type: 'event', event: 'update.required', payload: { version: '9.9.9' } }), 500);
         }
         break;
       }

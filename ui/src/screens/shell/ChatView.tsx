@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
+import { UPDATE_REASON_ID, useReadOnlyProps, useUpdateRequired } from './UpdateRequired';
 import { isCoreError, useCore, type Id, type Member, type Message, type ServerSummary } from '../../core';
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
 import { BackIcon, CloseIcon, EditIcon, HashIcon, RefreshIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
@@ -58,6 +59,7 @@ export function ChatView({
   const isOwner = server.ownerId === myId;
   // #589: an update ready to install (the rail pill's state), for the update-needed line.
   const staged = useStore(store, (s) => s.update);
+  const updateRequired = useUpdateRequired();
 
   // G-21: where the new messages started when I opened the channel. Kept until
   // I leave it, even after it's all read, so the divider stays put.
@@ -262,6 +264,7 @@ export function ChatView({
           }}
           onEditLast={editLast}
           onTyping={onTyping}
+          readOnly={updateRequired}
           onSubmit={async (body) => {
             if (editing) {
               if (body !== editing.body) await core.editMessage(editing.id, body);
@@ -353,6 +356,7 @@ function Composer({
   onEditLast,
   onTyping,
   onSubmit,
+  readOnly = false,
 }: {
   members: Member[];
   myId: string;
@@ -365,8 +369,11 @@ function Composer({
   /** G-29: true while there is text being typed, false when it is sent or cleared. */
   onTyping: (on: boolean) => void;
   onSubmit: (body: string) => Promise<void>;
+  /** #577: a required update: the draft stays (selectable, copyable), nothing sends. */
+  readOnly?: boolean;
 }) {
   const intl = useIntl();
+  const readOnlyProps = useReadOnlyProps();
   const [text, setText] = useState('');
   // Empty: the interface direction (cursor and placeholder on the right in Hebrew).
   const textProps = useUserTextProps(text);
@@ -474,7 +481,7 @@ function Composer({
 
   const submit = async () => {
     const body = toTokens(text.trim(), mentionMap.current);
-    if (!body || tooLong) return;
+    if (!body || tooLong || readOnly) return;
     setFailed(null);
     onTyping(false);
     if (!editing) setText('');
@@ -552,6 +559,7 @@ function Composer({
           title={intl.formatMessage({ id: 'emoji.insert' })}
           aria-haspopup="dialog"
           aria-expanded={emojiOpen}
+          {...readOnlyProps}
           onClick={() => {
             const el = ref.current;
             caret.current = el ? [el.selectionStart ?? text.length, el.selectionEnd ?? text.length] : null;
@@ -564,10 +572,11 @@ function Composer({
           ref={ref}
           {...textProps}
           aria-invalid={tooLong || undefined}
-          aria-describedby={nearLimit || failed ? 'composer-status' : undefined}
+          aria-describedby={[nearLimit || failed ? 'composer-status' : '', readOnly ? UPDATE_REASON_ID : ''].filter(Boolean).join(' ') || undefined}
+          readOnly={readOnly}
           rows={1}
           value={text}
-          placeholder={intl.formatMessage({ id: 'chat.composer' }, { channel: channelName })}
+          placeholder={intl.formatMessage(readOnly ? { id: 'update.required.disabled' } : { id: 'chat.composer' }, { channel: channelName })}
           aria-label={intl.formatMessage({ id: 'chat.composer' }, { channel: channelName })}
           aria-controls="mention-suggestions"
           aria-autocomplete="list"
@@ -622,12 +631,12 @@ function Composer({
             } else if (e.key === 'ArrowUp' && !text && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
               // G-32: a plain ↑ only; Alt+↑ / Ctrl+Alt+↑ move between channels and servers.
               e.preventDefault();
-              onEditLast();
+              if (!readOnly) onEditLast();
             }
           }}
         />
         <EmojiPicker mode="composer" open={emojiOpen} anchor={emojiButton} onClose={() => setEmojiOpen(false)} onPick={insertEmoji} />
-        <button type="submit" className="icon-button send" aria-label={intl.formatMessage({ id: 'chat.send' })} disabled={!text.trim() || tooLong}>
+        <button type="submit" className="icon-button send" aria-label={intl.formatMessage({ id: 'chat.send' })} disabled={!text.trim() || tooLong || readOnly}>
           <SendIcon />
         </button>
       </form>

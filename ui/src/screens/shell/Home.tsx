@@ -8,6 +8,7 @@ import { LinkIcon, PlusIcon, ShieldIcon, WifiOffIcon } from '../../components/ic
 import { useUserTextProps } from '../../app/textDir';
 import { LINK_MAX } from '../../core/sanitize';
 import { takeFirstRun } from '../../app/firstRun';
+import { useReadOnlyProps } from './UpdateRequired';
 
 export function Home({
   hasServers,
@@ -70,6 +71,7 @@ export function Home({
 function JoinPaste({ onJoinLink }: { onJoinLink: (link: string, status: JoinStatus) => void }) {
   const core = useCore();
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const [link, setLink] = useState('');
   const [invalid, setInvalid] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -107,7 +109,7 @@ function JoinPaste({ onJoinLink }: { onJoinLink: (link: string, status: JoinStat
             setInvalid(false);
           }}
         />
-        <button type="submit" className="primary" disabled={busy || !link.trim()}>
+        <button type="submit" className="primary" disabled={busy || !link.trim()} {...ro}>
           <FormattedMessage id="home.join.submit" />
         </button>
       </div>
@@ -136,6 +138,7 @@ export function CreateServerDialog({
 }) {
   const core = useCore();
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const store = useAppStore();
   const checked = useStore(store, (s) => s.identity?.recoveryChecked ?? false);
   const [name, setName] = useState('');
@@ -249,7 +252,7 @@ export function CreateServerDialog({
             </p>
           )}
           <div className="actions">
-            <button type="submit" className="primary" disabled={busy}>
+            <button type="submit" className="primary" disabled={busy} {...ro}>
               <FormattedMessage id="create.submit" />
             </button>
             <button type="button" className="secondary" onClick={onClose}>
@@ -282,6 +285,7 @@ export function JoinDialog({
 }) {
   const core = useCore();
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const [link, setLink] = useState('');
   const [status, setStatus] = useState<JoinStatus | null>(null);
 
@@ -391,7 +395,7 @@ export function JoinDialog({
               <FormattedMessage id="common.close" />
             </button>
           ) : (
-            <button type="submit" className="primary" disabled={busy || !link.trim()}>
+            <button type="submit" className="primary" disabled={busy || !link.trim()} {...ro}>
               <FormattedMessage id="join.submit" />
             </button>
           )}

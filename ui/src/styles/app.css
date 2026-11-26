@@ -874,6 +874,60 @@ legend {
   flex: 1;
 }
 
+/* #577: the required-update banner; no close, no "later". */
+.banner.update-required {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  padding-block: 0.75rem;
+}
+
+.update-required-text {
+  flex: 1 1 20rem;
+  min-inline-size: 0;
+}
+
+.update-required-text p {
+  margin: 0;
+}
+
+.update-required-title {
+  font-weight: 700;
+  font-size: 0.9375rem;
+}
+
+.update-required-line {
+  margin-block-start: 0.25rem !important;
+  font-weight: 600;
+}
+
+.update-required-details summary {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.update-required-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.update-required-actions button {
+  min-block-size: 1.5rem;
+}
+
+@media (pointer: coarse) {
+  .update-required-actions button {
+    min-block-size: 2.75rem;
+  }
+}
+
+/* Controls that write or connect, while an update is required: in place, visibly off. */
+[aria-disabled='true'][aria-describedby='update-required-reason'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* rail: the outer edge (right in Hebrew, left in English) */
 .rail {
   grid-area: rail;

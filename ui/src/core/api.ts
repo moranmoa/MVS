@@ -277,6 +277,13 @@ export interface CoreCommands {
   /** The one-time disclosure was acknowledged ("OK"). */
   markMemberRelayDisclosureSeen(): Promise<null>;
   restartToUpdate(): Promise<void>;
+  /** Desktop shell (#577): the required-update gate now (also the `update.gate` event). Not required outside the shell. */
+  getUpdateGate(): Promise<UpdateGate>;
+  /**
+   * The required banner's Retry: main asks the core to check now, at most
+   * every 30 s. 'ok', 'too-soon', or the core's code ('offline', 'check-clock', …).
+   */
+  checkUpdate(): Promise<string>;
 }
 
 export interface CoreEvents {

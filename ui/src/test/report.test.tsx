@@ -13,12 +13,24 @@ import { REPORT_NOTIFY_GAP_MS } from '../screens/shell/reportsState';
 
 const en: Settings = { locale: 'en', theme: 'light', uiScale: 1, fontSize: 15 };
 
+/**
+ * The app is up and Shell's effects have run. The composer can be in the DOM
+ * before them, and Shell subscribes to report.received and notify.click in
+ * effects: an event a test emitted in that gap had no listener and was
+ * dropped, so the expected notification never came (the CI flake under load;
+ * the same race as #596).
+ */
+async function appReady() {
+  await screen.findByRole('textbox', { name: /^Message / });
+  await act(async () => {});
+}
+
 // `prepare` runs before the app starts (the sanitizer wraps the core then).
 async function setup(prepare?: (core: MockCore) => unknown) {
   const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
   await prepare?.(core);
   render(<App core={core} initialSettings={en} />);
-  await screen.findByRole('textbox', { name: /^Message / });
+  await appReady();
   return { core };
 }
 const click = async (el: Element) =>
@@ -297,7 +309,7 @@ describe('G-48 follow-ups', () => {
     try {
       const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
       render(<App core={core} initialSettings={{ ...en, notify: { ...defaultNotifyPrefs(), desktop: false } }} />);
-      await screen.findByRole('textbox', { name: /^Message / });
+      await appReady();
       const server = (await core.listServers())[0]!;
       await act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id }) }));
       expect(notify).not.toHaveBeenCalled();
@@ -338,7 +350,7 @@ describe('G-48 (PO on #567): report notifications through a mute, with their own
     const server = (await core.listServers()).find((x) => x.ownerId === me)!;
     prepare?.(server.id);
     render(<App core={core} initialSettings={{ ...en, ...settings }} />);
-    await screen.findByRole('textbox', { name: /^Message / });
+    await appReady();
     const report = async () => act(async () => emitOf(core)('report.received', { serverId: server.id, report: summary({ serverId: server.id }) }));
     return { notify, server, report };
   }

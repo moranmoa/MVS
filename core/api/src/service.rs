@@ -385,6 +385,9 @@ struct Inner {
     update_required: Option<Option<String>>,
     /// G-48: delivers report boxes (sync); `None` without a network.
     report_net: Option<Arc<dyn crate::report::ReportNet>>,
+    /// G-48: reports kept per server ([`MAX_STORED_REPORTS`]; lower only in
+    /// tests, feature `test-hooks`).
+    report_store_cap: usize,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -668,6 +671,7 @@ impl Core {
             typing: typing::Typing::default(),
             update_required: None,
             report_net: None,
+            report_store_cap: MAX_STORED_REPORTS,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
             adult_keys_warned: HashSet::new(),
@@ -6548,8 +6552,13 @@ mod device_notice_tests {
 
 /// My reports waiting for each recipient's ack.
 const KV_REPORT_OUTBOX: &str = "report-outbox";
-/// Reports sealed to me, as staff.
+/// Reports sealed to me, as staff: one store per server,
+/// `report-inbox/<server>` (the Tech Lead's #515 follow-up). The bare key is
+/// the first release's single store, moved over on first use.
 const KV_REPORT_INBOX: &str = "report-inbox";
+/// The servers that have a `report-inbox/<server>` store, so pruning finds
+/// them (kv has no prefix scan).
+const KV_REPORT_INBOXES: &str = "report-inboxes";
 /// Report IDs I received, with their reporter, for dedup and the receiver's
 /// per-reporter cap; kept 31 days.
 const KV_REPORT_SEEN: &str = "report-seen";
@@ -6580,6 +6589,10 @@ struct OutRow {
 #[derive(Clone, Serialize, Deserialize)]
 struct InRow {
     server: String,
+    /// The report ID (hex): `find_report` matches on it without opening any
+    /// box. Empty in rows from the first release, filled on first lookup.
+    #[serde(default)]
+    id: String,
     sealed: String,
     at: u64,
     dismissed: bool,
@@ -6817,24 +6830,20 @@ impl Core {
             seen.push(SeenRow { id, reporter, at: now });
             inner.set_kv_json(KV_REPORT_SEEN, &seen)?;
             let server_hex = model::hex_id(server.as_bytes());
-            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut inbox = inner.inbox(server)?;
             inbox.push(InRow {
                 server: server_hex.clone(),
+                id: model::hex_id(&opened.id()),
                 sealed: hex::encode(sealed),
                 at: now,
                 dismissed: false,
             });
-            if inbox.iter().filter(|r| r.server == server_hex).count() > MAX_STORED_REPORTS {
-                // The oldest dismissed one here, else the oldest.
-                let pick = inbox
-                    .iter()
-                    .position(|r| r.server == server_hex && r.dismissed)
-                    .or_else(|| inbox.iter().position(|r| r.server == server_hex));
-                if let Some(i) = pick {
-                    inbox.remove(i);
-                }
+            if inbox.len() > inner.report_store_cap {
+                // The oldest dismissed one, else the oldest.
+                let pick = inbox.iter().position(|r| r.dismissed).unwrap_or(0);
+                inbox.remove(pick);
             }
-            inner.set_kv_json(KV_REPORT_INBOX, &inbox)?;
+            inner.set_inbox(server, &inbox)?;
             let summary = inner.report_summary(server, &opened, now, false)?;
             events.push(Event::ReportReceived { server_id: server_hex, report: summary });
             Ok(())
@@ -6850,10 +6859,9 @@ impl Core {
             inner.load_mine(server)?;
             inner.prune_reports(ports.clock.now_ms())?;
             inner.staff_check(server)?;
-            let server_hex = model::hex_id(server.as_bytes());
-            let inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let inbox = inner.inbox(server)?;
             let mut out = Vec::new();
-            for row in inbox.iter().rev().filter(|r| r.server == server_hex) {
+            for row in inbox.iter().rev() {
                 let Ok(sealed) = hex::decode(&row.sealed) else { continue };
                 let Some((_, opened)) = inner.open_report(&sealed)? else { continue };
                 out.push(inner.report_summary(server, &opened, row.at, row.dismissed)?);
@@ -6867,10 +6875,29 @@ impl Core {
         self.run(|inner, _, _| {
             let (index, server, _) = inner.find_report(report_id)?;
             inner.staff_check(server)?;
-            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut inbox = inner.inbox(server)?;
             inbox[index].dismissed = true;
-            inner.set_kv_json(KV_REPORT_INBOX, &inbox)
+            inner.set_inbox(server, &inbox)
         })
+    }
+
+    /// Tests only (the Tech Lead's #515 follow-up; feature `test-hooks`,
+    /// never in a release build): signs `report` as me, with none of
+    /// `reportContent`'s checks, and seals it to `to`, so a test can hand a
+    /// receiver what a modified client would send. Not a command.
+    #[cfg(feature = "test-hooks")]
+    pub fn sealed_report_for_tests(&self, report: &Report, to: PublicKey) -> CoreResult<Vec<u8>> {
+        let inner = self.lock();
+        let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let signed = report.sign(me.identity.signing_key()).ok_or(ErrorCode::BadRequest)?;
+        groupkeys::seal_box(report.server, &to, &signed, &mut OsRng).map_err(|_| ErrorCode::Internal.into())
+    }
+
+    /// Tests only (feature `test-hooks`): how many reports a server's store
+    /// keeps, so the eviction can be tested without a thousand boxes.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_report_store_cap_for_tests(&self, cap: usize) {
+        self.lock().report_store_cap = cap;
     }
 
     /// G-48 `getReportEvidence(reportId)`: the reported message, on an
@@ -6975,18 +7002,83 @@ impl Inner {
         Ok(found)
     }
 
-    /// My stored report `report_id`: its inbox index, server and contents.
+    /// My stored report `report_id`: its index in its server's inbox, the
+    /// server and its contents. Matched by the stored ID; only the match is
+    /// opened (rows from the first release get their ID filled once).
     fn find_report(&mut self, report_id: &str) -> CoreResult<(usize, ServerId, Report)> {
-        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
-        for (index, row) in inbox.iter().enumerate() {
-            let Ok(sealed) = hex::decode(&row.sealed) else { continue };
-            if let Some((server, opened)) = self.open_report(&sealed)? {
-                if model::hex_id(&opened.id()) == report_id {
+        for server in self.inbox_servers()? {
+            let mut inbox = self.inbox(server)?;
+            let mut filled = false;
+            for row in inbox.iter_mut().filter(|r| r.id.is_empty()) {
+                let opened = hex::decode(&row.sealed).ok().map(|s| self.open_report(&s)).transpose()?.flatten();
+                if let Some((_, opened)) = opened {
+                    row.id = model::hex_id(&opened.id());
+                    filled = true;
+                }
+            }
+            if filled {
+                self.set_inbox(server, &inbox)?;
+            }
+            let Some(index) = inbox.iter().position(|r| r.id == report_id) else { continue };
+            let sealed = hex::decode(&inbox[index].sealed).map_err(|_| ErrorCode::Internal)?;
+            if let Some((found, opened)) = self.open_report(&sealed)? {
+                if found == server && model::hex_id(&opened.id()) == report_id {
                     return Ok((index, server, opened));
                 }
             }
         }
         Err(ErrorCode::NotFound.into())
+    }
+
+    fn inbox_key(server: ServerId) -> String {
+        format!("{KV_REPORT_INBOX}/{}", model::hex_id(server.as_bytes()))
+    }
+
+    /// The servers with an inbox store, after moving the first release's
+    /// single store over (once).
+    fn inbox_servers(&mut self) -> CoreResult<Vec<ServerId>> {
+        if let Some(legacy) = self.kv_json::<Vec<InRow>>(KV_REPORT_INBOX)? {
+            let mut by_server: BTreeMap<String, Vec<InRow>> = BTreeMap::new();
+            for row in legacy {
+                by_server.entry(row.server.clone()).or_default().push(row);
+            }
+            for (hex, rows) in by_server {
+                let Some(server) = model::parse_hex32(&hex).map(ServerId::from_bytes) else { continue };
+                let mut inbox: Vec<InRow> = self.kv_json(&Self::inbox_key(server))?.unwrap_or_default();
+                // A move cut short by a crash may have copied some already.
+                for row in rows {
+                    if !inbox.iter().any(|r| r.sealed == row.sealed) {
+                        inbox.push(row);
+                    }
+                }
+                self.set_inbox(server, &inbox)?;
+            }
+            self.db.delete(KV_REPORT_INBOX)?;
+        }
+        let list: Vec<String> = self.kv_json(KV_REPORT_INBOXES)?.unwrap_or_default();
+        Ok(list.iter().filter_map(|h| model::parse_hex32(h).map(ServerId::from_bytes)).collect())
+    }
+
+    /// One server's stored reports, oldest first.
+    fn inbox(&mut self, server: ServerId) -> CoreResult<Vec<InRow>> {
+        self.inbox_servers()?;
+        Ok(self.kv_json(&Self::inbox_key(server))?.unwrap_or_default())
+    }
+
+    /// Writes one server's reports; an empty list deletes the store.
+    fn set_inbox(&mut self, server: ServerId, rows: &[InRow]) -> CoreResult<()> {
+        let hex = model::hex_id(server.as_bytes());
+        let mut list: Vec<String> = self.kv_json(KV_REPORT_INBOXES)?.unwrap_or_default();
+        if rows.is_empty() {
+            self.db.delete(&Self::inbox_key(server))?;
+            list.retain(|h| *h != hex);
+        } else {
+            self.set_kv_json(&Self::inbox_key(server), &rows)?;
+            if !list.contains(&hex) {
+                list.push(hex);
+            }
+        }
+        self.set_kv_json(KV_REPORT_INBOXES, &list)
     }
 
     fn report_summary(
@@ -7048,14 +7140,13 @@ impl Inner {
             staff.insert(hex, list.iter().map(|k| model::hex_id(k.as_bytes())).collect());
         }
         let me_hex = me.map(|k| model::hex_id(k.as_bytes())).unwrap_or_default();
-        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
-        let kept: Vec<InRow> = inbox
-            .iter()
-            .filter(|r| staff.get(&r.server).is_some_and(|s| s.contains(&me_hex)))
-            .cloned()
-            .collect();
-        if kept.len() != inbox.len() {
-            self.set_kv_json(KV_REPORT_INBOX, &kept)?;
+        // A server's whole store goes when I'm no longer staff there, or no
+        // longer in it at all (left, kicked, purged).
+        for server in self.inbox_servers()? {
+            let hex = model::hex_id(server.as_bytes());
+            if !staff.get(&hex).is_some_and(|s| s.contains(&me_hex)) {
+                self.set_inbox(server, &[])?;
+            }
         }
         let outbox: Vec<OutRow> = self.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
         let kept: Vec<OutRow> = outbox

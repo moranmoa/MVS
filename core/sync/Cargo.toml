@@ -17,7 +17,7 @@ anyhow = "1"
 # The request-response codec trait (`voice`); already in the tree through libp2p.
 async-trait = "0.1"
 blake3 = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # The LAN beacon socket (`lan_beacon`): shared port, multicast. Already in
 # the tree through tokio.
 socket2 = { version = "0.6", features = ["all"] }

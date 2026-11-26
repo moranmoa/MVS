@@ -22,7 +22,7 @@ ed25519-dalek = "2"
 # CC0-1.0 OR Apache-2.0
 blake3 = "1"
 # MIT OR Apache-2.0
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # Device link (already in the tree: x25519 through libp2p's noise, hkdf and
 # sha2 through identity). No new crypto crate.
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }

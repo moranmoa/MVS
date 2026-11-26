@@ -11,6 +11,7 @@ import { useUserTextProps } from '../../app/textDir';
 import { Avatar, Code, inkOn, Name } from '../../components/common';
 import { isCoreError, useCore } from '../../core';
 import { cleanName } from '../../core/sanitize';
+import { useReadOnlyProps } from '../shell/UpdateRequired';
 
 /** Scrolls a field into view, clear of the sticky save bar (partly visible counts as hidden). */
 function keepClear(el: HTMLElement): void {
@@ -147,6 +148,7 @@ export const ProfileEditor = forwardRef<ProfileEditorHandle, { onDirtyChange: (d
   const store = useAppStore();
   const core = useCore();
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const identity = useStore(store, (s) => s.identity)!;
   const saved: Draft = { name: identity.displayName, bio: identity.bio ?? '', avatar: identity.avatarDataUrl, color: identity.color };
   const [draft, setDraft] = useState<Draft>(saved);
@@ -341,6 +343,7 @@ export const ProfileEditor = forwardRef<ProfileEditorHandle, { onDirtyChange: (d
             className="primary"
             disabled={!dirty || !!busy}
             aria-describedby={ids.hint}
+            {...ro}
             onClick={() => void save()}
           >
             <FormattedMessage id={busy === 'saving' ? 'profile.edit.saving' : saveError ? 'common.retry' : 'profile.edit.save'} />

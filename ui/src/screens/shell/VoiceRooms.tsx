@@ -14,6 +14,7 @@ import { isCoreError, useCore, type Id, type Member, type ServerSummary, type Vo
 import { VOICE_ROOM_LIMIT_MAX, VOICE_ROOM_NAME_MAX, VOICE_ROOMS_MAX } from '../../core/sanitize';
 import { CallError, codeOf, FAILURE_TEXT, ipNoticeSeen, rememberIpNotice, VOLUME_TICKS, VolumeTicks, type CallEngine } from './CallBar';
 import { useVoiceP2p } from '../../voice/useVoiceP2p';
+import { useUpdateRequired } from './UpdateRequired';
 
 const NO_MEMBERS: Member[] = [];
 const NO_ROOMS: VoiceRoom[] = [];
@@ -35,7 +36,9 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
   // G-81 B: with calls over the P2P network on, the notice is v3 (new wording, new key).
   const p2p = useVoiceP2p();
   // Relay-only turns calls off, except with G-81 B on: then calls go through our relay (the v3 notice says so).
-  const callsBlocked = relayOnly && !p2p;
+  // #577: a required update: no calls either (main refuses joinCall).
+  const updateRequired = useUpdateRequired();
+  const callsBlocked = (relayOnly && !p2p) || updateRequired;
   const callError = useStore(store, (s) => s.callError);
   const callRoomId = useStore(store, (s) => s.call?.channelId ?? null);
   const { bind, menu } = useContextMenu();
@@ -103,7 +106,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
   }, [rooms, callRoomId, intl]);
 
   const capped = rooms.length >= VOICE_ROOMS_MAX;
-  const rootBlocked = callsBlocked ? 'call.error.relayOnly' : capped ? 'voiceRooms.capReached' : null;
+  const rootBlocked = updateRequired ? 'update.required.disabled' : callsBlocked ? 'call.error.relayOnly' : capped ? 'voiceRooms.capReached' : null;
 
   const start = (action: Pending, from: HTMLElement | null) => {
     returnTo.current = from;
@@ -177,7 +180,7 @@ export function VoiceRooms({ server, myId, engine }: { server: ServerSummary; my
       {rootBlocked && (
         <p id={reasonId} className="voice-room-reason">
           <FormattedMessage id={rootBlocked} />
-          {callsBlocked && (
+          {callsBlocked && !updateRequired && (
             <>
               {' '}
               <button type="button" className="link small" onClick={() => store.openSettings('privacy')}>

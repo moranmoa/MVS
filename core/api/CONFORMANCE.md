@@ -554,6 +554,9 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - **The form:** a `MessageEdit` with the same text and the original's `ts`. It's sealed for the current readers once the join re-key covers the joiner.
   - **Limits:** at most 50 per channel per Join, and 100 a minute.
   - **Never re-sent:** to a joiner removed meanwhile, or anything from before that window (D30).
+  - **18+ channels turned plain (PO, child safety):** a message written while its channel was 18+ never reaches a joiner who isn't an adult. It stays hidden like pre-join history, with no placeholder.
+    - Where the message sits decides, not its time: for such a joiner, in a channel that was ever 18+ (it has a `State.adult_edits` entry), only messages whose `auth_deps` reach the channel's latest accepted edit back to plain are re-sent. A backdated `Join.ts` (a window of about 10 min) changes nothing.
+    - It fails closed: with no edit back to plain, or concurrent ones none of which has the others in its past, nothing from that channel is re-sent to them.
   - Display, for every core from this one on:
     - **A reader who can open both the original and the edit:** `editedAt` is absent when the texts are equal, so there's no "edited" label, no `message.updated` and no second unread. With a different text it's an ordinary edit, even when its `ts` equals the original's.
     - **A reader who can't open the original (the joiner):** the edit's text shows in the message's place. `editedAt` is absent when the edit's `ts` equals the original's. Unread and mentions count once, as for a new message.
@@ -585,9 +588,21 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `lv:N` is per release, not per feature (Tech Lead on #590). It means "this core decodes every kind introduced up to level N".
     - The first release that ships a new kind posts the next level, and every kind that release introduces gates on `lv >= N`.
     - The kind codes are fixed: `SecretRotation` (T17) is 25 and `ServerAgeLimit` (G-52) is 26. If both ship in one release, both gate on that release's level.
-- Server age limit (G-52, planned; design `docs/design/server-age-limit.md`, Security Lead on #590):
-  - After a raise to 18+, every channel's readers are members ∩ adults. The receiver rule's `reaches` must cover the later of the server-wide raise and the channel's own 18+ edit.
-  - **Accepted residual:** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata. T17's leave rotation never fires for it. Such members show as not adult to the owner and admins, who can kick them, and the kick rotates the secret.
+- Server age limit (G-52; design `docs/design/server-age-limit.md`, Security Lead and Tech Lead on #590; records and authority #610):
+  - `setAgeRestriction(serverId, 'none' | '16+' | '18+')` returns the updated `ServerSummary` and sends `server.updated`.
+    - The owner only (`not-allowed`); `not-found` for a server I'm not in; `bad-request` for any other value.
+    - `18+` only while my effective age is 18 or more (`too-young`, PO on #512).
+    - Behind `lv:1` (`update-needed` while a member's latest profile lacks it; `getUpdateNeeded(serverId, 'lv:1')` lists who): an older core would ignore the limit and keep keying minors.
+    - The current value signs nothing. The UI confirms raises and lowerings before calling (spec §2, §3); the core takes no "confirmed" flag.
+  - `countAgeAffected(serverId, ageRestriction)` returns `{ count }`: for `18+`, the members other than me without an accepted 18+ claim; 0 otherwise. No names. The owner or an admin (`not-allowed`).
+  - The effective limit (the latest accepted change, else the genesis value) replaces the genesis value everywhere: `ServerSummary.ageRestriction`, the join preview and `AgeBlocked`, birth-date corrections and `server.removed`'s `required`.
+  - **While the server is 18+:**
+    - every channel's readers are members ∩ adults, so the next rotation (at once, in the owner's call) leaves minors out;
+    - the receiver rule applies to every channel: deps that don't reach the raise, and the channel's own 18+ edit where there is one, count only from an adult now. A server 18+ from its genesis counts as raised there;
+    - a member's core under the limit leaves (`server.removed`, reason `age`, `required: '18+'`), unless its age is unknown (a restored device without a birth date) or it is the owner.
+  - **Lowering** re-keys forward only: 16- and 17-year-olds get no key to anything sealed while it was 18+. 18+ channels keep their own readers.
+  - `Member.notAdult?: true`: in an 18+ server, a member without an accepted 18+ claim, shown to the owner and admins only.
+  - **Accepted residual (Security Lead on #590):** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata, and T17's leave rotation never fires for it. Such members show as `notAdult` to the owner and admins, who can kick them; a kick rotates the secret.
 - 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
   - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
   - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.

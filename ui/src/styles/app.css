@@ -874,6 +874,60 @@ legend {
   flex: 1;
 }
 
+/* #577: the required-update banner; no close, no "later". */
+.banner.update-required {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  padding-block: 0.75rem;
+}
+
+.update-required-text {
+  flex: 1 1 20rem;
+  min-inline-size: 0;
+}
+
+.update-required-text p {
+  margin: 0;
+}
+
+.update-required-title {
+  font-weight: 700;
+  font-size: 0.9375rem;
+}
+
+.update-required-line {
+  margin-block-start: 0.25rem !important;
+  font-weight: 600;
+}
+
+.update-required-details summary {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.update-required-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.update-required-actions button {
+  min-block-size: 1.5rem;
+}
+
+@media (pointer: coarse) {
+  .update-required-actions button {
+    min-block-size: 2.75rem;
+  }
+}
+
+/* Controls that write or connect, while an update is required: in place, visibly off. */
+[aria-disabled='true'][aria-describedby='update-required-reason'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* rail: the outer edge (right in Hebrew, left in English) */
 .rail {
   grid-area: rail;
@@ -1174,6 +1228,19 @@ legend {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* G-52: the name with the "no 18+ claim" tag under it. */
+.member-name-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.125rem;
+  min-inline-size: 0;
+}
+
+.member-name-stack > bdi {
+  max-inline-size: 100%;
 }
 
 .member.offline {
@@ -2176,6 +2243,18 @@ kbd {
   overflow: auto;
   white-space: pre-wrap;
   font-weight: 400;
+}
+
+/* #622: a required update ended the call; the restart button when staged. */
+.call-ended-update {
+  max-inline-size: min(36rem, calc(100vw - 2rem));
+}
+
+.call-ended-update button {
+  flex: none;
+  border-color: currentColor;
+  background: transparent;
+  color: inherit;
 }
 
 .toast-close {
@@ -4051,4 +4130,53 @@ input.switch:disabled {
   .row.target .msg {
     animation: none;
   }
+}
+
+/* G-51: a server's icon fills its rail button (a circle, as the button). */
+.rail-button .server-icon {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
+/* G-51: the icon row on the "כללי" page. */
+.server-icon-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.server-icon-preview {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 5rem;
+  height: 5rem;
+  border-radius: 50%;
+  overflow: hidden;
+  color: #fff;
+  font-weight: 700;
+  font-size: 1.5rem;
+}
+
+.server-icon-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.server-meta textarea {
+  resize: vertical;
+}
+
+/* G-51: the settings title shows the icon too. */
+.server-settings-icon {
+  overflow: hidden;
+}
+
+.server-settings-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }

@@ -37,6 +37,7 @@ import type {
   DeviceAdded,
   MemberRelay,
   Id,
+  UpdateGate,
 } from './types';
 import { REPORT_REASONS } from './types';
 
@@ -224,10 +225,28 @@ export function cleanIdentity(i: Identity): Identity {
   };
 }
 
+/** G-51: a server icon the core could have accepted: PNG or WebP, base64, at most 8 KiB of data. */
+const serverIcon = (raw: unknown): string | undefined =>
+  typeof raw === 'string' && raw.length <= 11_000 && /^data:image\/(?:png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(raw) ? raw : undefined;
+
+/** G-51: plain text, up to 500 code points and 5 lines; controls other than line breaks dropped. */
+function serverDescription(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const lines = cut(raw, 4000)
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .slice(0, 5)
+    .map((l) => stripCommon(l).replace(BIDI_MARKS, '').trimEnd());
+  const text = [...lines.join('\n').trim()].slice(0, 500).join('');
+  return text || undefined;
+}
+
 export function cleanServer(s: ServerSummary): ServerSummary {
   const name = cleanName(s.name, SERVER_NAME_MAX);
+  // G-51: the raw icon and description never pass through; only their cleaned forms below.
+  const { iconDataUrl: _icon, description: _desc, ...rest } = s;
   return {
-    ...s,
+    ...rest,
     name,
     initials: cleanName(s.initials, 2) || graphemes(name)[0] || '?',
     color: safeColor(s.color),
@@ -237,6 +256,9 @@ export function cleanServer(s: ServerSummary): ServerSummary {
     mentions: count(s.mentions),
     closed: s.closed === true,
     updateNeeded: s.updateNeeded === true,
+    // G-51: only a still PNG or WebP data URL is an icon; anything else is dropped.
+    ...(serverIcon(s.iconDataUrl) ? { iconDataUrl: serverIcon(s.iconDataUrl) } : {}),
+    ...(serverDescription(s.description) ? { description: serverDescription(s.description) } : {}),
   };
 }
 
@@ -379,13 +401,15 @@ export function cleanChannel(c: Channel): Channel {
 }
 
 export function cleanMember(m: Member): Member {
-  const { avatarDataUrl: rawAvatar, color: rawColor, ...m0 } = m;
+  const { avatarDataUrl: rawAvatar, color: rawColor, notAdult: rawNotAdult, ...m0 } = m;
   const avatar = cleanSmallAvatar(rawAvatar);
   const color = cleanHexColor(rawColor);
   m = m0 as Member;
   return {
     ...(avatar ? { avatarDataUrl: avatar } : {}),
     ...(color ? { color } : {}),
+    // G-52: only exactly true is kept.
+    ...(rawNotAdult === true ? { notAdult: true as const } : {}),
     ...m,
     displayName: cleanName(m.displayName),
     shortCode: cleanCode(m.shortCode),
@@ -706,7 +730,7 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'identity.changed': cleanIdentity,
   'server.added': cleanServer,
   'server.updated': cleanServer,
-  'server.removed': (p) => ({ serverId: id(p.serverId), reason: p.reason === 'left' || p.reason === 'closed' ? p.reason : undefined }),
+  'server.removed': (p) => ({ serverId: id(p.serverId), reason: p.reason === 'left' || p.reason === 'closed' || p.reason === 'age' ? p.reason : undefined }),
   'server.closed': (p) => ({ serverId: id(p.serverId) }),
   'channel.updated': cleanChannel,
   'channel.added': cleanChannel,
@@ -772,7 +796,19 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
     notes: typeof u.notes === 'string' ? cleanText(u.notes, 2000, 30).text : null,
   }),
   'update.rolledBack': (u) => ({ failed: cleanName(u.failed, 32), running: cleanName(u.running, 32) }),
+  'update.gate': (g) => cleanUpdateGate(g),
 };
+
+/** #577: main's gate. Only exact booleans count; the version is a plain short name or null. */
+export function cleanUpdateGate(g: UpdateGate | null | undefined): UpdateGate {
+  return {
+    required: g?.required === true,
+    version: typeof g?.version === 'string' ? cleanName(g.version, 32) || null : null,
+    active: g?.active === true,
+    phase: g?.phase === 'gated' ? 'gated' : 'none',
+    endedCall: g?.endedCall === true,
+  };
+}
 
 /** The core as the UI sees it: same API, every peer-supplied value cleaned. */
 export function guardCore(core: CoreApi): CoreApi {
@@ -796,11 +832,17 @@ export function guardCore(core: CoreApi): CoreApi {
     listMembers: wrap(core.listMembers, (l) => l.map(cleanMember)),
     createServer: wrap(core.createServer, cleanServer),
     renameServer: wrap(core.renameServer, cleanServer),
+    setAgeRestriction: wrap(core.setAgeRestriction, cleanServer),
+    countAgeAffected: wrap(core.countAgeAffected, (r) => ({ count: count(r?.count) })),
+    setServerIcon: wrap(core.setServerIcon, cleanServer),
+    setServerDescription: wrap(core.setServerDescription, cleanServer),
     getUpdateNeeded: wrap(core.getUpdateNeeded, (l) => (Array.isArray(l) ? l.filter((x): x is string => typeof x === 'string').map(id) : [])),
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
     listBlocked: wrap(core.listBlocked, cleanBlockedList),
     listReports: wrap(core.listReports, cleanReports),
+    getUpdateGate: wrap(core.getUpdateGate, cleanUpdateGate),
+    checkUpdate: wrap(core.checkUpdate, (r) => (typeof r === 'string' && /^[a-z][a-z-]{0,39}$/.test(r) ? r : 'internal')),
     getReportEvidence: wrap(core.getReportEvidence, cleanReportEvidence),
     reportContent: wrap(core.reportContent, (r) => ({ reportId: id(r?.reportId), recipients: count(r?.recipients) })),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>

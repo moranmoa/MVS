@@ -69,6 +69,10 @@ export interface ServerSummary {
    * newer MVS and this computer may miss what it adds. The UI asks to update.
    */
   updateNeeded?: boolean;
+  /** G-51: the server's icon, a still PNG or WebP data URL (at most 128 px, 8 KiB). */
+  iconDataUrl?: string;
+  /** G-51: plain text, up to 5 lines; shown as is (never Markdown or links). */
+  description?: string;
 }
 
 export interface Channel {
@@ -118,6 +122,11 @@ export interface Member {
   isOwner: boolean;
   /** Blocked by me: their messages are collapsed on this device only. */
   blocked?: boolean;
+  /**
+   * G-52 (core #616): in an 18+ server, a member without an 18+ claim. Only in
+   * the owner's and admins' member lists, so they can remove them; absent = nothing to show.
+   */
+  notAdult?: true;
   bio?: string;
   /** #359: the member's small picture (data:image/webp|png), from their profile post. */
   avatarDataUrl?: string;
@@ -184,7 +193,11 @@ export interface CoreError {
     /** G-48: nobody can receive the report (the owner is reported and there are no admins). */
     | 'no-recipient'
     /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
-    | 'profile-too-large';
+    | 'profile-too-large'
+    /** G-52 (core #590): 18+ chosen by an owner under 18. */
+    | 'too-young'
+    /** #577: a required update is pending; main refuses everything that writes or connects. */
+    | 'update-required';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */
   detail?: CoreDownDetail;
   /** 1-based word positions that were not recognised (restore). */
@@ -275,6 +288,18 @@ export interface UpdateInfo {
   version: string;
   /** While in a voice call the update waits until the call ends. */
   waitingForCall: boolean;
+}
+
+/**
+ * Desktop shell (#577, #626): the required-update gate, on every change and on
+ * every page load. `endedCall` stays true once the gate ended a call.
+ */
+export interface UpdateGate {
+  required: boolean;
+  version: string | null;
+  active: boolean;
+  phase: 'none' | 'gated';
+  endedCall: boolean;
 }
 
 export type UpdateChannel = 'stable' | 'beta';

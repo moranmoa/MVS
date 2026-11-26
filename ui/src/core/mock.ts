@@ -37,6 +37,7 @@ import type {
   ServerSummary,
   StorageUsage,
   UpdateChannel,
+  UpdateGate,
   ReportEvidence,
   ReportReason,
   ReportReceipt,
@@ -70,6 +71,12 @@ export interface MockOptions {
   updateInstalled?: boolean;
   /** Shortly after start: the last update failed and the previous version is back. */
   updateRolledBack?: boolean;
+  /** G-52: shortly after start, a server I'm in is removed for its new 18+ limit (screenshots). */
+  ageRemoved?: boolean;
+  /** #577: a required update is pending from the start, in this banner state (screenshots). */
+  updateRequired?: 'downloading' | 'ready' | 'offline' | 'check-clock' | 'not-available' | 'failed';
+  /** #622: this long after joining a call, a required update ends it (as main does). */
+  requiredInCallMs?: number;
   /** Act as if in a voice call: restartToUpdate is refused with not-allowed. */
   inCall?: boolean;
   /** As the desktop shell would: report the core down, for the T8-01 screen. */
@@ -90,6 +97,8 @@ export interface MockOptions {
   signOutKeyring?: boolean;
   /** updateProfile fails (B11e: the save error state). */
   profileError?: boolean;
+  /** G-51: setServerIcon answers rate-limited (screenshots, tests). */
+  serverIconRateLimited?: boolean;
   /** The first demo voice room starts with 5 people in it (full). */
   roomFull?: boolean;
   /** Voice rooms (0.4.3): how many live rooms each demo server starts with (default 1; 0 = none; up to 10). */
@@ -236,6 +245,8 @@ export class MockCore implements CoreApi {
   private storageLimit = 5 * 1024 ** 3;
   private releaseChannel: UpdateChannel = 'stable';
   private pendingJoins = new Map<string, ReturnType<typeof setTimeout>>();
+  /** #622: a required update ended my call (the mock's gate is on from then). */
+  private gateEnded = false;
   private timers: ReturnType<typeof setTimeout | typeof setInterval>[] = [];
   private speed: number;
 
@@ -292,6 +303,22 @@ export class MockCore implements CoreApi {
     }
     if (options.updateRolledBack) {
       this.timers.push(setTimeout(() => this.emit('update.rolledBack', { failed: '0.3.0', running: '0.2.0' }), 800));
+    }
+    if (options.ageRemoved) {
+      // G-52: a server I'm a member of (not mine) was raised to 18+ and I'm under 18.
+      this.timers.push(
+        setTimeout(() => {
+          const s = [...this.servers.values()].find((x) => x.summary.ownerId !== this.identity?.id);
+          if (!s) return;
+          this.servers.delete(s.summary.id);
+          for (const c of s.channels) this.channelIndex.delete(c.channel.id);
+          this.emit('server.removed', { serverId: s.summary.id, reason: 'age' });
+        }, 600),
+      );
+    }
+    if (options.updateRequired === 'ready') {
+      // #577: the required version is already downloaded and staged.
+      this.timers.push(setTimeout(() => this.emit('update.ready', { version: '0.6.0', waitingForCall: false }), 100));
     }
     if (options.updateAfterMs !== undefined) {
       this.timers.push(
@@ -1213,12 +1240,55 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1' | 'server-meta-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
     // As the core: only cap names it knows.
     if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
+  }
+
+  /** G-51: as the core (owner here; admins too in the core), with its limits. */
+  private lastIconSet = new Map<Id, number>();
+  async setServerIcon(serverId: Id, dataUrl: string | null): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    if (dataUrl !== null) {
+      if (!/^data:image\/(?:png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(dataUrl) || dataUrl.length > 11_000) throw err({ code: 'bad-request' });
+      const last = this.lastIconSet.get(serverId) ?? 0;
+      if (this.options.serverIconRateLimited || Date.now() - last < 10 * 60_000) throw err({ code: 'rate-limited' });
+    }
+    this.lifecycleGate(s);
+    await this.wait(150);
+    if (dataUrl !== null) this.lastIconSet.set(serverId, Date.now());
+    const { iconDataUrl: _old, ...rest } = s.summary;
+    s.summary = dataUrl === null ? rest : { ...rest, iconDataUrl: dataUrl };
+    this.emit('server.updated', s.summary);
+    return s.summary;
+  }
+
+  async setServerDescription(serverId: Id, description: string): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    const text = description.trim();
+    const lines = text.split('\n');
+    if (
+      [...text].length > 500 ||
+      lines.length > 5 ||
+      /[\r\u2028\u2029]/.test(text) ||
+      lines.some((l) => l !== l.trimEnd()) ||
+      /\n\n\n/.test(text)
+    ) {
+      throw err({ code: 'bad-request' });
+    }
+    this.lifecycleGate(s);
+    await this.wait(150);
+    const { description: _old, ...rest } = s.summary;
+    s.summary = text ? { ...rest, description: text } : rest;
+    this.emit('server.updated', s.summary);
+    return s.summary;
   }
 
   async renameServer(serverId: Id, name: string): Promise<ServerSummary> {
@@ -1235,6 +1305,41 @@ export class MockCore implements CoreApi {
     s.summary = { ...s.summary, name: clean, initials: initialsOf(clean) };
     this.emit('server.updated', s.summary);
     return s.summary;
+  }
+
+  async setAgeRestriction(serverId: Id, ageRestriction: AgeRestriction): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    if (!['none', '16+', '18+'].includes(ageRestriction)) throw err({ code: 'bad-request' });
+    // As the core: the current value signs nothing.
+    if (ageRestriction === s.summary.ageRestriction) return s.summary;
+    // G-52 (PO, #512): an owner under 18 can't make a server 18+.
+    if (ageRestriction === '18+' && this.ageOf(this.identity!.birthDate) < 18) throw err({ code: 'too-young' });
+    this.lifecycleGate(s);
+    await this.wait(150);
+    s.summary = { ...s.summary, ageRestriction };
+    // G-52: at 18+ the owner sees who has no 18+ claim (every third other member, as countAgeAffected).
+    const me = this.identity?.id;
+    let i = 0;
+    s.members = s.members.map((m) => {
+      const { notAdult: _, ...rest } = m;
+      if (m.id === me || ageRestriction !== '18+') return rest;
+      return i++ % 3 === 0 ? { ...rest, notAdult: true as const } : rest;
+    });
+    this.emit('members.changed', { serverId, members: s.members });
+    this.emit('server.updated', s.summary);
+    return s.summary;
+  }
+
+  /** G-52: the demo's members without an 18+ claim (every third other member). */
+  async countAgeAffected(serverId: Id, ageRestriction: AgeRestriction): Promise<{ count: number }> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    // Owner here; admins too in the core (the mock has no admins).
+    if (s.summary.ownerId !== this.identity?.id) throw err({ code: 'not-allowed' });
+    if (ageRestriction !== '18+') return { count: 0 };
+    return { count: s.members.filter((m) => m.id !== this.identity?.id).filter((_, i) => i % 3 === 0).length };
   }
 
   async leaveServer(serverId: Id): Promise<void> {
@@ -1579,6 +1684,16 @@ export class MockCore implements CoreApi {
     this.emitRooms(found.serverId);
     this.call = this.callOf(found.room);
     this.emitCall();
+    if (this.options.requiredInCallMs !== undefined) {
+      // As main does (#626): the gate ends the call, the page hears it, then the leave.
+      this.timers.push(
+        setTimeout(() => {
+          this.gateEnded = true;
+          this.emit('update.gate', { required: true, version: '0.6.0', active: true, phase: 'gated', endedCall: true });
+          void this.leaveCall();
+        }, this.options.requiredInCallMs),
+      );
+    }
     return this.call;
   }
 
@@ -1959,6 +2074,18 @@ export class MockCore implements CoreApi {
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {
     this.releaseChannel = channel;
+  }
+
+  async getUpdateGate(): Promise<UpdateGate> {
+    const r = this.options.updateRequired ?? (this.gateEnded ? 'downloading' : undefined);
+    if (!r) return { required: false, version: null, active: false, phase: 'none', endedCall: false };
+    return { required: true, version: r === 'not-available' ? null : '0.6.0', active: true, phase: 'gated', endedCall: this.gateEnded };
+  }
+
+  async checkUpdate(): Promise<string> {
+    await this.wait(150);
+    const r = this.options.updateRequired;
+    return r === 'offline' || r === 'check-clock' ? r : r === 'failed' ? 'invalid-update' : 'ok';
   }
 
   async restartToUpdate(): Promise<void> {

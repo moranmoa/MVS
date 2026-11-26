@@ -232,6 +232,62 @@ test('call gate: switching calls (the old call.state [] comes first) ends in the
   assert.equal(gate.inCall, true);
 });
 
+// QA P1 (voice-e2e on main 4be31c5): the core sends call.state (me in the call)
+// before it answers joinCall; the page starts the microphone on that event.
+test('call gate: the new call.state opens it while the join is still being answered', () => {
+  for (const cmd of ['joinCall', 'createVoiceRoom']) {
+    const gate = sec.createCallGate();
+    const t = gate.beforeCommand(cmd);
+    gate.onEvent('call.state', CALL);
+    assert.equal(gate.inCall, true, cmd);
+    assert.equal(sec.allowPermissionRequest(PAGE, 'media', micReq(), gate.inCall), true, cmd);
+    gate.afterCommand(cmd, t, { ok: CALL });
+    assert.equal(gate.inCall, true, cmd);
+  }
+});
+
+test('call gate: a call.state with participants never opens it without a join in flight', () => {
+  const gate = sec.createCallGate();
+  gate.onEvent('call.state', CALL);
+  assert.equal(gate.inCall, false, 'no join sent');
+  // Answered joins are done: a later event can't reopen after a leave.
+  joined(gate);
+  gate.beforeCommand('leaveCall');
+  gate.onEvent('call.state', CALL);
+  assert.equal(gate.inCall, false, 'after leave');
+  // Other commands in flight don't count.
+  gate.beforeCommand('setMuted');
+  gate.onEvent('call.state', CALL);
+  assert.equal(gate.inCall, false, 'setMuted in flight');
+});
+
+test('call gate: an early call.state, then a failed answer: shut again', () => {
+  const gate = sec.createCallGate();
+  const t = gate.beforeCommand('joinCall');
+  gate.onEvent('call.state', CALL);
+  assert.equal(gate.inCall, true);
+  gate.afterCommand('joinCall', t, { error: { code: 'call-full' } });
+  assert.equal(gate.inCall, false);
+  gate.onEvent('call.state', CALL);
+  assert.equal(gate.inCall, false, 'nothing in flight any more');
+});
+
+test('call gate: a join sent before a leave, a core restart or quit: its early call.state stays shut', () => {
+  for (const [label, act] of [
+    ['leaveCall', (g) => g.beforeCommand('leaveCall')],
+    ['core restart', (g) => g.onCoreStatus({ state: 'starting' })],
+    ['quit', (g) => g.end()],
+  ]) {
+    const gate = sec.createCallGate();
+    const t = gate.beforeCommand('joinCall');
+    act(gate);
+    gate.onEvent('call.state', CALL);
+    assert.equal(gate.inCall, false, label);
+    gate.afterCommand('joinCall', t, { ok: CALL });
+    assert.equal(gate.inCall, false, label);
+  }
+});
+
 test('screen capture is denied', () => {
   for (const perm of ['display-capture', 'screen', 'desktop', 'window-management', 'window-placement']) {
     assert.equal(allowReq(PAGE, perm, micReq()), false, perm);

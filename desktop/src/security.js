@@ -195,7 +195,9 @@ const hasParticipants = (state) => !!state && Array.isArray(state.participants) 
  * V-C2: whether we are in a call, as main sees it from the core's answers and
  * events. It opens only on a successful call-starting command (CALL_STARTERS:
  * joinCall, or createVoiceRoom, whose creator is in the new room; each
- * answers a CallState with participants) and fails closed: it shuts on
+ * answers a CallState with participants), or on the call.state with
+ * participants that the core sends while such a command is still in flight,
+ * before its answer; it fails closed: it shuts on
  * leaveCall (when sent), on any call-starting command that fails, on a
  * call.state with no participants (left, ended, timed out, refused),
  * whenever the core is not up (a restarted core has no call), and on quit.
@@ -207,9 +209,13 @@ const CALL_STARTERS = Object.freeze(new Set(['joinCall', 'createVoiceRoom']));
 function createCallGate() {
   let inCall = false;
   let gen = 0;
+  // Call-starting commands sent and not yet answered, by generation.
+  const starting = new Map();
   const shut = () => {
     inCall = false;
     gen += 1;
+    // Joins of older generations can never open it again (TL nit, #641).
+    starting.clear();
   };
   return {
     get inCall() {
@@ -218,20 +224,30 @@ function createCallGate() {
     /** Before a command goes to the core; returns a token for its answer. */
     beforeCommand(cmd) {
       if (cmd === 'leaveCall') shut();
+      if (CALL_STARTERS.has(cmd)) starting.set(gen, (starting.get(gen) || 0) + 1);
       return gen;
     },
     /** The core's answer ({ ok } or { error }) to a command sent with `token`. */
     afterCommand(cmd, token, res) {
       if (!CALL_STARTERS.has(cmd)) return;
+      const left = (starting.get(token) || 1) - 1;
+      if (left > 0) starting.set(token, left);
+      else starting.delete(token);
       // Both leave any other call first, so a failed one leaves us out.
       if (!res || res.error || !hasParticipants(res.ok)) return void shut();
       if (token === gen) inCall = true;
     },
     /** Every core event. */
     onEvent(name, payload) {
-      // Only shuts: a join that is still being answered must not lose its
+      if (name !== 'call.state') return;
+      // Shuts: a join that is still being answered must not lose its
       // generation to the leave of the call it replaces.
-      if (name === 'call.state' && !hasParticipants(payload)) inCall = false;
+      if (!hasParticipants(payload)) inCall = false;
+      // QA P1 (voice-e2e, joiner sent no audio): the core announces the new
+      // call before it answers the join, and the page starts the microphone
+      // on that event. Opens only while a join/create of this generation is
+      // in flight; a failed answer still shuts it (afterCommand).
+      else if (starting.get(gen) > 0) inCall = true;
     },
     /** Every core status ({ state: 'starting' | 'up' | 'down', ... }). */
     onCoreStatus(status) {

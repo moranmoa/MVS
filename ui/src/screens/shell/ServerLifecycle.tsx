@@ -14,19 +14,20 @@ import { Dialog, Name } from '../../components/common';
 import { isCoreError, useCore, type Member, type ServerSummary } from '../../core';
 import { SERVER_NAME_MAX } from '../../core/sanitize';
 import { displayName } from './MemberList';
+import { useReadOnlyProps } from './UpdateRequired';
 
 const NO_MEMBERS: Member[] = [];
 
-type Failure = { kind: 'update-needed' } | { kind: 'bad-name' } | { kind: 'other' };
+export type Failure = { kind: 'update-needed' } | { kind: 'bad-name' } | { kind: 'other' };
 
-function failureOf(e: unknown): Failure {
+export function failureOf(e: unknown): Failure {
   if (isCoreError(e) && e.code === 'update-needed') return { kind: 'update-needed' };
   if (isCoreError(e) && e.code === 'bad-request') return { kind: 'bad-name' };
   return { kind: 'other' };
 }
 
 /** `update-needed`: who still runs an older MVS, and the two ways out. */
-export function UpdateNeeded({ server }: { server: ServerSummary }) {
+export function UpdateNeeded({ server, cap }: { server: ServerSummary; cap?: 'server-meta-v1' }) {
   const core = useCore();
   const store = useAppStore();
   const members = useStore(store, (s) => s.members[server.id] ?? NO_MEMBERS);
@@ -36,11 +37,11 @@ export function UpdateNeeded({ server }: { server: ServerSummary }) {
   useEffect(() => {
     let live = true;
     // Without the list the alert still says what happened and what to do.
-    core.getUpdateNeeded(server.id).then((ids) => live && setMemberIds(ids), () => {});
+    core.getUpdateNeeded(server.id, cap).then((ids) => live && setMemberIds(ids), () => {});
     return () => {
       live = false;
     };
-  }, [core, server.id]);
+  }, [core, server.id, cap]);
   const names = memberIds.map((id) => members.find((m) => m.id === id)).filter((m): m is Member => !!m);
   return (
     <div className="warning update-needed" role="alert">
@@ -70,7 +71,7 @@ export function UpdateNeeded({ server }: { server: ServerSummary }) {
   );
 }
 
-function FailureNote({ server, failure }: { server: ServerSummary; failure: Failure | null }) {
+export function FailureNote({ server, failure }: { server: ServerSummary; failure: Failure | null }) {
   if (!failure) return null;
   if (failure.kind === 'update-needed') return <UpdateNeeded server={server} />;
   return (
@@ -83,6 +84,7 @@ function FailureNote({ server, failure }: { server: ServerSummary; failure: Fail
 /** Settings → General: the server's name, for the owner (admins too, once roles reach the UI). */
 export function RenameForm({ server }: { server: ServerSummary }) {
   const core = useCore();
+  const ro = useReadOnlyProps();
   const [name, setName] = useState(server.name);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -125,7 +127,7 @@ export function RenameForm({ server }: { server: ServerSummary }) {
         />
       </label>
       <div className="actions">
-        <button type="submit" className="primary" disabled={busy || !name.trim() || name.trim() === server.name}>
+        <button type="submit" className="primary" disabled={busy || !name.trim() || name.trim() === server.name} {...ro}>
           <FormattedMessage id="server.rename.save" />
         </button>
         {saved && (

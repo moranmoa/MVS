@@ -14,9 +14,12 @@ import { Avatar, Dialog, InviteBox, Name } from '../../components/common';
 import { GearIcon, HashIcon, PlusIcon } from '../../components/icons';
 import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
+import { AgeLimitSetting } from './AgeLimit';
+import { ServerMetaForm } from './ServerMeta';
 import { RemovedAccounts } from './RemovedAccounts';
 import { ReportsPage } from './Reports';
 import { useOpenReports } from './reportsState';
+import { useReadOnlyProps } from './UpdateRequired';
 
 export type ServerSettingsPage = 'general' | 'channels' | 'invite' | 'members' | 'removed' | 'reports' | 'danger';
 const PAGES: ServerSettingsPage[] = ['general', 'channels', 'invite', 'members', 'removed', 'reports', 'danger'];
@@ -79,7 +82,7 @@ export function ServerSettings({
       title={
         <span className="server-settings-title" title={server.name}>
           <span className="server-settings-icon" style={{ background: server.color }} aria-hidden="true">
-            <bdi>{server.initials}</bdi>
+            {server.iconDataUrl ? <img src={server.iconDataUrl} alt="" /> : <bdi>{server.initials}</bdi>}
           </span>
           <Name>{server.name}</Name>
         </span>
@@ -137,23 +140,13 @@ export function ServerSettings({
 }
 
 function GeneralPage({ server }: { server: ServerSummary }) {
-  const age = server.ageRestriction === 'none' ? 'none' : server.ageRestriction.slice(0, 2);
   return (
     <div className="stack">
       <RenameForm server={server} />
-      <dl className="server-facts">
-        <dt>
-          <FormattedMessage id="server.settings.age" />
-        </dt>
-        <dd>
-          <bdi>
-            <FormattedMessage id={`age.${age}`} />
-          </bdi>
-        </dd>
-      </dl>
-      <p className="muted small">
-        <FormattedMessage id="server.settings.ageReadOnly" />
-      </p>
+      {/* G-51: icon and description (its own save until the page-wide save, after G-52). */}
+      <ServerMetaForm server={server} />
+      {/* G-52: editable, with its own confirmations (AgeLimit.tsx). */}
+      <AgeLimitSetting server={server} />
     </div>
   );
 }
@@ -162,10 +155,11 @@ function ChannelsPage({ server, onCreate, onEdit }: { server: ServerSummary; onC
   const store = useAppStore();
   const channels = useStore(store, (s) => s.channels[server.id] ?? NO_CHANNELS);
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   return (
     <div className="stack">
       <div>
-        <button type="button" className="secondary small" onClick={onCreate}>
+        <button type="button" className="secondary small" onClick={onCreate} {...ro}>
           <PlusIcon /> <FormattedMessage id="channel.create" />
         </button>
       </div>
@@ -200,6 +194,7 @@ function MembersPage({ server }: { server: ServerSummary }) {
   const members = useStore(store, (s) => s.members[server.id] ?? NO_MEMBERS);
   const myId = useStore(store, (s) => s.identity?.id);
   const [kick, setKick] = useState<Member | null>(null);
+  const ro = useReadOnlyProps();
   return (
     <>
       <ul className="settings-list">
@@ -213,7 +208,7 @@ function MembersPage({ server }: { server: ServerSummary }) {
               </span>
             )}
             {m.id !== myId && !m.isOwner && (
-              <button type="button" className="danger small" onClick={() => setKick(m)}>
+              <button type="button" className="danger small" onClick={() => setKick(m)} {...ro}>
                 <FormattedMessage id="profile.kick" />
               </button>
             )}
@@ -236,6 +231,7 @@ const MAX_USES = [0, 1, 5, 10, 25, 100];
 function InvitePage({ server, onOpenRemoved }: { server: ServerSummary; onOpenRemoved: () => void }) {
   const core = useCore();
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const members = useStore(useAppStore(), (s) => s.members[server.id] ?? NO_MEMBERS);
   const [invites, setInvites] = useState<Invite[] | null>(null);
   const [expiry, setExpiry] = useState<Expiry>('never');
@@ -333,7 +329,7 @@ function InvitePage({ server, onOpenRemoved }: { server: ServerSummary; onOpenRe
             ))}
           </select>
         </label>
-        <button type="button" className="primary" disabled={busy} onClick={() => void create()}>
+        <button type="button" className="primary" disabled={busy} onClick={() => void create()} {...ro}>
           <FormattedMessage id="invite.createButton" />
         </button>
       </div>
@@ -391,7 +387,7 @@ function InvitePage({ server, onOpenRemoved }: { server: ServerSummary; onOpenRe
                     </button>
                   </span>
                 ) : (
-                  <button type="button" className="secondary small" onClick={() => setConfirm(i.id)}>
+                  <button type="button" className="secondary small" onClick={() => setConfirm(i.id)} {...ro}>
                     <FormattedMessage id="invite.revoke" />
                   </button>
                 )}

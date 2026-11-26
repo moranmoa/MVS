@@ -115,8 +115,10 @@ const globalMute = ptt.createGlobalMute({
 /** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
 /**
  * Required updates (#577, required.js): once the core says the running
- * version is revoked, the page may only read local data and update. It waits
- * for a call to end, for at most 30 min (then main ends the call).
+ * version is revoked, the page may only read local data and update. A call in
+ * progress ends at once (TL; the core's RU1 has already stopped its voice):
+ * a normal leave for the others, no reload (drafts stay), and update.gate
+ * carries endedCall for the banner (update.required.callEnded).
  */
 const requiredGate = required.createRequiredGate({
   inCall: () => callGate.inCall,

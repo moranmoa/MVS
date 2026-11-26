@@ -19,7 +19,7 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor, voiceP2pArgs } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
@@ -319,7 +319,8 @@ function startCore() {
     // Without a relay the core runs offline (no invites, no chat with others).
     relays,
     bootstrap,
-    extraArgs: update.coreArgs(UPDATE),
+    // G-81 B: the core learns the flag from the same source as the page (voiceP2pFor); off without it.
+    extraArgs: [...update.coreArgs(UPDATE), ...voiceP2pArgs(VOICE_P2P)],
     onEvent: (name, payload) => {
       // G-81: audio frames take their own channel (voiceframe.js), never the generic one.
       if (name === 'voice.frame') {

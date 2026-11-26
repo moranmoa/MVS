@@ -17,6 +17,8 @@
   "diag.person": "Name",
   "diag.state": "State",
   "diag.path": "Path",
+  "diag.route": "Route",
+  "diag.playout": "Playout: {type}",
   "diag.candidates": "My candidates",
   "diag.setup": "Setup",
   "diag.ms": "{n} ms",

@@ -109,6 +109,7 @@ const NOT_READ_ONLY = Object.freeze(
     'setMuted',
     'setDeafened',
     'sendSignal',
+    'setCallWebrtcPeers',
     'setMemberRelay',
     'setMemberRelayCap',
     // G-48: a report is a signed record.

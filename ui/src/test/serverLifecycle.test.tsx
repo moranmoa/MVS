@@ -40,8 +40,8 @@ describe('rename (owner)', () => {
     const panel = openSettings(sidebar, 'General');
     const field = within(panel).getByLabelText('Server name');
     fireEvent.change(field, { target: { value: '  Gamers HQ  ' } });
-    await click(within(panel).getByRole('button', { name: 'Save name' }));
-    expect(await within(panel).findByText('Saved.')).toBeTruthy();
+    await click(within(panel).getByRole('button', { name: 'Save' }));
+    expect(await within(panel).findByText('Changes saved')).toBeTruthy();
     await waitFor(() => expect(within(sidebar()).getByRole('heading', { name: 'Gamers HQ' })).toBeTruthy());
   });
 
@@ -49,7 +49,7 @@ describe('rename (owner)', () => {
     const { sidebar } = await setup();
     const panel = openSettings(sidebar, 'General');
     fireEvent.change(within(panel).getByLabelText('Server name'), { target: { value: 'evil‮name' } });
-    await click(within(panel).getByRole('button', { name: 'Save name' }));
+    await click(within(panel).getByRole('button', { name: 'Save' }));
     expect(within(panel).getByRole('alert').textContent).toBe("The name contains characters that can't be used in names.");
   });
 });
@@ -100,7 +100,7 @@ describe('update-needed', () => {
     const before = within(sidebar()).getByRole('heading', { level: 1 }).textContent;
     const panel = openSettings(sidebar, 'General');
     fireEvent.change(within(panel).getByLabelText('Server name'), { target: { value: 'New name' } });
-    await click(within(panel).getByRole('button', { name: 'Save name' }));
+    await click(within(panel).getByRole('button', { name: 'Save' }));
     const alert = within(panel).getByRole('alert');
     expect(alert.textContent).toContain('Some members use an older version of MVS');
     // The names come from getUpdateNeeded.

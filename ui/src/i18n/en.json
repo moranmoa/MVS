@@ -262,6 +262,7 @@
   "server.desc.counter": "{n}/300",
   "server.desc.lines": "Up to 5 lines.",
   "server.settings.save": "Save",
+  "server.settings.unsavedTitle": "Save your server changes?",
   "server.settings.saving": "Saving…",
   "server.settings.discard": "Discard changes",
   "server.settings.saved": "Changes saved",

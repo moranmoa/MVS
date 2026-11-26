@@ -2,12 +2,13 @@
 // and description on the "כללי" page. A draft until "שמירה"; the rail, header
 // and title follow the saved record (server.updated), never the draft.
 
-import { useEffect, useRef, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { isCoreError, useCore, type ServerSummary } from '../../core';
 import { serverIconFrom } from '../../app/image';
 import { UpdateNeeded } from './ServerLifecycle';
 import { UPDATE_REASON_ID, useReadOnlyProps, useUpdateRequired } from './UpdateRequired';
+import type { SectionHandle, SectionState } from './generalDraft';
 
 /** The UI's cap (the core allows 500); the counter shows from 260. */
 export const DESC_MAX = 300;
@@ -28,7 +29,11 @@ export function normalizeDescription(raw: string): string {
 type IconError = 'unusable' | 'rate-limited' | null;
 type Failure = 'update-needed' | 'other' | null;
 
-export function ServerMetaForm({ server }: { server: ServerSummary }) {
+/** G-51n: a section of the General page's one "Save" (generalDraft.ts). */
+export const ServerMetaForm = forwardRef<SectionHandle, { server: ServerSummary; onState: (s: SectionState) => void }>(function ServerMetaForm(
+  { server, onState },
+  ref,
+) {
   const intl = useIntl();
   // #577: while an update is required, nothing here can be saved (main refuses it).
   const ro = useReadOnlyProps();
@@ -41,7 +46,6 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
   const [busy, setBusy] = useState(false);
   const [iconError, setIconError] = useState<IconError>(null);
   const [failure, setFailure] = useState<Failure>(null);
-  const [saved, setSaved] = useState(false);
   const file = useRef<HTMLInputElement>(null);
 
   // A save elsewhere (or by another admin) moves the baseline; an untouched draft follows it.
@@ -60,22 +64,23 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
   const length = [...desc].length;
   const tooManyLines = normalized.split('\n').length > DESC_MAX_LINES;
   const tooLong = length > DESC_MAX;
+  const invalid = tooLong || tooManyLines;
+  useEffect(() => onState({ dirty, invalid }), [dirty, invalid, onState]);
 
   const pick = async (f: File | undefined) => {
     if (!f) return;
     setIconError(null);
-    setSaved(false);
     const r = await serverIconFrom(f);
     if (r.ok) setIcon(r.dataUrl);
     else setIconError('unusable');
   };
 
-  const save = async () => {
-    if (readOnly) return;
+  const save = async (): Promise<boolean> => {
+    if (readOnly || invalid) return false;
+    if (!dirty) return true;
     setBusy(true);
     setFailure(null);
     setIconError(null);
-    setSaved(false);
     let ok = true;
     // The description first: an icon refused for its rate limit must not stop it.
     if (descDirty) {
@@ -98,17 +103,18 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
       }
     }
     setBusy(false);
-    if (ok) setSaved(true);
+    return ok;
   };
+  const discard = () => {
+    setIcon(savedIcon);
+    setDesc(savedDesc);
+    setIconError(null);
+    setFailure(null);
+  };
+  useImperativeHandle(ref, () => ({ save, discard }));
 
   return (
-    <form
-      className="stack server-meta"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (dirty && !busy && !tooLong && !tooManyLines) void save();
-      }}
-    >
+    <div className="stack server-meta">
       <div className="server-icon-row">
         <span className="server-icon-preview" style={{ background: server.color }} aria-hidden="true">
           {icon ? <img src={icon} alt="" /> : <bdi>{server.initials}</bdi>}
@@ -149,10 +155,7 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
           aria-describedby={readOnly ? `server-desc-hint server-desc-status ${UPDATE_REASON_ID}` : 'server-desc-hint server-desc-status'}
           readOnly={readOnly}
           aria-invalid={tooLong || tooManyLines || undefined}
-          onChange={(e) => {
-            setDesc(e.target.value);
-            setSaved(false);
-          }}
+          onChange={(e) => setDesc(e.target.value)}
           disabled={busy}
         />
       </label>
@@ -178,32 +181,6 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
           <FormattedMessage id="error.generic" />
         </p>
       )}
-      <div className="actions">
-        {saved && !dirty && (
-          <span className="muted small" role="status">
-            <FormattedMessage id="server.settings.saved" />
-          </span>
-        )}
-        <span className="spacer" />
-        {dirty && (
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => {
-              setIcon(savedIcon);
-              setDesc(savedDesc);
-              setIconError(null);
-              setFailure(null);
-            }}
-            disabled={busy}
-          >
-            <FormattedMessage id="server.settings.discard" />
-          </button>
-        )}
-        <button type="submit" className="primary" disabled={!dirty || busy || tooLong || tooManyLines} {...ro}>
-          <FormattedMessage id={busy ? 'server.settings.saving' : failure ? 'common.retry' : 'server.settings.save'} />
-        </button>
-      </div>
-    </form>
+    </div>
   );
-}
+});

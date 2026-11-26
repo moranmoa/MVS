@@ -6,9 +6,10 @@
 // nothing. An owner under 18 can't choose 18+ (the core refuses it too).
 // 18+ channels keep their own keys and members either way (B7-k).
 //
-// Until G-51's page-wide "Save" exists, this section saves with its own button.
+// G-51n: a section of the General page's one "Save". The page asks confirm()
+// first (the raise or lower dialog); cancelling saves nothing on the page.
 
-import { useEffect, useId, useRef, useState } from 'react';
+import { forwardRef, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { ageOn } from '../../app/age';
@@ -17,7 +18,7 @@ import { Dialog } from '../../components/common';
 import { isCoreError, useCore, type AgeRestriction, type ServerSummary } from '../../core';
 import { failureOf, FailureNote, type Failure } from './ServerLifecycle';
 import './ageLimit.css';
-import { useReadOnlyProps } from './UpdateRequired';
+import type { SectionHandle, SectionState } from './generalDraft';
 
 const OPTIONS: AgeRestriction[] = ['none', '16+', '18+'];
 const key = (a: AgeRestriction) => (a === 'none' ? 'none' : a.slice(0, 2));
@@ -30,10 +31,12 @@ export function ageChangeKind(from: AgeRestriction, to: AgeRestriction): 'none' 
   return 'none';
 }
 
-export function AgeLimitSetting({ server }: { server: ServerSummary }) {
+export const AgeLimitSetting = forwardRef<SectionHandle, { server: ServerSummary; onState: (s: SectionState) => void }>(function AgeLimitSetting(
+  { server, onState },
+  ref,
+) {
   const core = useCore();
   const intl = useIntl();
-  const ro = useReadOnlyProps();
   const store = useAppStore();
   const birthDate = useStore(store, (s) => s.identity?.birthDate);
   const ownerMinor = !!birthDate && ageOn(birthDate) < 18;
@@ -42,7 +45,6 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
   const [confirm, setConfirm] = useState<'raise' | 'lower' | null>(null);
   const [checked, setChecked] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [failure, setFailure] = useState<Failure | null>(null);
   const minorId = useId();
   // The spec: each confirmation opens with focus on "Cancel". The dialog's
@@ -74,35 +76,55 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
   const raiseCountId = useId();
   const lowerBodyId = useId();
 
-  const save = async () => {
-    setConfirm(null);
+  const dirty = age !== server.ageRestriction;
+  useEffect(() => onState({ dirty, invalid: false }), [dirty, onState]);
+
+  const save = async (): Promise<boolean> => {
+    if (!dirty) return true;
     setBusy(true);
     setFailure(null);
     setTooYoung(false);
-    setSaved(false);
     try {
       await core.setAgeRestriction(server.id, age);
-      setSaved(true);
+      return true;
     } catch (e) {
       // A bad request here isn't about a name: the general message.
       const f = failureOf(e);
       if (isCoreError(e) && e.code === 'too-young') setTooYoung(true);
       else setFailure(f.kind === 'bad-name' ? { kind: 'other' } : f);
+      return false;
     } finally {
       setBusy(false);
     }
   };
-  const onSave = () => {
+  // The open confirmation's answer, for the page's Save.
+  const answer = useRef<((ok: boolean) => void) | null>(null);
+  const settle = (ok: boolean) => {
+    setConfirm(null);
+    answer.current?.(ok);
+    answer.current = null;
+  };
+  const askConfirm = (): Promise<boolean> => {
     const kind = ageChangeKind(server.ageRestriction, age);
-    if (kind === 'none') return void save();
+    if (kind === 'none') return Promise.resolve(true);
     setChecked(false);
     setConfirm(kind);
+    return new Promise((resolve) => (answer.current = resolve));
   };
   // Cancelling the confirmation saves nothing: the choice goes back to the saved limit.
   const cancel = () => {
-    setConfirm(null);
     setAge(server.ageRestriction);
+    settle(false);
   };
+  useImperativeHandle(ref, () => ({
+    confirm: askConfirm,
+    save,
+    discard: () => {
+      setAge(server.ageRestriction);
+      setFailure(null);
+      setTooYoung(false);
+    },
+  }));
 
   return (
     <div className="stack age-limit">
@@ -122,7 +144,6 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
                 disabled={disabled}
                 onChange={() => {
                   setAge(a);
-                  setSaved(false);
                   setFailure(null);
                 }}
               />
@@ -136,16 +157,6 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
           </p>
         )}
       </fieldset>
-      <div className="actions">
-        <button type="button" className="primary" disabled={busy || age === server.ageRestriction} onClick={onSave} {...ro}>
-          <FormattedMessage id="server.age.save" />
-        </button>
-        {saved && (
-          <span className="success small" role="status">
-            <FormattedMessage id="server.age.saved" />
-          </span>
-        )}
-      </div>
       <FailureNote server={server} failure={failure} />
       {tooYoung && (
         <p className="error small" role="alert">
@@ -166,7 +177,7 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
           {affected !== null && <FormattedMessage id="server.age.raise.count" values={{ count: affected }} />}
         </p>
         <div className="actions">
-          <button type="button" className="danger" onClick={() => void save()}>
+          <button type="button" className="danger" onClick={() => settle(true)}>
             <FormattedMessage id="server.age.raise.confirm" />
           </button>
           <button ref={cancelRef} type="button" className="secondary" onClick={cancel}>
@@ -191,7 +202,7 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
             className="primary"
             aria-disabled={!checked || undefined}
             aria-describedby={checkId}
-            onClick={() => checked && void save()}
+            onClick={() => checked && settle(true)}
           >
             <FormattedMessage id="server.age.lower.confirm" />
           </button>
@@ -202,4 +213,4 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
       </Dialog>
     </div>
   );
-}
+});

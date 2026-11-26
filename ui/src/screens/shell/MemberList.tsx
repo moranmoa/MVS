@@ -175,14 +175,21 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
               >
                 <Avatar name={displayName(m)} color={m.color ?? m.avatarColor} src={m.avatarDataUrl} size={32} presence={m.presence} />
                 {m.connection && <ConnectionIcon connection={m.connection} />}
-                <Name>{displayName(m)}</Name>
+                {m.notAdult ? (
+                  // G-52 (UX): the tag on its own line, so the name isn't cut (staff act on it).
+                  <span className="member-name-stack">
+                    <Name>{displayName(m)}</Name>
+                    <NotAdultTag />
+                  </span>
+                ) : (
+                  <Name>{displayName(m)}</Name>
+                )}
                 {m.id === myId && (
                   <span className="muted small">
                     <FormattedMessage id="members.me" />
                   </span>
                 )}
                 {flagged.has(m.id) && <LookalikeTag />}
-                {m.notAdult && <NotAdultTag />}
                 {m.isOwner && (
                   <span className="owner-tag" title={intl.formatMessage({ id: 'members.owner' })}>
                     <FormattedMessage id="members.owner" />

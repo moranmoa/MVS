@@ -262,6 +262,7 @@
   "server.desc.counter": "\u2068{n}\u2069/300",
   "server.desc.lines": "אפשר לכתוב עד 5 שורות.",
   "server.settings.save": "שמירה",
+  "server.settings.unsavedTitle": "לשמור את השינויים בשרת?",
   "server.settings.saving": "שומרים…",
   "server.settings.discard": "ביטול שינויים",
   "server.settings.saved": "השינויים נשמרו",

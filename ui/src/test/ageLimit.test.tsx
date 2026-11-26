@@ -29,7 +29,7 @@ async function openGeneral(prepare?: (core: MockCore, serverId: string) => Promi
   return { core, server, set, dialog };
 }
 const radio = (dialog: HTMLElement, name: string) => within(dialog).getByRole('radio', { name }) as HTMLInputElement;
-const saveButton = (dialog: HTMLElement) => within(dialog).getByRole('button', { name: 'Save age limit' });
+const saveButton = (dialog: HTMLElement) => within(dialog).getByRole('button', { name: 'Save' });
 
 describe('G-52: which changes need a confirmation', () => {
   it('none between "no limit" and 16+; raise to 18+; lower from 18+', () => {
@@ -51,7 +51,7 @@ describe("G-52: the server's age limit", () => {
     await click(saveButton(dialog));
     expect(screen.queryByRole('dialog', { name: /Limit this server/ })).toBeNull();
     expect(set).toHaveBeenCalledWith(server.id, '16+');
-    expect(await within(dialog).findByText('Age limit saved')).toBeTruthy();
+    expect(await within(dialog).findByText('Changes saved')).toBeTruthy();
   });
 
   it('while an update is required (#577): Save is off with the reason, and nothing saves', async () => {

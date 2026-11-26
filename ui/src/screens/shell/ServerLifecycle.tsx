@@ -5,7 +5,7 @@
 // then. The UI asks the core who (`getUpdateNeeded`), and says that removing
 // them is the other way out. A leave is never gated.
 
-import { useEffect, useState, type FormEvent } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
@@ -14,7 +14,7 @@ import { Dialog, Name } from '../../components/common';
 import { isCoreError, useCore, type Member, type ServerSummary } from '../../core';
 import { SERVER_NAME_MAX } from '../../core/sanitize';
 import { displayName } from './MemberList';
-import { useReadOnlyProps } from './UpdateRequired';
+import type { SectionHandle, SectionState } from './generalDraft';
 
 const NO_MEMBERS: Member[] = [];
 
@@ -81,36 +81,52 @@ export function FailureNote({ server, failure }: { server: ServerSummary; failur
   );
 }
 
-/** Settings → General: the server's name, for the owner (admins too, once roles reach the UI). */
-export function RenameForm({ server }: { server: ServerSummary }) {
+/**
+ * Settings → General: the server's name, for the owner (admins too, once roles
+ * reach the UI). G-51n: a section of the page's one "Save" (generalDraft.ts).
+ */
+export const RenameForm = forwardRef<SectionHandle, { server: ServerSummary; onState: (s: SectionState) => void }>(function RenameForm(
+  { server, onState },
+  ref,
+) {
   const core = useCore();
-  const ro = useReadOnlyProps();
   const [name, setName] = useState(server.name);
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [failure, setFailure] = useState<Failure | null>(null);
   const nameProps = useUserTextProps(name);
   useEffect(() => setName(server.name), [server.name]);
+  const clean = name.trim();
+  const dirty = name !== server.name;
+  const invalid = !clean;
+  useEffect(() => onState({ dirty, invalid }), [dirty, invalid, onState]);
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    const clean = name.trim();
-    if (!clean || clean === server.name || busy) return;
-    setBusy(true);
-    setFailure(null);
-    setSaved(false);
-    try {
-      await core.renameServer(server.id, clean);
-      setSaved(true);
-    } catch (err) {
-      setFailure(failureOf(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+  useImperativeHandle(
+    ref,
+    () => ({
+      save: async () => {
+        if (!dirty || invalid) return !invalid;
+        if (clean === server.name) {
+          setName(server.name);
+          return true;
+        }
+        setFailure(null);
+        try {
+          await core.renameServer(server.id, clean);
+          return true;
+        } catch (err) {
+          setFailure(failureOf(err));
+          return false;
+        }
+      },
+      discard: () => {
+        setName(server.name);
+        setFailure(null);
+      },
+    }),
+    [clean, core, dirty, invalid, server.id, server.name],
+  );
 
   return (
-    <form className="stack" onSubmit={submit} noValidate>
+    <div className="stack">
       <label className="field">
         <span>
           <FormattedMessage id="server.settings.name" />
@@ -121,25 +137,14 @@ export function RenameForm({ server }: { server: ServerSummary }) {
           maxLength={SERVER_NAME_MAX}
           onChange={(e) => {
             setName(e.target.value);
-            setSaved(false);
             setFailure(null);
           }}
         />
       </label>
-      <div className="actions">
-        <button type="submit" className="primary" disabled={busy || !name.trim() || name.trim() === server.name} {...ro}>
-          <FormattedMessage id="server.rename.save" />
-        </button>
-        {saved && (
-          <span className="success small" role="status">
-            <FormattedMessage id="server.rename.saved" />
-          </span>
-        )}
-      </div>
       <FailureNote server={server} failure={failure} />
-    </form>
+    </div>
   );
-}
+});
 
 /** Settings → Danger zone: close the server for good, behind a typed-name confirmation. */
 export function ClosePanel({ server }: { server: ServerSummary }) {

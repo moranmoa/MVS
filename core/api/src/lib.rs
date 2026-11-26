@@ -37,6 +37,7 @@ pub mod sidecar;
 pub mod syncnet;
 pub mod types;
 pub mod update;
+pub mod report;
 pub mod typing;
 mod voice;
 mod voice_media;
@@ -57,6 +58,7 @@ pub use service::{
     SYNC_EVERY,
 };
 pub use types::*;
+pub use report::ReportNet;
 pub use typing::TypingNet;
 pub use voice_media::VoiceFrames;
 pub use voice::{

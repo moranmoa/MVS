@@ -119,6 +119,12 @@ pub struct ServerSummary {
     /// when there is none (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// A current member wrote a validly signed record of a kind this
+    /// version doesn't know: it runs a newer version, and this one should
+    /// update to keep up with the server (additive). In memory only: false
+    /// again after a restart until it is seen again.
+    #[serde(default)]
+    pub update_needed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +372,10 @@ pub enum ErrorCode {
     /// owner can't leave, and its restriction is never lifted for me).
     /// `servers` names them. Nothing changed.
     OwnsRestrictedServer,
+    /// `updateProfile`: the name, picture and colour together don't fit one
+    /// profile post (a long name of 4-byte characters beside the largest
+    /// picture). Nothing was saved or posted; the old profile stays.
+    ProfileTooLarge,
     /// Rust addition: malformed command JSON or arguments.
     BadRequest,
     /// Rust addition: in the contract, not done by this core yet.
@@ -387,6 +397,15 @@ pub enum ErrorCode {
     /// trying).
     LockedOut,
     DiskFull,
+    /// A required update is pending (RU1): the core signs nothing and
+    /// sends nothing until it runs a version that isn't revoked.
+    UpdateRequired,
+    /// G-48: I already reported this message or member in the last 30 days.
+    AlreadyReported,
+    /// G-48: nobody can receive the report: the owner is reported and the
+    /// server has no admins. Nothing was signed; the UI points at the
+    /// abuse address (B24).
+    NoRecipient,
 }
 
 impl CoreError {
@@ -476,6 +495,20 @@ pub struct AppInfo {
     /// through the relay, and calls are off.
     #[serde(default)]
     pub relay_only: bool,
+    /// A required update (`docs/design/required-update.md`): `null` unless
+    /// an accepted signed manifest revoked this version. Then the app is
+    /// local read-only plus update, and the core signs and syncs nothing
+    /// (RU1) for the rest of the process.
+    #[serde(default)]
+    pub update_required: Option<UpdateRequired>,
+}
+
+/// `AppInfo.updateRequired` and `update.required`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRequired {
+    /// The newer version on offer; `null`: none yet ("not available yet").
+    pub version: Option<String>,
 }
 
 /// `getRecoveryChallenge`'s result: 1-based positions.
@@ -588,6 +621,9 @@ pub enum Event {
     MessageAdded(Message),
     #[serde(rename = "update.ready")]
     UpdateReady(UpdateInfo),
+    /// A required update turned on (or the version on offer changed).
+    #[serde(rename = "update.required")]
+    UpdateRequired(UpdateRequired),
     /// Voice: my call changed (join, leave, mute, timeout). After a leave,
     /// or a refusal by a full call, its participants are empty.
     #[serde(rename = "call.state")]
@@ -611,6 +647,14 @@ pub enum Event {
     /// that changes; at most one per channel per tick. Empty: nobody.
     #[serde(rename = "typing", rename_all = "camelCase")]
     Typing { channel_id: Id, user_ids: Vec<Id> },
+    /// G-48: a report reached me as the owner or an admin of `serverId`.
+    /// Never carries evidence: `getReportEvidence` on a click.
+    #[serde(rename = "report.received", rename_all = "camelCase")]
+    ReportReceived { server_id: Id, report: ReportSummary },
+    /// G-48: my report's delivery: staff who acked it, and who it still waits
+    /// for.
+    #[serde(rename = "report.status", rename_all = "camelCase")]
+    ReportStatus { report_id: Id, delivered: u32, pending: u32 },
     /// Member relays (#368): anything in `getMemberRelay`'s answer changed.
     #[serde(rename = "memberRelay.changed")]
     MemberRelayChanged(MemberRelay),
@@ -1033,4 +1077,72 @@ pub struct DeviceLinkState {
 pub struct DeviceApproval {
     pub sas: String,
     pub expires_at: u64,
+}
+
+/// G-48: what `reportContent` reports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ReportTarget {
+    Message { message_id: Id, channel_id: Id },
+    Member { user_id: Id },
+}
+
+/// G-48: what `reportContent` takes as its target (the channel of a
+/// message is the core's to find).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ReportTargetInput {
+    Message { message_id: Id },
+    Member { user_id: Id },
+}
+
+/// G-48: a report as staff see it in `listReports` and `report.received`.
+/// Never the evidence itself: `getReportEvidence` on an explicit click.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportSummary {
+    pub id: Id,
+    pub server_id: Id,
+    pub reporter_id: Id,
+    pub target: ReportTarget,
+    /// The reported member: the message's author for a message.
+    pub reported_id: Id,
+    /// `spam`, `harassment`, `hate`, `violence`, `sexual`, `minor`,
+    /// `self-harm`, `illegal`, `impersonation` or `other`.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// The reporter's clock, ms.
+    pub ts: u64,
+    pub received_at: u64,
+    pub dismissed: bool,
+    /// A message report whose evidence is that message (R4). False:
+    /// `getReportEvidence` says it is invalid.
+    pub evidence_valid: bool,
+    /// Reasons `sexual` and `minor`: the evidence is behind a click, and
+    /// withheld from me without an 18+ claim (`getReportEvidence` is then
+    /// `not-allowed`).
+    pub evidence_withheld: bool,
+}
+
+/// G-48: `getReportEvidence`, the reported message as its author signed it.
+/// Plain text only: never Markdown with live links, never HTML (R4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportEvidence {
+    pub author_id: Id,
+    pub channel_id: Id,
+    pub ts: u64,
+    /// Absent when I can't open it (no key for that channel's epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// G-48: `reportContent`'s answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportReceipt {
+    pub report_id: Id,
+    /// Staff it goes to (each acks separately; see `report.status`).
+    pub recipients: u32,
 }

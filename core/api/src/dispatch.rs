@@ -42,6 +42,24 @@ struct UpdateNeededArgs {
     cap: Option<String>,
 }
 
+/// G-48 `reportContent`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportArgs {
+    server_id: String,
+    target: ReportTargetInput,
+    reason: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// G-48: a report's ID.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReportIdArg {
+    report_id: String,
+}
+
 /// G-29.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -489,6 +507,14 @@ impl Core {
                 let a: ReactArgs = args(raw)?;
                 ok(self.react(&a.message_id, &a.emoji, a.on))
             }
+            // G-48: reports to the owners and admins.
+            "reportContent" => {
+                let a: ReportArgs = args(raw)?;
+                ok(self.report_content(&a.server_id, &a.target, &a.reason, a.text.as_deref()))
+            }
+            "listReports" => ok(self.list_reports(&args::<ServerArg>(raw)?.server_id)),
+            "dismissReport" => ok(self.dismiss_report(&args::<ReportIdArg>(raw)?.report_id)),
+            "getReportEvidence" => ok(self.get_report_evidence(&args::<ReportIdArg>(raw)?.report_id)),
             // G-29.
             "setTyping" => {
                 let a: TypingArgs = args(raw)?;

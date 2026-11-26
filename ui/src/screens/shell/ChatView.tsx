@@ -4,7 +4,7 @@ import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
 import { isCoreError, useCore, type Id, type Member, type Message, type ServerSummary } from '../../core';
 import { Avatar, Code, Dialog, Name, RICH } from '../../components/common';
-import { BackIcon, CloseIcon, EditIcon, HashIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
+import { BackIcon, CloseIcon, EditIcon, HashIcon, RefreshIcon, ReplyIcon, SendIcon, SmileIcon, UsersIcon, WifiOffIcon } from '../../components/icons';
 import { EmojiPicker } from '../../components/EmojiPicker';
 import { TopicDialog } from './TopicDialog';
 import { useUserTextProps } from '../../app/textDir';
@@ -16,6 +16,8 @@ import { BODY_MAX, BODY_MAX_BYTES, isHeld } from '../../core/sanitize';
 const COUNTER_FROM = 3800;
 const utf8 = new TextEncoder();
 import { MemberNames, MessageList } from './MessageList';
+import { displayName } from './MemberList';
+import { ReportDialog, type ReportRequest } from './ReportDialog';
 
 const NO_MEMBERS: Member[] = [];
 
@@ -45,6 +47,8 @@ export function ChatView({
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [editing, setEditing] = useState<Message | null>(null);
   const [toDelete, setToDelete] = useState<Message | null>(null);
+  // G-48: the message being reported.
+  const [report, setReport] = useState<ReportRequest | null>(null);
   const [stickToken, setStickToken] = useState(0);
   // G-14: the topic dialog (view; the owner can edit).
   const [topicOpen, setTopicOpen] = useState(false);
@@ -52,6 +56,8 @@ export function ChatView({
   const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const nobodyOnline = members.length > 0 && members.every((m) => m.id === myId || m.presence === 'offline');
   const isOwner = server.ownerId === myId;
+  // #589: an update ready to install (the rail pill's state), for the update-needed line.
+  const staged = useStore(store, (s) => s.update);
 
   // G-21: where the new messages started when I opened the channel. Kept until
   // I leave it, even after it's all read, so the divider stays put.
@@ -186,6 +192,26 @@ export function ChatView({
         </button>
       </header>
       {channel && <TopicDialog channel={channel} canEdit={isOwner && !server.closed} open={topicOpen} onClose={() => setTopicOpen(false)} />}
+      {/* #589: members here run a newer MVS; this computer may miss what it adds. */}
+      {server.updateNeeded && (
+        <div className="offline-banner update-needed-banner" role="status">
+          <RefreshIcon />
+          <span>
+            <FormattedMessage id="server.syncUpdateNeeded" />
+          </span>
+          {/* Only once an update is staged; until then the rail pill shows the download (UX). */}
+          {staged && (
+            <button
+              type="button"
+              className="secondary small"
+              onClick={() => core.restartToUpdate().catch((e) => isCoreError(e) && store.updateRefused(e.code))}
+              disabled={staged.waitingForCall}
+            >
+              <FormattedMessage id="server.syncUpdateNeeded.restart" />
+            </button>
+          )}
+        </div>
+      )}
       {nobodyOnline && (
         <div className="offline-banner" role="status">
           <WifiOffIcon />
@@ -210,6 +236,10 @@ export function ChatView({
         onEdit={onEdit}
         onDelete={onDelete}
         onRetry={onRetry}
+        onReport={(m) => {
+          const a = members.find((x) => x.id === m.authorId);
+          setReport({ serverId: server.id, target: { kind: 'message', messageId: m.id }, name: a ? displayName(a) : '…' });
+        }}
       />
       </MemberNames.Provider>
       {!server.closed && <TypingLine channelId={channelId} myId={myId} members={members} />}
@@ -245,6 +275,7 @@ export function ChatView({
           }}
         />
       )}
+      <ReportDialog request={report} onClose={() => setReport(null)} />
       <Dialog open={!!toDelete} onClose={() => setToDelete(null)} title={intl.formatMessage({ id: 'chat.delete' })}>
         <p>
           <FormattedMessage id="chat.deleteConfirm" />

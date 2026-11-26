@@ -111,6 +111,10 @@ process.stdin.on('data', (chunk) => {
         if (m.args.channelId === 'e'.repeat(64)) {
           setTimeout(() => out({ type: 'event', event: 'call.state', payload: { ...call, participants: [] } }), 300);
         }
+        // Required updates: <data-dir>/fake-required-on-call → the update turns required mid-call.
+        if (fs.existsSync(path.join(dataDir, 'fake-required-on-call'))) {
+          setTimeout(() => out({ type: 'event', event: 'update.required', payload: { version: '9.9.9' } }), 500);
+        }
         break;
       }
       case 'leaveCall':

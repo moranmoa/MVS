@@ -204,6 +204,8 @@ export class Store {
   private unsubs: (() => void)[] = [];
   /** While my own leaveCall runs: that end of the call isn't news. */
   private leaving = false;
+  /** When my last call ended (0: none yet), for #622's toast when call.state lands before update.gate. */
+  private callEndedAt = 0;
 
   /** Fires when the next timed mute ends, so muted marks go away on time. */
   private muteTimer: ReturnType<typeof setTimeout> | null = null;
@@ -280,6 +282,7 @@ export class Store {
       on('call.state', (c) => {
         const ended = !c.participants.length && !!this.state.call && !this.leaving;
         const relayOnly = this.state.relayOnly || c.relayOnly === true;
+        if (!c.participants.length && this.state.call) this.callEndedAt = Date.now();
         this.set({
           call: c.participants.length ? c : null,
           relayOnly,
@@ -297,7 +300,8 @@ export class Store {
       // the gate is re-sent on every page load with endedCall still true.
       on('update.gate', (g) => {
         this.setGate(g);
-        if (g.endedCall && this.state.call) this.set({ call: null, callEndedForUpdate: Date.now() });
+        // In a call, or one that ended in the last 2 s: the core's "ended" may land first (TL, #632).
+        if (g.endedCall && (this.state.call || Date.now() - this.callEndedAt <= 2000)) this.set({ call: null, callEndedForUpdate: Date.now() });
       }),
       on('update.rolledBack', (u) => this.set({ updateNote: { kind: 'rolledBack', ...u } })),
       // rekey-waiting: the failed message's own line says why; no toast (UX, #289).

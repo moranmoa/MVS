@@ -542,6 +542,13 @@ const _: () = assert!(!WRITE_SECRET_ROTATION, "S3/S4 and S5 must ship with the f
 /// stays, sealed, for reading the old secret's frozen prefix.
 pub const PREVIOUS_SECRET_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// T17 (Security Lead Q1 on #609): how old a leave must be before an admin,
+/// not only the owner, rotates for it.
+pub const ADMIN_LEAVE_ROTATE_MS: u64 = 24 * 60 * 60 * 1000;
+/// T17: the most an admin waits on top, from a hash of its key and the
+/// server, so several admins rarely rotate at once.
+pub const ADMIN_LEAVE_JITTER_MS: u64 = 6 * 60 * 60 * 1000;
+
 /// T17: the rotation whose secret this device moved to, per server.
 fn secret_rotation_key(server: ServerId) -> String {
     format!("secret-rotation/{}", hex::encode(server.as_bytes()))
@@ -4161,12 +4168,40 @@ impl Inner {
         }
         self.save_secret(server, secret)?;
         self.db.set(&secret_rotation_key(server), opened.rotation.as_bytes())?;
-        // TODO(T17 S3/S4, dev-sync): serve and read the old secret's frozen
-        // prefix from the kept previous secret until it expires.
+        // S3/S4 and the beacon (S5): sync moves to the new secret and keeps
+        // reading the old ones' frozen prefixes (`set_previous_secrets`).
         self.open_sync(ports, server)?;
-        // TODO(T17 S5): re-issue open invites, re-key the backup and the
-        // LAN beacon from the new secret.
+        // S5: the backup follows by itself (its fingerprint covers the
+        // secret, so the next round writes it). Invites: see below.
+        self.reissue_invites(ports, server, secret)?;
         events.push(Event::ServerUpdated(self.counted_summary(&*ports.cipher, server)?));
+        let me = self.me.as_ref().map(Me::key);
+        if me.is_some_and(|me| self.view(server).is_ok_and(|v| v.state.role(me) >= authority::Role::Admin)) {
+            events.push(Event::Notice { kind: NoticeKind::InvitesReissued, server_id: model::hex_id(server.as_bytes()) });
+        }
+        Ok(())
+    }
+
+    /// T17 S5 (Q3): every short link sealed the old secret, so they all stop:
+    /// the publications I hold or serve for `server` are dropped, and each
+    /// live invite of mine gets a new one under the new secret (a new short
+    /// link; the full link already carries the new secret). Other members'
+    /// invites are re-published by their authors when they move.
+    fn reissue_invites(&mut self, ports: &Ports, server: ServerId, secret: &[u8; 32]) -> CoreResult<()> {
+        ports.network.drop_server_invites(server);
+        let held = self.db.invite_publications(server)?;
+        for (invite, _) in &held {
+            self.db.delete_invite(server, *invite)?;
+        }
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        let now = ports.clock.now_ms();
+        let mine: Vec<RecordId> = {
+            let view = self.view(server)?;
+            view.state.invites.keys().copied().filter(|id| view.live_invite_author(*id, now) == Some(me)).collect()
+        };
+        for invite in mine {
+            self.publish_invite(ports, server, invite, secret)?;
+        }
         Ok(())
     }
 
@@ -4204,9 +4239,9 @@ impl Inner {
     ///   new secret, so ordinary joins rotate nothing. A join whose invite
     ///   can't be placed counts as missing.
     ///
-    /// TODO(T17 step 2c, SL Q1 on #609): with no owner online, an admin
-    /// rotates for a leave once 24 h (plus 0–6 h of jitter) pass with no
-    /// newer rotation, checking again just before signing.
+    /// - An admin (SL Q1 on #609) rotates for a leave once it is
+    ///   [`ADMIN_LEAVE_ROTATE_MS`] old plus a jitter of its own up to
+    ///   [`ADMIN_LEAVE_JITTER_MS`], with no newer rotation: the owner may be away.
     fn secret_rotation_due(
         &self,
         server: ServerId,
@@ -4234,6 +4269,28 @@ impl Inner {
         };
         if !gone.is_empty() && (owner || gone.iter().any(mine)) {
             return Ok(true);
+        }
+        // SL Q1 on #609: with the owner away, an admin rotates for a leave
+        // once it is ADMIN_LEAVE_ROTATE_MS old, plus a jitter of up to
+        // ADMIN_LEAVE_JITTER_MS of its own, so admins don't all rotate at once.
+        // Checked against this round's view, under the lock that signs.
+        if state.role(me) >= authority::Role::Admin {
+            let now = self.clock.now_ms();
+            let jitter = {
+                let seed = blake3::derive_key("mvs/t17-admin-jitter/v1", &[me.as_bytes().as_slice(), server.as_bytes()].concat());
+                u64::from_le_bytes(seed[..8].try_into().expect("8 bytes")) % ADMIN_LEAVE_JITTER_MS
+            };
+            let left_long_ago = |member: &PublicKey| {
+                view.records
+                    .iter()
+                    .filter(|r| r.author() == *member && r.kind() == records::Kind::Leave && state.accepted.contains(&r.id()))
+                    .map(|r| r.ts())
+                    .max()
+                    .is_some_and(|at| now.saturating_sub(at) >= ADMIN_LEAVE_ROTATE_MS + jitter)
+            };
+            if gone.iter().any(left_long_ago) {
+                return Ok(true);
+            }
         }
         if !owner {
             return Ok(false);
@@ -4532,6 +4589,13 @@ impl Inner {
     fn open_sync(&self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         if let Some(secret) = self.secret(server)? {
             ports.network.open_server(server, &secret, &self.known(server)?);
+            // T17 S3/S4: the secrets rotations replaced, still in their keep.
+            let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            let key = *me.identity.storage_key().expose_secret();
+            let now = ports.clock.now_ms();
+            let mut previous = self.db.load_previous_server_secrets(&key, server)?;
+            previous.retain(|(_, until)| *until > now);
+            ports.network.set_previous_secrets(server, &previous);
         }
         Ok(())
     }

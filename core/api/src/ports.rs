@@ -182,9 +182,24 @@ pub trait Network: Send + Sync {
         Vec::new()
     }
 
+    /// T17 (S3/S4, the sync side is dev-sync's): the secrets `server`'s
+    /// rotations replaced, each with the time (core clock, ms) until it is
+    /// kept, oldest first; expired ones are already left out. Called every
+    /// round after [`Self::open_server`]. With them, sync reads (never
+    /// writes: S4) each old secret's frozen prefix, the rotation record's
+    /// causal past plus the record, control log only (S3), so a member who
+    /// was offline during a rotation still finds the record sealed to them.
+    /// Empty: nothing to keep.
+    fn set_previous_secrets(&self, server: ServerId, previous: &[(Zeroizing<[u8; 32]>, u64)]) {
+        let _ = (server, previous);
+    }
+
     /// GAP-4: sync `server` members-only, with its secret, and these
     /// channels (the ones authority knows). Called at load and whenever
-    /// the channels change; opening again is harmless.
+    /// the channels change; opening again is harmless. T17: called again
+    /// with a new secret after a rotation; the network must then move the
+    /// server to it (topics, handles, the LAN beacon key: S5), never keep
+    /// serving on the old one (S4).
     fn open_server(
         &self,
         server: ServerId,
@@ -360,6 +375,8 @@ pub struct LoopbackNetwork {
     link: Mutex<Option<FakeLink>>,
     /// The detector: what `offer_raw` peeked, for `take_unknown_records`.
     unknown: Mutex<Vec<records::UnknownRecord>>,
+    /// T17: what `set_previous_secrets` last got, per server (tests).
+    previous: Mutex<HashMap<ServerId, Vec<[u8; 32]>>>,
 }
 
 impl LoopbackNetwork {
@@ -378,6 +395,12 @@ impl LoopbackNetwork {
         buddies.get(member.as_bytes()).map(|held| held.keys().copied().collect()).unwrap_or_default()
     }
 
+    /// Tests: the previous secrets the last core to open `server` handed
+    /// over (T17 S3/S4).
+    pub fn previous_secrets(&self, server: ServerId) -> Vec<[u8; 32]> {
+        self.previous.lock().expect("not poisoned").get(&server).cloned().unwrap_or_default()
+    }
+
     /// Tests: bytes a peer sent, as sync's ingest sees them. A record
     /// decodes and is published; one of a kind this version doesn't know
     /// goes to `take_unknown_records` if `peek_unknown` reports it; anything
@@ -394,6 +417,11 @@ impl LoopbackNetwork {
 impl Network for LoopbackNetwork {
     fn take_unknown_records(&self) -> Vec<records::UnknownRecord> {
         std::mem::take(&mut *self.unknown.lock().expect("not poisoned"))
+    }
+
+    fn set_previous_secrets(&self, server: ServerId, previous: &[(Zeroizing<[u8; 32]>, u64)]) {
+        let kept = previous.iter().map(|(secret, _)| **secret).collect();
+        self.previous.lock().expect("not poisoned").insert(server, kept);
     }
 
     fn publish(&self, record: &Record) {

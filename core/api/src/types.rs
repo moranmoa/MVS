@@ -564,6 +564,11 @@ pub enum NoticeKind {
     /// minors there may read what's sent. `getUpdateNeeded(serverId,
     /// 'adult-keys-v1')` lists them. Sent once until that list is empty.
     AdultKeysOutdated,
+    /// T17 (Q3, to the owner and admins): the server's sync secret rotated
+    /// (a kick or a leave), so every invite link from before stopped
+    /// working. The links in the server's settings are the new ones; share
+    /// them again. Sent once per rotation.
+    InvitesReissued,
 }
 
 /// `CoreEvents` in api.ts, as `{ "event": name, "payload": ... }`.

@@ -1777,6 +1777,59 @@ impl Core {
         })
     }
 
+    /// G-52 `setAgeRestriction(serverId, 'none' | '16+' | '18+')`
+    /// (`docs/design/server-age-limit.md`): the owner only (`not-allowed`);
+    /// `18+` only while my effective age is 18 or more (`too-young`, PO on
+    /// #512); behind `lv:1` (`update-needed`: an older core would ignore the
+    /// limit and keep keying minors). The current value signs nothing. A
+    /// raise to 18+ re-keys every channel for the adult members at once
+    /// (Security Lead Q2 on #590); a lowering re-keys forward only, so
+    /// nothing written while it was 18+ opens to 16- and 17-year-olds.
+    pub fn set_age_restriction(&self, server_id: &str, limit: AgeRestriction) -> CoreResult<ServerSummary> {
+        let server = parse_server(server_id)?;
+        let _ = self.sync_now();
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Owner)?;
+            if inner.view(server)?.age_limit() == limit {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            let now = ports.clock.now_ms();
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            if limit == AgeRestriction::Eighteen && me.profile.effective_age(now).is_none_or(|age| age < 18) {
+                return Err(ErrorCode::TooYoung.into());
+            }
+            inner.cap_gate(server, model::LEVEL_CAP)?;
+            inner.publish_control(ports, server, &Action::ServerAgeLimit { min: limit.min_age() as u8 })?;
+            // The readers changed: re-key now rather than at the next send.
+            if inner.rekey(ports, server, events).is_err() {
+                events.push(Event::Notice { kind: NoticeKind::RekeyWaiting, server_id: server_id.to_owned() });
+            }
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
+    /// G-52 `countAgeAffected(serverId, ageRestriction)`: how many members
+    /// other than me a change to `ageRestriction` would lock out: for `18+`,
+    /// those without an accepted 18+ claim; 0 otherwise (the app's minimum
+    /// is 16). No names. The owner or an admin (`not-allowed`).
+    pub fn count_age_affected(&self, server_id: &str, limit: AgeRestriction) -> CoreResult<AgeAffected> {
+        let server = parse_server(server_id)?;
+        let mut inner = self.lock();
+        inner.load_mine(server)?;
+        inner.lifecycle_role(server, authority::Role::Admin)?;
+        if limit != AgeRestriction::Eighteen {
+            return Ok(AgeAffected { count: 0 });
+        }
+        let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        let view = inner.view(server)?;
+        let state = view.state;
+        let count = state.members.iter().filter(|m| **m != me && !state.adults.contains(*m)).count();
+        Ok(AgeAffected { count: u32::try_from(count).unwrap_or(u32::MAX) })
+    }
+
     /// `leaveServer`: any member but the owner (`not-allowed`; the owner
     /// deletes instead). The `Leave` goes out, so the others re-key; then
     /// the server leaves this device (`server.removed`, `left`). A leaver
@@ -2974,6 +3027,12 @@ impl Core {
                     inner.close_locally(ports, server, events)?;
                     continue;
                 }
+                // G-52: raised above my age; I leave (never aborts the round).
+                match inner.leave_if_under_limit(ports, server, events) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => eprintln!("mvs-core: an age-limit leave wasn't sent: {:?}", e.code),
+                }
                 let meta_changed = {
                     let view = inner.view(server)?;
                     view.state.server_name != name_before
@@ -4129,7 +4188,7 @@ impl Inner {
             let server_id = model::hex_id(server.as_bytes());
             let name = view.state.server_name.clone().unwrap_or_else(|| view.genesis.name.clone());
             let owner = view.state.role(key) == authority::Role::Owner;
-            if view.genesis.age_restriction.min_age() > age {
+            if view.age_limit().min_age() > age {
                 let loss = AgeLoss { server_id, name, channel: None };
                 if owner { owned.push(loss) } else { out.push(loss) }
             } else if age < 18 && view.state.adults.contains(&key) {
@@ -4162,7 +4221,7 @@ impl Inner {
                 continue;
             }
             let was_adult = view.state.adults.contains(&key);
-            let leave = view.genesis.age_restriction.min_age() > age && view.state.role(key) != authority::Role::Owner;
+            let leave = view.age_limit().min_age() > age && view.state.role(key) != authority::Role::Owner;
             let adult_channels: Vec<(String, String)> = view
                 .state
                 .channels
@@ -4175,12 +4234,7 @@ impl Inner {
                 ports.network.publish(&claim);
             }
             if leave {
-                let record = self.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
-                self.db.set_leave(server, &record)?;
-                if self.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
-                    ports.network.publish(&record);
-                }
-                self.purge_server(ports, server, RemovedReason::Age, &[], true, events)?;
+                self.leave_for_age(ports, server, events)?;
             } else if was_adult && age < 18 {
                 let server_id = model::hex_id(server.as_bytes());
                 for (channel_id, name) in adult_channels {
@@ -4194,6 +4248,34 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// G-77: I'm under `server`'s age limit and not its owner: the `Leave`
+    /// goes through the leave outbox, and the server leaves this device
+    /// (`server.removed`, reason `age`, with the limit as `required`).
+    fn leave_for_age(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<()> {
+        let record = self.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
+        self.db.set_leave(server, &record)?;
+        if self.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
+            ports.network.publish(&record);
+        }
+        self.purge_server(ports, server, RemovedReason::Age, &[], true, events)
+    }
+
+    /// G-52: a raise read by sync left me under the server's limit (spec
+    /// §4, B7): I leave it as for a lowered birth date. Only with a known
+    /// age (a restored device without its birth date keeps the claim the
+    /// server holds), and never as the owner.
+    fn leave_if_under_limit(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<bool> {
+        let Some(me) = self.me.as_ref() else { return Ok(false) };
+        let (key, age) = (me.key(), me.profile.effective_age(ports.clock.now_ms()));
+        let view = self.view(server)?;
+        let under = age.is_some_and(|age| age < view.age_limit().min_age());
+        if !under || !view.state.is_member(key) || view.state.role(key) == authority::Role::Owner {
+            return Ok(false);
+        }
+        self.leave_for_age(ports, server, events)?;
+        Ok(true)
     }
 
     /// B6-p: every full record an accepted delete or edit replaced is pruned
@@ -5028,35 +5110,71 @@ impl Inner {
             // a channel that was ever 18+ re-seals only messages whose deps
             // reach its latest edit back to plain; none without one. Nothing
             // from its 18+ time ever reaches them.
-            let adult_joiner = view.state.adults.contains(&joiner);
-            let after_plain = |r: &Record, channel: ChannelId| -> bool {
-                if adult_joiner || !view.state.adult_edits.contains_key(&channel) {
-                    return true;
+            // Each ever-18+ channel's latest edit back to plain, found once per
+            // Join (dev-sync on #635): the one with every other plain edit
+            // for that channel in its past; None (none, or concurrent ones)
+            // fails closed.
+            let latest_plain: HashMap<ChannelId, Option<RecordId>> = if view.state.adults.contains(&joiner) {
+                HashMap::new()
+            } else {
+                let mut plain: HashMap<ChannelId, Vec<RecordId>> = HashMap::new();
+                for e in log.records.iter().filter(|e| view.state.accepted.contains(&e.id())) {
+                    if let Some(Action::ChannelEdit { channel, adult: false, .. }) = Action::from_record(e) {
+                        plain.entry(channel).or_default().push(e.id());
+                    }
                 }
-                let plain: Vec<RecordId> = log
+                view.state
+                    .adult_edits
+                    .keys()
+                    .map(|channel| {
+                        let edits = plain.remove(channel).unwrap_or_default();
+                        let latest =
+                            edits.iter().find(|p| edits.iter().all(|o| o == *p || log.resolver.reaches(*o, &[**p])));
+                        (*channel, latest.copied())
+                    })
+                    .collect()
+            };
+            let after_plain = |r: &Record, channel: ChannelId| match latest_plain.get(&channel) {
+                None => true,
+                Some(Some(edit)) => log.resolver.reaches(*edit, r.auth_deps()),
+                Some(None) => false,
+            };
+            // G-52 (forward-only lowering): for a joiner who isn't an adult,
+            // in a server that was ever 18+, only messages written after the
+            // latest lowering, so their deps reach it; nothing from the 18+
+            // time is ever re-sealed to them.
+            let ever_adult = log.genesis_min >= 18 || view.state.age_raise.is_some();
+            let lowered_at = if ever_adult && !view.state.adults.contains(&joiner) {
+                let lowerings: Vec<RecordId> = log
                     .records
                     .iter()
-                    .filter(|e| view.state.accepted.contains(&e.id()))
-                    .filter(|e| {
-                        matches!(Action::from_record(e), Some(Action::ChannelEdit { channel: c, adult: false, .. }) if c == channel)
-                    })
-                    .map(|e| e.id())
+                    .filter(|r| view.state.accepted.contains(&r.id()))
+                    .filter(|r| matches!(Action::from_record(r), Some(Action::ServerAgeLimit { min }) if min < 18))
+                    .map(|r| r.id())
                     .collect();
-                // The owner signs channel edits in a chain: the latest reaches the rest.
-                let latest = plain.iter().find(|p| plain.iter().all(|o| o == *p || log.resolver.reaches(*o, &[**p])));
-                latest.is_some_and(|edit| log.resolver.reaches(*edit, r.auth_deps()))
+                // The owner signs them in a chain: the latest reaches the rest.
+                let latest = lowerings.iter().find(|l| lowerings.iter().all(|o| o == *l || log.resolver.reaches(*o, &[**l])));
+                Some(latest.copied())
+            } else {
+                None
+            };
+            let after_lowering = |r: &Record| match lowered_at {
+                None => true,
+                Some(Some(lowering)) => log.resolver.reaches(lowering, r.auth_deps()),
+                Some(None) => false,
             };
             let mut by_channel: BTreeMap<ChannelId, Vec<(RecordId, u64)>> = BTreeMap::new();
             for r in &log.channel {
                 let Scope::Channel(channel) = r.scope() else { continue };
                 let fits = r.kind() == Kind::Message
-                    && after_plain(r, channel)
                     && r.author() == me
                     && r.ts() >= join_ts.saturating_sub(RESEAL_BEFORE_JOIN_MS)
                     && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS
                     && !done.contains(&r.id())
                     && !touched.contains(&r.id())
-                    && !log.resolver.reaches(join, r.auth_deps());
+                    && !log.resolver.reaches(join, r.auth_deps())
+                    && after_plain(r, channel)
+                    && after_lowering(r);
                 if fits && channel_readers(&view, channel).contains(&joiner) {
                     by_channel.entry(channel).or_default().push((r.id(), r.ts()));
                 }
@@ -5932,7 +6050,7 @@ impl Inner {
     ) -> CoreResult<()> {
         // G-77: an age removal says which restriction I'm now under.
         let required = (reason == RemovedReason::Age)
-            .then(|| self.view(server).ok().map(|v| v.genesis.age_restriction))
+            .then(|| self.view(server).ok().map(|v| v.age_limit()))
             .flatten();
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
@@ -6128,6 +6246,9 @@ impl Inner {
         let server_id = model::hex_id(view.id.as_bytes());
         let mut out = Vec::new();
         let looks = view.looks();
+        // G-52: the owner and admins see who isn't an adult in an 18+ server.
+        let staff = me.is_some_and(|me| view.state.role(me) >= authority::Role::Admin);
+        let adult_server = view.age_limit() == AgeRestriction::Eighteen;
         // Profile save (#378): my own row shows my saved profile at once,
         // not what my last profile post said (it may still be waiting).
         let mine = self.me.as_ref().map(|me| {
@@ -6168,6 +6289,7 @@ impl Inner {
                 bio: None,
                 avatar_data_url: avatar,
                 color,
+                not_adult: (staff && adult_server && !view.state.adults.contains(&member.key)).then_some(true),
             });
         }
         Ok(out)
@@ -6214,7 +6336,7 @@ impl Inner {
         // new computer): no new join, and nothing that would overwrite what
         // the server already holds about me.
         let member = view.state.is_member(key);
-        let required = view.genesis.age_restriction;
+        let required = view.age_limit();
         // As it counts now: at most 17 while a raise waits its 30 days.
         let age = me.profile.effective_age(ports.clock.now_ms());
         // A member's earlier age claim stands while this device has no birth
@@ -6303,7 +6425,7 @@ impl ServerView<'_> {
             initials: model::initials(&name),
             name,
             color: model::color_for(self.id.as_bytes()),
-            age_restriction: self.genesis.age_restriction,
+            age_restriction: self.age_limit(),
             owner_id: model::hex_id(self.owner.as_bytes()),
             invite_link,
             unread: false,
@@ -6375,7 +6497,8 @@ impl ServerView<'_> {
 /// members, and for an 18+ channel only those with an accepted 18+ claim.
 fn channel_readers(view: &ServerView, channel: ChannelId) -> BTreeSet<PublicKey> {
     let members = view.state.members.iter().copied();
-    if view.state.channels.get(&channel).is_some_and(|c| c.adult) {
+    // G-52: while the server is 18+, every channel is read by its adults only.
+    if view.age_limit() == AgeRestriction::Eighteen || view.state.channels.get(&channel).is_some_and(|c| c.adult) {
         members.filter(|m| view.state.adults.contains(m)).collect()
     } else {
         members.collect()

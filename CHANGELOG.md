@@ -10,6 +10,23 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
+## [0.6.0] - TBD
+
+### New
+- **Required updates:** when an update is required, MVS keeps showing what's on your computer but switches to read-only. A banner you can't dismiss explains why, with Update and Try again buttons. Until you update, nothing is sent and nothing connects. Anything you were typing stays on screen, so you can copy it. A call in progress ends at once.
+- **Report to the owners:** report a message or a member to the server's owner and admins. Only they see the report, and they also see that you sent it. Reports about a minor or sexual content are shown only after a click, and never to staff under 18.
+- **Update notice for servers:** if others in a server are on a newer version of MVS, the server tells you to update so you can keep getting and sending messages there.
+- **Server icon and description:** server owners can give a server an icon and a short description.
+- **Changing a server's age limit:** server owners can change the age limit after creating the server. Raising it removes members below the new age, after a confirmation that says how many, and each removed member sees why. Lowering it removes nobody. TBD: confirm the settings screen is in this release.
+- **Member relays:** a member with an open connection can help others in a server reach each other. It starts only after you've seen what it means, and you can turn it off. TBD: if port mapping (R1b) isn't in, add "At home, this needs an open port." TBD: only if #565 (R1) is merged before release.
+
+### Fixed
+- On the same network, a member's very first message could fail to reach the others. Fixed.
+- The diagnostics file (for bug reports) now shows only rounded sizes and times, and network counts as ranges and shares. It never shows an address, an ID or a name.
+
+### Known
+- Calls across the internet without a server are built but still switched off while they're tested. Calls work between people on the same network.
+
 ## [0.5.0] - 2026-11-24
 
 ### New

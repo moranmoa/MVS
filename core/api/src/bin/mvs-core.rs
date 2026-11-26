@@ -64,6 +64,8 @@ struct Args {
     relays: Vec<String>,
     bootstrap: Vec<String>,
     update_root: Option<PathBuf>,
+    /// G-81: `--voice-p2p` (no value), from the shell's voiceP2p flag.
+    voice_p2p: bool,
 }
 
 fn args() -> Option<Args> {
@@ -75,7 +77,12 @@ fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
     let mut relays = Vec::new();
     let mut bootstrap = Vec::new();
     let mut update_root = None;
+    let mut voice_p2p = false;
     while let Some(flag) = args.next() {
+        if flag.to_str()? == "--voice-p2p" {
+            voice_p2p = true;
+            continue;
+        }
         let value = args.next()?;
         match flag.to_str()? {
             "--data-dir" if data_dir.is_none() => data_dir = Some(PathBuf::from(value)),
@@ -85,7 +92,7 @@ fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Args> {
             _ => return None,
         }
     }
-    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root })
+    Some(Args { data_dir: data_dir?, relays, bootstrap, update_root, voice_p2p })
 }
 
 /// What is logged without RUST_LOG (see `init_logging`).
@@ -234,6 +241,10 @@ fn main() -> ExitCode {
     // delivery thread ends with the node.
     if let Some(net) = &sync {
         core.set_voice(net.clone());
+        core.set_voice_p2p(args.voice_p2p);
+        if let Some(media) = net.take_media() {
+            std::thread::spawn(move || api::syncnet::deliver_media(media, core));
+        }
         if let Some(signals) = net.take_voice() {
             std::thread::spawn(move || api::syncnet::deliver_voice(signals, core));
         }
@@ -242,6 +253,14 @@ fn main() -> ExitCode {
         if let Some(signals) = net.take_typing() {
             std::thread::spawn(move || api::syncnet::deliver_typing(signals, core));
         }
+        // G-48: report boxes over their own member-only protocol, and the
+        // outbox.
+        core.set_report_net(net.clone());
+        if let Some(boxes) = net.take_reports() {
+            std::thread::spawn(move || api::syncnet::deliver_reports(boxes, core));
+        }
+        // Delivery waits for acks: never on the thread that receives.
+        std::thread::spawn(move || api::syncnet::run_report_outbox(core));
     }
     eprintln!("mvs-core: ready");
     // With a network, a background sync beside the request loop; it stops
@@ -252,7 +271,7 @@ fn main() -> ExitCode {
             let stop = &stop;
             scope.spawn(move || core.run_sync_loop(&hints, stop));
         }
-        let served = sidecar::serve(core, io::stdin().lock(), &out);
+        let served = sidecar::serve(core, io::BufReader::new(io::stdin()), &out);
         core.stop_updates();
         // Quitting leaves any call (its bye goes out).
         let _ = core.leave_call();

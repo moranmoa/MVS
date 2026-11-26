@@ -13,9 +13,9 @@ use libp2p::{
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
 use sync::{
-    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ServerSecret, TypingError, VoiceCall,
-    VoiceError, VoiceFrame, VoicePath,
-    MAX_TYPING_BLOB, MAX_VOICE_BLOB,
+    log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ReportError, ServerSecret, TypingError,
+    VoiceCall, VoiceError, VoiceFrame, VoicePath,
+    MAX_REPORT_BLOB, MAX_TYPING_BLOB, MAX_VOICE_BLOB,
 };
 use tokio::sync::mpsc;
 
@@ -1190,8 +1190,8 @@ async fn a_forged_dial_back_answer_is_never_believed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_helper_keeps_the_punch_gate_closed_until_its_answer_settles() {
     let (relay, _relay) = voice_relay();
-    let (a, _ea) = bound_node_events("r1-slow-a", &relay, 60, true, Arc::new(AcceptAll)).await;
-    let (b, _eb) = bound_node_events("r1-slow-b", &relay, 61, true, Arc::new(AcceptAll)).await;
+    let (a, _ea) = bound_node_events("r1-slow-a", &relay, 62, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-slow-b", &relay, 63, true, Arc::new(AcceptAll)).await;
     a.test_no_direct_dials().unwrap();
     a.test_no_hole_punch().unwrap();
     b.test_no_hole_punch().unwrap();
@@ -1199,7 +1199,7 @@ async fn a_slow_helper_keeps_the_punch_gate_closed_until_its_answer_settles() {
     b.test_local_dialback().unwrap();
     b.test_dialback_delay(Duration::from_secs(12)).unwrap();
     a.set_member_relay(true, 1024, true).unwrap();
-    voice_meet(&a, &b, voice_id(60), voice_id(61), true).await;
+    voice_meet(&a, &b, voice_id(62), voice_id(63), true).await;
     let start = Instant::now();
     while !a.test_dialback_waiting(b.peer_id()).await.unwrap() {
         assert!(start.elapsed() < Duration::from_secs(30), "A never asked B");
@@ -1233,6 +1233,39 @@ async fn a_relay_only_node_never_becomes_a_relay() {
     voice_meet(&a, &b, voice_id(58), voice_id(59), false).await;
     assert_eq!(reachable_within(&a, Duration::from_secs(10)).await, None, "relay-only asked or was confirmed");
     assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// Required update (#577 RU1): a quiet node signs, syncs and serves nothing
+/// for the rest of the process. It drops its member peers, closes any new
+/// connection at once (so a reachable quiet node answers nothing), and
+/// appends nothing of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_node_takes_and_serves_nothing() {
+    let (relay, _relay) = voice_relay();
+    let a = bound_node("quiet-a", &relay, 60, true, Arc::new(AcceptAll)).await;
+    let b = bound_node("quiet-b", &relay, 61, true, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(60), voice_id(61), false).await;
+    a.set_quiet().unwrap();
+    let start = Instant::now();
+    while a.peers().await.unwrap().contains(&b.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(20), "the quiet node kept its member peer");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // B keeps trying (discovery, pulls): nothing sticks.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(!a.peers().await.unwrap().contains(&b.peer_id()), "a quiet node took a connection");
+    assert!(a.append(messages(1).remove(0)).await.is_err(), "a quiet node appended a record");
+    // Nothing signed goes to the relay's mailboxes, or to a member (SL on #593).
+    assert!(a.put_backup(vec![1; 64]).await.is_err(), "a quiet node put a backup");
+    assert!(a.put_notice(vec![1; 64]).await.is_err(), "a quiet node put a notice");
+    assert!(a.report_send(voice_id(61), vec![1; 64]).await.is_err(), "a quiet node sent a report");
+    // A record B writes never reaches A.
+    b.append(messages(2).remove(0)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let log = log_name(test_server().0, Scope::Channel(test_server().1));
+    assert!(a.heads(&log).await.unwrap_or_default().is_empty(), "a quiet node took a record");
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }
@@ -1280,6 +1313,87 @@ async fn typing_signals_go_between_members_with_their_own_caps() {
     b.shutdown().await.unwrap();
 }
 
+
+/// G-48: report boxes go between members over `/mvs/report/1`, acked only
+/// once they arrive, with their own caps (a burst of 3, then one every
+/// 10 s), never as voice or typing; a non-member's is dropped unanswered
+/// (so never acked) and none go to one; 20 KiB at most.
+#[tokio::test(flavor = "multi_thread")]
+async fn report_boxes_go_between_members_acked_with_their_own_caps() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    let (a, _ea) = bound_node_events("report-a", &relay, 32, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("report-b", &relay, 33, false, Arc::new(gate.clone())).await;
+    voice_meet(&a, &b, voice_id(32), voice_id(33), false).await;
+
+    // Five at once: the burst of 3 is acked; past it, a box is dropped
+    // unanswered and times out unacked (a token comes back only every 10 s).
+    let start = Instant::now();
+    let sends = (0..5u8).map(|n| a.report_send(voice_id(33), vec![n; MAX_REPORT_BLOB]));
+    let results = futures::future::join_all(sends).await;
+    let acked = results.iter().filter(|r| r.is_ok()).count();
+    let allowed = 3 + (start.elapsed().as_secs_f64() / 10.0).floor() as usize;
+    assert!(acked >= 3 && acked <= allowed.min(4), "{acked} acked, {allowed} allowed");
+    assert!(results.iter().all(|r| matches!(r, Ok(()) | Err(ReportError::NotAcked))), "{results:?}");
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        match event {
+            NodeEvent::ReportBox { from, bytes } => got.push((from, bytes)),
+            NodeEvent::VoiceSignal { .. } | NodeEvent::TypingSignal { .. } => panic!("a report arrived as voice or typing"),
+            _ => {}
+        }
+    }
+    assert_eq!(got.len(), acked, "exactly the acked ones arrived");
+    assert!(got.iter().all(|(from, bytes)| *from == voice_id(32) && bytes.len() == MAX_REPORT_BLOB));
+    assert_eq!(a.report_send(voice_id(33), vec![0; MAX_REPORT_BLOB + 1]).await, Err(ReportError::TooLarge));
+    assert_eq!(a.report_send(voice_id(99), b"x".to_vec()).await, Err(ReportError::NotMember));
+
+    // Not a member to B: dropped unanswered there, and B sends it none.
+    gate.set(voice_id(32), true);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(a.report_send(voice_id(33), b"from a non-member".to_vec()).await, Err(ReportError::NotAcked));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, eb.recv()).await {
+        assert!(!matches!(event, NodeEvent::ReportBox { .. }), "a non-member's report arrived");
+    }
+    assert_eq!(b.report_send(voice_id(32), b"to a non-member".to_vec()).await, Err(ReportError::NotMember));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// G-48 (the Tech Lead's #515 review): with a report sink, a box is acked
+/// only once it is in the sink. A stalled receiver (a full sink nobody
+/// drains) leaves boxes unacked, so the sender's outbox keeps them; once it
+/// drains, the next one is acked. Nothing acked is ever lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_report_inbox_never_acks() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("report-stall-a", &relay, 34, false, Arc::new(AcceptAll)).await;
+    let (b, mut eb) = bound_node_events("report-stall-b", &relay, 35, false, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(34), voice_id(35), false).await;
+    let (sink, inbox) = std::sync::mpsc::sync_channel(1);
+    b.set_report_sink(sink).unwrap();
+
+    assert_eq!(a.report_send(voice_id(35), b"first".to_vec()).await, Ok(()), "room for one");
+    assert_eq!(
+        a.report_send(voice_id(35), b"second".to_vec()).await,
+        Err(ReportError::NotAcked),
+        "the inbox is full: not acked, so the sender keeps it"
+    );
+    assert_eq!(inbox.try_recv().unwrap(), (voice_id(34), b"first".to_vec()));
+    assert!(inbox.try_recv().is_err(), "the unacked box never went in");
+    // Drained: acked again (a token is back after 10 s).
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(a.report_send(voice_id(35), b"third".to_vec()).await, Ok(()));
+    assert_eq!(inbox.try_recv().unwrap().1, b"third".to_vec());
+    // With a sink, boxes never travel the event stream.
+    while let Ok(event) = eb.try_recv() {
+        assert!(!matches!(event, NodeEvent::ReportBox { .. }));
+    }
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
 /// T8-02 piece 3: a member's invite publication reaches the other members
 /// (`/mvs/invite-pub/1`), also one that binds later; anyone, a stranger
 /// with no server secret included, can ask for its envelope handle

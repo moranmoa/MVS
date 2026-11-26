@@ -218,7 +218,10 @@ button:disabled {
 
 .field input,
 .field select,
-.field textarea {
+.field textarea,
+/* Fields outside a .field label: the G-14 topic and G-92 invite inputs (UX on #549). */
+.topic-field,
+.join-paste-row input {
   font-weight: 400;
   font-size: 1rem;
   padding: 0.625rem 0.75rem;
@@ -229,6 +232,8 @@ button:disabled {
 }
 
 .field input[aria-invalid],
+.topic-field[aria-invalid],
+.join-paste-row input[aria-invalid],
 .word-inputs input[aria-invalid] {
   border-color: var(--danger);
   background: var(--danger-soft);
@@ -1383,7 +1388,8 @@ legend {
 }
 
 .msg.deleted,
-.msg.blocked {
+.msg.blocked,
+.msg.unreadable {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -3920,6 +3926,11 @@ input.switch:disabled {
   margin-inline-end: auto;
 }
 
+/* Voice IP notice v3: two paragraphs (direct, relay-only). */
+.ip-notice p + p {
+  margin-block-start: 0.5rem;
+}
+
 /* G-14: the channel topic, after the name in the header: one muted line. */
 .chat-topic {
   min-width: 0;
@@ -4008,4 +4019,36 @@ input.switch:disabled {
    once a link is typed it's LTR. */
 :root[dir='rtl'] .join-paste input:placeholder-shown {
   direction: rtl;
+}
+
+/* G-30: the message a link pointed at: an accent wash and a start-side bar
+   (not colour alone) for 2.5 s, fading out; no fade with reduced motion. */
+.row.target .msg {
+  background: var(--accent-soft);
+  animation: target-fade 2.5s ease-in forwards;
+}
+
+.row.target .msg::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
+@keyframes target-fade {
+  0%,
+  60% {
+    background: var(--accent-soft);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row.target .msg {
+    animation: none;
+  }
 }

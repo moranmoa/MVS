@@ -4,8 +4,9 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { createContext, Fragment, memo, useCallback, useContext, useMemo, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
-import type { MessageWindow } from '../../app/store';
-import { isCoreError, useCore, type Member, type Message } from '../../core';
+import { useStore, type MessageWindow } from '../../app/store';
+import { messageLink } from '../../app/messageLink';
+import { isCoreError, useCore, type Id, type Member, type Message } from '../../core';
 import { EmojiPicker } from '../../components/EmojiPicker';
 import { isHeld } from '../../core/sanitize';
 import { MENTION, splitMentions } from '../../app/mentions';
@@ -19,6 +20,8 @@ import {
   EditIcon,
   ReplyIcon,
   TrashIcon,
+  LockIcon,
+  ShieldAlertIcon,
   SmilePlusIcon,
 } from '../../components/icons';
 import { textDir, useUiDir } from '../../app/textDir';
@@ -37,6 +40,8 @@ interface Handlers {
   onEdit: (m: Message) => void;
   onDelete: (m: Message) => void;
   onRetry: (m: Message) => void;
+  /** G-48: report someone else's message to the owner and admins. */
+  onReport?: (m: Message) => void;
 }
 
 /** A calendar day in local time, to compare two messages. */
@@ -62,6 +67,7 @@ export function DateDivider({ at }: { at: number }) {
 
 export function MessageList({
   win,
+  serverId,
   channelName,
   memberMap,
   myId,
@@ -72,6 +78,8 @@ export function MessageList({
   ...handlers
 }: {
   win: MessageWindow;
+  /** G-30: for "Copy message link". */
+  serverId: Id;
   channelName: string;
   memberMap: Map<string, Member>;
   myId: string;
@@ -93,6 +101,8 @@ export function MessageList({
   const [active, setActive] = useState<number | null>(null);
   const [revealed, setRevealed] = useState<Set<string>>(() => new Set());
   const [flash, setFlash] = useState<number | null>(null);
+  /** G-30: the row a link pointed at, highlighted for a moment. */
+  const [targeted, setTargeted] = useState<number | null>(null);
   const focusPending = useRef(false);
   const count = win.count;
   const flagged = useMemo(() => lookalikeIds([...memberMap.values()]), [memberMap]);
@@ -121,7 +131,8 @@ export function MessageList({
     return a ? displayName(a) : '…';
   };
   const messageItems = (m: Message): MenuItem[] =>
-    m.deleted || (memberMap.get(m.authorId)?.blocked && !revealed.has(m.authorId))
+    m.deleted ||
+    m.unreadable || (memberMap.get(m.authorId)?.blocked && !revealed.has(m.authorId))
       ? []
       : isHeld(m)
         ? // Not on the network yet: no id to reply to, edit or delete.
@@ -142,6 +153,17 @@ export function MessageList({
             // the direction marks are added only when it is shown.
             onSelect: async () => store.showFlash((await copyText(plainText(m.body))) ? 'common.copied' : 'menu.copyFailed'),
           },
+          // G-30: only once the message is on the network (not while sending or failed;
+          // held rows have their own short menu above).
+          ...(m.sendState === 'pending' || m.sendState === 'failed'
+            ? []
+            : [
+                {
+                  key: 'copy-link',
+                  label: intl.formatMessage({ id: 'msglink.copy' }),
+                  onSelect: async () => store.showFlash((await copyText(messageLink(serverId, m.channelId, m.id))) ? 'msglink.copied' : 'menu.copyFailed'),
+                },
+              ]),
           {
             key: 'copy-id',
             label: intl.formatMessage({ id: 'menu.copyMessageId' }),
@@ -149,6 +171,9 @@ export function MessageList({
           },
           ...(m.authorId === myId ? [{ key: 'edit', label: intl.formatMessage({ id: 'chat.edit' }), onSelect: () => handlers.onEdit(m) }] : []),
           { kind: 'separator' },
+          ...(m.authorId !== myId && handlers.onReport
+            ? [{ key: 'report', label: intl.formatMessage({ id: 'report.action' }), onSelect: () => handlers.onReport?.(m) }]
+            : []),
           ...(m.authorId === myId || isOwner
             ? [{ key: 'delete', label: intl.formatMessage({ id: 'chat.delete' }), danger: true, onSelect: () => handlers.onDelete(m) }]
             : []),
@@ -231,6 +256,22 @@ export function MessageList({
 
   const goToRef = useRef(goTo);
   goToRef.current = goTo;
+  // G-30: a link was opened for this channel: scroll there, highlight, focus the row.
+  const target = useStore(store, (s) => (s.messageTarget?.channelId === win.channelId ? s.messageTarget : null));
+  // The highlight's timer lives outside the effect: clearing the target re-runs
+  // the effect, and its cleanup must not cancel the fade-out.
+  const targetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(targetTimer.current), []);
+  useEffect(() => {
+    if (!target || count === 0) return;
+    store.clearMessageTarget();
+    if (target.index >= count) return store.showFlash('msglink.notFound');
+    goToRef.current(target.index, 'center');
+    setTargeted(target.index);
+    clearTimeout(targetTimer.current);
+    targetTimer.current = setTimeout(() => setTargeted((f) => (f === target.index ? null : f)), 2500);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target, count]);
   const jumpToReply = useCallback((index: number) => {
     goToRef.current(index, 'center');
     setFlash(index);
@@ -297,10 +338,10 @@ export function MessageList({
         if (m && !m.deleted) handlers.onReply(m);
         break;
       case 'e':
-        if (m && !m.deleted && m.authorId === myId) handlers.onEdit(m);
+        if (m && !m.deleted && !m.unreadable && m.authorId === myId) handlers.onEdit(m);
         break;
       case 'Delete':
-        if (m && !m.deleted && (m.authorId === myId || isOwner)) handlers.onDelete(m);
+        if (m && !m.deleted && !m.unreadable && (m.authorId === myId || isOwner)) handlers.onDelete(m);
         break;
       default:
         return;
@@ -338,6 +379,8 @@ export function MessageList({
               !!m &&
               !!prev &&
               !prev.deleted &&
+              // A placeholder row has no head: what follows starts its own.
+              !prev.unreadable &&
               !m.replyTo &&
               prev.authorId === m.authorId &&
               m.createdAt - prev.createdAt < GROUP_GAP_MS &&
@@ -349,7 +392,7 @@ export function MessageList({
                 key={item.key}
                 data-index={item.index}
                 ref={virtualizer.measureElement}
-                className={`row ${flash === item.index ? 'flash' : ''}`}
+                className={`row ${flash === item.index ? 'flash' : ''} ${targeted === item.index ? 'target' : ''}`}
                 style={{ transform: `translateY(${item.start}px)` }}
                 tabIndex={item.index === tabRow ? 0 : -1}
                 role="article"
@@ -527,6 +570,26 @@ const MessageRow = memo(function MessageRow({
         <TrashIcon />
         <span className="muted small">
           <FormattedMessage id="chat.deleted" />
+        </span>
+      </div>
+    );
+  }
+
+  // Core #527: a message that can't be opened here: a muted line, no actions.
+  if (m.unreadable) {
+    return (
+      <div className={`msg unreadable ${m.unreadable}`}>
+        {/* A lock: waiting for its key here; a shield with "!": the sender can't be verified (UX). */}
+        {m.unreadable === 'no-key' ? <LockIcon /> : <ShieldAlertIcon />}
+        <span className="muted small">
+          {/* Screen readers hear only the text (PO); the name is for the eye. */}
+          {m.unreadable === 'no-key' && author && (
+            <span aria-hidden="true">
+              <Name>{name}</Name>
+              {' · '}
+            </span>
+          )}
+          <FormattedMessage id={m.unreadable === 'no-key' ? 'msg.unreadable.noKey' : 'msg.unreadable.untrusted'} />
         </span>
       </div>
     );
@@ -786,7 +849,7 @@ function useNewMessageAnnouncement(
     const fresh: Message[] = [];
     for (let i = before; i < count; i++) {
       const m = win.get(i);
-      if (m && !m.deleted && m.authorId !== myId && !now.current.memberMap.get(m.authorId)?.blocked) fresh.push(m);
+      if (m && !m.deleted && !m.unreadable && m.authorId !== myId && !now.current.memberMap.get(m.authorId)?.blocked) fresh.push(m);
     }
     if (fresh.length === 0) return;
     pending.current = { last: fresh[fresh.length - 1]!, n: (pending.current?.n ?? 0) + fresh.length };

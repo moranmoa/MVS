@@ -64,6 +64,11 @@ export interface ServerSummary {
   mentions: number;
   /** Closed by its owner (#261): read-only until it is purged 30 days later. */
   closed?: boolean;
+  /**
+   * #589: a member wrote a record kind this version doesn't know, so they run a
+   * newer MVS and this computer may miss what it adds. The UI asks to update.
+   */
+  updateNeeded?: boolean;
 }
 
 export interface Channel {
@@ -129,6 +134,8 @@ export interface CoreStatus {
   detail?: CoreDownDetail;
   /** Our STUN server for voice (#222), from the shell's config; absent without one. */
   stunUrl?: string;
+  /** G-81 B: calls over the P2P network are on in this build (off by default). */
+  voiceP2p?: boolean;
 }
 
 /** Commands reject with this shape; `code` maps to a translated message. */
@@ -171,7 +178,13 @@ export interface CoreError {
     | 'nothing-staged'
     | 'disk-full'
     // Server lifecycle (#261): a member's MVS is too old for rename, leave or close; nothing was signed.
-    | 'update-needed';
+    | 'update-needed'
+    /** G-48: I already reported this message or member in the last 30 days. */
+    | 'already-reported'
+    /** G-48: nobody can receive the report (the owner is reported and there are no admins). */
+    | 'no-recipient'
+    /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
+    | 'profile-too-large';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */
   detail?: CoreDownDetail;
   /** 1-based word positions that were not recognised (restore). */
@@ -206,6 +219,13 @@ export interface Message {
   replyTo?: { id: Id; index: number; authorId: Id; excerpt: string };
   /** Only set on messages written on this device. */
   sendState?: SendState;
+  /**
+   * TODO #21 / core #527: a message here that can't be opened. 'no-key': its
+   * channel key isn't on this computer (it may open later, as message.updated);
+   * 'untrusted': the sender can't be verified (no author). The body is empty,
+   * and it takes no reactions, replies, edits or deletes.
+   */
+  unreadable?: 'no-key' | 'untrusted';
   mentionsMe?: boolean;
   /**
    * G-24 (#330): the users this message mentions who are members now, as
@@ -264,6 +284,78 @@ export interface AppInfo {
   updateChannel: UpdateChannel;
   /** Relay-only (GAP-6r, #272): this device is reached only through the relay; calls are off. */
   relayOnly?: boolean;
+  /** G-48 / B24: where to report abuse to the MVS team, from the build (the shell, #552); absent when unset. */
+  abuseAddress?: string;
+}
+
+/** G-48 (core #515): why something is reported. 'sexual' and 'minor' are reasons 5 and 6. */
+export type ReportReason =
+  | 'spam'
+  | 'harassment'
+  | 'hate'
+  | 'violence'
+  | 'sexual'
+  | 'minor'
+  | 'self-harm'
+  | 'illegal'
+  | 'impersonation'
+  | 'other';
+export const REPORT_REASONS: readonly ReportReason[] = [
+  'spam',
+  'harassment',
+  'hate',
+  'violence',
+  'sexual',
+  'minor',
+  'self-harm',
+  'illegal',
+  'impersonation',
+  'other',
+];
+/** G-48: the reasons whose evidence is behind a click with a warning, never inline (PO 1). */
+export const SENSITIVE_REASONS: ReadonlySet<ReportReason> = new Set(['sexual', 'minor']);
+
+/** G-48: what is reported, as `reportContent` takes it. */
+export type ReportTargetInput = { kind: 'message'; messageId: Id } | { kind: 'member'; userId: Id };
+/** G-48: what was reported, as staff see it (the core adds a message's channel). */
+export type ReportTarget = { kind: 'message'; messageId: Id; channelId: Id } | { kind: 'member'; userId: Id };
+
+/** G-48: a report as the server's owner and admins see it. Never carries the evidence. */
+export interface ReportSummary {
+  id: Id;
+  serverId: Id;
+  reporterId: Id;
+  target: ReportTarget;
+  /** The reported member: the message's author for a message. */
+  reportedId: Id;
+  reason: ReportReason;
+  /** The reporter's note, one line. */
+  text?: string;
+  /** The reporter's clock. */
+  ts: Timestamp;
+  receivedAt: Timestamp;
+  /** My own triage, on this device only. */
+  dismissed: boolean;
+  /** False: the evidence didn't check out (`getReportEvidence` says bad-request). */
+  evidenceValid: boolean;
+  /** Reasons 5 and 6 for staff without an 18+ claim: the evidence is withheld. */
+  evidenceWithheld: boolean;
+}
+
+/** G-48: the reported message as its author signed it. Shown as plain text only. */
+export interface ReportEvidence {
+  authorId: Id;
+  channelId: Id;
+  ts: Timestamp;
+  /** Absent when I hold no key for it. */
+  text?: string;
+}
+
+/** G-48: `reportContent`'s answer. */
+export interface ReportReceipt {
+  reportId: Id;
+  /** How many staff it goes to. */
+  recipients: number;
 }
 
 /**

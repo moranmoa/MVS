@@ -4,6 +4,7 @@
 //
 //   node manifest-body.mjs --version 0.1.0 --platforms "linux-x86_64 ..." --dir dist [--channel alpha] [--days 14] [--notes-dir notes] --out manifest-body.json
 //   node manifest-body.mjs --restamp manifest-body.json [--days 14]
+//   add [--require-from 0.6.0 [--published "0.5.0 0.5.1"]] to either for a required release
 //
 // Updater artifacts are named mvs-<version>-<platform>.zip|.tar.gz. Every
 // platform in --platforms (space- or comma-separated) must have exactly one,
@@ -14,6 +15,15 @@
 // --notes-dir holds one <lang>.txt per language ("what's new", B8), e.g.
 // he.txt, en.txt. They go into the signed body as `notes`, with the limits
 // core/updater enforces (MAX_NOTES_LANGUAGES, MAX_NOTES_BYTES).
+//
+// --require-from <version> makes it a REQUIRED release (docs/design/
+// required-update.md §1): `revoked` gets every published version below
+// <version> on the body's channel, never the body's own version. It works
+// with a new body and with --restamp. "Published" = a non-draft GitHub
+// release tagged v<version> that carries manifest-body-<channel>.json (for
+// alpha also the pre-channel manifest-body.json). --published "0.4.5 0.4.7"
+// gives the list instead of asking GitHub (offline, tests). Revocations
+// already in the body are kept: clients never drop one anyway.
 
 import { createHash } from "node:crypto";
 import { createReadStream, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -115,8 +125,55 @@ function zipUnpackedBytes(path) {
   return total;
 }
 
+// Mirrors core/updater MAX_MANIFEST_BYTES (the signed envelope adds ~200 bytes).
+const MAX_BODY_BYTES = 64 * 1024 - 1024;
+const REPO = "moranmoa/MVS";
+
+const parseVersion = (v) => v.split(".").map(Number);
+function cmpVersion(x, y) {
+  const [a, b] = [parseVersion(x), parseVersion(y)];
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+/** Versions published on `channel`, from the GitHub releases API. */
+async function publishedVersions(channel) {
+  const assets = new Set([`manifest-body-${channel}.json`, ...(channel === "alpha" ? ["manifest-body.json"] : [])]);
+  const headers = { accept: "application/vnd.github+json", "user-agent": "mvs-release-script" };
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const out = [];
+  let url = `https://api.github.com/repos/${REPO}/releases?per_page=100`;
+  while (url) {
+    const res = await fetch(url, { headers });
+    if (!res.ok) fail(`GitHub releases: HTTP ${res.status} (use --published to give the list by hand)`);
+    for (const r of await res.json()) {
+      const m = /^v(.+)$/.exec(r.tag_name);
+      if (r.draft || !m || !VERSION.test(m[1])) continue;
+      if (r.assets.some((x) => assets.has(x.name))) out.push(m[1]);
+    }
+    url = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") ?? "")?.[1];
+  }
+  return out;
+}
+
+/** Fills body.revoked for --require-from (see the header). */
+async function requireFrom(body, from, publishedArg) {
+  if (!VERSION.test(from)) fail(`--require-from ${from} is not MAJOR.MINOR.PATCH`);
+  if (cmpVersion(from, body.version) > 0) fail(`--require-from ${from} is above this release (${body.version}): it would revoke the release itself`);
+  const published = publishedArg !== undefined ? publishedArg.split(/[\s,]+/).filter(Boolean) : await publishedVersions(body.channel);
+  for (const v of published) if (!VERSION.test(v)) fail(`--published: ${v} is not MAJOR.MINOR.PATCH`);
+  const below = published.filter((v) => cmpVersion(v, from) < 0 && v !== body.version);
+  if (below.length === 0) fail(`--require-from ${from}: no published ${body.channel} version is below it, so nothing would be required`);
+  const revoked = [...new Set([...(body.revoked ?? []), ...below])].filter((v) => v !== body.version).sort(cmpVersion);
+  body.revoked = revoked;
+  console.log(`required release: ${body.channel} revokes ${revoked.length} version(s): ${revoked.join(" ")}`);
+}
+
 function write(path, body) {
-  writeFileSync(path, JSON.stringify(body, null, 2) + "\n");
+  if (body.revoked?.includes(body.version)) fail(`the body revokes its own version ${body.version}`);
+  const text = JSON.stringify(body, null, 2) + "\n";
+  if (Buffer.byteLength(text) > MAX_BODY_BYTES) fail(`the body is over ${MAX_BODY_BYTES} bytes`);
+  writeFileSync(path, text);
   const until = new Date(body.expires_at * 1000).toISOString();
   console.log(`${path}: ${body.channel} ${body.version}, ${Object.keys(body.artifacts).join(", ")}; expires ${until}`);
 }
@@ -126,6 +183,7 @@ const days = Number(a.days ?? 14);
 
 if (a.restamp) {
   const body = JSON.parse(readFileSync(a.restamp, "utf8"));
+  if (a["require-from"]) await requireFrom(body, a["require-from"], a.published);
   stamp(body, days);
   write(a.restamp, body);
 } else {
@@ -153,6 +211,7 @@ if (a.restamp) {
 
   const body = { format: 1, channel, version, issued_at: 0, expires_at: 0, artifacts, revoked: [] };
   if (a["notes-dir"]) body.notes = readNotes(a["notes-dir"]);
+  if (a["require-from"]) await requireFrom(body, a["require-from"], a.published);
   stamp(body, days);
   write(out, body);
 }

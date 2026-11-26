@@ -123,7 +123,8 @@ pub struct Resolver {
     /// Every channel create, in linear order, accepted or not. The first
     /// accepted one is #general.
     channel_creates: Vec<RecordId>,
-    /// Every server rename, in linear order, accepted or not.
+    /// Every server rename, icon, description (G-51) and secret rotation part
+    /// (T17), in linear order, accepted or not.
     server_edits: Vec<RecordId>,
 
     // What the reference run would hold for the joined records.
@@ -150,6 +151,8 @@ pub struct Resolver {
     /// A record couldn't be applied incrementally; re-resolve once the
     /// current arrival and the records it unblocked have joined.
     stale: Option<Fallback>,
+    /// G-52: any `ServerAgeLimit` joined; age claims then re-resolve.
+    age_limit_seen: bool,
     stats: Stats,
 }
 
@@ -192,6 +195,7 @@ impl Resolver {
             unsettled: HashMap::new(),
             owner_unsettled: false,
             stale: None,
+            age_limit_seen: false,
             stats: Stats::default(),
         }
     }
@@ -324,12 +328,18 @@ impl Resolver {
         // G-51: the icon and description are server meta, like a rename.
         if matches!(
             action,
-            Some(Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. })
+            Some(
+                Action::ServerEdit { .. }
+                    | Action::ServerIcon { .. }
+                    | Action::ServerDescription { .. }
+                    | Action::SecretRotation { .. }
+            )
         ) {
             let pos = &self.pos;
             let edits = &mut self.server_edits;
             edits.insert(edits.partition_point(|other| pos[other] < at), id);
         }
+        self.age_limit_seen |= matches!(action, Some(Action::ServerAgeLimit { .. }));
         self.actions.insert(id, action);
 
         self.stats.joined += 1;
@@ -429,7 +439,10 @@ impl Resolver {
                 }
                 return Ok(());
             }
-            Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+            Action::ServerEdit { .. }
+            | Action::ServerIcon { .. }
+            | Action::ServerDescription { .. }
+            | Action::SecretRotation { .. } => {
                 // Changes no roles; whether it counts depends on the author's
                 // role, which must be the same in every pass. The latest in
                 // linear order names the server.
@@ -443,6 +456,12 @@ impl Resolver {
                 }
                 self.refresh_server_name();
                 return Ok(());
+            }
+            // G-52: an 18+ limit counts only from an adult owner, and a later
+            // age claim can land before it in linear order: re-resolve both.
+            Action::ServerAgeLimit { .. } => return Err(Fallback::Other),
+            Action::AgeClaim { .. } if self.age_limit_seen && self.state.owner == Some(author) => {
+                return Err(Fallback::Other)
             }
             Action::AgeClaim { .. } => {
                 // Changes no roles; whether it counts depends on the author's
@@ -766,6 +785,14 @@ impl Resolver {
         let mut name = None;
         let mut icon = None;
         let mut description = None;
+        // T17: every accepted secret rotation part, in linear order.
+        self.state.secret_rotations = self
+            .server_edits
+            .iter()
+            .filter(|id| self.state.accepted.contains(*id))
+            .filter(|id| matches!(self.actions[*id], Some(Action::SecretRotation { .. })))
+            .copied()
+            .collect();
         for id in self.server_edits.iter().rev().filter(|id| self.state.accepted.contains(*id)) {
             match &self.actions[id] {
                 Some(Action::ServerEdit { name: n }) if name.is_none() => name = Some(n.clone()),
@@ -900,7 +927,10 @@ impl Resolver {
                     }
                     dirty.insert(author);
                 }
-                Action::ServerEdit { .. } | Action::ServerIcon { .. } | Action::ServerDescription { .. } => {
+                Action::ServerEdit { .. }
+                | Action::ServerIcon { .. }
+                | Action::ServerDescription { .. }
+                | Action::SecretRotation { .. } => {
                     if now {
                         self.state.accepted.insert(id);
                     } else {
@@ -930,6 +960,12 @@ impl Resolver {
                     self.refresh_channel(channel);
                 }
                 // The author's membership changed under it.
+                // G-52: whether an age limit counts depends on the owner's age
+                // claims at its position: re-resolve.
+                Action::ServerAgeLimit { .. } => return Err(Fallback::Other),
+                Action::AgeClaim { .. } if self.age_limit_seen && self.state.owner == Some(author) => {
+                    return Err(Fallback::Other)
+                }
                 Action::AgeClaim { .. } => {
                     if now {
                         self.state.accepted.insert(id);
@@ -1080,6 +1116,12 @@ impl Resolver {
     /// per record.
     pub fn adult_at(&self, actor: Actor, auth_deps: &[RecordId]) -> Result<bool, Vec<RecordId>> {
         let at = self.position_after(auth_deps)?;
+        Ok(self.adult_before(actor, at))
+    }
+
+    /// Whether `actor`'s latest accepted age claim before position `at` in
+    /// linear order says adult.
+    fn adult_before(&self, actor: Actor, at: usize) -> bool {
         let latest = self.touch.get(&actor).into_iter().flatten().rev().find_map(|id| {
             let before = self.pos.get(id).is_some_and(|pos| *pos < at);
             if !before || self.known[id].author() != actor || !self.state.accepted.contains(id) {
@@ -1090,7 +1132,7 @@ impl Resolver {
                 _ => None,
             }
         });
-        Ok(latest == Some(true))
+        latest == Some(true)
     }
 
     /// B7-k, query only (no state changes): whether the control record
@@ -1208,6 +1250,11 @@ impl View for AtPosition<'_> {
 
     fn has_channels(&self) -> bool {
         self.resolver.first_create(self.at).is_some()
+    }
+
+    /// The actor's latest accepted age claim before this position.
+    fn is_adult(&self, actor: Actor) -> bool {
+        self.resolver.adult_before(actor, self.at)
     }
 
     fn owner(&self) -> Option<Actor> {

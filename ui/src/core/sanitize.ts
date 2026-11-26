@@ -17,6 +17,9 @@ import type {
   Invite,
   RemovedMember,
   BlockedUser,
+  ReportEvidence,
+  ReportSummary,
+  ReportTarget,
   JoinStatus,
   Member,
   Message,
@@ -34,6 +37,7 @@ import type {
   MemberRelay,
   Id,
 } from './types';
+import { REPORT_REASONS } from './types';
 
 export const NAME_MAX = 32;
 export const SERVER_NAME_MAX = 48;
@@ -231,6 +235,7 @@ export function cleanServer(s: ServerSummary): ServerSummary {
     unread: s.unread === true,
     mentions: count(s.mentions),
     closed: s.closed === true,
+    updateNeeded: s.updateNeeded === true,
   };
 }
 
@@ -273,6 +278,72 @@ export function cleanRemovedMember(r: RemovedMember): RemovedMember | null {
     shortCode: cleanCode(r.shortCode),
     displayName: cleanName(r.displayName),
     removedAt: when(r.removedAt) ?? 0,
+  };
+}
+
+/** G-48: the reporter's note, as the core allows it: one line, 280 characters. */
+export const REPORT_TEXT_MAX = 280;
+const reportText = (raw: unknown): string | undefined => {
+  if (typeof raw !== 'string') return undefined;
+  const t = cleanText(raw.replace(/\s+/g, ' '), REPORT_TEXT_MAX, 1).text.trim();
+  return t || undefined;
+};
+
+/**
+ * G-48 (TL on #531): a report's ids are rejected, not truncated, when they
+ * aren't a plain id: 1–128 of letters, digits, '-', '_', ':' or '#' (the
+ * core's are 64 hex; the mock's are named).
+ */
+const REPORT_ID = /^[A-Za-z0-9_:#-]{1,128}$/;
+const reportId = (raw: unknown): string | null => (typeof raw === 'string' && REPORT_ID.test(raw) ? raw : null);
+
+function cleanReportTarget(t: unknown): ReportTarget | null {
+  const x = t as Record<string, unknown> | null;
+  if (x?.kind === 'message') {
+    const messageId = reportId(x.messageId);
+    const channelId = reportId(x.channelId);
+    return messageId && channelId ? { kind: 'message', messageId, channelId } : null;
+  }
+  if (x?.kind === 'member' && typeof x.userId === 'string') return { kind: 'member', userId: cleanHexId(x.userId) };
+  return null;
+}
+
+/** G-48: a report for staff, or null when its reason or target isn't one we know. Never evidence. */
+export function cleanReportSummary(r: ReportSummary): ReportSummary | null {
+  if (!r || typeof r !== 'object') return null;
+  const rid = reportId(r.id);
+  const serverId = reportId(r.serverId);
+  const target = cleanReportTarget(r.target);
+  const reason = REPORT_REASONS.find((x) => x === r.reason);
+  if (!rid || !serverId || !target || !reason) return null;
+  const text = reportText(r.text);
+  return {
+    id: rid,
+    serverId,
+    reporterId: cleanHexId(r.reporterId),
+    target,
+    reportedId: cleanHexId(r.reportedId),
+    reason,
+    ...(text ? { text } : {}),
+    ts: when(r.ts) ?? 0,
+    receivedAt: when(r.receivedAt) ?? 0,
+    dismissed: r.dismissed === true,
+    evidenceValid: r.evidenceValid === true,
+    // Withheld unless the core says otherwise: the safe default for reasons 5 and 6.
+    evidenceWithheld: r.evidenceWithheld !== false,
+  };
+}
+const cleanReports = (l: unknown): ReportSummary[] =>
+  Array.isArray(l) ? l.map(cleanReportSummary).filter((r): r is ReportSummary => r !== null) : [];
+
+/** G-48: the reported message, as plain text (the UI never parses it as Markdown or HTML). */
+export function cleanReportEvidence(e: ReportEvidence): ReportEvidence {
+  const text = typeof e?.text === 'string' ? cleanText(e.text).text : undefined;
+  return {
+    authorId: cleanHexId(e?.authorId),
+    channelId: id(e?.channelId),
+    ts: when(e?.ts) ?? 0,
+    ...(text !== undefined ? { text } : {}),
   };
 }
 
@@ -364,10 +435,25 @@ function cleanReactions(raw: unknown): Message['reactions'] {
 }
 
 export function cleanMessage(m: Message): Message {
+  // Core #527: a placeholder carries no text, author (untrusted) or extras.
+  const unreadable = m.unreadable === 'no-key' || m.unreadable === 'untrusted' ? m.unreadable : undefined;
+  if (unreadable) {
+    return {
+      id: id(m.id),
+      channelId: id(m.channelId),
+      index: typeof m.index === 'number' && Number.isInteger(m.index) && m.index >= 0 ? m.index : 0,
+      authorId: unreadable === 'untrusted' ? '' : id(m.authorId),
+      createdAt: typeof m.createdAt === 'number' && Number.isFinite(m.createdAt) ? m.createdAt : 0,
+      body: '',
+      unreadable,
+      mentionsMe: false,
+    };
+  }
   const { text, clipped } = cleanText(m.body);
   // Only the exact held-id shape is a replacement; anything else is dropped.
   const replaces = typeof m.replaces === 'string' && HELD_ID.test(m.replaces) ? m.replaces : undefined;
-  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, ...rest } = m;
+  // An unknown unreadable kind is dropped: the message is shown as a message.
+  const { replaces: _ignored, mentions: rawMentions, reactions: rawReactions, unreadable: _unknown, ...rest } = m;
   const mentions = cleanMentions(rawMentions);
   const reactions = cleanReactions(rawReactions);
   return {
@@ -414,6 +500,9 @@ const cleanRange = (r: MessageRange): MessageRange => ({ ...r, messages: r.messa
  * bearer credential: the link is never logged, only shown, copied and passed
  * to joinServer.
  */
+/** G-30: a core id (64 lower-case hex), or the demo core's short ids (letters, digits, - and #). */
+const isLinkId = (v: unknown): v is string => typeof v === 'string' && (/^[0-9a-f]{64}$/.test(v) || /^[a-z0-9][a-z0-9#-]{0,63}$/.test(v));
+
 const INVITE_LINK = /^mvs:\/\/join\/([0-9a-f]{64})\/([0-9a-f]{64})\/([0-9a-f]{64})\/?$/;
 
 /** The canonical invite link, or '' when it is not exactly that format. */
@@ -618,6 +707,9 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
   'channel.removed': (p) => ({ serverId: p.serverId, channelId: p.channelId, name: cleanName(p.name, CHANNEL_NAME_MAX) || '…' }),
   'members.changed': (p) => ({ ...p, members: p.members.map(cleanMember) }),
   'blocks.changed': (p) => ({ blocked: cleanBlockedList(p?.blocked) }),
+  // A report that doesn't clean up becomes an empty list's worth of nothing: dropped by the listener.
+  'report.received': (p) => ({ serverId: id(p?.serverId), report: cleanReportSummary(p?.report) as ReportSummary }),
+  'report.status': (p) => ({ reportId: id(p?.reportId), delivered: count(p?.delivered), pending: count(p?.pending) }),
   'message.added': cleanMessage,
   'message.updated': cleanMessage,
   // Only the kinds the UI knows; anything else is dropped.
@@ -627,6 +719,13 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       : null,
   'join.status': cleanJoin,
   'link.open': (p) => ({ link: cleanInviteLink(p?.link) }),
+  // G-30: three ids, like notify.click; a missing one drops the event.
+  // G-30: three ids or nothing. Main sends only what deeplink.js parsed as
+  // 64 lower-case hex (SL); the demo core's short ids are the one other shape.
+  'link.message': (p) =>
+    isLinkId(p?.serverId) && isLinkId(p.channelId) && isLinkId(p.messageId)
+      ? { serverId: p.serverId, channelId: p.channelId, messageId: p.messageId }
+      : null,
   'window.state': (p) => ({ maximized: p?.maximized === true, fullScreen: p?.fullScreen === true }),
   'window.closeRequest': () => ({}),
   'notify.click': (p) => (typeof p?.channelId === 'string' ? { channelId: id(p.channelId), messageId: typeof p.messageId === 'string' ? id(p.messageId) : null } : null),
@@ -655,6 +754,8 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
       state: s?.state === 'up' || s?.state === 'down' ? s.state : 'starting',
       detail: (['missing', 'start-failed', 'crashed', 'crash-loop', 'keyring'] as const).find((d) => d === s?.detail),
       ...(stunUrl ? { stunUrl } : {}),
+      // G-81 B: on only for an exact true.
+      ...(s?.voiceP2p === true ? { voiceP2p: true } : {}),
     };
   },
   'update.ready': (u) => ({ version: cleanName(u.version, 32), waitingForCall: u.waitingForCall === true }),
@@ -693,6 +794,9 @@ export function guardCore(core: CoreApi): CoreApi {
     createInvite: wrap(core.createInvite, (r) => ({ ...r, id: id(r.id), link: cleanLink(r.link), expiresAt: when(r.expiresAt) })),
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
     listBlocked: wrap(core.listBlocked, cleanBlockedList),
+    listReports: wrap(core.listReports, cleanReports),
+    getReportEvidence: wrap(core.getReportEvidence, cleanReportEvidence),
+    reportContent: wrap(core.reportContent, (r) => ({ reportId: id(r?.reportId), recipients: count(r?.recipients) })),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>
       Array.isArray(l) ? l.map(cleanRemovedMember).filter((r): r is RemovedMember => r !== null) : [],
     ),
@@ -706,6 +810,13 @@ export function guardCore(core: CoreApi): CoreApi {
       }),
     createVoiceRoom: wrap(core.createVoiceRoom, cleanCall),
     getSettings: () => core.getSettings().then(cleanCoreSettings),
+    // G-30: an index, nothing else; anything malformed is the core's error.
+    locateMessage: (serverId: Id, channelId: Id, messageId: Id) =>
+      core.locateMessage(serverId, channelId, messageId).then((r) => {
+        const index = r?.index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) throw { code: 'internal' };
+        return { index };
+      }),
     getServerRestore: () =>
       core.getServerRestore().then((r) => {
         const clean = cleanServerRestore(r);

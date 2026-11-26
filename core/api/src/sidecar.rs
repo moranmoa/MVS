@@ -102,34 +102,49 @@ fn read_line(input: &mut impl BufRead) -> io::Result<Option<Result<Vec<u8>, ()>>
 /// answered; an error only when reading or writing fails.
 pub fn serve<W: Write + Send>(
     core: &Core,
-    mut input: impl BufRead,
+    input: impl BufRead + Send + 'static,
     out: &Lines<W>,
 ) -> io::Result<u64> {
+    // G-81 (#509, the TL, the SL, dev-identity): a reader thread parses
+    // each line; an exact `voiceFrame` goes straight to the voice media
+    // path (no reply, never `handle_value`), so a slow command (a join
+    // waiting 5 s) never stalls audio. Everything else goes, in order, to
+    // this thread, the one worker: `handle_value` never runs on two
+    // threads, and replies keep their order. The queue between them is
+    // bounded: a wedged worker makes the reader wait.
+    //
+    // The reader is never joined: it may be blocked reading stdin. On end
+    // of input it drops its sender, and the worker answers what's queued
+    // and returns. Signed out, the worker returns right after that reply;
+    // what's still queued is never run.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Read>(READ_QUEUE);
+    let voice = core.voice_frames();
+    std::thread::Builder::new()
+        .name("mvs-core-reader".into())
+        .spawn(move || reader(input, tx, voice))?;
     let bad = || Err(CoreError::from(ErrorCode::BadRequest));
     let mut answered = 0;
-    while let Some(line) = read_line(&mut input)? {
-        let reply = match line {
-            Err(()) => {
+    for read in rx {
+        let reply = match read {
+            Read::Failed(e) => return Err(e),
+            Read::TooLong => {
                 eprintln!("mvs-core: refused a request over {MAX_LINE} bytes");
                 response(&Value::Null, bad())
             }
-            Ok(line) if line.iter().all(u8::is_ascii_whitespace) => continue,
-            Ok(line) => match serde_json::from_slice::<Value>(&line) {
-                Ok(Value::Object(mut request)) => {
-                    // Only a number or string is echoed: anything else could
-                    // be large or shaped to confuse the shell.
-                    let id = match request.remove("id") {
-                        Some(id @ (Value::Number(_) | Value::String(_))) => id,
-                        _ => Value::Null,
-                    };
-                    let args = request.remove("args").unwrap_or(Value::Null);
-                    match request.get("cmd").and_then(Value::as_str) {
-                        Some(cmd) if !id.is_null() => response(&id, core.handle_value(cmd, args)),
-                        _ => response(&id, bad()),
-                    }
+            Read::NotARequest => response(&Value::Null, bad()),
+            Read::Request(mut request) => {
+                // Only a number or string is echoed: anything else could
+                // be large or shaped to confuse the shell.
+                let id = match request.remove("id") {
+                    Some(id @ (Value::Number(_) | Value::String(_))) => id,
+                    _ => Value::Null,
+                };
+                let args = request.remove("args").unwrap_or(Value::Null);
+                match request.get("cmd").and_then(Value::as_str) {
+                    Some(cmd) if !id.is_null() => response(&id, core.handle_value(cmd, args)),
+                    _ => response(&id, bad()),
                 }
-                _ => response(&Value::Null, bad()),
-            },
+            }
         };
         out.write(&reply)?;
         answered += 1;
@@ -140,4 +155,45 @@ pub fn serve<W: Write + Send>(
         }
     }
     Ok(answered)
+}
+
+/// Lines waiting for the worker (TL: bounded; the reader waits when full).
+const READ_QUEUE: usize = 256;
+
+/// What the reader hands the worker, in input order.
+enum Read {
+    Request(serde_json::Map<String, Value>),
+    TooLong,
+    NotARequest,
+    Failed(io::Error),
+}
+
+/// The reader thread: the line cap, then one JSON parse, then routing by
+/// an exact `cmd == "voiceFrame"` (SL 1, dev-identity 4–5). A voice frame
+/// never waits for the worker: it's checked and handed on, or dropped
+/// (counted, never logged); it gets no reply, even with an `id` (a
+/// caller's bug). Ends at end of input or when the worker is gone.
+fn reader(mut input: impl BufRead, tx: std::sync::mpsc::SyncSender<Read>, voice: crate::VoiceFrames) {
+    loop {
+        let read = match read_line(&mut input) {
+            Ok(None) => return,
+            Err(e) => Read::Failed(e),
+            Ok(Some(Err(()))) => Read::TooLong,
+            Ok(Some(Ok(line))) if line.iter().all(u8::is_ascii_whitespace) => continue,
+            Ok(Some(Ok(line))) => match serde_json::from_slice::<Value>(&line) {
+                Ok(Value::Object(request)) => {
+                    if request.get("cmd").and_then(Value::as_str) == Some("voiceFrame") {
+                        voice.take(request.get("args"));
+                        continue;
+                    }
+                    Read::Request(request)
+                }
+                _ => Read::NotARequest,
+            },
+        };
+        let failed = matches!(read, Read::Failed(_));
+        if tx.send(read).is_err() || failed {
+            return;
+        }
+    }
 }

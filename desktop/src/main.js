@@ -19,10 +19,11 @@ const { toRequest } = require('./commands');
 const signout = require('./signout');
 const { Sidecar } = require('./sidecar');
 const deeplink = require('./deeplink');
-const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress } = require('./config');
+const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, abuseHost, withAbuseAddress, voiceP2pFor } = require('./config');
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
+const required = require('./required');
 const { createNotifier } = require('./notify');
 const ptt = require('./ptt');
 const badge = require('./badge');
@@ -84,7 +85,9 @@ let coreStatus = { state: 'starting' };
  */
 const STUN_URL = stunFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
 if (stunHost(STUN_URL)) fileLog.hide(stunHost(STUN_URL));
-const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL });
+/** G-81 B: calls over the P2P network (off by default; voiceP2pFor). */
+const VOICE_P2P = voiceP2pFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
+const statusForPage = (status) => ({ ...status, stunUrl: STUN_URL, ...(VOICE_P2P ? { voiceP2p: true } : {}) });
 // G-48 (B24): the build's abuse-report address, for the page's getAppInfo.
 // Text only, never opened; never logged (its domain is private).
 const ABUSE_ADDRESS = abuseAddressFor({ packaged: app.isPackaged, resourcesPath: process.resourcesPath });
@@ -109,7 +112,40 @@ const globalMute = ptt.createGlobalMute({
 });
 
 /** After any change to the call or the lock: push-to-talk lets go, and the global shortcut follows. */
+/**
+ * Required updates (#577, required.js): once the core says the running
+ * version is revoked, the page may only read local data and update. A call in
+ * progress ends at once (TL; the core's RU1 has already stopped its voice):
+ * a normal leave for the others, no reload (drafts stay), and update.gate
+ * carries endedCall for the banner (update.required.callEnded).
+ */
+const requiredGate = required.createRequiredGate({
+  inCall: () => callGate.inCall,
+  endCall: () => {
+    callGate.end();
+    syncCall();
+    core?.request('leaveCall', {}).catch(() => {});
+  },
+  onChange: (st) => toPages('update.gate', st),
+});
+
+/** The page's Retry (update:check): main asks the core, rate-limited. */
+const updateCheck = required.createCheckThrottle({
+  run: () => (core ? core.request('checkForUpdate', {}) : Promise.resolve({ error: { code: 'core-unavailable' } })),
+});
+
+/** Asks the core whether this version must update (at every core start). */
+function checkRequired() {
+  if (!core) return;
+  Promise.resolve(core.request('getAppInfo', {}))
+    .then((res) => {
+      if (res && res.ok && res.ok.updateRequired) requiredGate.set(res.ok.updateRequired);
+    })
+    .catch(() => {});
+}
+
 function syncCall() {
+  requiredGate.callChanged();
   if (!callGate.inCall) appLock.callEnded();
   if (!callGate.inCall || !lockOpen()) pushToTalk.reset();
   globalMute.sync();
@@ -212,7 +248,7 @@ function toPages(name, payload) {
  * call's audio keeps playing). Never core:invoke, never logged.
  */
 const voiceFrames = voiceframe.createVoiceFrames({
-  canSend: () => callGate.inCall && lockOpen(),
+  canSend: () => voiceframe.sendAllowed({ inCall: callGate.inCall, unlocked: lockOpen(), requiredGate }),
   canReceive: () => callGate.inCall && (lockOpen() || (appLock.state.locked && appLock.state.path === 'B')),
   send: (frame) => (core ? core.send('voiceFrame', frame) : false),
   deliver: (frame) => {
@@ -230,6 +266,8 @@ function setCoreStatus(status) {
   if (status.state === 'up') appLock.coreUp().catch(() => {});
   // The core keeps the metered flag in memory: tell every core that comes up.
   if (status.state === 'up') sendMetered();
+  // Required updates (#577): a revoked version may only read and update.
+  if (status.state === 'up') checkRequired();
 }
 
 /** Member relays, slice 3a: the metered-connection watch (metered.js). */
@@ -288,6 +326,7 @@ function startCore() {
         voiceFrames.fromCore(payload);
         return;
       }
+      if (name === 'update.required') requiredGate.set(payload);
       callGate.onEvent(name, payload);
       syncCall();
       if (appLock.forwards(name)) toPages(name, payload);
@@ -310,6 +349,8 @@ function serveCoreIpc() {
     if (req.error) return { error: { code: req.error } };
     // G-78: while locked, only what the lock screen (and a call behind it) needs.
     if (!appLock.allows(req.cmd, req.args)) return { error: { code: 'locked' } };
+    // A required update: local read-only plus update (#577).
+    if (!requiredGate.allows(req.cmd)) return { error: { code: 'update-required' } };
     if (!core) return { error: { code: 'core-unavailable', detail: 'missing' } };
     // "Restart to update": the core's applyUpdate (refused during a call),
     // then a relaunch through the launcher, which starts the staged version.
@@ -424,6 +465,11 @@ function serveCoreIpc() {
   // G-78: the lock screen's three calls. The passcode or words go straight
   // to the core (applock.js shapes them); nothing here logs them.
   ipcMain.handle('lock:state', (event) => (fromUs(event) ? lockPayload() : null));
+  // Required updates (#577): the gate's state, for a page that asks (TL).
+  ipcMain.handle('update:gate', (event) => (fromUs(event) ? requiredGate.state : null));
+  // The banner's Retry: main runs the core's update check itself (checkForUpdate
+  // stays main/core only, B8 A2), at most once every 30 s; only a code goes back.
+  ipcMain.handle('update:check', (event) => (fromUs(event) ? updateCheck() : 'invalid'));
   ipcMain.handle('lock:unlock', async (event, input) => {
     if (!fromUs(event)) return 'invalid';
     return appLock.unlock(input);
@@ -730,6 +776,9 @@ function createWindow() {
     flushLink();
     // The page may have missed earlier changes; the preload keeps this for the UI.
     if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('core:event', 'core.status', statusForPage(coreStatus));
+    // Required updates (#577, TL): every load (cold start, reload, the lock's
+    // reload) gets the gate's state, so the banner never goes missing.
+    if (sec.isInternalUrl(win.webContents.getURL()) && requiredGate.state.required) win.webContents.send('core:event', 'update.gate', requiredGate.state);
     // Commit this version once the UI is up and the core answers (main only, once).
     if (!healthReported) {
       healthReported = true;

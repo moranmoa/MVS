@@ -54,7 +54,7 @@ T17 closes that: after a kick, the remaining members move to a new secret the ki
 - The restore backup carries the current secret.
 
 ## Decision and rules (Tech Lead on #557)
-- **Distribution: A.** A new control kind, `SecretRotation`:
+- **Distribution: A.** A new control kind, `SecretRotation`, with the fixed kind code **25** (Tech Lead on #590; G-52's age limit is 26):
   - the new secret is sealed to each remaining member with groupkeys' per-member boxes, as `KeyRotation` does for channel keys;
   - it's privileged (moderator and above), so a concurrent kick voids it;
   - the latest accepted rotation in linear order wins, so concurrent rotations converge.

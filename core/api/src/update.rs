@@ -199,6 +199,15 @@ impl Updates {
         Ok(Outcome { ok: json!({ "committed": committed }), events })
     }
 
+    /// A required update (`docs/design/required-update.md` §2): `None`
+    /// unless an accepted manifest revoked the running version; inside, the
+    /// newer version on offer, if any. From `policy.json`, so a restart
+    /// keeps it. Also `None` when updates can't be set up for `ui`.
+    pub fn required(&self, ui: UpdateChannel) -> Option<Option<String>> {
+        let up = self.updater(ui).ok()?;
+        up.required().map(|v| v.map(|v| v.to_string()))
+    }
+
     /// The owner's signed global member-relay switch (slice 3b): the last
     /// verified value, false when none was ever verified or updates are off.
     pub fn member_relay_off(&self, ui: UpdateChannel) -> bool {

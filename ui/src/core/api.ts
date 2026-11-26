@@ -15,6 +15,11 @@ import type {
   Invite,
   RemovedMember,
   BlockedUser,
+  ReportEvidence,
+  ReportReason,
+  ReportReceipt,
+  ReportSummary,
+  ReportTargetInput,
   JoinStatus,
   Member,
   Message,
@@ -179,6 +184,22 @@ export interface CoreCommands {
    * (it isn't made a member). `not-allowed` for anyone else or someone not removed.
    */
   undoKick(serverId: Id, userId: Id): Promise<void>;
+  /**
+   * G-48 (core #515): reports a message or member to the server's owner and
+   * admins, signed by me. `text`: one line, up to 280 characters. Errors:
+   * bad-request, not-found, not-allowed (myself, or not a member),
+   * rate-limited, already-reported (30 days), no-recipient. Then report.status.
+   */
+  reportContent(serverId: Id, target: ReportTargetInput, reason: ReportReason, text?: string): Promise<ReportReceipt>;
+  /** G-48: owner and admins only (not-allowed otherwise): the reports I hold, newest first. */
+  listReports(serverId: Id): Promise<ReportSummary[]>;
+  /** G-48: my own triage, on this device only. */
+  dismissReport(reportId: Id): Promise<null>;
+  /**
+   * G-48: the reported message, on an explicit click only. not-allowed for
+   * reasons 5 and 6 without an 18+ claim; bad-request when it doesn't check out.
+   */
+  getReportEvidence(reportId: Id): Promise<ReportEvidence>;
   // Device link (device-link-slice.md)
   /** New device: a one-time link (5 minutes); replaces an earlier one. Progress comes as deviceLink.state. */
   startDeviceLink(): Promise<DeviceLinkOffer>;
@@ -198,6 +219,14 @@ export interface CoreCommands {
   setTypingIndicator(on: boolean): Promise<null>;
   /** G-91: how far my servers are from coming back after a restore. */
   getServerRestore(): Promise<ServerRestore>;
+  /**
+   * G-30: where a linked message is, from the local store only (no network).
+   * The three ids must agree. Errors: not-found for everything I can't see
+   * (not a member, a hidden or missing channel, a mismatch, not here, unreadable,
+   * still sending), bad-request for an id that isn't 64 hex. The index is a
+   * snapshot: check the id there.
+   */
+  locateMessage(serverId: Id, channelId: Id, messageId: Id): Promise<{ index: number }>;
   // Voice v1 (#223)
   /** Voice rooms (0.4.3): a server's live rooms, oldest first. Rejects not-found, not-allowed (not a member, kicked). */
   listVoiceRooms(serverId: Id): Promise<VoiceRoom[]>;
@@ -262,6 +291,10 @@ export interface CoreEvents {
   'members.changed': { serverId: Id; members: Member[] };
   /** G-47: the whole list of blocked accounts, after any change. */
   'blocks.changed': { blocked: BlockedUser[] };
+  /** G-48: a report reached me as staff. Never carries the evidence. */
+  'report.received': { serverId: Id; report: ReportSummary };
+  /** G-48: my report's delivery: staff who have it, and who it still waits for. */
+  'report.status': { reportId: Id; delivered: number; pending: number };
   'message.added': Message;
   'message.updated': Message;
   'join.status': JoinStatus;
@@ -296,6 +329,8 @@ export interface CoreEvents {
   typing: TypingState;
   /** G-91: sent when anything in the restore progress changes. */
   'serverRestore.changed': ServerRestore;
+  /** G-30: an mvs://m/… link from the OS (desktop parses it strictly; ids only). */
+  'link.message': { serverId: Id; channelId: Id; messageId: Id };
   /** Device link, new device: waiting → confirm (with the digits) → done; or expired / failed. On done, identity.changed follows. */
   'deviceLink.state': DeviceLinkState;
   /** A device was added to my account (dev-identity #393): on the approving device, and on my other devices once the cross-device notice lands. Re-sent at startup until acknowledged. */

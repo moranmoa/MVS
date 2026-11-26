@@ -5,7 +5,7 @@
 
 import { useSyncExternalStore } from 'react';
 import type { CoreApi } from '../core/api';
-import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, CallState, VoiceRoom, MemberRelay, DeviceAdded } from '../core/types';
+import type { Channel, Id, Identity, Member, Message, ServerSummary, UpdateInfo, UpdateGate, CallState, VoiceRoom, MemberRelay, DeviceAdded } from '../core/types';
 import { liveMutes, loadMutes, MUTE_DURATIONS, MUTE_FOREVER, nextExpiry, saveMutes, type MuteDuration, type MuteKey, type Mutes } from './mute';
 
 const PAGE = 100;
@@ -118,6 +118,12 @@ export interface StoreState {
   notice: { kind: 'encryption-renewed'; serverId: Id; at: number } | null;
   /** Shown once: a new version was installed, or the previous one is back. */
   updateNote: UpdateNote | null;
+  /** #577: main's required-update gate; while `required`, the app is read-only with the banner. */
+  gate: UpdateGate | null;
+  /** #577: the last Retry's answer, for the banner's line (null: none, or it went fine). */
+  updateCheck: 'offline' | 'check-clock' | 'failed' | null;
+  /** A Retry is running. */
+  checkingUpdate: boolean;
   /** #622: a required update ended my call (when), for its toast. */
   callEndedForUpdate: number | null;
   /** "A new device was added to your account", until answered. */
@@ -162,6 +168,9 @@ export class Store {
     notice: null,
     updateNote: null,
     callEndedForUpdate: null,
+    gate: null,
+    updateCheck: null,
+    checkingUpdate: false,
     deviceNotices: [],
     call: null,
     callError: null,
@@ -195,6 +204,8 @@ export class Store {
   private unsubs: (() => void)[] = [];
   /** While my own leaveCall runs: that end of the call isn't news. */
   private leaving = false;
+  /** When my last call ended (0: none yet), for #622's toast when call.state lands before update.gate. */
+  private callEndedAt = 0;
 
   /** Fires when the next timed mute ends, so muted marks go away on time. */
   private muteTimer: ReturnType<typeof setTimeout> | null = null;
@@ -271,6 +282,7 @@ export class Store {
       on('call.state', (c) => {
         const ended = !c.participants.length && !!this.state.call && !this.leaving;
         const relayOnly = this.state.relayOnly || c.relayOnly === true;
+        if (!c.participants.length && this.state.call) this.callEndedAt = Date.now();
         this.set({
           call: c.participants.length ? c : null,
           relayOnly,
@@ -286,7 +298,11 @@ export class Store {
       ),
       // #622: a required update ended my call at once. Only while I'm in one:
       // the gate is re-sent on every page load with endedCall still true.
-      on('update.gate', (g) => g.endedCall && this.state.call && this.set({ call: null, callEndedForUpdate: Date.now() })),
+      on('update.gate', (g) => {
+        this.setGate(g);
+        // In a call, or one that ended in the last 2 s: the core's "ended" may land first (TL, #632).
+        if (g.endedCall && (this.state.call || Date.now() - this.callEndedAt <= 2000)) this.set({ call: null, callEndedForUpdate: Date.now() });
+      }),
       on('update.rolledBack', (u) => this.set({ updateNote: { kind: 'rolledBack', ...u } })),
       // rekey-waiting: the failed message's own line says why; no toast (UX, #289).
       on('notice', (n) => n.kind !== 'rekey-waiting' && this.set({ notice: { ...n, kind: n.kind, at: Date.now() } })),
@@ -298,6 +314,9 @@ export class Store {
   }
 
   async init(): Promise<void> {
+    // #577: first, so a required start opens read-only with no flash of enabled controls.
+    const gate = await this.core.getUpdateGate().catch(() => null);
+    if (gate) this.setGate(gate);
     const identity = await this.core.getIdentity();
     this.set({ identity });
     // Relay-only is per device and needs no identity (#272).
@@ -452,6 +471,23 @@ export class Store {
 
   clearUpdateNote(): void {
     this.set({ updateNote: null });
+  }
+
+  /** The gate never clears within a process: a later "not required" can't undo it. */
+  private setGate(g: UpdateGate): void {
+    const was = this.state.gate;
+    if (was?.required && !g.required) return;
+    this.set({ gate: g });
+  }
+
+  /** #577: the banner's Retry (and its quiet re-check every 15 minutes). */
+  async checkUpdate(): Promise<void> {
+    if (this.state.checkingUpdate) return;
+    this.set({ checkingUpdate: true });
+    const r = await this.core.checkUpdate().catch(() => 'internal');
+    // too-soon: main checked under 30 s ago; the line stays as it was.
+    const updateCheck = r === 'too-soon' ? this.state.updateCheck : r === 'ok' ? null : r === 'offline' || r === 'check-clock' ? r : 'failed';
+    this.set({ checkingUpdate: false, updateCheck });
   }
 
   clearCallEndedForUpdate(): void {

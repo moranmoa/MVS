@@ -78,6 +78,29 @@ describe('the call-ended toast (#622)', () => {
     expect(toast()).toBeUndefined();
   });
 
+  it("the core's 'call ended' landing first still gets the toast, within 2 s (TL)", async () => {
+    const { core } = await setup();
+    await joinCall(core);
+    const [server] = await core.listServers();
+    const call = { serverId: server.id, channelId: 'x', participants: [], full: false } as unknown as CoreEvents['call.state'];
+    act(() => emit(core, 'call.state', call));
+    act(() => emit(core, 'update.gate', ENDED));
+    expect(toast()).toBeTruthy();
+  });
+
+  it('a call that ended more than 2 s before the gate: no toast', async () => {
+    const { core } = await setup();
+    await joinCall(core);
+    const [server] = await core.listServers();
+    const call = { serverId: server.id, channelId: 'x', participants: [], full: false } as unknown as CoreEvents['call.state'];
+    act(() => emit(core, 'call.state', call));
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 2500);
+    act(() => emit(core, 'update.gate', ENDED));
+    clock.mockRestore();
+    expect(toast()).toBeUndefined();
+  });
+
   it('a gate that ended no call: no toast', async () => {
     const { core } = await setup();
     await joinCall(core);

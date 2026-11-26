@@ -14,6 +14,7 @@ import { Dialog, Name } from '../../components/common';
 import { isCoreError, useCore, type Member, type ServerSummary } from '../../core';
 import { SERVER_NAME_MAX } from '../../core/sanitize';
 import { displayName } from './MemberList';
+import { useReadOnlyProps } from './UpdateRequired';
 
 const NO_MEMBERS: Member[] = [];
 
@@ -83,6 +84,7 @@ function FailureNote({ server, failure }: { server: ServerSummary; failure: Fail
 /** Settings → General: the server's name, for the owner (admins too, once roles reach the UI). */
 export function RenameForm({ server }: { server: ServerSummary }) {
   const core = useCore();
+  const ro = useReadOnlyProps();
   const [name, setName] = useState(server.name);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -125,7 +127,7 @@ export function RenameForm({ server }: { server: ServerSummary }) {
         />
       </label>
       <div className="actions">
-        <button type="submit" className="primary" disabled={busy || !name.trim() || name.trim() === server.name}>
+        <button type="submit" className="primary" disabled={busy || !name.trim() || name.trim() === server.name} {...ro}>
           <FormattedMessage id="server.rename.save" />
         </button>
         {saved && (

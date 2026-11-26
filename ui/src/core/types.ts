@@ -188,7 +188,9 @@ export interface CoreError {
     /** G-48: nobody can receive the report (the owner is reported and there are no admins). */
     | 'no-recipient'
     /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
-    | 'profile-too-large';
+    | 'profile-too-large'
+    /** #577: a required update is pending; main refuses everything that writes or connects. */
+    | 'update-required';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */
   detail?: CoreDownDetail;
   /** 1-based word positions that were not recognised (restore). */

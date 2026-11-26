@@ -26,6 +26,7 @@ import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
 import { LeaveServerDialog } from './ServerLifecycle';
 import { useDesktopNotifications } from './useNotifications';
+import { UpdateRequiredBanner, useUpdateRequired } from './UpdateRequired';
 import { useWindowTitle } from '../../app/TitleBar';
 
 const MEMBERS_KEY = 'mvp.ui.membersOpen';
@@ -42,6 +43,7 @@ export function Shell() {
   const notice = useStore(store, (s) => s.notice);
   const updateNote = useStore(store, (s) => s.updateNote);
   const callEndedForUpdate = useStore(store, (s) => s.callEndedForUpdate);
+  const updateRequired = useUpdateRequired();
   const staged = useStore(store, (s) => s.update);
   const flash = useStore(store, (s) => s.flash);
   const settingsRequest = useStore(store, (s) => s.settingsRequest);
@@ -339,7 +341,9 @@ export function Shell() {
           <FormattedMessage id="a11y.skipToChat" />
         </a>
       )}
-      {!identity.recoveryChecked && (
+      {/* #577: a required update; the recovery check would sign, so its banner waits. */}
+      <UpdateRequiredBanner />
+      {!identity.recoveryChecked && !updateRequired && (
         <div className="banner" role="status">
           <ShieldIcon />
           <span>

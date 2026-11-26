@@ -37,6 +37,7 @@ import type {
   DeviceAdded,
   MemberRelay,
   Id,
+  UpdateGate,
 } from './types';
 import { REPORT_REASONS } from './types';
 
@@ -793,15 +794,19 @@ const EVENT_CLEANERS: { [E in CoreEventName]?: (p: CoreEvents[E]) => CoreEvents[
     notes: typeof u.notes === 'string' ? cleanText(u.notes, 2000, 30).text : null,
   }),
   'update.rolledBack': (u) => ({ failed: cleanName(u.failed, 32), running: cleanName(u.running, 32) }),
-  // Only exact booleans count; the version is a plain short name or null.
-  'update.gate': (g) => ({
+  'update.gate': (g) => cleanUpdateGate(g),
+};
+
+/** #577: main's gate. Only exact booleans count; the version is a plain short name or null. */
+export function cleanUpdateGate(g: UpdateGate | null | undefined): UpdateGate {
+  return {
     required: g?.required === true,
     version: typeof g?.version === 'string' ? cleanName(g.version, 32) || null : null,
     active: g?.active === true,
     phase: g?.phase === 'gated' ? 'gated' : 'none',
     endedCall: g?.endedCall === true,
-  }),
-};
+  };
+}
 
 /** The core as the UI sees it: same API, every peer-supplied value cleaned. */
 export function guardCore(core: CoreApi): CoreApi {
@@ -832,6 +837,8 @@ export function guardCore(core: CoreApi): CoreApi {
     listInvites: wrap(core.listInvites, (l) => l.map(cleanInvite)),
     listBlocked: wrap(core.listBlocked, cleanBlockedList),
     listReports: wrap(core.listReports, cleanReports),
+    getUpdateGate: wrap(core.getUpdateGate, cleanUpdateGate),
+    checkUpdate: wrap(core.checkUpdate, (r) => (typeof r === 'string' && /^[a-z][a-z-]{0,39}$/.test(r) ? r : 'internal')),
     getReportEvidence: wrap(core.getReportEvidence, cleanReportEvidence),
     reportContent: wrap(core.reportContent, (r) => ({ reportId: id(r?.reportId), recipients: count(r?.recipients) })),
     listRemovedMembers: wrap(core.listRemovedMembers, (l) =>

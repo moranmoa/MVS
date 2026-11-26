@@ -37,6 +37,7 @@ import type {
   ServerSummary,
   StorageUsage,
   UpdateChannel,
+  UpdateGate,
   ReportEvidence,
   ReportReason,
   ReportReceipt,
@@ -70,6 +71,8 @@ export interface MockOptions {
   updateInstalled?: boolean;
   /** Shortly after start: the last update failed and the previous version is back. */
   updateRolledBack?: boolean;
+  /** #577: a required update is pending from the start, in this banner state (screenshots). */
+  updateRequired?: 'downloading' | 'ready' | 'offline' | 'check-clock' | 'not-available' | 'failed';
   /** #622: this long after joining a call, a required update ends it (as main does). */
   requiredInCallMs?: number;
   /** Act as if in a voice call: restartToUpdate is refused with not-allowed. */
@@ -240,6 +243,8 @@ export class MockCore implements CoreApi {
   private storageLimit = 5 * 1024 ** 3;
   private releaseChannel: UpdateChannel = 'stable';
   private pendingJoins = new Map<string, ReturnType<typeof setTimeout>>();
+  /** #622: a required update ended my call (the mock's gate is on from then). */
+  private gateEnded = false;
   private timers: ReturnType<typeof setTimeout | typeof setInterval>[] = [];
   private speed: number;
 
@@ -296,6 +301,10 @@ export class MockCore implements CoreApi {
     }
     if (options.updateRolledBack) {
       this.timers.push(setTimeout(() => this.emit('update.rolledBack', { failed: '0.3.0', running: '0.2.0' }), 800));
+    }
+    if (options.updateRequired === 'ready') {
+      // #577: the required version is already downloaded and staged.
+      this.timers.push(setTimeout(() => this.emit('update.ready', { version: '0.6.0', waitingForCall: false }), 100));
     }
     if (options.updateAfterMs !== undefined) {
       this.timers.push(
@@ -1630,6 +1639,7 @@ export class MockCore implements CoreApi {
       // As main does (#626): the gate ends the call, the page hears it, then the leave.
       this.timers.push(
         setTimeout(() => {
+          this.gateEnded = true;
           this.emit('update.gate', { required: true, version: '0.6.0', active: true, phase: 'gated', endedCall: true });
           void this.leaveCall();
         }, this.options.requiredInCallMs),
@@ -2015,6 +2025,18 @@ export class MockCore implements CoreApi {
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {
     this.releaseChannel = channel;
+  }
+
+  async getUpdateGate(): Promise<UpdateGate> {
+    const r = this.options.updateRequired ?? (this.gateEnded ? 'downloading' : undefined);
+    if (!r) return { required: false, version: null, active: false, phase: 'none', endedCall: false };
+    return { required: true, version: r === 'not-available' ? null : '0.6.0', active: true, phase: 'gated', endedCall: this.gateEnded };
+  }
+
+  async checkUpdate(): Promise<string> {
+    await this.wait(150);
+    const r = this.options.updateRequired;
+    return r === 'offline' || r === 'check-clock' ? r : r === 'failed' ? 'invalid-update' : 'ok';
   }
 
   async restartToUpdate(): Promise<void> {

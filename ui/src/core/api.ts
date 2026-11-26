@@ -358,4 +358,12 @@ export type Unsubscribe = () => void;
 
 export interface CoreApi extends CoreCommands {
   on<E extends CoreEventName>(event: E, handler: (payload: CoreEvents[E]) => void): Unsubscribe;
+  // Not core commands: main answers these itself (window.mvs.updateGate / checkUpdate, #586).
+  /** Desktop shell (#577): the required-update gate now (also the `update.gate` event). Not required outside the shell. */
+  getUpdateGate(): Promise<UpdateGate>;
+  /**
+   * The required banner's Retry: main asks the core to check now, at most
+   * every 30 s. 'ok', 'too-soon', or the core's code ('offline', 'check-clock', …).
+   */
+  checkUpdate(): Promise<string>;
 }

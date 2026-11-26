@@ -31,6 +31,7 @@ import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
 import { useAppStore } from '../../app/App';
 import { useSettings } from '../../app/settings';
+import { useReadOnlyProps } from './UpdateRequired';
 
 const GROUP_GAP_MS = 5 * 60_000;
 const BOTTOM_SLACK_PX = 48;
@@ -485,6 +486,7 @@ const REACTIONS_SHOWN = 20;
 /** G-26: the chips under a message: the emoji and the count; mine is pressed. Click toggles mine. */
 function Reactions({ message: m, tab, onAdd, onReact }: { message: Message; tab: number; onAdd: (m: Message) => void; onReact: (m: Message, emoji: string, on: boolean) => void }) {
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const list = m.reactions ?? [];
   return (
     <div className="reactions" role="group" aria-label={intl.formatMessage({ id: 'reactions.label' })}>
@@ -498,6 +500,7 @@ function Reactions({ message: m, tab, onAdd, onReact }: { message: Message; tab:
             className={`reaction ${r.mine ? 'mine' : ''}`}
             aria-pressed={r.mine}
             aria-label={label}
+            {...ro}
             title={label}
             onClick={() => onReact(m, r.emoji, !r.mine)}
           >
@@ -511,7 +514,7 @@ function Reactions({ message: m, tab, onAdd, onReact }: { message: Message; tab:
         );
       })}
       {list.length < REACTIONS_SHOWN && (
-        <button type="button" tabIndex={tab} className="reaction add" aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })} onClick={() => onAdd(m)}>
+        <button type="button" tabIndex={tab} className="reaction add" aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })} {...ro} onClick={() => onAdd(m)}>
           +
         </button>
       )}
@@ -554,6 +557,7 @@ const MessageRow = memo(function MessageRow({
   onReact: (m: Message, emoji: string, on: boolean) => void;
 } & Handlers) {
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const uiDir = useUiDir();
   const renderText = useCallback((text: string) => <MentionText text={text} message={m} />, [m]);
   const name = author ? displayName(author) : '…';
@@ -681,12 +685,12 @@ const MessageRow = memo(function MessageRow({
           <ReplyIcon />
         </button>
         {!m.deleted && (m.reactions?.length ?? 0) < REACTIONS_SHOWN && (
-          <button type="button" tabIndex={tab} onClick={() => onAddReaction(m)} aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })}>
+          <button type="button" tabIndex={tab} onClick={() => onAddReaction(m)} aria-label={intl.formatMessage({ id: 'reactions.add' })} title={intl.formatMessage({ id: 'reactions.add' })} {...ro}>
             <SmilePlusIcon />
           </button>
         )}
         {mine && (
-          <button type="button" tabIndex={tab} onClick={() => onEdit(m)} aria-label={intl.formatMessage({ id: 'chat.edit' })} title={intl.formatMessage({ id: 'chat.edit' })}>
+          <button type="button" tabIndex={tab} onClick={() => onEdit(m)} aria-label={intl.formatMessage({ id: 'chat.edit' })} title={intl.formatMessage({ id: 'chat.edit' })} {...ro}>
             <EditIcon />
           </button>
         )}
@@ -698,6 +702,7 @@ const MessageRow = memo(function MessageRow({
             onClick={() => onDelete(m)}
             aria-label={intl.formatMessage({ id: 'chat.delete' })}
             title={intl.formatMessage({ id: 'chat.delete' })}
+            {...ro}
           >
             <TrashIcon />
           </button>

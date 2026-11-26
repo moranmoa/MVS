@@ -21,6 +21,10 @@ export interface DesktopBridge {
   setPushToTalk?(settings: PushToTalkSettings): Promise<PushToTalkResult>;
   /** G-78: the app lock (desktop only). Main owns it; see docs/design/app-lock.md. */
   lock?: LockBridge;
+  /** #577: the required-update gate now (shell #586). */
+  updateGate?(): Promise<unknown>;
+  /** #577: the required banner's Retry (main throttles it to every 30 s). */
+  checkUpdate?(): Promise<unknown>;
   /** Read-only: the OS the desktop app runs on. */
   platform?: string;
 }
@@ -250,6 +254,8 @@ export async function setUnreadCount(count: number, bridge: DesktopBridge | unde
  * late listeners. Not update.required: main's update.gate already carries
  * that state (re-sent on every load, and asked with mvs.updateGate()).
  */
+const NO_GATE = { required: false, version: null, active: false, phase: 'none', endedCall: false };
+
 const STATE_EVENTS = new Set(['core.status', 'memberRelay.changed', 'update.ready']);
 
 export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridge): CoreApi {
@@ -305,6 +311,9 @@ export function createIpcCore(bridge: DesktopBridge = window.mvs as DesktopBridg
   return new Proxy({ on } as CoreApi, {
     get(target, prop) {
       if (prop === 'on') return target.on;
+      // Not core commands: main answers these itself (#577).
+      if (prop === 'getUpdateGate') return async () => (bridge.updateGate ? bridge.updateGate() : NO_GATE);
+      if (prop === 'checkUpdate') return async () => (bridge.checkUpdate ? bridge.checkUpdate() : 'internal');
       // Not a thenable, so `await core` does not call the bridge.
       if (typeof prop !== 'string' || prop === 'then') return undefined;
       return call(prop);

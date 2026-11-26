@@ -7,6 +7,7 @@ import { FormattedMessage, useIntl } from 'react-intl';
 import { isCoreError, useCore, type ServerSummary } from '../../core';
 import { serverIconFrom } from '../../app/image';
 import { UpdateNeeded } from './ServerLifecycle';
+import { UPDATE_REASON_ID, useReadOnlyProps, useUpdateRequired } from './UpdateRequired';
 
 /** The UI's cap (the core allows 500); the counter shows from 260. */
 export const DESC_MAX = 300;
@@ -29,6 +30,9 @@ type Failure = 'update-needed' | 'other' | null;
 
 export function ServerMetaForm({ server }: { server: ServerSummary }) {
   const intl = useIntl();
+  // #577: while an update is required, nothing here can be saved (main refuses it).
+  const ro = useReadOnlyProps();
+  const readOnly = useUpdateRequired();
   const core = useCore();
   const savedIcon = server.iconDataUrl ?? null;
   const savedDesc = server.description ?? '';
@@ -67,6 +71,7 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
   };
 
   const save = async () => {
+    if (readOnly) return;
     setBusy(true);
     setFailure(null);
     setIconError(null);
@@ -109,7 +114,7 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
           {icon ? <img src={icon} alt="" /> : <bdi>{server.initials}</bdi>}
         </span>
         <input ref={file} type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={(e) => void pick(e.target.files?.[0])} />
-        <button type="button" className="secondary small" aria-label={intl.formatMessage({ id: 'server.icon.chooseFor' })} onClick={() => file.current?.click()} disabled={busy}>
+        <button type="button" className="secondary small" aria-label={intl.formatMessage({ id: 'server.icon.chooseFor' })} onClick={() => file.current?.click()} disabled={busy} {...ro}>
           <FormattedMessage id="server.icon.choose" />
         </button>
         {icon && (
@@ -121,6 +126,7 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
               setIconError(null);
             }}
             disabled={busy}
+            {...ro}
           >
             <FormattedMessage id="server.icon.remove" />
           </button>
@@ -140,7 +146,8 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
           rows={4}
           value={desc}
           maxLength={DESC_MAX * 2}
-          aria-describedby="server-desc-hint server-desc-status"
+          aria-describedby={readOnly ? `server-desc-hint server-desc-status ${UPDATE_REASON_ID}` : 'server-desc-hint server-desc-status'}
+          readOnly={readOnly}
           aria-invalid={tooLong || tooManyLines || undefined}
           onChange={(e) => {
             setDesc(e.target.value);
@@ -193,7 +200,7 @@ export function ServerMetaForm({ server }: { server: ServerSummary }) {
             <FormattedMessage id="server.settings.discard" />
           </button>
         )}
-        <button type="submit" className="primary" disabled={!dirty || busy || tooLong || tooManyLines}>
+        <button type="submit" className="primary" disabled={!dirty || busy || tooLong || tooManyLines} {...ro}>
           <FormattedMessage id={busy ? 'server.settings.saving' : failure ? 'common.retry' : 'server.settings.save'} />
         </button>
       </div>

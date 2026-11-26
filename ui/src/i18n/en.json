@@ -664,6 +664,7 @@
   "memberRelay.reason.relayOnly": "Off while \"Relay only\" is on.",
   "memberRelay.reason.metered": "Off on a metered connection.",
   "memberRelay.reason.globalOff": "Turned off for everyone for now.",
+  "memberRelay.paused": "Paused: this computer is on battery or a metered connection. Relaying resumes when that changes.",
   "memberRelay.disclosure.title": "Relay for your members is on",
   "memberRelay.disclosure.body": "Members of your servers can connect through this computer when they can't reach each other directly. They'll be able to see this computer's IP address, and you'll see theirs. Nothing they send is readable by you. This uses up to \u2068{quota}\u2069 a day. You can turn it off in Settings → Privacy.",
   "memberRelay.disclosure.ok": "OK",

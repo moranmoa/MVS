@@ -49,7 +49,6 @@ describe('member relays, slice 1', () => {
 
   it.each([
     ['minor', 'Off: available from age 18.'],
-    ['metered', 'Off on a metered connection.'],
     ['global-off', 'Turned off for everyone for now.'],
   ] as const)('forced off (%s): the toggle is off and disabled, with the reason', async (reason, text) => {
     await setup({ memberRelayReason: reason });
@@ -58,6 +57,28 @@ describe('member relays, slice 1', () => {
     expect(toggle.disabled).toBe(true);
     expect(toggle.getAttribute('aria-describedby')).toContain('member-relay-reason');
     expect(document.getElementById('member-relay-reason')?.textContent).toBe(text);
+  });
+
+  it.each(['metered', 'on-battery'] as const)('paused (%s, UX #574): the switch keeps the choice and stays on, with the paused line', async (reason) => {
+    const { core } = await setup({ memberRelayReason: reason });
+    const toggle = await openPrivacy();
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(false);
+    const line = document.getElementById('member-relay-reason')!;
+    expect(line.getAttribute('role')).toBe('status');
+    expect(line.textContent).toBe('Paused: this computer is on battery or a metered connection. Relaying resumes when that changes.');
+    expect(toggle.getAttribute('aria-describedby')).toContain('member-relay-reason');
+    // Still a real choice: turning it off sets off, and the paused line goes.
+    await click(toggle);
+    expect((await core.getMemberRelay()).setting).toBe('off');
+    expect(toggle.checked).toBe(false);
+    expect(document.getElementById('member-relay-reason')).toBeNull();
+  });
+
+  it('the sanitizer keeps on-battery (core #640) instead of dropping the whole state', () => {
+    const r = { setting: 'on', effective: false, reason: 'on-battery', role: true, disclosureSeen: true, dailyCapMb: 2048 };
+    expect(cleanMemberRelay(r)?.reason).toBe('on-battery');
+    expect(cleanMemberRelay({ ...r, reason: 'on-fire' })).toBeNull();
   });
 
   it('relay-only forces it off with its reason; turning relay-only off brings it back', async () => {

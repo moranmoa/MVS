@@ -474,7 +474,11 @@ export interface VoiceRoom {
 /** Member relays, slice 1 (design #368): relaying for my servers' members. */
 export type MemberRelaySetting = 'auto' | 'on' | 'off';
 /** Why it is off whatever the setting (first match). */
-export type MemberRelayReason = 'global-off' | 'minor' | 'relay-only' | 'metered';
+/**
+ * Why relaying is off. 'minor', 'relay-only' and 'global-off' turn the switch off;
+ * 'metered' and 'on-battery' (core #640) only pause it (UX #574, relay-in-app.md §2).
+ */
+export type MemberRelayReason = 'global-off' | 'minor' | 'relay-only' | 'metered' | 'on-battery';
 export interface MemberRelay {
   setting: MemberRelaySetting;
   /** Relaying now. */

@@ -20,12 +20,15 @@ export function capText(mb: number): string {
   return `${Number.isInteger(gb) ? gb : Number(gb.toFixed(2))} GB`;
 }
 
+/** The reasons that turn the switch off (and say why). */
 const REASON_TEXT = {
   minor: 'memberRelay.reason.minor',
   'relay-only': 'memberRelay.reason.relayOnly',
-  metered: 'memberRelay.reason.metered',
   'global-off': 'memberRelay.reason.globalOff',
 } as const;
+
+/** UX #574 (SL): battery and metered change during the day, so they pause relaying; the switch keeps the choice. */
+export const isPause = (reason: MemberRelay['reason']): boolean => reason === 'metered' || reason === 'on-battery';
 
 /** "Relay for your members is on": OK acknowledges it, Turn off sets "off". */
 export function MemberRelayDisclosure({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -73,7 +76,7 @@ export function MemberRelayDisclosure({ open, onClose }: { open: boolean; onClos
  * do: no reason, and "on", or "auto" for an owner or admin.
  */
 export function wouldRelay(r: MemberRelay): boolean {
-  return r.effective || (!r.reason && (r.setting === 'on' || (r.setting === 'auto' && r.role)));
+  return r.effective || ((!r.reason || isPause(r.reason)) && (r.setting === 'on' || (r.setting === 'auto' && r.role)));
 }
 
 /** At start or on a change: the disclosure, once, the first time relaying is (or would be) on. */
@@ -84,7 +87,10 @@ export function MemberRelayFirstRun() {
   return <MemberRelayDisclosure open={due && !dismissed} onClose={() => setDismissed(true)} />;
 }
 
-/** Settings → Privacy: the toggle shows what is on now; a reason turns it off and says why. */
+/**
+ * Settings → Privacy: the toggle shows what is on now; a reason turns it off and
+ * says why. A pause (battery, metered) keeps the choice and says "paused".
+ */
 export function MemberRelaySetting() {
   const store = useAppStore();
   const core = useCore();
@@ -104,7 +110,8 @@ export function MemberRelaySetting() {
       setBusy(false);
     }
   };
-  const blocked = !!relay.reason;
+  const paused = isPause(relay.reason) && wouldRelay(relay);
+  const blocked = !!relay.reason && !isPause(relay.reason);
   return (
     <div className="stack member-relay">
       <label className="switch-row">
@@ -117,13 +124,18 @@ export function MemberRelaySetting() {
           className="switch"
           checked={wouldRelay(relay)}
           disabled={busy || blocked}
-          aria-describedby={`member-relay-hint${blocked ? ' member-relay-reason' : ''}`}
+          aria-describedby={`member-relay-hint${blocked || paused ? ' member-relay-reason' : ''}`}
           onChange={(e) => void set(e.target.checked ? 'on' : 'off')}
         />
       </label>
+      {paused && (
+        <p id="member-relay-reason" className="muted small" role="status">
+          <FormattedMessage id="memberRelay.paused" />
+        </p>
+      )}
       {blocked && (
         <p id="member-relay-reason" className="muted small">
-          <FormattedMessage id={REASON_TEXT[relay.reason!]} />
+          <FormattedMessage id={REASON_TEXT[relay.reason as keyof typeof REASON_TEXT]} />
           {relay.reason === 'relay-only' && (
             <>
               {' '}

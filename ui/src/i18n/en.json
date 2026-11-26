@@ -164,7 +164,7 @@
   "update.required.offline": "Can't reach updates right now. Check your internet connection.",
   "update.required.checkClock": "Your computer's clock is off, so the update can't be verified. Fix the time and try again.",
   "update.required.notAvailable": "There's no new version for this computer yet. We keep checking every 15 minutes.",
-  "update.required.failed": "The update didn't work. Try again, or download it manually.",
+  "update.required.failed": "The update didn't work. Try again.",
   "update.required.disabled": "Update MVS to do this.",
   "update.rolledBack": "The update to \u2068{failed}\u2069 didn’t start properly, so version \u2068{running}\u2069 is back.",
 

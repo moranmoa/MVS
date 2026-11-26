@@ -66,7 +66,7 @@ describe('the update-required banner (#577)', () => {
     for (const [state, text] of [
       ['offline', "Can't reach updates right now. Check your internet connection."],
       ['check-clock', "Your computer's clock is off, so the update can't be verified. Fix the time and try again."],
-      ['failed', "The update didn't work. Try again, or download it manually."],
+      ['failed', "The update didn't work. Try again."],
     ] as const) {
       const { check } = await setup({ updateRequired: state });
       const b = banner()!;

@@ -163,7 +163,7 @@
   "update.required.offline": "אי אפשר להגיע לעדכונים כרגע. כדאי לבדוק את החיבור לאינטרנט.",
   "update.required.checkClock": "השעון במחשב לא מכוון, ולכן אי אפשר לאמת את העדכון. כדאי לתקן את השעה ולנסות שוב.",
   "update.required.notAvailable": "עדיין אין גרסה חדשה למחשב הזה. ממשיכים לבדוק כל רבע שעה.",
-  "update.required.failed": "העדכון לא הצליח. אפשר לנסות שוב, או להוריד ידנית.",
+  "update.required.failed": "העדכון לא הצליח. אפשר לנסות שוב.",
   "update.required.disabled": "צריך לעדכן את MVS כדי לעשות את זה.",
   "update.whatsNew": "מה חדש",
   "update.rolledBack": "העדכון לגרסה \u2068{failed}\u2069 לא עלה כמו שצריך, ולכן חזרה גרסה \u2068{running}\u2069.",

@@ -110,6 +110,24 @@ describe('the G-51 editor', () => {
     expect(within(panel).queryByText('Changes saved')).toBeNull();
   });
 
+  it('while an update is required (#577): the form is read-only, with the reason, and nothing saves', async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false, updateRequired: 'downloading' });
+    const desc = vi.spyOn(core, 'setServerDescription');
+    const panel = await openGeneral(core);
+    const box = within(panel).getByRole('textbox', { name: 'Description' }) as HTMLTextAreaElement;
+    expect(box.readOnly).toBe(true);
+    expect(box.getAttribute('aria-describedby')).toContain('update-required-reason');
+    const choose = within(panel).getByRole('button', { name: /^Choose/ });
+    expect(choose.getAttribute('aria-disabled')).toBe('true');
+    expect(choose.getAttribute('title')).toBe('Update MVS to do this.');
+    const save = within(panel).getByRole('button', { name: 'Save' });
+    expect(save.getAttribute('aria-disabled')).toBe('true');
+    await act(async () => {
+      fireEvent.submit(save.closest('form')!);
+    });
+    expect(desc).not.toHaveBeenCalled();
+  });
+
   it('the rail shows a server icon once the core has one', async () => {
     const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
     render(<App core={core} initialSettings={en} />);

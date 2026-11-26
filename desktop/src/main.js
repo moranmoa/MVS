@@ -23,6 +23,7 @@ const { relaysFor, bootstrapFor, logHost, stunFor, stunHost, abuseAddressFor, ab
 const update = require('./update');
 const { createLog } = require('./logfile');
 const metered = require('./metered');
+const power = require('./power');
 const required = require('./required');
 const { createNotifier } = require('./notify');
 const ptt = require('./ptt');
@@ -282,6 +283,8 @@ function setCoreStatus(status) {
   if (status.state === 'up') appLock.coreUp().catch(() => {});
   // The core keeps the metered flag in memory: tell every core that comes up.
   if (status.state === 'up') sendMetered();
+  // Relay-in-app R1: and the power source, likewise.
+  if (status.state === 'up') sendOnBattery();
   // Required updates (#577): a revoked version may only read and update.
   if (status.state === 'up') checkRequired();
 }
@@ -293,6 +296,18 @@ let meteredWatch = null;
 function sendMetered() {
   if (!core || coreStatus.state !== 'up' || !meteredWatch) return;
   Promise.resolve(core.request('setMetered', { metered: meteredWatch.current() })).catch(() => {});
+}
+
+/** Relay-in-app R1 (RR2): the power-source watch (power.js). */
+let powerWatch = null;
+
+/**
+ * Tells the core whether we're on battery (shell only; the page can't). A
+ * core from before R1 answers bad-request; that changes nothing.
+ */
+function sendOnBattery() {
+  if (!core || coreStatus.state !== 'up' || !powerWatch) return;
+  Promise.resolve(core.request('setOnBattery', { onBattery: powerWatch.current() })).catch(() => {});
 }
 
 // In-app update (B8): on only in an installed copy that has mvs-launcher; the
@@ -827,6 +842,7 @@ app.whenReady().then(async () => {
   if (app.isPackaged) app.setAsDefaultProtocolClient(deeplink.SCHEME, UPDATE ? UPDATE.launcher : process.execPath, ['--']);
   startCore();
   meteredWatch = metered.watchMetered({ onChange: () => sendMetered() });
+  powerWatch = power.watchPower({ powerMonitor, onChange: () => sendOnBattery() });
   // G-78: the first page load already matches the lock (no flash of data).
   await Promise.race([appLock.start(), new Promise((r) => setTimeout(r, applock.START_TIMEOUT_MS))]);
   createWindow();
@@ -855,6 +871,7 @@ app.on('second-instance', (_event, argv) => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   meteredWatch?.stop();
+  powerWatch?.stop();
   callGate.end();
   core?.stop();
 });

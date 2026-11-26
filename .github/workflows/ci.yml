@@ -45,14 +45,10 @@ jobs:
           workspaces: core
       - run: cargo test --release --locked
         working-directory: core
-      # The shipped binaries build as release.yml builds them: no test
-      # targets, so no dev-dependency features (sync's `test-util`). An item
-      # that exists only under cfg(test)/test-util but is used in normal code
-      # fails here instead of in the release build.
-      - name: binaries build without test features
-        run: |
-          cargo build --release --locked --workspace
-          cargo clippy --workspace --locked -- -D warnings
+      # Lints on the shipped code alone: no test targets, so no
+      # dev-dependency features (sync's `test-util`), as release.yml builds it.
+      - name: clippy (no test features)
+        run: cargo clippy --workspace --locked -- -D warnings
         working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy

@@ -94,7 +94,10 @@ export async function serverIconFrom(file: File): Promise<ImageResult> {
       }
     }
     const png = await canvas.convertToBlob({ type: 'image/png' });
-    if (png.size <= SERVER_ICON_MAX_BYTES) return { ok: true, dataUrl: await readAsDataUrl(png) };
+    if (png.type === 'image/png' && png.size <= SERVER_ICON_MAX_BYTES) {
+      const src = await readAsDataUrl(png);
+      if (src.startsWith('data:image/png;base64,')) return { ok: true, dataUrl: src };
+    }
     return { ok: false, error: 'too-large' };
   } finally {
     bitmap.close();

@@ -82,7 +82,8 @@ describe('ipc core', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(seen).toEqual([{ effective: true }]);
     // Content events are not replayed.
-    emit('message.new', { id: 'm1' });
+    // (Not "id: '…'" with a lower-case value: the i18n test reads that as a message key.)
+    emit('message.new', { messageId: 'M1' });
     const late: unknown[] = [];
     core.on('message.new' as never, (p: unknown) => late.push(p));
     await new Promise((r) => setTimeout(r, 0));

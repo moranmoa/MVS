@@ -33,22 +33,55 @@ fn known<'a>(vocabulary: &[&'a str], label: &str) -> Option<&'a str> {
     vocabulary.iter().copied().find(|v| *v == label)
 }
 
-/// The `network` object of the diagnostics file:
-/// `{ "connections": { <purpose>: { <path>: count } }, "reachability": <label> }`,
-/// every purpose and path present (0 when unreported), counts saturating.
+/// Totals as the file shows them (SL on #620): a bucket, never a count.
+pub const TOTAL_BUCKETS: [&str; 5] = ["0", "1-5", "6-20", "21-100", ">100"];
+/// Below this total, path shares are left out: they'd give counts away.
+pub const SHARES_FROM: u64 = 6;
+
+fn bucket(total: u64) -> &'static str {
+    match total {
+        0 => TOTAL_BUCKETS[0],
+        1..=5 => TOTAL_BUCKETS[1],
+        6..=20 => TOTAL_BUCKETS[2],
+        21..=100 => TOTAL_BUCKETS[3],
+        _ => TOTAL_BUCKETS[4],
+    }
+}
+
+/// `part` of `total` in percent, rounded to the nearest 10.
+fn share(part: u64, total: u64) -> u64 {
+    // round(part / total * 10) tenths, in integers: (2·10·part + total) / (2·total).
+    let tenths = (u128::from(part) * 20 + u128::from(total)) / (u128::from(total) * 2);
+    (tenths.min(10) * 10) as u64
+}
+
+/// The `network` object of the diagnostics file, with no exact counts
+/// (the manager's call on the SL's #620 note; R5 needs path proportions):
+/// `{ "connections": { <purpose>: { "total": <bucket>, "shares"?: { <path>: <0..100 step 10> } } },
+///    "reachability": <label> }`.
+/// Every purpose is present; `shares` (every path) only from a total of
+/// [`SHARES_FROM`].
 pub fn network_json(raw: &RawCounters) -> Value {
     let mut connections = Map::new();
     for purpose in PURPOSES {
-        let mut by_path = Map::new();
-        for path in PATHS {
-            let n = raw
-                .paths
-                .iter()
-                .filter(|(p, q, _)| known(&PURPOSES, p) == Some(purpose) && known(&PATHS, q) == Some(path))
-                .fold(0u64, |sum, (_, _, n)| sum.saturating_add(*n));
-            by_path.insert(path.to_owned(), json!(n));
+        let counts: Vec<u64> = PATHS
+            .iter()
+            .map(|path| {
+                raw.paths
+                    .iter()
+                    .filter(|(p, q, _)| known(&PURPOSES, p) == Some(purpose) && known(&PATHS, q) == Some(*path))
+                    .fold(0u64, |sum, (_, _, n)| sum.saturating_add(*n))
+            })
+            .collect();
+        let total = counts.iter().fold(0u64, |sum, n| sum.saturating_add(*n));
+        let mut entry = Map::new();
+        entry.insert("total".to_owned(), json!(bucket(total)));
+        if total >= SHARES_FROM {
+            let shares: Map<String, Value> =
+                PATHS.iter().zip(&counts).map(|(path, n)| ((*path).to_owned(), json!(share(*n, total)))).collect();
+            entry.insert("shares".to_owned(), Value::Object(shares));
         }
-        connections.insert(purpose.to_owned(), Value::Object(by_path));
+        connections.insert(purpose.to_owned(), Value::Object(entry));
     }
     let reachability = known(&REACHABILITY, &raw.reachability).unwrap_or("unknown");
     json!({ "connections": connections, "reachability": reachability })
@@ -83,18 +116,48 @@ mod tests {
             reachability: "cgnat-likely".into(),
         };
         let v = network_json(&raw);
-        assert_eq!(v["connections"]["sync"]["direct-lan"], 5);
-        assert_eq!(v["connections"]["call"]["our-relay"], 1);
-        assert_eq!(v["connections"]["join"]["member-relay"], u64::MAX, "saturates");
-        assert_eq!(v["connections"]["call"]["none"], 0);
+        // sync: 5 → a bucket, and too few for shares.
+        assert_eq!(v["connections"]["sync"], json!({ "total": "1-5" }));
+        assert_eq!(v["connections"]["call"], json!({ "total": "1-5" }));
+        // join: saturates, >100, all of it member-relay.
+        assert_eq!(v["connections"]["join"]["total"], ">100");
+        assert_eq!(
+            v["connections"]["join"]["shares"],
+            json!({ "direct-lan": 0, "direct-holepunch": 0, "member-relay": 100, "our-relay": 0, "none": 0 })
+        );
         assert_eq!(v["reachability"], "cgnat-likely");
         let empty = network_json(&RawCounters::default());
         assert_eq!(empty["reachability"], "unknown");
         for purpose in PURPOSES {
-            for path in PATHS {
-                assert_eq!(empty["connections"][purpose][path], 0);
-            }
+            assert_eq!(empty["connections"][purpose], json!({ "total": "0" }));
         }
+        // Shares from 6 on, to the nearest 10%.
+        let mixed = RawCounters {
+            paths: vec![
+                ("call".into(), "direct-lan".into(), 7),
+                ("call".into(), "direct-holepunch".into(), 2),
+                ("call".into(), "our-relay".into(), 1),
+            ],
+            reachability: "nat".into(),
+        };
+        let v = network_json(&mixed);
+        assert_eq!(v["connections"]["call"]["total"], "6-20");
+        assert_eq!(
+            v["connections"]["call"]["shares"],
+            json!({ "direct-lan": 70, "direct-holepunch": 20, "member-relay": 0, "our-relay": 10, "none": 0 })
+        );
+    }
+
+    #[test]
+    fn buckets_and_shares() {
+        let buckets: Vec<&str> = [0, 1, 5, 6, 20, 21, 100, 101, u64::MAX].iter().map(|n| bucket(*n)).collect();
+        assert_eq!(buckets, ["0", "1-5", "1-5", "6-20", "6-20", "21-100", "21-100", ">100", ">100"]);
+        assert_eq!(share(1, 3), 30);
+        assert_eq!(share(1, 6), 20);
+        assert_eq!(share(5, 100), 10, "5% rounds up");
+        assert_eq!(share(4, 100), 0);
+        assert_eq!(share(u64::MAX, u64::MAX), 100);
+        assert_eq!(share(0, 7), 0);
     }
 
     #[test]
@@ -163,7 +226,8 @@ mod tests {
             .iter()
             .chain(PATHS.iter())
             .chain(REACHABILITY.iter())
-            .chain(["connections", "reachability"].iter())
+            .chain(TOTAL_BUCKETS.iter())
+            .chain(["connections", "reachability", "total", "shares"].iter())
             .copied()
             .collect();
         for _ in 0..2_000 {
@@ -186,10 +250,22 @@ mod tests {
             assert!(!text.contains("12D3KooW") && !text.contains("/ip") && !text.contains("/dns"), "{text}");
             assert!(!text.contains("example") && !text.contains("mvs://"), "{text}");
             assert!(!has_ipv4(&text) && !has_hex_run(&text, 64), "{text}");
-            // The shape never changes.
+            // No exact counts: every number is a share, 0..=100 in steps of 10.
+            let mut numbers = Vec::new();
+            collect_numbers(&v, &mut numbers);
+            assert!(numbers.iter().all(|n| *n <= 100 && n % 10 == 0), "{text}");
+            // The shape: every purpose, a total bucket, shares (all paths) only from 6.
             assert_eq!(v["connections"].as_object().unwrap().len(), PURPOSES.len());
             for purpose in PURPOSES {
-                assert_eq!(v["connections"][purpose].as_object().unwrap().len(), PATHS.len());
+                let entry = &v["connections"][purpose];
+                assert!(TOTAL_BUCKETS.contains(&entry["total"].as_str().unwrap()));
+                match entry.get("shares") {
+                    Some(shares) => {
+                        assert!(!["0", "1-5"].contains(&entry["total"].as_str().unwrap()));
+                        assert_eq!(shares.as_object().unwrap().len(), PATHS.len());
+                    }
+                    None => assert!(["0", "1-5"].contains(&entry["total"].as_str().unwrap())),
+                }
             }
         }
     }
@@ -204,6 +280,15 @@ mod tests {
                 }
             }
             Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+            _ => {}
+        }
+    }
+
+    fn collect_numbers(v: &Value, out: &mut Vec<u64>) {
+        match v {
+            Value::Number(n) => out.push(n.as_u64().expect("whole numbers only")),
+            Value::Object(map) => map.values().for_each(|v| collect_numbers(v, out)),
+            Value::Array(items) => items.iter().for_each(|v| collect_numbers(v, out)),
             _ => {}
         }
     }

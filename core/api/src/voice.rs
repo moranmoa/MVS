@@ -141,6 +141,17 @@ pub trait VoiceNet: Send + Sync {
     /// Sends one blob (at most [`MAX_BLOB`]) to that identity's peer, best
     /// effort.
     fn send(&self, to: PublicKey, blob: Vec<u8>);
+
+    /// G-81: one of my voice frames, for my current call's media targets
+    /// (sync checks the call, the targets and the caps).
+    fn media_frame(&self, frame: sync::VoiceFrame) {
+        let _ = frame;
+    }
+
+    /// G-81: my current call for voice media, or none.
+    fn set_media_call(&self, call: Option<sync::VoiceCall>) {
+        let _ = call;
+    }
 }
 
 /// Who may be in which call, and whom to tell: the core's member state.
@@ -408,6 +419,8 @@ impl Meta {
 
 /// My call.
 struct Mine {
+    /// G-81: this call's ID (`CallState.callId`), new on every join.
+    call_id: [u8; 16],
     server: ServerId,
     channel: ChannelId,
     muted: bool,
@@ -456,6 +469,9 @@ pub(crate) struct Calls {
     dirty: BTreeSet<ServerId>,
     /// The user's relay-only setting (`setRelayOnly`), kept by the core.
     relay_only: bool,
+    /// G-81 `--voice-p2p`: calls run over libp2p, so relay-only (our
+    /// relays' circuits only) no longer ends or refuses them.
+    voice_p2p: bool,
     /// The room my own identity is in from another computer, and when its
     /// last hello reached us. `createVoiceRoom` and `joinCall` here answer
     /// `in-call-elsewhere` (one room per identity).
@@ -464,6 +480,11 @@ pub(crate) struct Calls {
     /// advertised the `deafen` cap, and when we received it. Bounded by
     /// [`MAX_CAPS_ENTRIES`].
     caps: HashMap<PublicKey, u64>,
+    /// G-81: how my frames reach each call peer (the node's `VoicePath`),
+    /// and the peers the UI has on LAN WebRTC (`setCallWebrtcPeers`):
+    /// both reset with each new call.
+    paths: HashMap<PublicKey, VoicePathKind>,
+    webrtc: HashSet<PublicKey>,
 }
 
 impl Calls {
@@ -480,6 +501,23 @@ impl Calls {
     /// Relay-only is on: the setting, or the transport says so.
     pub fn relay_only(&self) -> bool {
         self.relay_only || self.net.as_ref().is_some_and(|net| net.relay_only())
+    }
+
+    /// G-81 `--voice-p2p` (the shell's flag, off by default): with it on,
+    /// calls run over libp2p and so work under relay-only too (over our
+    /// relays' circuits only, which the node enforces).
+    pub fn set_voice_p2p(&mut self, on: bool) {
+        self.voice_p2p = on;
+    }
+
+    pub fn voice_p2p(&self) -> bool {
+        self.voice_p2p
+    }
+
+    /// Calls are refused, and a call in progress ends: relay-only without
+    /// `--voice-p2p` (its media would go direct over WebRTC).
+    fn calls_blocked(&self) -> bool {
+        self.relay_only() && !self.voice_p2p
     }
 
     /// One `voice.rooms` for `server` at the next tick (its `relayOnly`
@@ -604,7 +642,7 @@ impl Calls {
         server: ServerId,
         channel: Option<ChannelId>,
     ) -> CoreResult<()> {
-        if self.relay_only() {
+        if self.calls_blocked() {
             return Err(ErrorCode::RelayOnly.into());
         }
         self.net()?;
@@ -688,7 +726,10 @@ impl Calls {
         channel: ChannelId,
         joined_at: u64,
     ) -> CoreResult<CallState> {
-        self.mine = Some(Mine { server, channel, muted: false, deafened: false, joined_at, since: ctx.now });
+        // G-81: a new call: no WebRTC peers or paths carried over.
+        self.webrtc.clear();
+        self.paths.clear();
+        self.mine = Some(Mine { server, channel, muted: false, deafened: false, joined_at, since: ctx.now, call_id: { let mut id = [0u8; 16]; OsRng.fill_bytes(&mut id); id } });
         self.dirty.insert(server);
         self.hello(ctx, members, None);
         let state = self.state(ctx.me()).expect("in a call");
@@ -711,6 +752,7 @@ impl Calls {
             participants: Vec::new(),
             full: false,
             relay_only: self.relay_only(),
+            call_id: None,
         }));
     }
 
@@ -862,7 +904,7 @@ impl Calls {
         if let Some(server) = self.mine.as_ref().map(|m| m.server) {
             // Kicked, or relay-only turned on mid-call (the media would go
             // direct): leave, with a bye.
-            if self.relay_only() || !members.may_call(ctx.me(), server) {
+            if self.calls_blocked() || !members.may_call(ctx.me(), server) {
                 self.leave(ctx, members);
             }
         }
@@ -938,6 +980,7 @@ impl Calls {
                     participants: Vec::new(),
                     full: true,
                     relay_only: self.relay_only(),
+                    call_id: None,
                 }));
             }
             WireKind::Edit => {
@@ -1249,6 +1292,40 @@ impl Calls {
         changed
     }
 
+    /// G-81: my current call for voice media (`sync::VoiceCall`): its ID,
+    /// everyone else in it, and those of them my frames go to over libp2p
+    /// (everyone not on LAN WebRTC, `setCallWebrtcPeers`). None with no
+    /// call.
+    pub fn media_call(&self) -> Option<sync::VoiceCall> {
+        let mine = self.mine.as_ref()?;
+        let participants: Vec<PublicKey> =
+            self.rooms.get(&mine.channel).map(|room| room.peers.keys().copied().collect()).unwrap_or_default();
+        let targets = participants.iter().filter(|p| !self.webrtc.contains(p)).copied().collect();
+        Some(sync::VoiceCall { call_id: mine.call_id, participants, targets })
+    }
+
+    /// G-81 `setCallWebrtcPeers`: the call peers the UI has on LAN WebRTC
+    /// (others are ignored). It only excludes: the core picks the targets.
+    pub fn set_webrtc_peers(&mut self, ctx: &mut Ctx, peers: HashSet<PublicKey>) {
+        if self.webrtc != peers {
+            self.webrtc = peers;
+            // `call.state` (the core then hands the node the new targets).
+            if let Some(state) = self.state(ctx.me()) {
+                ctx.events.push(Event::CallState(state));
+            }
+        }
+    }
+
+    /// G-81: the node says how my frames reach `peer` now; a change is a
+    /// `call.state`.
+    pub fn set_path(&mut self, ctx: &mut Ctx, peer: PublicKey, path: VoicePathKind) {
+        if self.mine.is_some() && self.paths.insert(peer, path) != Some(path) {
+            if let Some(state) = self.state(ctx.me()) {
+                ctx.events.push(Event::CallState(state));
+            }
+        }
+    }
+
     /// My call: me first, then the others by key.
     fn state(&self, me: PublicKey) -> Option<CallState> {
         let mine = self.mine.as_ref()?;
@@ -1256,6 +1333,7 @@ impl Calls {
             identity: model::hex_id(me.as_bytes()),
             muted: mine.muted,
             deafened: mine.deafened && mine.muted,
+            path: None,
         }];
         let mut limit = MAX_PARTICIPANTS;
         if let Some(room) = self.rooms.get(&mine.channel) {
@@ -1264,6 +1342,7 @@ impl Calls {
                 identity: model::hex_id(key.as_bytes()),
                 muted: peer.muted,
                 deafened: peer.deafened,
+                path: self.paths.get(key).copied(),
             }));
         }
         let full = participants.len() >= limit;
@@ -1272,6 +1351,7 @@ impl Calls {
             participants,
             full,
             relay_only: self.relay_only(),
+            call_id: Some(hex::encode(mine.call_id)),
         })
     }
 

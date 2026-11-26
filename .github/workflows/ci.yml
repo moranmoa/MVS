@@ -45,6 +45,16 @@ jobs:
           workspaces: core
       - run: cargo test --release --locked
         working-directory: core
+      # The shipped code as release.yml builds it: no test targets, so no
+      # dev-dependency features (sync's `test-util`), which `cargo test` turns
+      # on for every crate and so hides code that only compiles with them.
+      # Every workspace binary (mvs-core, mvs-launcher, ...) built, then the
+      # same code linted.
+      - name: build as shipped (no test features)
+        run: |
+          cargo build --release --locked --workspace
+          cargo clippy --workspace --locked -- -D warnings
+        working-directory: core
       # Tests that need a test-only hook (feature `test-hooks`, never in a
       # release build): G-48 report receiver, T17 secret rotation.
       - name: api test hooks

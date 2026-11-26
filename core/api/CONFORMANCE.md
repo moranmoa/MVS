@@ -168,6 +168,62 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - the in-app updater (hourly check) narrows the window;
     - once their profile post lacks the cap, `getUpdateNeeded(serverId, "reactions-v1")` names them, and new reactions wait for them again.
 
+- Report to the owners (G-48; design `docs/design/report-to-owners.md`, with the Tech Lead's Amendment 1, the security lead's R1–R7 and the Product Owner's decisions):
+  - `reportContent({ serverId, target, reason, text? })` returns `{ reportId, recipients }`.
+    - `target` is `{ kind: 'message', messageId }` or `{ kind: 'member', userId }`.
+    - `reason` is one of: `spam`, `harassment`, `hate`, `violence`, `sexual`, `minor`, `self-harm`, `illegal`, `impersonation`, `other`.
+    - `text` is optional and trimmed. It follows the topic rule (one line, the strict text rule), up to 280 code points and 1024 bytes.
+    - Errors, with nothing signed:
+      - `bad-request`: the reason or text is wrong;
+      - `not-found`: no such message (in a channel I can see) or member (current or removed) in that server;
+      - `not-allowed`: reporting myself or my own message, or I'm not a member;
+      - `rate-limited`: 5 an hour or 20 a day per server;
+      - `already-reported`: the same target within 30 days;
+      - `no-recipient`: nobody is left to receive it. The UI then points at the abuse address (B24).
+  - **Who gets it:**
+    - Recipients are the server's owner and admins, current and not kicked, minus the reported member and me. For a message, the reported member is its author.
+    - Moderators don't get reports in v1.
+    - Admins added after a report don't get it.
+  - **Delivery:**
+    - A direct, members-only protocol, `/mvs/report/1`. A box goes to each recipient on its own; nothing enters a log, so other members never learn a report exists.
+    - The reporter's outbox retries about every 10 seconds while the recipient is online, and drops a row once it is acked.
+    - At each send, the recipient is resolved again (R1): a row whose recipient is no longer owner or admin, or is the reported member, is dropped, and so are rows older than 30 days or for a server I left.
+    - `report.status { reportId, delivered, pending }` follows progress.
+  - **Staff:**
+    - `listReports(serverId)` lists reports newest first. It is `not-allowed` unless I am owner or admin now, and losing that role, leaving or a kick deletes the reports I hold.
+    - `report.received { serverId, report }` fires on arrival.
+    - `dismissReport(reportId)` is local triage only.
+    - A `ReportSummary` is `{ id, serverId, reporterId, target, reportedId, reason, text?, ts, receivedAt, dismissed, evidenceValid, evidenceWithheld }`. It **never carries evidence**: not in the list, the event, a notification or a preview.
+  - **`getReportEvidence(reportId)`** (an explicit click) returns `{ authorId, channelId, ts, text? }`, the reported message as its author signed it.
+    - `text` is absent when I hold no key for it.
+    - Show it as plain text: never Markdown with live links, never HTML.
+    - Errors:
+      - `bad-request`: the evidence isn't that message (R4: the ID, server, channel, kind `Message` and the author's signature must all check);
+      - `not-allowed`: for `sexual` and `minor`, staff without an 18+ claim (Product Owner). `evidenceWithheld: true` says so in advance.
+    - No API path exports or forwards evidence.
+    - The evidence outlives the author's delete. That's a deliberate retention exception.
+  - **Non-repudiation is intended:** staff hold the reporter's signature. The UI must say "the owner and admins will see that you reported this".
+  - **Wire:**
+    - The signed report is a fixed 1200-byte part, then `ev_len u32` and the evidence (the reported message's own signed record, padded to 0, 2 KiB, 8 KiB or the largest record), then an Ed25519 signature under `mvs/report/v1`.
+    - Each box is X25519 to the recipient's key (from Ed25519, as `groupkeys`), BLAKE3 `derive_key`, then XChaCha20-Poly1305. The associated data is `"mvs/report-box/v1" ‖ ephemeral ‖ recipient ‖ server`, and an all-zero shared secret is refused.
+    - A box is at most 20 KiB.
+    - Sync caps per peer: a burst of 3, then one every 10 s. Across all peers: a burst of 20, then 2 a second.
+    - Sync acks every box that passes those caps before the core tries to open it, so the answer never depends on what the box holds (R7).
+  - **Receiving:**
+    - A box is dropped quietly unless:
+      - it opens for me in one of my servers;
+      - the report verifies;
+      - its signer is the identity sync bound the peer to;
+      - its time is within 30 days back and 10 minutes ahead;
+      - I'm staff there;
+      - the reporter is a current member;
+      - a member target is current or removed;
+      - it's new: report IDs are kept 31 days;
+      - the reporter has sent under 10 an hour.
+    - Each server stores at most 1000 reports.
+  - **Storage:** only sealed boxes are on disk, both the outbox and the reports I received. Neither is in the account backup or the logs. The report commands aren't in the app lock's allow-set (G-78).
+  - **Older peers** don't speak `/mvs/report/1`: the row stays in the outbox until they update or it expires.
+
 - Channel topic (G-14; design `docs/design/channel-topic.md`):
   - `setChannelTopic(channelId, topic)` returns the updated `Channel` and fires `channel.updated`. The topic is trimmed; an empty one clears it. Setting the topic the channel already has signs nothing and fires nothing.
   - `Channel.topic?: string` (additive), absent when there is none. A member reading a topic change by sync gets `channel.updated` for that channel. A topic is never unread, never a mention and never a notification.
@@ -258,6 +314,10 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - The app then starts at "create or restore". No new event: the UI goes back to onboarding on `ok` (pending requests fail with `core-restarted`).
 
 - `updateProfile` with a new display name (trimmed) posts a new profile post to every server I'm still a member of (not kicked, not left, not closed); the latest one wins for everyone. The same name, or a new bio or avatar only, posts nothing: bio and avatar stay on this device, since the profile post carries the name (and caps) only. A server that refuses the post is skipped; the call still succeeds. Errors as before: `bad-request` for a bad name, bio or avatar, `not-found` with no identity.
+  - **`profile-too-large`** (new code): the name, small picture and colour together don't fit one profile post (4 KiB with the caps).
+    - This happens only with a long name of 4-byte characters (emoji) beside a picture near the 2,560-byte cap. For example, 128 emoji and the largest picture are refused.
+    - Nothing is saved or posted, and the old profile stays. The UI says to shorten the name or use a smaller picture.
+    - The budget: a 32-emoji name, the largest picture, a colour and every cap leave at least 256 bytes for later releases' caps (`lv:N`). A test guards this.
 
 - Age claims and the 30-day rule (decision 18, B13 §3, B7 §9). Each claim is decided from my latest accepted claim in that server:
   - A birth date that raises me from "not adult" to adult posts nothing. It sets `Identity.pendingBirthDate: { date, effectiveAt }` (`effectiveAt` = when found + 30 days). Until then I count as under 18: the core refuses 18+ joins (`age-blocked`), and servers keep my earlier claim.
@@ -355,11 +415,25 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - They also go to my own identity, which reaches only my other computers (same recovery words). A hello or bye signed by me counts only when sync bound its sender to me and it has no `to`. It marks me "in a call elsewhere" until its bye or 30 s without a hello, and never appears in a roster. My own envelopes echoed back are replays.
     - A full call's refusal counts only if it comes from someone already in that call, within 10 s of joining.
   - `applyUpdate` answers `not-allowed` during a call.
+  - Voice media over libp2p (G-81 2a part c, #509 §2.3). The core carries Opus frames to the call's peers that the UI has no LAN WebRTC connection with:
+    - `CallState.callId`: 32 lower-case hex. It's random for each call I join, present only while I'm in one, and new on every join.
+    - `CallParticipant.path`: `'lan' | 'direct' | 'circuit' | 'member-circuit' | 'none'`, how my frames reach that participant now, as the node reports it. It's absent until the node reports one, and a change is a `call.state`. It's a display hint; the node picks routes, never the UI.
+    - `setCallWebrtcPeers({ identities: string[] })` returns `null`. It names the participants the UI has a live LAN WebRTC connection with, and the core sends frames to every other participant. The UI can only exclude peers, never add targets.
+      - At most 5 identities; more, or a malformed ID, is `bad-request`.
+      - It resets on every new call. A change is a `call.state`.
+    - `voiceFrame` is a sidecar line `{"cmd":"voiceFrame","args":{"callId","seq","ts","data"}}`. It has no `id` and never gets a reply, even with an `id`.
+      - The sidecar's reader routes it on an exact `cmd` match only (`VoiceFrame` or `voiceFrame ` are ordinary commands, so they get `bad-request`). It never waits for a command, and replies to commands keep their order.
+      - Strict: exactly those four fields. `callId` is 32 lower-case hex, `seq` and `ts` are u32, and `data` is standard base64 of at most 400 bytes (empty means a DTX gap); the length is checked before decoding.
+      - It's sent only while I'm in the call with that `callId`, the keys aren't locked and I'm not signed out. Anything else is dropped silently, counted, and never logged.
+      - The gate closes synchronously on leave and on a relay-only switch without `--voice-p2p`, before the node is told. So a frame that overtakes `leaveCall`, or comes after it, sends nothing.
+      - Lock, sign-out and a required update (RU1) shut it first and unconditionally, whether or not leaving the call succeeds. Until unlock, no frame passes either way and no call reopens it; after sign-out or RU1, not for the rest of the process.
+    - `voice.frame { callId, from, seq, ts, data }`: a frame from a participant of my current call (`data` as above). Frames of any other call are dropped.
+    - `mvs-core --voice-p2p` (no value; the shell's `voiceP2p` flag): while relay-only is on, `createVoiceRoom` and `joinCall` work, and switching relay-only on doesn't end my call. Media then runs over our relay circuits only, never direct or through a member relay. Without the flag, relay-only refuses calls as below.
 - Relay-only (GAP-6r), per device:
   - `setRelayOnly(on: boolean)` returns `null`. It's stored in the core database and needs no identity. On:
     - the network keeps no direct listener, makes no direct dials, and reaches peers only through relay circuits, and direct connections already open are closed (#274);
     - my call ends at once (a bye to the others, then a `call.state` with `participants: []` and `relayOnly: true`);
-    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off.
+    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off (not with `--voice-p2p`, above).
   - At start, `mvs-core` reads the stored value before the network starts, and the node starts relay-only from the first moment (`NodeConfig.relay_only`: no direct listener, no bootstrap dial, no punching). It fails closed: a database that can't be opened or read, or a value other than off, means on.
   - Shown up front:
     - `AppInfo.relayOnly` from `getAppInfo`;
@@ -475,6 +549,16 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `'untrusted'`: it opens only under a rotation authority doesn't accept (#21). It has **no `authorId`** and no `sendState`, and it's never a reply target.
   - `react`, `editMessage` and `deleteMessage` on a placeholder give `bad-request`.
   - An edit that doesn't open leaves the original text shown (with no `editedAt`); the message is a placeholder only when the original doesn't open either.
+- Re-seals (LM-2, the SL's and the TL's decision): a sender who sealed a message before applying someone's Join re-sends it, so the joiner can read it.
+  - **What gets re-sent:** my own messages that don't reach that Join, with `ts ≥ Join.ts − 60 s`, that I sent at most 10 min before I applied the Join, in a channel the joiner reads now, and that I never edited or deleted.
+  - **The form:** a `MessageEdit` with the same text and the original's `ts`. It's sealed for the current readers once the join re-key covers the joiner.
+  - **Limits:** at most 50 per channel per Join, and 100 a minute.
+  - **Never re-sent:** to a joiner removed meanwhile, or anything from before that window (D30).
+  - Display, for every core from this one on:
+    - **A reader who can open both the original and the edit:** `editedAt` is absent when the texts are equal, so there's no "edited" label, no `message.updated` and no second unread. With a different text it's an ordinary edit, even when its `ts` equals the original's.
+    - **A reader who can't open the original (the joiner):** the edit's text shows in the message's place. `editedAt` is absent when the edit's `ts` equals the original's. Unread and mentions count once, as for a new message.
+    - Older cores show a re-seal as an ordinary edit with the same text, perhaps labelled "edited".
+  - A message whose latest edit carries its own `ts` isn't pruned (B6-p), and neither are its same-`ts` edits, so readers can compare the texts.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):
@@ -498,6 +582,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `update-needed` (rename and close only): a current member's latest profile post doesn't carry `caps: ['server-lifecycle-v1']`, or they have no profile post. Nothing was signed. An older member would refuse the record and stall on every control record after it.
   - Profile posts now carry `caps: ['server-lifecycle-v1', 'reactions-v1', 'channel-topic-v1', 'adult-keys-v1', 'server-meta-v1']`, and older versions ignore the field. A core re-posts its profile once where its latest post lacks one of them.
   - **Caps are frozen after `server-meta-v1`** (Tech Lead on #555): released cores gate on these exact names, so they are posted for good. The next gated feature adds one cap of the form `"lv:N"`, a single level that implies every feature up to N; a gate checks `lv >= k`, older cores ignore it, and the profile post stops growing with each release.
+    - `lv:N` is per release, not per feature (Tech Lead on #590). It means "this core decodes every kind introduced up to level N".
+    - The first release that ships a new kind posts the next level, and every kind that release introduces gates on `lv >= N`.
+    - The kind codes are fixed: `SecretRotation` (T17) is 25 and `ServerAgeLimit` (G-52) is 26. If both ship in one release, both gate on that release's level.
+- Server age limit (G-52, planned; design `docs/design/server-age-limit.md`, Security Lead on #590):
+  - After a raise to 18+, every channel's readers are members ∩ adults. The receiver rule's `reaches` must cover the later of the server-wide raise and the channel's own 18+ edit.
+  - **Accepted residual:** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata. T17's leave rotation never fires for it. Such members show as not adult to the owner and admins, who can kick them, and the kick rotates the secret.
 - 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
   - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
   - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
@@ -541,6 +631,10 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - A failing record is dropped like a kicked author's: not shown, never unread, a mention or a notice. It stays in the log. A plain channel, or one turned plain, has no check. Nothing is cached per record: it's recomputed on every fold.
   - So a minor's post with stale deps is dropped, and an adult who lowers their age keeps what they posted after the channel turned 18+. Posts from before the flip by someone who isn't an adult now are hidden: the accepted cost.
   - **Accepted residual (Security Lead):** a former adult whose claim a modified client lowered can still post with stale deps that point at an adult moment after the edit. The claim is self-attested anyway (GAP-22).
+- Newer versions in a server (the detector, Tech Lead plan):
+  - `ServerSummary` gains `updateNeeded: boolean` (additive, default false). It turns true when a current member of a server I'm in wrote a validly signed record of a kind this version doesn't know (`records::Record::peek_unknown`): they run a newer version, and mine may miss what it adds. The UI shows an "update to keep up" hint for that server.
+  - Sync still refuses that record: it's never stored, forwarded or acked. Anyone else's (a stranger, a kicked member, a broken signature, a server I'm not in) never sets the flag.
+  - One `server.updated` when it turns true, then none for further records. In memory only: never cleared by a timer, only by a restart, so it comes back after one only if such a record is seen again.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 
@@ -579,6 +673,18 @@ plus a relaunch through the launcher.
 | `update.ready` (exists: `UpdateInfo`) | `{ "version": "1.3.0", "waitingForCall": false }` | after a stage, and again when a call ends |
 | `update.installed` (new) | `{ "version": "1.3.0", "notes": "plain text" \| null }` | once, after `markHealthy` commits a new version; `notes` comes from `ManifestBody::notes_for(<UI language>)`. The UI shows it as **text only** |
 | `update.rolledBack` (new) | `{ "failed": "1.3.0", "running": "1.2.0" }` | once, on the first healthy start after the launcher rolled back |
+| `update.required` (new) | `{ "version": "1.3.0" \| null }` | when a required update turns on (an accepted manifest revoked the running version), or when the version on offer changes; `null`: none yet |
+
+**Required updates** (`docs/design/required-update.md`):
+- `getAppInfo` gains `updateRequired: { version: string | null } | null`. It's set from the first moment of a start when an earlier check found the running version revoked (`policy.json`), and after any check that does. It never clears within a process; only a restart into a version that isn't revoked clears it.
+- While it's set:
+  - the download starts at once and checks repeat every 15 minutes;
+  - a version that failed its trial here is never fetched again;
+  - **RU1:** the core signs nothing and syncs nothing. Every command that would sign answers `update-required` (a new `ErrorCode`), with nothing signed. The sync round, re-keys, rotations, re-joins, profile posts and the report outbox don't run, and the node goes quiet (no gossip, pulls, dials or relaying). Local reads still answer.
+- `checkForUpdate` keeps working; it's what the banner's Try again calls.
+- **Residuals, accepted by the SL on #599:**
+  - **Unreadable or missing `policy.json`:** it fails open. The version isn't required until the next accepted check (within minutes), and in that window an outdated core could run one sync round. Fail-closed would lock people out over a corrupt file, and only local file access can cause it. Network-side refusal is the backstop.
+  - **Startup:** the node starts just before the core reads `policy.json` and quiets it, so for a moment it may serve and store records. The core signs and publishes nothing in that window. Follow-up: start the node quiet.
 
 **Rules the core keeps:**
 - The first check runs once the UI is up (the first `markHealthy`, so the

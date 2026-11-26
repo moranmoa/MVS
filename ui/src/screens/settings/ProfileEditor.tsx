@@ -153,7 +153,8 @@ export const ProfileEditor = forwardRef<ProfileEditorHandle, { onDirtyChange: (d
   const [busy, setBusy] = useState<'image' | 'saving' | null>(null);
   const [imageError, setImageError] = useState<'too-large' | 'unsupported' | null>(null);
   const [nameError, setNameError] = useState<'empty' | 'chars' | null>(null);
-  const [saveError, setSaveError] = useState(false);
+  /** true: a generic failure; 'too-large': the name and picture don't fit one profile post (#594). */
+  const [saveError, setSaveError] = useState<boolean | 'too-large'>(false);
   const [justSaved, setJustSaved] = useState<false | 'shared' | 'local'>(false);
   const nameRef = useRef<HTMLInputElement>(null);
   const nameProps = useUserTextProps(draft.name);
@@ -206,7 +207,7 @@ export const ProfileEditor = forwardRef<ProfileEditorHandle, { onDirtyChange: (d
       if (isCoreError(e) && e.code === 'bad-request') {
         setNameError('chars');
         nameRef.current?.focus();
-      } else setSaveError(true);
+      } else setSaveError(isCoreError(e) && e.code === 'profile-too-large' ? 'too-large' : true);
       return false;
     } finally {
       setBusy(null);
@@ -321,7 +322,7 @@ export const ProfileEditor = forwardRef<ProfileEditorHandle, { onDirtyChange: (d
         </p>
         {saveError && (
           <p className="error" role="alert">
-            <FormattedMessage id="profile.edit.saveError" />
+            <FormattedMessage id={saveError === 'too-large' ? 'profile.edit.tooLarge' : 'profile.edit.saveError'} />
           </p>
         )}
         {justSaved && !dirty && (

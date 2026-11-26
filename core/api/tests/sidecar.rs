@@ -12,6 +12,11 @@ use serde_json::{json, Value};
 
 /// Runs `input` through a fresh core; returns every output line.
 fn run(input: &[u8]) -> Vec<Value> {
+    run_counting(input).0
+}
+
+/// As [`run`], also with how many voice frames the fast path dropped.
+fn run_counting(input: &[u8]) -> (Vec<Value>, u64) {
     let out = Lines::new(Vec::new());
     let core = Core::open(
         Config { db_path: None, app_version: "0.1.0-alpha".into() },
@@ -24,12 +29,59 @@ fn run(input: &[u8]) -> Vec<Value> {
         },
     )
     .unwrap();
+    let frames = core.voice_frames();
     sidecar::serve(&core, Cursor::new(input.to_vec()), &out).unwrap();
     drop(core);
     let bytes = Arc::try_unwrap(out).ok().expect("core dropped").into_inner();
     let text = String::from_utf8(bytes).unwrap();
     assert!(text.is_empty() || text.ends_with('\n'));
-    text.lines().map(|line| serde_json::from_str(line).expect("each line is JSON")).collect()
+    let lines = text.lines().map(|line| serde_json::from_str(line).expect("each line is JSON")).collect();
+    (lines, frames.dropped())
+}
+
+/// G-81 (#509, SL 1, dev-identity 4–5): an exact `voiceFrame` takes the
+/// fast path: never a reply (not even with an `id`), never blocking the
+/// commands around it, whose replies keep their order. A frame with no
+/// call open, or malformed, is dropped and counted; serving goes on. A
+/// near miss (`VoiceFrame`, a trailing space) is an ordinary command, so
+/// it gets the usual error.
+#[test]
+fn voice_frames_take_the_fast_path_and_keep_reply_order() {
+    let frame = r#"{"cmd":"voiceFrame","args":{"callId":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","seq":1,"ts":960,"data":"AQID"}}"#;
+    let mut input = String::new();
+    for i in 0..20 {
+        input.push_str(&format!("{{\"id\":{i},\"cmd\":\"getIdentity\"}}\n"));
+        for _ in 0..5 {
+            input.push_str(frame);
+            input.push('\n');
+        }
+    }
+    let malformed = [
+        r#"{"cmd":"voiceFrame"}"#,
+        r#"{"cmd":"voiceFrame","args":[1,2]}"#,
+        r#"{"cmd":"voiceFrame","args":{"callId":"0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A","seq":1,"ts":0,"data":""}}"#,
+        r#"{"cmd":"voiceFrame","args":{"callId":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","seq":1,"ts":0,"data":"not base64!"}}"#,
+        r#"{"id":"x","cmd":"voiceFrame","args":{}}"#,
+    ];
+    for line in malformed {
+        input.push_str(line);
+        input.push('\n');
+    }
+    input.push_str(r#"{"id":"near1","cmd":"VoiceFrame","args":{}}"#);
+    input.push('\n');
+    input.push_str(r#"{"id":"near2","cmd":"voiceFrame ","args":{}}"#);
+    input.push('\n');
+    input.push_str(r#"{"id":"last","cmd":"getIdentity"}"#);
+    input.push('\n');
+
+    let (lines, dropped) = run_counting(input.as_bytes());
+    let mut want: Vec<Value> = (0..20).map(|i| json!({ "type": "response", "id": i, "ok": null })).collect();
+    want.push(bad_request(json!("near1")));
+    want.push(bad_request(json!("near2")));
+    want.push(json!({ "type": "response", "id": "last", "ok": null }));
+    assert_eq!(lines, want);
+    // No call is open here, so every frame, well-formed or not, is dropped.
+    assert_eq!(dropped, 20 * 5 + malformed.len() as u64);
 }
 
 fn bad_request(id: Value) -> Value {

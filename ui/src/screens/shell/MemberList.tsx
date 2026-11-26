@@ -10,6 +10,7 @@ import { CloseIcon, CloudIcon, LinkIcon } from '../../components/icons';
 import { useContextMenu, type MenuItem } from '../../components/ContextMenu';
 import { copyText } from '../../app/clipboard';
 import { nameSkeleton } from '../../core/sanitize';
+import { ReportDialog, type ReportRequest } from './ReportDialog';
 import { memberMatcher, SEARCH_FROM } from './memberMatch';
 import { MemberSearchField } from './MemberSearch';
 
@@ -73,6 +74,7 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
   const core = useCore();
   const [openId, setOpenId] = useState<string | null>(null);
   const [kickId, setKickId] = useState<string | null>(null);
+  const [report, setReport] = useState<ReportRequest | null>(null);
   const { bind, menu } = useContextMenu();
   const owner = server.ownerId === myId;
   // B25 §4: the member menu. Every item is also on the profile card.
@@ -86,7 +88,15 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
     { kind: 'separator' },
     ...(m.id === myId
       ? []
-      : [{ key: 'block', label: intl.formatMessage({ id: m.blocked ? 'profile.unblock' : 'profile.block' }), onSelect: () => void core.blockUser(m.id) }]),
+      : [
+          { key: 'block', label: intl.formatMessage({ id: m.blocked ? 'profile.unblock' : 'profile.block' }), onSelect: () => void core.blockUser(m.id) },
+          // G-48
+          {
+            key: 'report',
+            label: intl.formatMessage({ id: 'report.action' }),
+            onSelect: () => setReport({ serverId: server.id, target: { kind: 'member', userId: m.id }, name: displayName(m) }),
+          },
+        ]),
     ...(owner && m.id !== myId && !m.isOwner
       ? [
           {
@@ -229,6 +239,7 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
         />
       )}
       {menu}
+      <ReportDialog request={report} onClose={() => setReport(null)} />
     </aside>
   );
 }
@@ -255,6 +266,7 @@ export function ProfileCard({
   const uiDir = useUiDir();
   const myId = useStore(store, (s) => s.identity?.id);
   const [confirmKick, setConfirmKick] = useState(!!startKick);
+  const [report, setReport] = useState<ReportRequest | null>(null);
   const canKick = server.ownerId === myId && !isMe && !member.isOwner;
   const name = displayName(member);
 
@@ -296,6 +308,9 @@ export function ProfileCard({
           <div className="actions">
             <button type="button" className="secondary" onClick={() => void core.blockUser(member.id)}>
               <FormattedMessage id={member.blocked ? 'profile.unblock' : 'profile.block'} />
+            </button>
+            <button type="button" className="secondary" onClick={() => setReport({ serverId: server.id, target: { kind: 'member', userId: member.id }, name })}>
+              <FormattedMessage id="report.action" />
             </button>
             {canKick && (
               <button type="button" className="danger" onClick={() => setConfirmKick(true)}>
@@ -343,6 +358,7 @@ export function ProfileCard({
           </div>
         )}
       </div>
+      <ReportDialog request={report} onClose={() => setReport(null)} />
     </Dialog>
   );
 }

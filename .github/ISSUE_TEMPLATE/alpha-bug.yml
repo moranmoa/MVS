@@ -1,0 +1,77 @@
+name: "Alpha tester: something went wrong"
+description: "Report a problem with MVS. | דיווח על תקלה ב-MVS (אפשר לכתוב בעברית)."
+title: "[alpha] "
+labels: ["alpha", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing MVS. You can write in Hebrew or English.
+        תודה שאתם בודקים את MVS. אפשר לכתוב בעברית או באנגלית.
+
+        > [!CAUTION]
+        > **Never include your 12 recovery words, here or anywhere. Nobody from MVS will ever ask for them.**
+        > **לעולם אל תכתבו כאן את 12 מילות השחזור. אף אחד מ-MVS לא יבקש אותן.**
+        >
+        > This page is public: also leave out passwords, IP addresses, invite links and other people's names.
+        > הדף הזה ציבורי: אל תכתבו גם סיסמאות, כתובות IP, קישורי הזמנה או שמות של אנשים אחרים.
+  - type: textarea
+    id: did
+    attributes:
+      label: "What I did | מה עשיתי"
+      description: "The steps, one per line. | הצעדים, צעד בכל שורה."
+      placeholder: |
+        1. Opened the server
+        2. Clicked "Join chat"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "What I expected | מה ציפיתי שיקרה"
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: "What happened | מה קרה בפועל"
+      description: "Any error text, exactly as shown. A screenshot helps (crop out names and messages). | טקסט שגיאה כמו שהופיע. צילום מסך עוזר (בלי שמות והודעות)."
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: "Operating system | מערכת הפעלה"
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (.deb)
+        - Linux (AppImage)
+        - Other | אחר
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "MVS version | גרסת MVS"
+      description: "Settings → About. | הגדרות → אודות."
+      placeholder: "0.5.0"
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: "Diagnostics file | קובץ אבחון"
+      description: |
+        Settings → Diagnostics → "Export diagnostics", then drag the saved file here. It has no message text, recovery words, date of birth or IP addresses.
+        הגדרות → אבחון → "ייצוא קובץ אבחון", ואז לגרור לכאן את הקובץ שנשמר. אין בו תוכן הודעות, מילות שחזור, תאריך לידה או כתובות IP.
+      placeholder: "Drag the diagnostics file here. | לגרור לכאן את קובץ האבחון."
+    validations:
+      required: false
+  - type: checkboxes
+    id: safe
+    attributes:
+      label: "Before sending | לפני השליחה"
+      options:
+        - label: "I did not include my 12 recovery words or any password. | לא כתבתי את 12 מילות השחזור או סיסמה."
+          required: true

@@ -399,6 +399,21 @@ async function joinViaUi() {
   });
   await notice.locator('button.primary').click();
   joinedAt = Date.now();
+  // Diagnostic (QA, 2026-11-26): every change of each peer connection's state
+  // for 120 s after OK, so a slow or second-attempt setup shows when it happens.
+  {
+    let last = '';
+    const poll = setInterval(async () => {
+      const s = await page
+        .evaluate(() =>
+          (window.__pcs ?? []).map((pc, i) => `${i}:${pc.connectionState}/${pc.iceConnectionState}/${pc.signalingState}/${pc.localDescription?.type ?? '-'}/${pc.remoteDescription?.type ?? '-'}`).join(' '),
+        )
+        .catch(() => 'n/a');
+      if (s !== last) log(`setup +${((Date.now() - joinedAt) / 1000).toFixed(1)} s: ${s || 'no peer connection'}`);
+      last = s;
+    }, 1000);
+    setTimeout(() => clearInterval(poll), 120_000).unref?.();
+  }
   await check('V6.3', 'after OK: joined, the notice is remembered, focus on Mute', async () => {
     await page.locator('.call-bar').waitFor({ timeout: 15_000 });
     const key = await page.evaluate(() => localStorage.getItem('mvs.notices.voiceIp.v2'));

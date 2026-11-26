@@ -535,6 +535,16 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `'untrusted'`: it opens only under a rotation authority doesn't accept (#21). It has **no `authorId`** and no `sendState`, and it's never a reply target.
   - `react`, `editMessage` and `deleteMessage` on a placeholder give `bad-request`.
   - An edit that doesn't open leaves the original text shown (with no `editedAt`); the message is a placeholder only when the original doesn't open either.
+- Re-seals (LM-2, the SL's and the TL's decision): a sender who sealed a message before applying someone's Join re-sends it, so the joiner can read it.
+  - **What gets re-sent:** my own messages that don't reach that Join, with `ts ≥ Join.ts − 60 s`, that I sent at most 10 min before I applied the Join, in a channel the joiner reads now, and that I never edited or deleted.
+  - **The form:** a `MessageEdit` with the same text and the original's `ts`. It's sealed for the current readers once the join re-key covers the joiner.
+  - **Limits:** at most 50 per channel per Join, and 100 a minute.
+  - **Never re-sent:** to a joiner removed meanwhile, or anything from before that window (D30).
+  - Display, for every core from this one on:
+    - **A reader who can open both the original and the edit:** `editedAt` is absent when the texts are equal, so there's no "edited" label, no `message.updated` and no second unread. With a different text it's an ordinary edit, even when its `ts` equals the original's.
+    - **A reader who can't open the original (the joiner):** the edit's text shows in the message's place. `editedAt` is absent when the edit's `ts` equals the original's. Unread and mentions count once, as for a new message.
+    - Older cores show a re-seal as an ordinary edit with the same text, perhaps labelled "edited".
+  - A message whose latest edit carries its own `ts` isn't pruned (B6-p), and neither are its same-`ts` edits, so readers can compare the texts.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):

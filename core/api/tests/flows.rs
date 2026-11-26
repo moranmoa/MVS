@@ -1915,6 +1915,8 @@ fn join_re_keys_spend_a_token_bucket() {
     let world = World::new();
     let (owner, server, channel) = keyed_server(&world, "Bucket");
     owner.core.send_message(&channel, "before anyone joined", None).unwrap();
+    // Over LM-2's 60 s slack: never re-sealed for a joiner.
+    advance(&world, 61_000);
 
     // A burst of 3: each re-keyed at once, each can write at once.
     let mut first = Vec::new();
@@ -2005,6 +2007,189 @@ fn a_message_sent_while_the_join_re_key_is_in_flight_reaches_the_joiner() {
     let bodies: Vec<String> =
         b.core.get_messages(&channel, 0, 9).unwrap().messages.into_iter().map(|m| m.body).collect();
     assert!(bodies.iter().any(|m| m == "pre a"), "B misses A's message: {bodies:?}");
+}
+
+fn shown_messages(peer: &Peer, channel: &str) -> Vec<Message> {
+    peer.core.sync_now().unwrap();
+    peer.core.get_messages(channel, 0, 200).unwrap().messages
+}
+
+fn edits_in(world: &World, server: &ServerSummary) -> usize {
+    world.network.fetch(server_key(server)).iter().filter(|r| r.kind() == Kind::MessageEdit).count()
+}
+
+/// LM-2 (QA's LAN first-message P1): two join at once and the owner writes
+/// before either Join reached it, so the message is sealed without them,
+/// and no hold (#517) fires. Once the owner applies the Joins, it re-seals
+/// that message for them: same text, the original's `ts`, no "edited",
+/// unread once. One re-seal covers both. The owner sees no change.
+#[test]
+fn a_message_sent_before_a_join_arrived_is_re_sealed_for_the_joiner() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Reseal");
+    owner.core.send_message(&channel, "before anyone joined", None).unwrap();
+    advance(&world, 120_000);
+    let a = joiner(&world, &server, "A");
+    let b = joiner(&world, &server, "B");
+    // The owner writes before it has seen either Join.
+    owner.core.send_message(&channel, "pre o", None).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 1, "one re-seal, for both joiners");
+    for peer in [&a, &b] {
+        let shown = shown_messages(peer, &channel);
+        let pre = shown.iter().find(|m| m.body == "pre o").expect("the joiner never got it");
+        assert_eq!(pre.edited_at, None, "a re-seal shows no \"edited\"");
+        // Pre-join history stays closed (D30).
+        assert!(!shown.iter().any(|m| m.body == "before anyone joined"));
+        let general = peer.core.list_channels(&server.id).unwrap().remove(0);
+        assert_eq!(general.unread_count, Some(1), "unread once");
+    }
+    // The owner sees its own message as before: not "edited".
+    let mine = shown_messages(&owner, &channel);
+    assert_eq!(mine.iter().find(|m| m.body == "pre o").unwrap().edited_at, None);
+    // Nothing more on the next rounds.
+    advance(&world, 1000);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 1);
+}
+
+/// LM-2, the D30 bound (SL): an honest Join gets only messages from at
+/// most 60 s before it; older ones, though they don't reach the Join, stay
+/// closed. A message I edited before seeing the Join isn't re-sealed (TL).
+#[test]
+fn only_untouched_messages_from_just_before_a_join_are_re_sealed() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Window");
+    owner.core.send_message(&channel, "61 s before", None).unwrap();
+    advance(&world, 61_000);
+    let edited = owner.core.send_message(&channel, "typo", None).unwrap();
+    owner.core.edit_message(&edited.id, "fixed").unwrap();
+    let a = joiner(&world, &server, "A");
+    owner.core.send_message(&channel, "just after", None).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    let bodies: Vec<String> = shown_messages(&a, &channel).into_iter().map(|m| m.body).collect();
+    assert!(bodies.iter().any(|m| m == "just after"), "{bodies:?}");
+    assert!(!bodies.iter().any(|m| m == "61 s before" || m == "fixed" || m == "typo"), "{bodies:?}");
+    // The real edit, plus one re-seal.
+    assert_eq!(edits_in(&world, &server), 2);
+}
+
+/// LM-2: a backdated `Join.ts` still gets nothing I sent more than 10 min
+/// before I applied the Join (SL).
+#[test]
+fn a_backdated_join_gets_at_most_ten_minutes() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Backdated");
+    let start = *world.clock.0.lock().unwrap();
+    owner.core.send_message(&channel, "eleven minutes ago", None).unwrap();
+    advance(&world, 11 * 60_000);
+    owner.core.send_message(&channel, "recent", None).unwrap();
+    let now = *world.clock.0.lock().unwrap();
+    // The joiner's clock says it joined back then.
+    *world.clock.0.lock().unwrap() = start;
+    let a = joiner(&world, &server, "A");
+    *world.clock.0.lock().unwrap() = now + 100;
+    owner.core.sync_now().unwrap();
+    let bodies: Vec<String> = shown_messages(&a, &channel).into_iter().map(|m| m.body).collect();
+    assert!(bodies.iter().any(|m| m == "recent"), "{bodies:?}");
+    assert!(!bodies.iter().any(|m| m == "eleven minutes ago"), "{bodies:?}");
+}
+
+/// LM-2: a member who could already read the message sees no change from
+/// its re-seal: no "edited", no `message.updated`, no second unread.
+#[test]
+fn a_reader_of_the_original_sees_no_change_from_its_re_seal() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Quiet");
+    let b = joiner(&world, &server, "B");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    b.core.sync_now().unwrap();
+    let a = joiner(&world, &server, "A");
+    owner.core.send_message(&channel, "pre o", None).unwrap();
+    let before = shown_messages(&b, &channel);
+    assert_eq!(before.iter().find(|m| m.body == "pre o").unwrap().edited_at, None);
+    let unread = b.core.list_channels(&server.id).unwrap().remove(0).unread_count;
+    b.events.take();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 1);
+    let after = shown_messages(&b, &channel);
+    assert_eq!(after.iter().find(|m| m.body == "pre o").unwrap().edited_at, None);
+    assert_eq!(b.core.list_channels(&server.id).unwrap().remove(0).unread_count, unread);
+    let updated = b.events.take().into_iter().any(|e| matches!(&e, Event::MessageUpdated(m) if m.body == "pre o"));
+    assert!(!updated, "a re-seal announced a change to a reader of the original");
+    assert!(shown_messages(&a, &channel).iter().any(|m| m.body == "pre o"));
+}
+
+/// LM-2: a joiner who is gone again by the time I apply the Join (here a
+/// leave; a kick is the same) gets nothing re-sealed.
+#[test]
+fn a_joiner_removed_meanwhile_gets_no_re_seal() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Gone");
+    let a = joiner(&world, &server, "A");
+    owner.core.send_message(&channel, "pre o", None).unwrap();
+    a.core.leave_server(&server.id).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 0);
+}
+
+/// LM-2 caps: at most 50 re-seals per channel per Join.
+#[test]
+fn re_seals_are_capped_per_channel() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Caps");
+    let a = joiner(&world, &server, "A");
+    for i in 0..55 {
+        owner.core.send_message(&channel, &format!("burst {i}"), None).unwrap();
+    }
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 50);
+    let got = shown_messages(&a, &channel).iter().filter(|m| m.body.starts_with("burst")).count();
+    assert_eq!(got, 50);
+}
+
+/// SL on LM-2: the `ts` marker alone never hides a changed text from a
+/// reader who had the original. An edit by the author that carries the
+/// original's `ts` but other text shows as "edited".
+#[test]
+fn an_edit_with_the_original_ts_and_new_text_is_still_edited() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Marker");
+    let b = joiner(&world, &server, "B");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    b.core.sync_now().unwrap();
+    let sent = owner.core.send_message(&channel, "original", None).unwrap();
+    let ts = sent.created_at;
+    // Wind the clock back until an edit is signed at exactly that `ts`.
+    let mut text = None;
+    for back in (0..20u64).rev() {
+        *world.clock.0.lock().unwrap() = ts - 1 - back;
+        let body = format!("rewritten {back}");
+        owner.core.edit_message(&sent.id, &body).unwrap();
+        let exact = world
+            .network
+            .fetch(server_key(&server))
+            .iter()
+            .any(|r| r.kind() == Kind::MessageEdit && r.ts() == ts);
+        if exact {
+            text = Some(body);
+            break;
+        }
+    }
+    let text = text.expect("no edit landed on the original's ts");
+    let shown = shown_messages(&b, &channel);
+    let m = shown.iter().find(|m| m.id == sent.id).unwrap();
+    assert_eq!(m.body, text);
+    assert_eq!(m.edited_at, Some(ts), "a changed text with the original's ts hid \"edited\"");
 }
 
 /// The wait for a join re-key is bounded: with no moderator online, a
@@ -6075,6 +6260,8 @@ fn a_message_the_joiner_cant_open_is_a_placeholder_in_place() {
     let world = World::new();
     let (owner, server, channel) = keyed_server(&world, "Placeholder");
     owner.core.send_message(&channel, "before B joined", None).unwrap();
+    // Over LM-2's 60 s slack: never re-sealed for a joiner.
+    advance(&world, 61_000);
     let a = joiner(&world, &server, "A");
     advance(&world, 100);
     owner.core.sync_now().unwrap();

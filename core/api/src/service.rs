@@ -398,6 +398,15 @@ struct Inner {
     /// Who was missing then: a new joiner (someone not in that set) starts
     /// a wait of its own (dev-identity on #517).
     join_key_wait: HashMap<(ServerId, ChannelId), (BTreeSet<PublicKey>, u64)>,
+    /// LM-2: accepted Joins of others this process has applied, and what
+    /// it re-sealed for each ([`Inner::reseal_for_joins`]). No plain text:
+    /// the text is re-read from the log when sealing.
+    reseal: HashMap<(ServerId, RecordId), Reseal>,
+    /// LM-2: Joins whose re-seal window is over (bounded: cleared when
+    /// full; a cleared Join only finds messages it already covers).
+    reseal_done: HashSet<RecordId>,
+    /// LM-2: when my last re-seals went out (ms), for the per-author rate.
+    reseal_sent: std::collections::VecDeque<u64>,
     /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
     /// once every member posts the cap, so it comes again if it reopens.
     adult_keys_warned: HashSet<ServerId>,
@@ -408,6 +417,32 @@ struct Inner {
 }
 
 /// A message held for its channel key (`Core::send_message`).
+/// LM-2: one accepted Join of someone else, as this core handles it.
+struct Reseal {
+    /// When this core first applied it (ms, my clock).
+    applied_at: u64,
+    /// Who joined.
+    joiner: PublicKey,
+    /// My messages already re-sealed for it.
+    sealed: HashSet<RecordId>,
+    /// Re-seals per channel, against [`RESEAL_PER_CHANNEL`].
+    per_channel: HashMap<ChannelId, usize>,
+}
+
+/// LM-2 (SL and TL): a message is re-sealed for a joiner only if its `ts`
+/// is at most this long before the Join's `ts`: an honest joiner sees
+/// about this much of propagation slack, never older history (D30).
+const RESEAL_BEFORE_JOIN_MS: u64 = 60_000;
+/// LM-2: and only if I sent it at most this long before I applied the
+/// Join: a backdated `Join.ts` exposes at most this much.
+const RESEAL_SENT_WITHIN_MS: u64 = 600_000;
+/// LM-2: at most this many re-seals per channel per Join.
+const RESEAL_PER_CHANNEL: usize = 50;
+/// LM-2: at most this many re-seals a minute, all Joins together.
+const RESEAL_PER_MINUTE: usize = 100;
+/// LM-2: finished Joins remembered before the set starts over.
+const RESEAL_DONE_MAX: usize = 4096;
+
 struct KeyPending {
     /// Provisional, `pending-` + 16 random hex: never a record ID.
     id: String,
@@ -645,6 +680,9 @@ impl Core {
             report_store_cap: MAX_STORED_REPORTS,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
+            reseal: HashMap::new(),
+            reseal_done: HashSet::new(),
+            reseal_sent: std::collections::VecDeque::new(),
             adult_keys_warned: HashSet::new(),
             update_needed: BTreeSet::new(),
         };
@@ -2886,7 +2924,11 @@ impl Core {
             // the round; the next one retries.
             let _ = inner.prune_reports(ports.clock.now_ms());
             // Messages held for their key: sent now if it came.
-            inner.send_key_pending(ports, events)
+            inner.send_key_pending(ports, events)?;
+            // LM-2: my recent messages a new member's Join didn't reach,
+            // re-sealed for them. Never fails the round.
+            inner.reseal_for_joins(ports);
+            Ok(())
         })
     }
 
@@ -4550,6 +4592,170 @@ impl Inner {
                 extra -= usize::from(drop);
                 !drop
             });
+        }
+        Ok(())
+    }
+
+    /// LM-2 (SL and TL, lan-first-message P1): a message I sealed before
+    /// I applied someone's Join never reaches them: they weren't a reader,
+    /// and no rotation ever gives them that epoch (D30). So, for each
+    /// accepted Join of X, I re-seal my own messages that:
+    /// - don't reach the Join (it isn't in their `auth_deps`' past);
+    /// - have `ts ≥ Join.ts − 60 s`, and I sent them at most 10 min before
+    ///   I applied the Join (a backdated Join gets at most that);
+    /// - are in a channel X reads now (18+: adults), and that I never
+    ///   edited (bar earlier re-seals) or deleted.
+    ///
+    /// Each is a `MessageEdit` with the same text and the original's `ts`,
+    /// sealed for the current readers only once the join re-key covers X,
+    /// never by rotating past a removal. A Join of someone no longer a
+    /// member re-seals nothing. At most 50 per channel per Join and 100 a
+    /// minute. The text is read back from my log; nothing is held, and no
+    /// text or key is logged.
+    fn reseal_for_joins(&mut self, ports: &Ports) {
+        let Some(me) = self.me.as_ref().map(Me::key) else { return };
+        let now = ports.clock.now_ms();
+        let servers = match self.db.servers() {
+            Ok(servers) => servers,
+            Err(_) => return,
+        };
+        for server in servers {
+            if let Err(e) = self.reseal_server(ports, server, me, now) {
+                tracing::debug!(target: "mvs::keys", code = ?e.code, "re-seal for a join skipped this round");
+            }
+        }
+        let over: Vec<(ServerId, RecordId)> = self
+            .reseal
+            .iter()
+            .filter(|(_, r)| now.saturating_sub(r.applied_at) >= RESEAL_SENT_WITHIN_MS)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in over {
+            self.reseal.remove(&key);
+            if self.reseal_done.len() >= RESEAL_DONE_MAX {
+                self.reseal_done.clear();
+            }
+            self.reseal_done.insert(key.1);
+        }
+    }
+
+    fn reseal_server(&mut self, ports: &Ports, server: ServerId, me: PublicKey, now: u64) -> CoreResult<()> {
+        self.load(server)?;
+        let view = self.view(server)?;
+        if !view.state.is_member(me) || view.is_kicked(&me) || view.state.closed.is_some() {
+            return Ok(());
+        }
+        let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+        let joins: Vec<(RecordId, PublicKey, u64)> = log
+            .records
+            .iter()
+            .filter(|r| r.kind() == Kind::Join && r.author() != me && view.state.accepted.contains(&r.id()))
+            .filter(|r| !self.reseal_done.contains(&r.id()))
+            .map(|r| (r.id(), r.author(), r.ts()))
+            .collect();
+        // Every Join first, so one re-seal can count for all it covers.
+        for (join, joiner, _) in &joins {
+            self.reseal.entry((server, *join)).or_insert_with(|| Reseal {
+                applied_at: now,
+                joiner: *joiner,
+                sealed: HashSet::new(),
+                per_channel: HashMap::new(),
+            });
+        }
+        for (join, joiner, join_ts) in joins {
+            let entry = self.reseal.get(&(server, join)).ok_or(ErrorCode::Internal)?;
+            let applied_at = entry.applied_at;
+            let done = entry.sealed.clone();
+            let view = self.view(server)?;
+            // A concurrent removal of the joiner: nothing for them.
+            if !view.state.members.contains(&joiner) {
+                continue;
+            }
+            let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            // Edited (other than by a re-seal) or deleted: never re-sealed.
+            let mut touched: HashSet<RecordId> = HashSet::new();
+            let mine: HashMap<RecordId, u64> = log
+                .channel
+                .iter()
+                .filter(|r| r.kind() == Kind::Message && r.author() == me)
+                .map(|r| (r.id(), r.ts()))
+                .collect();
+            for r in &log.channel {
+                let Some(of) = chat::target(r) else { continue };
+                let Some(&ts) = mine.get(&of) else { continue };
+                let reseal = r.kind() == Kind::MessageEdit && r.author() == me && r.ts() == ts;
+                if !reseal && matches!(r.kind(), Kind::MessageEdit | Kind::MessageDelete) {
+                    touched.insert(of);
+                }
+            }
+            let mut by_channel: BTreeMap<ChannelId, Vec<(RecordId, u64)>> = BTreeMap::new();
+            for r in &log.channel {
+                let Scope::Channel(channel) = r.scope() else { continue };
+                let fits = r.kind() == Kind::Message
+                    && r.author() == me
+                    && r.ts() >= join_ts.saturating_sub(RESEAL_BEFORE_JOIN_MS)
+                    && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS
+                    && !done.contains(&r.id())
+                    && !touched.contains(&r.id())
+                    && !log.resolver.reaches(join, r.auth_deps());
+                if fits && channel_readers(&view, channel).contains(&joiner) {
+                    by_channel.entry(channel).or_default().push((r.id(), r.ts()));
+                }
+            }
+            for (channel, messages) in by_channel {
+                // Only once the join re-key covers them (#517's wait).
+                if self.waits_for_join_key(ports, server, channel)?
+                    || ports.cipher.missing_readers(server, channel).contains(&joiner)
+                {
+                    continue;
+                }
+                // Who a re-seal now reaches: every reader whose key is in
+                // place. One re-seal covers each such joiner's Join too.
+                let missing: HashSet<PublicKey> = ports.cipher.missing_readers(server, channel).into_iter().collect();
+                let covered: HashSet<PublicKey> =
+                    channel_readers(&self.view(server)?, channel).into_iter().filter(|r| !missing.contains(r)).collect();
+                let shown = self.shown(&*ports.cipher, server, channel)?;
+                for (target, ts) in messages {
+                    let entry = self.reseal.get(&(server, join)).ok_or(ErrorCode::Internal)?;
+                    if entry.per_channel.get(&channel).copied().unwrap_or(0) >= RESEAL_PER_CHANNEL {
+                        break;
+                    }
+                    while self.reseal_sent.front().is_some_and(|at| now.saturating_sub(*at) >= 60_000) {
+                        self.reseal_sent.pop_front();
+                    }
+                    if self.reseal_sent.len() >= RESEAL_PER_MINUTE {
+                        return Ok(());
+                    }
+                    let Some(text) = shown
+                        .iter()
+                        .find(|s| s.record.id() == target && !s.deleted && s.unreadable.is_none())
+                        .map(|s| Zeroizing::new(s.text.clone()))
+                    else {
+                        continue;
+                    };
+                    let sealed = self.seal_with(ports, server, channel, text.as_bytes(), false)?;
+                    let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+                    let seq = chat::channel_seq(log, channel, &me);
+                    let deps = chat::deps_with(log, channel, target);
+                    let auth = auth_deps(&self.view(server)?);
+                    let body = [target.as_bytes().as_slice(), &sealed].concat();
+                    let record = self.sign_channel(server, channel, seq, deps, auth, ts, Kind::MessageEdit, body)?;
+                    let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+                    if !chat::would_accept(log, &record) {
+                        continue;
+                    }
+                    self.store(server, record.clone())?;
+                    ports.network.publish(&record);
+                    self.reseal_sent.push_back(now);
+                    let entry = self.reseal.get_mut(&(server, join)).ok_or(ErrorCode::Internal)?;
+                    *entry.per_channel.entry(channel).or_default() += 1;
+                    for ((at, _), other) in self.reseal.iter_mut() {
+                        if *at == server && covered.contains(&other.joiner) {
+                            other.sealed.insert(target);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

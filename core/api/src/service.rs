@@ -4310,10 +4310,24 @@ impl Inner {
         // S5: the backup follows by itself (its fingerprint covers the
         // secret, so the next round writes it). Invites: see below.
         self.reissue_invites(ports, server, secret)?;
+        // A leaver this rotation left out needs no timer any more.
+        let recipients = opened.recipients.clone();
+        self.forget_leaves_seen(server, |leaver| !recipients.contains(leaver))?;
         events.push(Event::ServerUpdated(self.counted_summary(&*ports.cipher, server)?));
         let me = self.me.as_ref().map(Me::key);
         if me.is_some_and(|me| self.view(server).is_ok_and(|v| v.state.role(me) >= authority::Role::Admin)) {
             events.push(Event::Notice { kind: NoticeKind::InvitesReissued, server_id: model::hex_id(server.as_bytes()) });
+        }
+        Ok(())
+    }
+
+    /// T17: drops the leave-seen time of each accepted Leave in `server`
+    /// whose author `forget` picks (no longer a recipient, or everyone on a
+    /// purge), so the rows don't outlive their use.
+    fn forget_leaves_seen(&self, server: ServerId, forget: impl Fn(&PublicKey) -> bool) -> CoreResult<()> {
+        let Some(log) = self.logs.get(&server) else { return Ok(()) };
+        for leave in log.records.iter().filter(|r| r.kind() == records::Kind::Leave && forget(&r.author())) {
+            self.db.delete(&leave_seen_key(server, leave.id()))?;
         }
         Ok(())
     }
@@ -4419,6 +4433,8 @@ impl Inner {
             // When this core first saw each accepted Leave, kept in kv: the
             // record's own `ts` is the leaver's to set, and a future one
             // would keep every admin waiting for good (Tech Lead on #630).
+            // It is first written on a round with writing on, so after the
+            // write flip the day counts from then: later, never sooner.
             let first_seen = |leave: RecordId| -> CoreResult<u64> {
                 let key = leave_seen_key(server, leave);
                 if let Some(at) = self.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes) {
@@ -5992,6 +6008,8 @@ impl Inner {
         let required = (reason == RemovedReason::Age)
             .then(|| self.view(server).ok().map(|v| v.genesis.age_restriction))
             .flatten();
+        // T17: the leave-seen times go with the server (TL and SL on #630).
+        self.forget_leaves_seen(server, |_| true)?;
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
         // Held text goes with the server (lost-message P1, SL C3).

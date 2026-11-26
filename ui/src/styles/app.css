@@ -218,7 +218,10 @@ button:disabled {
 
 .field input,
 .field select,
-.field textarea {
+.field textarea,
+/* Fields outside a .field label: the G-14 topic and G-92 invite inputs (UX on #549). */
+.topic-field,
+.join-paste-row input {
   font-weight: 400;
   font-size: 1rem;
   padding: 0.625rem 0.75rem;
@@ -229,6 +232,8 @@ button:disabled {
 }
 
 .field input[aria-invalid],
+.topic-field[aria-invalid],
+.join-paste-row input[aria-invalid],
 .word-inputs input[aria-invalid] {
   border-color: var(--danger);
   background: var(--danger-soft);
@@ -2171,6 +2176,18 @@ kbd {
   overflow: auto;
   white-space: pre-wrap;
   font-weight: 400;
+}
+
+/* #622: a required update ended the call; the restart button when staged. */
+.call-ended-update {
+  max-inline-size: min(36rem, calc(100vw - 2rem));
+}
+
+.call-ended-update button {
+  flex: none;
+  border-color: currentColor;
+  background: transparent;
+  color: inherit;
 }
 
 .toast-close {

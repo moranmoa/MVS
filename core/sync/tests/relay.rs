@@ -12,6 +12,7 @@ use libp2p::{
     PeerId, StreamProtocol, SwarmBuilder,
 };
 use records::{ChannelId, Draft, Kind, RecordId, Scope, ServerId, SigningKey};
+use sync::netstats::{NetPath, NetPurpose};
 use sync::{
     log_name, AcceptAll, Access, ControlLog, Node, NodeConfig, NodeEvent, ReadGate, Record, ReportError, ServerSecret, TypingError,
     VoiceCall, VoiceError, VoiceFrame, VoicePath,
@@ -231,6 +232,12 @@ async fn a_peer_coming_online_catches_up_within_30_s_of_its_reservation() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     eprintln!("caught up 50 messages {:?} after the reservation", reserved.elapsed());
+    // NC-1: B's pulls were answered over our relay's circuit, and counted.
+    let stats = b.net_stats();
+    assert!(
+        stats.paths.iter().any(|(p, path, n)| *p == NetPurpose::Sync && *path == NetPath::OurRelay && *n > 0),
+        "{stats:?}"
+    );
     assert_eq!(b.state(&log).await.unwrap().hash, a.state(&log).await.unwrap().hash);
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
@@ -838,6 +845,10 @@ async fn call_participants_exchange_voice_frames_relayed_and_on_a_lan() {
         let (_, paths) = voice_media(&mut ea, Duration::from_millis(200)).await;
         let want = if lan { VoicePath::Lan } else { VoicePath::Circuit };
         assert_eq!(paths.last(), Some(&want), "paths reported: {paths:?}");
+        // NC-1: the call's media path is counted.
+        let counted = if lan { NetPath::DirectLan } else { NetPath::OurRelay };
+        let stats = a.net_stats();
+        assert!(stats.paths.iter().any(|(p, path, _)| *p == NetPurpose::Call && *path == counted), "{stats:?}");
         if !lan {
             assert!(a.direct_peers().await.unwrap().is_empty(), "the relayed run went direct");
         }
@@ -1052,6 +1063,39 @@ async fn a_senders_restart_mid_call_is_heard_at_once() {
     let start = Instant::now();
     voice_until_flowing(&a, &mut eb, 9, 1).await;
     assert!(start.elapsed() < Duration::from_secs(2), "the restart went unheard for {:?}", start.elapsed());
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// Required update (#577 RU1): a quiet node signs, syncs and serves nothing
+/// for the rest of the process. It drops its member peers, closes any new
+/// connection at once (so a reachable quiet node answers nothing), and
+/// appends nothing of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_node_takes_and_serves_nothing() {
+    let (relay, _relay) = voice_relay();
+    let a = bound_node("quiet-a", &relay, 60, true, Arc::new(AcceptAll)).await;
+    let b = bound_node("quiet-b", &relay, 61, true, Arc::new(AcceptAll)).await;
+    voice_meet(&a, &b, voice_id(60), voice_id(61), false).await;
+    a.set_quiet().unwrap();
+    let start = Instant::now();
+    while a.peers().await.unwrap().contains(&b.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(20), "the quiet node kept its member peer");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // B keeps trying (discovery, pulls): nothing sticks.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(!a.peers().await.unwrap().contains(&b.peer_id()), "a quiet node took a connection");
+    assert!(a.append(messages(1).remove(0)).await.is_err(), "a quiet node appended a record");
+    // Nothing signed goes to the relay's mailboxes, or to a member (SL on #593).
+    assert!(a.put_backup(vec![1; 64]).await.is_err(), "a quiet node put a backup");
+    assert!(a.put_notice(vec![1; 64]).await.is_err(), "a quiet node put a notice");
+    assert!(a.report_send(voice_id(61), vec![1; 64]).await.is_err(), "a quiet node sent a report");
+    // A record B writes never reaches A.
+    b.append(messages(2).remove(0)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let log = log_name(test_server().0, Scope::Channel(test_server().1));
+    assert!(a.heads(&log).await.unwrap_or_default().is_empty(), "a quiet node took a record");
     a.shutdown().await.unwrap();
     b.shutdown().await.unwrap();
 }

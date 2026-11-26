@@ -45,9 +45,26 @@ jobs:
           workspaces: core
       - run: cargo test --release --locked
         working-directory: core
+      # The shipped code as release.yml builds it: no test targets, so no
+      # dev-dependency features (sync's `test-util`), which `cargo test` turns
+      # on for every crate and so hides code that only compiles with them.
+      # Every workspace binary (mvs-core, mvs-launcher, ...) built, then the
+      # same code linted.
+      - name: build as shipped (no test features)
+        run: |
+          cargo build --release --locked --workspace
+          cargo clippy --workspace --locked -- -D warnings
+        working-directory: core
+      # Tests that need a test-only hook (feature `test-hooks`, never in a
+      # release build): G-48 report receiver, T17 secret rotation.
+      - name: api test hooks
+        run: cargo test --release --locked -p api --features test-hooks --test reports --test secret_rotation
+        working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p api --all-targets --locked --features test-hooks -- -D warnings
         working-directory: core
 
   updater-windows:
@@ -110,24 +127,16 @@ jobs:
         run: |
           git clone --quiet --depth 1 https://github.com/rustsec/advisory-db "$RUNNER_TEMP/advisory-db"
           python3 .github/scripts/check-vendored-advisories.py "$RUNNER_TEMP/advisory-db"
-
-  advisories:
-    # Informational for now: the open advisories are all in libp2p 0.54's
-    # tree (see the PR that added this). Make it blocking after the upgrade.
-    name: security advisories (non-blocking)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - name: Install cargo-deny (checksum verified)
-        run: .github/scripts/install-cargo-deny.sh
-      - name: core
+      # B10: RustSec advisories block, here in the required licence job (the
+      # old informational "security advisories (non-blocking)" job is gone).
+      # A vulnerability is fixed; an unmaintained-only notice may be listed in
+      # core/deny.toml with its reason. The relay too: it has public listeners
+      # (RUSTSEC-2026-0525, a remote panic in libp2p-quic, was only caught by
+      # hand), and it runs even if core fails.
+      - name: advisories (core)
+        if: always()
         run: cargo-deny --manifest-path core/Cargo.toml --config core/deny.toml check advisories
-      # The relay too: it has public listeners (e.g. RUSTSEC-2026-0525, a remote
-      # panic in libp2p-quic, was only caught by hand). Runs even if core fails.
-      - name: relay
+      - name: advisories (relay)
         if: always()
         run: cargo-deny --manifest-path infra/relay/Cargo.toml --config core/deny.toml check advisories
 
@@ -357,6 +366,15 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npx playwright test --project=smoke
+      # A flaky failure (e.g. channels.spec rename) needs its trace: keep the
+      # Playwright results (traces, screenshots, page snapshots) when it fails.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: qa-smoke-test-results
+          path: qa/test-results
+          retention-days: 7
+          if-no-files-found: warn
 
   relay-image:
     name: relay image build

@@ -7,7 +7,7 @@ import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
-import { useCore, useCoreEvent, type Id, type JoinStatus } from '../../core';
+import { isCoreError, useCore, useCoreEvent, type Id, type JoinStatus } from '../../core';
 import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
@@ -19,6 +19,8 @@ import { ChannelSidebar } from './ChannelSidebar';
 import { ChatView } from './ChatView';
 import { CreateServerDialog, Home, JoinDialog } from './Home';
 import { MemberList } from './MemberList';
+import { OPEN_REPORTS, useReportNotifications } from './reportsState';
+import { ReportsDialog } from './Reports';
 import { MEMBER_SEARCH_ID } from './MemberSearch';
 import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
@@ -39,6 +41,8 @@ export function Shell() {
   const servers = useStore(store, (s) => s.servers);
   const notice = useStore(store, (s) => s.notice);
   const updateNote = useStore(store, (s) => s.updateNote);
+  const callEndedForUpdate = useStore(store, (s) => s.callEndedForUpdate);
+  const staged = useStore(store, (s) => s.update);
   const flash = useStore(store, (s) => s.flash);
   const settingsRequest = useStore(store, (s) => s.settingsRequest);
   const serverGone = useStore(store, (s) => s.serverGone);
@@ -159,6 +163,13 @@ export function Shell() {
     return () => clearTimeout(t);
   }, [notice, store]);
 
+  // #622: "your call ended for the update" shows for 8 s.
+  useEffect(() => {
+    if (!callEndedForUpdate) return;
+    const t = setTimeout(() => store.clearCallEndedForUpdate(), 8000);
+    return () => clearTimeout(t);
+  }, [callEndedForUpdate, store]);
+
   // Update notes stay until closed when there are release notes to read.
   useEffect(() => {
     if (!updateNote || (updateNote.kind === 'installed' && updateNote.notes)) return;
@@ -246,6 +257,16 @@ export function Shell() {
     locate().then(open, () => open(null));
   });
   // G-61: a click on a desktop notification opens its channel.
+  // G-48: a report that reaches me as staff (no reason or content in it).
+  useReportNotifications();
+  // G-48 (TL on #531): Reports for staff, admins included (they have no settings gear).
+  const [reportsFor, setReportsFor] = useState<Id | null>(null);
+  useEffect(() => {
+    const open = (e: Event) => setReportsFor((e as CustomEvent<Id>).detail);
+    window.addEventListener(OPEN_REPORTS, open);
+    return () => window.removeEventListener(OPEN_REPORTS, open);
+  }, []);
+  const reportsServer = reportsFor ? servers.find((s) => s.id === reportsFor) : undefined;
   useDesktopNotifications(settingsOpen || (phone && phoneView === 'nav') ? null : (channelId ?? null), (sid, cid) => {
     setSettingsOpen(false);
     setServerId(sid);
@@ -415,6 +436,7 @@ export function Shell() {
           setServerId(id);
         }}
       />
+      <ReportsDialog server={reportsServer ?? null} onClose={() => setReportsFor(null)} />
       <JoinDialog
         open={dialog === 'join'}
         initialLink={invite}
@@ -457,6 +479,24 @@ export function Shell() {
       {/* Toasts stack in one column, so two at once never overlap. */}
       <DeviceNotices />
       <div className="toasts">
+        {callEndedForUpdate && (
+          <div className="toast call-ended-update" role="alert" key={callEndedForUpdate}>
+            <AlertIcon />
+            <span>
+              <FormattedMessage id="update.required.callEnded" />
+            </span>
+            {/* Already staged: the same restart as the rail pill and #604's banner button. */}
+            {staged && (
+              <button
+                type="button"
+                className="secondary small"
+                onClick={() => core.restartToUpdate().catch((e) => isCoreError(e) && store.updateRefused(e.code))}
+              >
+                <FormattedMessage id="server.syncUpdateNeeded.restart" />
+              </button>
+            )}
+          </div>
+        )}
         {serverGone && (
           <div className="toast" role="status" key={serverGone.at}>
             <FormattedMessage id={`server.gone.${serverGone.reason}`} values={{ name: serverGone.name }} />

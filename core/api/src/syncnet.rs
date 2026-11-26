@@ -132,6 +132,8 @@ pub struct SyncNetwork {
     voice: Mutex<Option<Receiver<VoiceSignal>>>,
     /// G-29: typing signals, as voice.
     typing: Mutex<Option<Receiver<VoiceSignal>>>,
+    /// G-81: voice frames and paths, until `deliver_media` takes them.
+    media: Mutex<Option<Receiver<Media>>>,
     /// G-48: report boxes, as voice.
     reports: Mutex<Option<Receiver<VoiceSignal>>>,
     /// T8-02: invite publications members pushed, until the core takes them.
@@ -239,6 +241,9 @@ impl SyncNetwork {
         let waker = hint.clone();
         let (voice_tx, voice) = std::sync::mpsc::sync_channel(VOICE_QUEUE);
         let (typing_tx, typing) = std::sync::mpsc::sync_channel(TYPING_QUEUE);
+        // G-81: voice frames and paths, for `deliver_media` (bounded; a full
+        // queue drops a frame: late audio is useless).
+        let (media_tx, media) = std::sync::mpsc::sync_channel(MEDIA_QUEUE);
         let (report_tx, reports) = std::sync::mpsc::sync_channel(REPORT_QUEUE);
         // G-48: boxes go straight to this queue, acked only once in it.
         node.set_report_sink(report_tx.clone())?;
@@ -260,6 +265,14 @@ impl SyncNetwork {
                     }
                     // Voice: from a verified current member (sync checked);
                     // the core checks the envelope.
+                    NodeEvent::VoiceFrame { from, frame } => {
+                        let _ = media_tx.try_send(Media::Frame(from, frame));
+                        false
+                    }
+                    NodeEvent::VoicePath { identity, path } => {
+                        let _ = media_tx.try_send(Media::Path(identity, path));
+                        false
+                    }
                     NodeEvent::VoiceSignal { from, bytes } => {
                         let _ = voice_tx.try_send((from, bytes));
                         false
@@ -315,6 +328,7 @@ impl SyncNetwork {
             waker,
             voice: Mutex::new(Some(voice)),
             typing: Mutex::new(Some(typing)),
+            media: Mutex::new(Some(media)),
             reports: Mutex::new(Some(reports)),
             invite_pushes,
             link_inbox,
@@ -380,6 +394,33 @@ impl SyncNetwork {
             .filter_map(|s| Record::decode(&s.bytes).ok())
             .filter(|r| log_of(r) == log)
             .collect()
+    }
+}
+
+/// G-81: what the node says about voice media.
+pub enum Media {
+    Frame(PublicKey, sync::VoiceFrame),
+    Path(PublicKey, sync::VoicePath),
+}
+
+/// G-81: frames and paths waiting for the core; frames past it are dropped.
+const MEDIA_QUEUE: usize = 256;
+
+impl SyncNetwork {
+    /// G-81: the frames and paths for [`deliver_media`] (once; `None` after).
+    pub fn take_media(&self) -> Option<Receiver<Media>> {
+        self.media.lock().expect("not poisoned").take()
+    }
+}
+
+/// G-81: hands each voice frame and path change to the core until the node
+/// stops. Its own thread, so frames never wait behind a command.
+pub fn deliver_media(media: Receiver<Media>, core: &Core) {
+    for item in media {
+        match item {
+            Media::Frame(from, frame) => core.voice_media_frame(from, frame),
+            Media::Path(peer, path) => core.voice_media_path(peer, path),
+        }
     }
 }
 
@@ -453,9 +494,54 @@ impl VoiceNet for SyncNetwork {
             tracing::debug!(%e, "voice signal not sent");
         }
     }
+
+    /// G-81: never waits; the node drops it when its queue is full.
+    fn media_frame(&self, frame: sync::VoiceFrame) {
+        self.node.voice_frame(frame);
+    }
+
+    fn set_media_call(&self, call: Option<sync::VoiceCall>) {
+        let _ = self.node.set_voice_call(call);
+    }
 }
 
 impl Network for SyncNetwork {
+    /// NC-1 (a): the node's counters, a cheap copy (atomics; this runs
+    /// under the core lock, TL on #620), in the file's typed vocabulary.
+    fn net_counters(&self) -> crate::netdiag::RawCounters {
+        use crate::netdiag::{NetPath, NetPurpose, Reachability};
+        use sync::netstats as s;
+        let snap = self.node.net_stats();
+        let paths = snap
+            .paths
+            .into_iter()
+            .map(|(purpose, path, n)| {
+                let purpose = match purpose {
+                    s::NetPurpose::Join => NetPurpose::Join,
+                    s::NetPurpose::Sync => NetPurpose::Sync,
+                    s::NetPurpose::Call => NetPurpose::Call,
+                };
+                let path = match path {
+                    s::NetPath::DirectLan => NetPath::DirectLan,
+                    s::NetPath::DirectHolepunch => NetPath::DirectHolepunch,
+                    s::NetPath::DirectPublic => NetPath::DirectPublic,
+                    s::NetPath::OurRelay => NetPath::OurRelay,
+                    s::NetPath::MemberRelay => NetPath::MemberRelay,
+                    s::NetPath::None => NetPath::None,
+                };
+                (purpose, path, n)
+            })
+            .collect();
+        let reachability = match snap.reachability {
+            s::NetReach::Unknown => Reachability::Unknown,
+            s::NetReach::Public => Reachability::Public,
+            s::NetReach::PortMapped => Reachability::PortMapped,
+            s::NetReach::Nat => Reachability::Nat,
+            s::NetReach::CgnatLikely => Reachability::CgnatLikely,
+        };
+        crate::netdiag::RawCounters { paths, reachability }
+    }
+
     fn link_counts(&self) -> Option<(usize, usize)> {
         let peers = self.runtime.block_on(self.node.peers()).ok()?.len();
         Some((peers, self.direct_peers().len()))
@@ -464,6 +550,13 @@ impl Network for SyncNetwork {
     fn set_relay_only(&self, on: bool) {
         if let Err(e) = self.node.set_relay_only(on) {
             tracing::warn!(%e, "relay-only not applied");
+        }
+    }
+
+    /// RU1: the node takes, serves and sends nothing from now on (one-way).
+    fn set_quiet(&self) {
+        if let Err(e) = self.node.set_quiet() {
+            tracing::warn!(%e, "quiet not applied");
         }
     }
 

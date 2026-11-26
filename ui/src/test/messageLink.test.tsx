@@ -75,6 +75,10 @@ describe('the link format', () => {
 async function setup(core = new MockCore({ demo: true, speed: 0, simulateActivity: false })) {
   render(<App core={core} initialSettings={en} />);
   await screen.findByRole('textbox', { name: /^Message / });
+  // The composer can be in the DOM before Shell's effects ran, and Shell
+  // subscribes to `link.message` in an effect: a link emitted in that gap had
+  // no listener and was dropped (the flake under load). Flush them first.
+  await act(async () => {});
   const servers = await core.listServers();
   return { core, servers };
 }

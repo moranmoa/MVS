@@ -397,6 +397,7 @@ enum Command {
     ListenAddrs { reply: oneshot::Sender<Vec<Multiaddr>> },
     RelayOnly { on: bool },
     NoDirectDials,
+    Quiet,
     NoHolePunch,
     MemberRelay { on: bool, daily_cap_mb: u32, preferred: bool },
     #[cfg(test)]
@@ -434,6 +435,34 @@ enum Command {
     LinkFind { rv: [u8; 32], reply: oneshot::Sender<Result<PeerId, LinkError>> },
     LinkRequest { peer: PeerId, request: crate::device_link::Request, reply: LinkReply },
     Shutdown { reply: oneshot::Sender<()> },
+}
+
+impl Command {
+    /// Quiet (RU1, SL on #593): what still runs. Reading local state, and
+    /// local-only changes; never anything that signs, sends, dials or
+    /// subscribes. Everything else is dropped, so its caller fails.
+    fn quiet_ok(&self) -> bool {
+        // A test-only variant: naming it unconditionally inside `matches!`
+        // breaks every build without `test-util` (release, desktop).
+        #[cfg(any(test, feature = "test-util"))]
+        if matches!(self, Command::MemberRelayCounts { .. }) {
+            return true;
+        }
+        matches!(
+            self,
+            Command::Heads { .. }
+                | Command::State { .. }
+                | Command::Presence { .. }
+                | Command::Peers { .. }
+                | Command::DirectPeers { .. }
+                | Command::ListenAddrs { .. }
+                | Command::Prune { .. }
+                | Command::DropInvite { .. }
+                | Command::DropServerInvites { .. }
+                | Command::ReportSink { .. }
+                | Command::Quiet
+        )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -693,6 +722,8 @@ pub struct Node {
     commands: mpsc::UnboundedSender<Command>,
     /// G-81: frames to send, bounded; full drops the frame (`voice_frame`).
     voice_frames: mpsc::Sender<VoiceFrame>,
+    /// NC-1: success counts by path, read without a round-trip.
+    stats: Arc<crate::netstats::NetStats>,
 }
 
 impl Node {
@@ -791,6 +822,7 @@ impl Node {
         let (voice_frames, voice_frame_rx) = mpsc::channel(VOICE_FRAMES_IN);
         let (voice_in_tx, voice_in_rx) = mpsc::channel(VOICE_READ_QUEUE);
         let link_peers = swarm.behaviour().guard.link_peers.clone();
+        let stats = Arc::new(crate::netstats::NetStats::default());
         let mut task = Task {
             swarm,
             store,
@@ -835,6 +867,7 @@ impl Node {
             fallback_at: HashMap::new(),
             fallback_done: HashSet::new(),
             direct_dials: true,
+            quiet: false,
             listen: listen.clone(),
             port_file,
             listener,
@@ -912,6 +945,8 @@ impl Node {
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
+            stats: stats.clone(),
+            holepunched: HashSet::new(),
         };
         // A relay-only start keeps no member addresses either (Security Lead).
         if task.relay_only {
@@ -921,7 +956,13 @@ impl Node {
             task.open(log, None);
         }
         tokio::spawn(task.run(command_rx, answer_rx, decoded_rx, beacon_rx, voice_frame_rx));
-        Ok((Node { peer_id, commands, voice_frames }, event_rx))
+        Ok((Node { peer_id, commands, voice_frames, stats }, event_rx))
+    }
+
+    /// NC-1: how operations succeeded so far, by path, and how others can
+    /// reach us. A cheap copy (atomics), never a round-trip to the task.
+    pub fn net_stats(&self) -> crate::netstats::NetStatsSnapshot {
+        self.stats.snapshot()
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -1316,6 +1357,14 @@ impl Node {
         }
     }
 
+    /// Required update (#577 RU1): from now on, for the rest of the process,
+    /// this node signs, syncs and serves nothing (one-way). Only the
+    /// connection to our relays is kept; every other one is closed, and any
+    /// new one closes as soon as it is up.
+    pub fn set_quiet(&self) -> Result<()> {
+        self.send(Command::Quiet)
+    }
+
     fn send(&self, command: Command) -> Result<()> {
         self.commands.send(command).ok().context("node has stopped")
     }
@@ -1515,6 +1564,10 @@ type Answer = (PeerId, ResponseChannel<SyncResponse>, SyncResponse, usize, Vec<R
 type Decoded = ((PeerId, String), Vec<Incoming>, bool, Vec<RecordId>);
 
 struct Task {
+    /// NC-1: success counts by path (shared with the handle).
+    stats: Arc<crate::netstats::NetStats>,
+    /// NC-1: connections a DCUtR hole punch opened (bounded at 1024).
+    holepunched: HashSet<ConnectionId>,
     swarm: Swarm<Behaviour>,
     store: Store,
     /// Read-only connection used by blocking threads to answer pulls.
@@ -1595,6 +1648,11 @@ struct Task {
     /// Tests: our own direct dials can be switched off (stands in for a
     /// firewall), to show the other side's turn.
     direct_dials: bool,
+    /// Required update (#577 RU1): quiet for the rest of the process. No
+    /// connection but our relays' is kept (any new one closes at once, so a
+    /// reachable quiet node answers nothing), no gossip in or out, no pulls,
+    /// no dials, no member relay, no beacon.
+    quiet: bool,
     /// The direct listener (`NodeConfig::listen`), removed while relay-only.
     listen: Multiaddr,
     listener: Option<ListenerId>,
@@ -1809,6 +1867,9 @@ impl Task {
                         let _ = reply.send(());
                         return;
                     }
+                    // Quiet (RU1): nothing but shutting down; a dropped reply
+                    // makes its caller fail (no put, send or fetch goes out).
+                    Some(command) if self.quiet && !command.quiet_ok() => drop(command),
                     Some(command) => self.on_command(command),
                     None => return,
                 },
@@ -1824,6 +1885,9 @@ impl Task {
                 Some(frame) = voice_frame_rx.recv() => self.voice_out_frame(frame),
                 Some((identity, connection, frame)) = self.voice_in_rx.recv() => self.voice_in_frame(identity, connection, frame),
                 _ = soon.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     // T24: send what the outgoing rate held back.
                     let waiting: Vec<PeerId> = self.queued_pulls.keys().copied().collect();
                     for peer in waiting {
@@ -1844,6 +1908,9 @@ impl Task {
                     self.went_offline(gone);
                 }
                 _ = anti_entropy.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     self.pending.expire(Instant::now(), PENDING_TTL);
                     // T23 state outlives a disconnect (a reset relay circuit
                     // must not make us re-probe everything), so it expires here.
@@ -1853,6 +1920,9 @@ impl Task {
                     self.pull_all("round");
                 }
                 _ = discovery.tick() => {
+                    if self.quiet {
+                        continue;
+                    }
                     self.discover();
                     self.member_relay_fallback();
                     self.redial_remembered();
@@ -1987,6 +2057,7 @@ impl Task {
             }
             Command::RelayOnly { on } => self.set_relay_only(on),
             Command::NoDirectDials => self.direct_dials = false,
+            Command::Quiet => self.go_quiet(),
             Command::NoHolePunch => self.swarm.behaviour_mut().punch.set_enabled(false),
             Command::MemberRelay { on, daily_cap_mb, preferred } => {
                 // Relay-only users never relay (design §1), whatever the core says.
@@ -2033,6 +2104,9 @@ impl Task {
     }
 
     fn append_local(&mut self, record: Record) -> Result<()> {
+        if self.quiet {
+            bail!("quiet: a required update is pending");
+        }
         let log = log_of(&record);
         if !self.logs.contains(&log) {
             bail!("log {log} is not open");
@@ -2086,6 +2160,9 @@ impl Task {
     }
 
     fn discover(&mut self) {
+        if self.quiet {
+            return;
+        }
         let mut any = false;
         for i in 0..self.relays.len() {
             let peer = self.relays[i].peer;
@@ -2738,6 +2815,9 @@ impl Task {
     /// Sends our beacon when due. With more open servers than slots, they
     /// take turns.
     fn lan_beacon_tick(&mut self) {
+        if self.quiet {
+            return;
+        }
         let now = Instant::now();
         if !self.beacon_on() || now < self.beacon_next {
             return;
@@ -3097,6 +3177,9 @@ impl Task {
     }
 
     fn pull(&mut self, peer: PeerId, log: &str, cause: &'static str) {
+        if self.quiet {
+            return;
+        }
         let key = (peer, log.to_string());
         // T23 on every path (round, queue, again, more…): a control log an
         // unbound peer answered empty lately isn't asked for again.
@@ -3221,6 +3304,21 @@ impl Task {
     }
 
     fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+        // Required update: any new connection but our relays' closes at once.
+        if self.quiet {
+            if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } = &event {
+                if !self.is_our_relay(peer_id) {
+                    self.swarm.close_connection(*connection_id);
+                    return;
+                }
+            }
+            // No protocol event is acted on (SL on #593): a request, even
+            // over our relays' connections, is dropped unanswered (its
+            // stream closes), and no answer of ours leaves.
+            if let SwarmEvent::Behaviour(_) = &event {
+                return;
+            }
+        }
         // G-81: each connection's kind, for choosing voice paths.
         match &event {
             SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. } => {
@@ -3230,6 +3328,7 @@ impl Task {
             }
             SwarmEvent::ConnectionClosed { connection_id, .. } => {
                 self.voice_conns.remove(connection_id);
+                self.holepunched.remove(connection_id);
                 self.voice_dirty = true;
             }
             _ => {}
@@ -3337,6 +3436,28 @@ impl Task {
                 self.queued_pulls.remove(&peer_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                // NC-1: how others reach us, from where they see us.
+                let observed = info.observed_addr.iter().find_map(|p| match p {
+                    Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+                    Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+                    _ => None,
+                });
+                if let Some(observed) = observed.filter(|ip| !ip.is_loopback()) {
+                    let listening: Vec<std::net::IpAddr> = self
+                        .swarm
+                        .listeners()
+                        .filter_map(|a| {
+                            a.iter().find_map(|p| match p {
+                                Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+                                Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+                    if let Some(reach) = crate::netstats::reach_of(observed, &listening) {
+                        self.stats.set_reach(reach);
+                    }
+                }
                 if let Some(i) = self.relays.iter().position(|r| r.peer == peer_id) {
                     // Relay circuit as a fallback for peers that can't reach us
                     // directly (NAT). On a LAN the direct address wins.
@@ -3533,11 +3654,13 @@ impl Task {
                     acceptance,
                 );
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message { peer, message, .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message { peer, connection_id, message })) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => self.on_request(peer, request, channel),
                     request_response::Message::Response { request_id, response } => {
                         if let Some(key) = self.inflight.remove(&request_id) {
+                            // NC-1: a pull answered, on this connection's path.
+                            self.stats.add(crate::netstats::NetPurpose::Sync, self.stat_path(connection_id));
                             self.on_response(key, response);
                             self.pull_next(peer);
                         }
@@ -3590,12 +3713,14 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::InvitePub(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "invite publication not delivered"),
-            SwarmEvent::Behaviour(BehaviourEvent::InviteAsk(request_response::Event::Message { peer, message, .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::InviteAsk(request_response::Event::Message { peer, connection_id, message })) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => {
                         self.on_invite_ask(peer, request, channel)
                     }
                     request_response::Message::Response { request_id, response } => {
+                        // NC-1: a join's invite fetch answered.
+                        self.stats.add(crate::netstats::NetPurpose::Join, self.stat_path(connection_id));
                         self.on_invite_answer(request_id, Some(response))
                     }
                 }
@@ -3698,7 +3823,13 @@ impl Task {
                 // flips the link to direct and parks the relayed one (#206).
                 // A failure leaves the relayed connection as it is.
                 match result {
-                    Ok(_) => info!(peer = %remote_peer_id, "hole punch succeeded"),
+                    Ok(id) => {
+                        info!(peer = %remote_peer_id, "hole punch succeeded");
+                        // NC-1: its connection counts as hole-punched (bounded).
+                        if self.holepunched.len() < 1024 {
+                            self.holepunched.insert(id);
+                        }
+                    }
                     Err(err) => debug!(peer = %remote_peer_id, %err, "hole punch failed: staying relayed"),
                 }
             }
@@ -3723,6 +3854,11 @@ impl Task {
     /// read-only connection. Dropping the channel fails the request on the
     /// other side.
     fn on_request(&mut self, peer: PeerId, request: SyncRequest, channel: ResponseChannel<SyncResponse>) {
+        if self.quiet {
+            // Refused: dropping the channel closes the stream unanswered.
+            drop((peer, request, channel));
+            return;
+        }
         #[cfg(test)]
         {
             self.pulls_received += 1;
@@ -3855,6 +3991,9 @@ impl Task {
     /// stops it here (and counts against the sender once peer scoring is on);
     /// Ignore neither forwards nor blames (a duplicate, or not judgeable yet).
     fn on_gossip(&mut self, from: PeerId, message: &gossipsub::Message) -> MessageAcceptance {
+        if self.quiet {
+            return MessageAcceptance::Ignore;
+        }
         let record = match check_pushed(&self.logs, &self.sealing, message) {
             Ok(record) => record,
             Err(Refuse::Ignore) => return MessageAcceptance::Ignore,
@@ -4807,6 +4946,19 @@ impl Task {
         }
     }
 
+    /// NC-1: the path of an open connection, for the counters.
+    fn stat_path(&self, connection: ConnectionId) -> crate::netstats::NetPath {
+        use crate::netstats::NetPath;
+        match self.voice_conns.get(&connection) {
+            Some(VoicePath::Lan) => NetPath::DirectLan,
+            Some(VoicePath::Direct) if self.holepunched.contains(&connection) => NetPath::DirectHolepunch,
+            Some(VoicePath::Direct) => NetPath::DirectPublic,
+            Some(VoicePath::Circuit) => NetPath::OurRelay,
+            Some(VoicePath::MemberCircuit) => NetPath::MemberRelay,
+            Some(VoicePath::None) | None => NetPath::None,
+        }
+    }
+
     /// Whether voice may use `connection` now: it is open, and relay-only
     /// (SL B5) allows only our circuits.
     fn voice_allowed(&self, connection: ConnectionId) -> bool {
@@ -4881,6 +5033,10 @@ impl Task {
             if self.voice_paths.get(&identity) != Some(&path) {
                 self.voice_paths.insert(identity, path);
                 self.emit(NodeEvent::VoicePath { identity, path });
+                // NC-1: a call peer's media on a new path.
+                if let Some((_, conn, _)) = route {
+                    self.stats.add(crate::netstats::NetPurpose::Call, self.stat_path(conn));
+                }
             }
             let current_ok = self
                 .voice_out
@@ -5083,6 +5239,34 @@ impl Task {
         // circuit): reopen now, not at the next tick (TL nit 7).
         if reroute {
             self.voice_reroute();
+        }
+    }
+}
+
+impl Task {
+    /// Required update (#577 RU1, one-way): stop relaying for members, the
+    /// beacon and voice; close every connection but our relays'. From here
+    /// on the gates in `on_swarm_event`, `on_request`, `on_gossip`,
+    /// `append_local`, `pull`, `discover` and the beacon tick keep it quiet.
+    ///
+    /// Why our relays' connections stay (TL on #593): dropping them would
+    /// only start the reconnect and backoff loop (`relay_lost`) for nothing.
+    /// They carry nothing while quiet: any circuit a peer opens to us
+    /// arrives as a new connection, which closes at once; and we offer no
+    /// reservation to anyone, since the member relay is stopped (its gates
+    /// close, so a reservation request finds no hop protocol).
+    fn go_quiet(&mut self) {
+        if self.quiet {
+            return;
+        }
+        info!("sync: quiet (a required update is pending)");
+        self.quiet = true;
+        self.swarm.behaviour_mut().member_relay.stop();
+        self.beacon = None;
+        self.set_voice_call(None);
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().filter(|p| !self.is_our_relay(p)).collect();
+        for peer in peers {
+            let _ = self.swarm.disconnect_peer_id(peer);
         }
     }
 }

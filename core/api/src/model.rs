@@ -198,11 +198,22 @@ pub(crate) const ADULT_KEYS_CAP: &str = "adult-keys-v1";
 /// records. Older cores refuse an unknown kind and stall the control log
 /// behind it, so nobody sets either until every member posts this.
 pub(crate) const SERVER_META_CAP: &str = "server-meta-v1";
+/// The first level (Tech Lead on #590 and #609): this version decodes every
+/// kind up to level 1, which is every code up to 26: `SecretRotation` (25,
+/// T17) and `ServerAgeLimit` (26, G-52). A gate checks `lv >= k`. The next
+/// release that adds a kind posts `lv:2` and adds its row to
+/// [`LEVEL_MAX_KIND`].
+pub(crate) const LEVEL_CAP: &str = "lv:1";
+/// Each level and the highest kind code it promises to decode. The last row
+/// is the level this version posts (`LEVEL_CAP`); a test holds it to what
+/// `records` decodes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LEVEL_MAX_KIND: [(u32, u16); 1] = [(1, 26)];
 /// Every cap this version posts, and the only names `getUpdateNeeded`
 /// takes. Frozen after server-meta-v1: later gates use one `lv:N` cap
 /// (Tech Lead on #555).
-pub(crate) const CAPS: [&str; 5] =
-    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP];
+pub(crate) const CAPS: [&str; 6] =
+    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP, LEVEL_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {
@@ -902,6 +913,26 @@ fn admin_cache() -> &'static std::sync::Mutex<HashMap<RecordId, bool>> {
 mod tests {
     use super::*;
 
+    /// The profile post's size budget (manager, 0.6.0): a 32-emoji name, the
+    /// largest picture, a colour and every cap fit one `Post` with at least
+    /// 256 bytes to spare for the caps of later releases (`lv:N`).
+    #[test]
+    fn a_full_profile_leaves_headroom_in_one_post() {
+        let picture = format!(
+            "data:image/webp;base64,{}",
+            "A".repeat(crate::avatar::AVATAR_SMALL_MAX.div_ceil(3) * 4)
+        );
+        let name = "🙂".repeat(32);
+        let Action::Post { text } = profile_action_with(&name, Some(&picture), Some("#ffffff")) else {
+            unreachable!("a profile is a post")
+        };
+        for cap in CAPS {
+            assert!(text.contains(cap), "every cap is posted");
+        }
+        let room = records::Kind::Post.max_body() - text.len();
+        assert!(room >= 256, "only {room} bytes left for later caps");
+    }
+
     /// G-24: `<@64 lower-case hex>` tokens, in order, each once; anything
     /// else (short, upper-case, unclosed, a name) isn't a mention.
     #[test]
@@ -1065,13 +1096,28 @@ mod tests {
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
     }
 
+    /// Tech Lead on #609: the posted level promises exactly what this core
+    /// decodes: every kind code up to the level's max decodes, and no code
+    /// above it does.
+    #[test]
+    fn the_posted_level_matches_what_this_core_decodes() {
+        let (level, max) = *LEVEL_MAX_KIND.last().expect("a level");
+        assert_eq!(LEVEL_CAP, format!("lv:{level}"), "LEVEL_CAP is the last row");
+        assert!(LEVEL_MAX_KIND.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        for code in 1..=max {
+            assert!(records::Kind::from_code(code).is_some(), "code {code} is promised by lv:{level}");
+        }
+        let highest = (1..=u16::MAX).filter(|c| records::Kind::from_code(*c).is_some()).max();
+        assert_eq!(highest, Some(max), "a new kind needs a new level");
+    }
+
     /// Every cap is posted once (Tech Lead on #555): a merge that loses a
     /// line of `CAPS`, or doubles one, fails here.
     #[test]
     fn every_cap_is_posted_once() {
         let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();
         assert_eq!(unique.len(), CAPS.len(), "a cap twice");
-        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP] {
+        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP, LEVEL_CAP] {
             assert!(CAPS.contains(&cap), "{cap} missing");
         }
     }

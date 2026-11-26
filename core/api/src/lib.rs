@@ -22,6 +22,7 @@ mod dispatch;
 mod gate;
 pub mod invite_link;
 mod model;
+pub mod netdiag;
 mod ports;
 pub mod reaction;
 // Member recovery: the pure parts first; the service wiring follows.

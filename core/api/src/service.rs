@@ -3027,12 +3027,16 @@ impl Core {
     pub fn export_diagnostics(&self) -> CoreResult<String> {
         let info = self.get_app_info()?;
         let inner = self.lock();
+        // NC-1 (QA's conditions): testers attach this file to public issues.
+        // Counts and a fixed vocabulary only; times to the minute, storage
+        // to the MiB.
         let report = serde_json::json!({
             "app": info,
-            "exportedAtMs": self.ports.clock.now_ms(),
+            "exportedAtMs": crate::netdiag::rounded_time(self.ports.clock.now_ms()),
             "hasIdentity": inner.me.is_some(),
+            "network": crate::netdiag::network_json(&self.ports.network.net_counters()),
             "servers": inner.db.servers()?.len(),
-            "storageBytes": inner.db.size_bytes()?,
+            "storageBytes": crate::netdiag::rounded_storage(inner.db.size_bytes()?),
         });
         Ok(serde_json::to_string_pretty(&report).expect("json value"))
     }

@@ -47,6 +47,16 @@ fn secret_key(server: ServerId) -> String {
     format!("server-secret/{}", hex::encode(server.as_bytes()))
 }
 
+/// T17: the sync secret a rotation replaced, kept until a time.
+fn previous_secret_key(server: ServerId) -> String {
+    format!("server-secret-previous/{}", hex::encode(server.as_bytes()))
+}
+
+const PREVIOUS_SECRET_AD: &[u8] = b"mvs/api/server-secret-previous/v1";
+
+/// T17: a replaced sync secret, kept until a time (ms).
+pub(crate) type KeptSecret = (Zeroizing<[u8; 32]>, u64);
+
 /// T8-02: a short link's invite key k, per invite (S4: sealed like the
 /// server secret).
 fn invite_key_key(server: ServerId, invite: RecordId) -> String {
@@ -182,6 +192,68 @@ impl Db {
         );
         let secret: [u8; 32] = plain.as_slice().try_into().map_err(|_| internal("secret size"))?;
         Ok(Some(Zeroizing::new(secret)))
+    }
+
+    /// T17 (Security Lead T17-W1, Tech Lead on #609): every secret a
+    /// rotation replaced that is still within its keep, for reading the old
+    /// secrets' frozen prefixes. Adds `secret` until `until_ms`, drops the
+    /// entries whose time has passed at `now_ms`, and seals the list as one,
+    /// bound to the server by the AD. Entry: `until u64 LE` ‖ secret.
+    pub fn save_previous_server_secret(
+        &self,
+        key: &[u8; 32],
+        server: ServerId,
+        secret: &[u8; 32],
+        until_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), CoreError> {
+        let mut kept = self.load_previous_server_secrets(key, server)?;
+        kept.retain(|(_, until)| *until > now_ms);
+        kept.push((Zeroizing::new(*secret), until_ms));
+        let mut plain = Zeroizing::new(Vec::with_capacity(kept.len() * 40));
+        for (secret, until) in &kept {
+            plain.extend_from_slice(&until.to_le_bytes());
+            plain.extend_from_slice(secret.as_ref());
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = [PREVIOUS_SECRET_AD, server.as_bytes().as_slice()].concat();
+        let sealed = XChaCha20Poly1305::new(key.into())
+            .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain.as_slice(), aad: &aad })
+            .map_err(internal)?;
+        self.set(&previous_secret_key(server), &[nonce.as_slice(), &sealed].concat())
+    }
+
+    /// The kept previous secrets, oldest first, each with until when
+    /// (expired or not: the caller compares with its clock). Read by sync's
+    /// frozen-prefix step (T17 S3/S4, next).
+    pub fn load_previous_server_secrets(
+        &self,
+        key: &[u8; 32],
+        server: ServerId,
+    ) -> Result<Vec<KeptSecret>, CoreError> {
+        let Some(blob) = self.get(&previous_secret_key(server))? else { return Ok(Vec::new()) };
+        if blob.len() < NONCE_LEN {
+            return Err(internal("short previous secrets"));
+        }
+        let (nonce, sealed) = blob.split_at(NONCE_LEN);
+        let aad = [PREVIOUS_SECRET_AD, server.as_bytes().as_slice()].concat();
+        let plain = Zeroizing::new(
+            XChaCha20Poly1305::new(key.into())
+                .decrypt(XNonce::from_slice(nonce), Payload { msg: sealed, aad: &aad })
+                .map_err(internal)?,
+        );
+        if plain.len() % 40 != 0 {
+            return Err(internal("previous secrets size"));
+        }
+        Ok(plain
+            .chunks_exact(40)
+            .map(|entry| {
+                let (until, secret) = entry.split_at(8);
+                let until = u64::from_le_bytes(until.try_into().expect("8 bytes"));
+                (Zeroizing::new(secret.try_into().expect("32 bytes")), until)
+            })
+            .collect())
     }
 
     /// T8-02 (S4): a short link's invite key, sealed with the identity's
@@ -598,6 +670,30 @@ mod tests {
     use super::*;
     use authority::Action;
     use records::SigningKey;
+
+    /// T17 (Tech Lead on #609): every replaced secret within its keep
+    /// stays; past ones go at the next save; the list opens with its server
+    /// only, and any tampering fails it.
+    #[test]
+    fn previous_secrets_are_kept_until_their_time_and_sealed_to_the_server() {
+        let db = Db::open(None).unwrap();
+        let (key, server, other) = ([1; 32], ServerId::from_bytes([2; 32]), ServerId::from_bytes([3; 32]));
+        assert!(db.load_previous_server_secrets(&key, server).unwrap().is_empty());
+        db.save_previous_server_secret(&key, server, &[9; 32], 1_000, 0).unwrap();
+        db.save_previous_server_secret(&key, server, &[8; 32], 2_000, 500).unwrap();
+        let kept: Vec<([u8; 32], u64)> =
+            db.load_previous_server_secrets(&key, server).unwrap().into_iter().map(|(s, u)| (*s, u)).collect();
+        assert_eq!(kept, [([9; 32], 1_000), ([8; 32], 2_000)], "both within their keep");
+        db.save_previous_server_secret(&key, server, &[7; 32], 3_000, 1_500).unwrap();
+        let kept: Vec<u64> = db.load_previous_server_secrets(&key, server).unwrap().into_iter().map(|(_, u)| u).collect();
+        assert_eq!(kept, [2_000, 3_000], "the first one's time passed");
+        assert!(db.load_previous_server_secrets(&key, other).unwrap().is_empty());
+        let mut blob = db.get(&previous_secret_key(server)).unwrap().unwrap();
+        let last = blob.len() - 1;
+        blob[last] ^= 1;
+        db.set(&previous_secret_key(server), &blob).unwrap();
+        assert!(db.load_previous_server_secrets(&key, server).is_err());
+    }
 
     /// A closed server's last purge keeps exactly the records asked for
     /// (its genesis and close); a leave keeps none. The tombstone stays.

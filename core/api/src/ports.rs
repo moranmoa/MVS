@@ -619,6 +619,29 @@ pub trait GroupCipher: Send + Sync {
         Err(CipherError::Unavailable)
     }
 
+    /// T17: seals a fresh sync secret for `recipients` (the members now,
+    /// minus the removed: SL S2) as the part bodies of one secret rotation,
+    /// each to be signed in its own `SecretRotation` record. `epoch` 0 has
+    /// no `prev`; each later one names the rotation it replaces.
+    fn seal_secret(
+        &self,
+        server: ServerId,
+        epoch: u64,
+        prev: Option<records::RecordId>,
+        recipients: &BTreeSet<PublicKey>,
+    ) -> Result<SealedSecret, CipherError> {
+        let _ = (server, epoch, prev, recipients);
+        Err(CipherError::Unavailable)
+    }
+
+    /// T17: assembles one secret rotation from all its part records (one
+    /// author, every part, no gaps: else `Err`) and opens my box, if I have
+    /// one. Never logs or returns the secret but in [`OpenedSecret`].
+    fn open_secret(&self, server: ServerId, parts: &[Record]) -> Result<OpenedSecret, CipherError> {
+        let _ = (server, parts);
+        Err(CipherError::Unavailable)
+    }
+
     /// The `KeyRotation` records of `server` that authority accepts now
     /// (deny by default: only these can become a channel's key).
     fn set_accepted(&self, server: ServerId, accepted: &BTreeSet<records::RecordId>) {
@@ -686,6 +709,32 @@ pub struct Opened {
     /// False: sealed under a rotation authority doesn't accept; show it as
     /// untrusted, never as a normal message.
     pub accepted: bool,
+}
+
+/// T17: a sealed secret rotation: the part bodies, in order, and the new
+/// secret (zeroized on drop).
+pub type SealedSecret = (Vec<Vec<u8>>, Zeroizing<[u8; 32]>);
+
+/// T17: one assembled secret rotation.
+pub struct OpenedSecret {
+    /// The rotation's ID (every part names it; a later one's `prev`).
+    pub rotation: records::RecordId,
+    pub epoch: u64,
+    /// Whom it was sealed for.
+    pub recipients: BTreeSet<PublicKey>,
+    /// Mine, if I'm a recipient. Never logged or put in an event.
+    pub secret: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for OpenedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedSecret")
+            .field("rotation", &self.rotation)
+            .field("epoch", &self.epoch)
+            .field("recipients", &self.recipients.len())
+            .field("secret", &self.secret.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

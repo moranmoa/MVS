@@ -463,3 +463,140 @@ fn twenty_a_day_per_server() {
     advance(&world, 24 * 60 * 60 * 1000);
     r.plain.core.report_content(&r.server.id, &target_message(&messages[20]), "spam", None).unwrap();
 }
+
+// ---- Receiver-side checks, with what a modified client would send ----------
+// (`Core::sealed_report_for_tests` signs as that member, with no sender-side
+// check; the Tech Lead's #515 follow-up.)
+
+#[cfg(feature = "test-hooks")]
+mod forged {
+use super::*;
+
+fn server_id(r: &Room) -> records::ServerId {
+    records::ServerId::from_bytes(hex::decode(&r.server.id).unwrap().try_into().unwrap())
+}
+
+fn now_ms(world: &World) -> u64 {
+    *world.clock.0.lock().unwrap()
+}
+
+/// A report by `from` about `target`, sealed to the owner.
+fn forged(
+    world: &World,
+    r: &Room,
+    from: (&Peer, &Identity),
+    target: api::report::Target,
+    evidence: Vec<u8>,
+    nonce: u8,
+) -> Vec<u8> {
+    let report = api::report::Report {
+        server: server_id(r),
+        reporter: key_of(&from.1.id),
+        target,
+        reason: api::report::Reason::Spam,
+        ts: now_ms(world),
+        nonce: [nonce; 16],
+        text: String::new(),
+        evidence,
+    };
+    from.0.core.sealed_report_for_tests(&report, key_of(&r.owner_id.id)).unwrap()
+}
+
+/// The signed record of `message` as the network holds it.
+fn record_of(world: &World, r: &Room, message: &Message) -> records::Record {
+    let id = hex::decode(&message.id).unwrap();
+    world.network.fetch(server_id(r)).into_iter().find(|x| x.id().as_bytes().as_slice() == id.as_slice()).unwrap()
+}
+
+/// The receiver keeps at most 10 an hour from one reporter, whatever the
+/// sender's own caps.
+#[test]
+fn the_receiver_takes_10_an_hour_per_reporter() {
+    let (world, r, _) = room();
+    let about_rude = api::report::Target::Member(key_of(&r.rude_id.id));
+    for n in 0..11 {
+        let sealed = forged(&world, &r, (&r.plain, &r.plain_id), about_rude, vec![], n);
+        r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &sealed);
+    }
+    assert_eq!(r.owner.core.list_reports(&r.server.id).unwrap().len(), 10, "the 11th within the hour is dropped");
+    advance(&world, 60 * 60 * 1000 + 1);
+    let later = forged(&world, &r, (&r.plain, &r.plain_id), about_rude, vec![], 11);
+    r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &later);
+    assert_eq!(r.owner.core.list_reports(&r.server.id).unwrap().len(), 11, "an hour later, taken");
+}
+
+/// A5: a member report about someone who was never in the server is
+/// dropped; so is a report about the receiver itself.
+#[test]
+fn a_stranger_or_myself_as_the_target_is_dropped() {
+    let (world, r, _) = room();
+    let from = (&r.plain, &r.plain_id);
+    let stranger = api::report::Target::Member(PublicKey::from_bytes([9; 32]));
+    let about_me = api::report::Target::Member(key_of(&r.owner_id.id));
+    for (n, target) in [stranger, about_me].into_iter().enumerate() {
+        let sealed = forged(&world, &r, from, target, vec![], n as u8);
+        r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &sealed);
+    }
+    assert!(received(&r.owner).is_empty());
+    assert!(r.owner.core.list_reports(&r.server.id).unwrap().is_empty());
+}
+
+/// A message report whose evidence is another record is stored, but its
+/// evidence is marked invalid and never served.
+#[test]
+fn invalid_evidence_is_kept_and_marked_invalid() {
+    let (world, r, message) = room();
+    let other = r.rude.core.send_message(&r.channel, "something else", None).unwrap();
+    r.sync_all();
+    let channel = records::ChannelId::from_bytes(hex::decode(&r.channel).unwrap().try_into().unwrap());
+    let target = api::report::Target::Message {
+        channel,
+        record: records::RecordId::from_bytes(hex::decode(&message.id).unwrap().try_into().unwrap()),
+    };
+    let wrong = record_of(&world, &r, &other).encode();
+    let sealed = forged(&world, &r, (&r.plain, &r.plain_id), target, wrong, 1);
+    r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &sealed);
+    let listed = r.owner.core.list_reports(&r.server.id).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].evidence_valid);
+    assert_eq!(r.owner.core.get_report_evidence(&listed[0].id).unwrap_err().code, ErrorCode::BadRequest);
+    // The right record: valid.
+    let right = record_of(&world, &r, &message).encode();
+    let sealed = forged(&world, &r, (&r.plain, &r.plain_id), target, right, 2);
+    r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &sealed);
+    let listed = r.owner.core.list_reports(&r.server.id).unwrap();
+    assert!(listed[0].evidence_valid, "newest first");
+    // Per-server storage: dismiss finds it by its stored ID.
+    r.owner.core.dismiss_report(&listed[1].id).unwrap();
+    assert!(r.owner.core.list_reports(&r.server.id).unwrap()[1].dismissed);
+}
+
+/// A server's store keeps at most its cap: the oldest dismissed report
+/// goes first, else the oldest (cap lowered for the test).
+#[test]
+fn the_store_evicts_dismissed_first_then_oldest() {
+    let (world, r, _) = room();
+    r.owner.core.set_report_store_cap_for_tests(3);
+    let about_rude = api::report::Target::Member(key_of(&r.rude_id.id));
+    let give = |n: u8| {
+        advance(&world, 60 * 60 * 1000 + 1); // under the receiver's 10/h
+        let sealed = forged(&world, &r, (&r.plain, &r.plain_id), about_rude, vec![], n);
+        r.owner.core.report_received(Some(key_of(&r.plain_id.id)), &sealed);
+    };
+    for n in 1..=3 {
+        give(n);
+    }
+    let ids = |r: &Room| -> Vec<String> {
+        r.owner.core.list_reports(&r.server.id).unwrap().into_iter().map(|x| x.id).collect()
+    };
+    let first = ids(&r); // newest first: [3, 2, 1]
+    r.owner.core.dismiss_report(&first[1]).unwrap(); // dismiss 2
+    give(4);
+    let after = ids(&r);
+    assert_eq!(after.len(), 3);
+    assert!(!after.contains(&first[1]), "the dismissed one went first");
+    give(5);
+    let last = ids(&r);
+    assert!(!last.contains(&first[2]), "then the oldest");
+}
+}

@@ -40,7 +40,7 @@ vocabulary!(
 );
 vocabulary!(
     /// How a connection reached the peer.
-    NetPath, PATHS: DirectLan = "direct-lan", DirectHolepunch = "direct-holepunch",
+    NetPath, PATHS: DirectLan = "direct-lan", DirectHolepunch = "direct-holepunch", DirectPublic = "direct-public",
     MemberRelay = "member-relay", OurRelay = "our-relay", None = "none",
 );
 vocabulary!(
@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(v["connections"]["join"]["total"], ">100");
         assert_eq!(
             v["connections"]["join"]["shares"],
-            json!({ "direct-lan": 0, "direct-holepunch": 0, "member-relay": 100, "our-relay": 0, "none": 0 })
+            json!({ "direct-lan": 0, "direct-holepunch": 0, "direct-public": 0, "member-relay": 100, "our-relay": 0, "none": 0 })
         );
         assert_eq!(v["reachability"], "cgnat-likely");
         let empty = network_json(&RawCounters::default());
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(v["connections"]["call"]["total"], "6-20");
         assert_eq!(
             v["connections"]["call"]["shares"],
-            json!({ "direct-lan": 70, "direct-holepunch": 20, "member-relay": 0, "our-relay": 10, "none": 0 })
+            json!({ "direct-lan": 70, "direct-holepunch": 20, "direct-public": 0, "member-relay": 0, "our-relay": 10, "none": 0 })
         );
     }
 
@@ -235,7 +235,7 @@ mod tests {
                 paths: (0..n)
                     .map(|_| {
                         let purpose = NetPurpose::ALL[(g.next() % 3) as usize];
-                        let path = NetPath::ALL[(g.next() % 5) as usize];
+                        let path = NetPath::ALL[(g.next() % NetPath::ALL.len() as u64) as usize];
                         let count = match g.next() % 4 {
                             0 => g.next() % 6,
                             1 => g.next() % 1_000,

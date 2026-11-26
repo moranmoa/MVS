@@ -242,3 +242,44 @@ fn owners_are_told_once_when_a_member_lacks_adult_keys() {
     assert!(owner.core.get_update_needed(&server.id, Some("adult-keys-v1")).unwrap().is_empty());
     assert!(!notices(&owner).contains(&NoticeKind::AdultKeysOutdated));
 }
+
+/// LM-2 (TL and SL on #619): a re-seal follows the channel's readers now.
+/// An adult and a minor join before the owner's messages reached them:
+/// both get the plain channel's message re-sealed, but in the 18+ channel
+/// only the adult does; the minor can't open that re-seal.
+#[test]
+fn a_minor_joiner_gets_no_re_seal_in_an_adult_channel() {
+    let world = World::new();
+    let (owner, _, _) = person(&world, "Owner", "1990-05-01");
+    let (adult, _, _) = person(&world, "Adult", "1990-05-01");
+    let (minor, minor_cipher, _) = person(&world, "Minor", "2009-06-01");
+    let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
+    let night = owner.core.create_channel(&server.id, "night", true).unwrap().id;
+    let lounge = owner.core.create_channel(&server.id, "lounge", false).unwrap().id;
+    for peer in [&adult, &minor] {
+        peer.core.join_server(&server.invite_link).unwrap();
+    }
+    // Written before the owner saw either Join.
+    owner.core.send_message(&night, "late", None).unwrap();
+    owner.core.send_message(&lounge, "hello all", None).unwrap();
+    owner.core.sync_now().unwrap();
+    let bodies = |peer: &Peer, channel: &str| -> Vec<String> {
+        peer.core.sync_now().unwrap();
+        peer.core.get_messages(channel, 0, 10).unwrap().messages.into_iter().map(|m| m.body).collect()
+    };
+    assert_eq!(bodies(&adult, &night), ["late"]);
+    assert_eq!(bodies(&adult, &lounge), ["hello all"]);
+    assert_eq!(bodies(&minor, &lounge), ["hello all"]);
+    let (server_key, night_key) = ids(&server, &night);
+    let reseals: Vec<Record> = world
+        .network
+        .fetch(server_key)
+        .into_iter()
+        .filter(|r| r.kind() == Kind::MessageEdit && r.scope() == Scope::Channel(night_key))
+        .collect();
+    assert!(!reseals.is_empty(), "no re-seal for the adult");
+    for edit in reseals {
+        let sealed = &edit.body()[32..];
+        assert!(minor_cipher.decrypt(server_key, night_key, edit.author(), sealed).is_err(), "the minor opened an 18+ re-seal");
+    }
+}

@@ -415,11 +415,25 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - They also go to my own identity, which reaches only my other computers (same recovery words). A hello or bye signed by me counts only when sync bound its sender to me and it has no `to`. It marks me "in a call elsewhere" until its bye or 30 s without a hello, and never appears in a roster. My own envelopes echoed back are replays.
     - A full call's refusal counts only if it comes from someone already in that call, within 10 s of joining.
   - `applyUpdate` answers `not-allowed` during a call.
+  - Voice media over libp2p (G-81 2a part c, #509 §2.3). The core carries Opus frames to the call's peers that the UI has no LAN WebRTC connection with:
+    - `CallState.callId`: 32 lower-case hex. It's random for each call I join, present only while I'm in one, and new on every join.
+    - `CallParticipant.path`: `'lan' | 'direct' | 'circuit' | 'member-circuit' | 'none'`, how my frames reach that participant now, as the node reports it. It's absent until the node reports one, and a change is a `call.state`. It's a display hint; the node picks routes, never the UI.
+    - `setCallWebrtcPeers({ identities: string[] })` returns `null`. It names the participants the UI has a live LAN WebRTC connection with, and the core sends frames to every other participant. The UI can only exclude peers, never add targets.
+      - At most 5 identities; more, or a malformed ID, is `bad-request`.
+      - It resets on every new call. A change is a `call.state`.
+    - `voiceFrame` is a sidecar line `{"cmd":"voiceFrame","args":{"callId","seq","ts","data"}}`. It has no `id` and never gets a reply, even with an `id`.
+      - The sidecar's reader routes it on an exact `cmd` match only (`VoiceFrame` or `voiceFrame ` are ordinary commands, so they get `bad-request`). It never waits for a command, and replies to commands keep their order.
+      - Strict: exactly those four fields. `callId` is 32 lower-case hex, `seq` and `ts` are u32, and `data` is standard base64 of at most 400 bytes (empty means a DTX gap); the length is checked before decoding.
+      - It's sent only while I'm in the call with that `callId`, the keys aren't locked and I'm not signed out. Anything else is dropped silently, counted, and never logged.
+      - The gate closes synchronously on leave and on a relay-only switch without `--voice-p2p`, before the node is told. So a frame that overtakes `leaveCall`, or comes after it, sends nothing.
+      - Lock, sign-out and a required update (RU1) shut it first and unconditionally, whether or not leaving the call succeeds. Until unlock, no frame passes either way and no call reopens it; after sign-out or RU1, not for the rest of the process.
+    - `voice.frame { callId, from, seq, ts, data }`: a frame from a participant of my current call (`data` as above). Frames of any other call are dropped.
+    - `mvs-core --voice-p2p` (no value; the shell's `voiceP2p` flag): while relay-only is on, `createVoiceRoom` and `joinCall` work, and switching relay-only on doesn't end my call. Media then runs over our relay circuits only, never direct or through a member relay. Without the flag, relay-only refuses calls as below.
 - Relay-only (GAP-6r), per device:
   - `setRelayOnly(on: boolean)` returns `null`. It's stored in the core database and needs no identity. On:
     - the network keeps no direct listener, makes no direct dials, and reaches peers only through relay circuits, and direct connections already open are closed (#274);
     - my call ends at once (a bye to the others, then a `call.state` with `participants: []` and `relayOnly: true`);
-    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off.
+    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off (not with `--voice-p2p`, above).
   - At start, `mvs-core` reads the stored value before the network starts, and the node starts relay-only from the first moment (`NodeConfig.relay_only`: no direct listener, no bootstrap dial, no punching). It fails closed: a database that can't be opened or read, or a value other than off, means on.
   - Shown up front:
     - `AppInfo.relayOnly` from `getAppInfo`;
@@ -535,6 +549,16 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `'untrusted'`: it opens only under a rotation authority doesn't accept (#21). It has **no `authorId`** and no `sendState`, and it's never a reply target.
   - `react`, `editMessage` and `deleteMessage` on a placeholder give `bad-request`.
   - An edit that doesn't open leaves the original text shown (with no `editedAt`); the message is a placeholder only when the original doesn't open either.
+- Re-seals (LM-2, the SL's and the TL's decision): a sender who sealed a message before applying someone's Join re-sends it, so the joiner can read it.
+  - **What gets re-sent:** my own messages that don't reach that Join, with `ts ≥ Join.ts − 60 s`, that I sent at most 10 min before I applied the Join, in a channel the joiner reads now, and that I never edited or deleted.
+  - **The form:** a `MessageEdit` with the same text and the original's `ts`. It's sealed for the current readers once the join re-key covers the joiner.
+  - **Limits:** at most 50 per channel per Join, and 100 a minute.
+  - **Never re-sent:** to a joiner removed meanwhile, or anything from before that window (D30).
+  - Display, for every core from this one on:
+    - **A reader who can open both the original and the edit:** `editedAt` is absent when the texts are equal, so there's no "edited" label, no `message.updated` and no second unread. With a different text it's an ordinary edit, even when its `ts` equals the original's.
+    - **A reader who can't open the original (the joiner):** the edit's text shows in the message's place. `editedAt` is absent when the edit's `ts` equals the original's. Unread and mentions count once, as for a new message.
+    - Older cores show a re-seal as an ordinary edit with the same text, perhaps labelled "edited".
+  - A message whose latest edit carries its own `ts` isn't pruned (B6-p), and neither are its same-`ts` edits, so readers can compare the texts.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):
@@ -649,6 +673,18 @@ plus a relaunch through the launcher.
 | `update.ready` (exists: `UpdateInfo`) | `{ "version": "1.3.0", "waitingForCall": false }` | after a stage, and again when a call ends |
 | `update.installed` (new) | `{ "version": "1.3.0", "notes": "plain text" \| null }` | once, after `markHealthy` commits a new version; `notes` comes from `ManifestBody::notes_for(<UI language>)`. The UI shows it as **text only** |
 | `update.rolledBack` (new) | `{ "failed": "1.3.0", "running": "1.2.0" }` | once, on the first healthy start after the launcher rolled back |
+| `update.required` (new) | `{ "version": "1.3.0" \| null }` | when a required update turns on (an accepted manifest revoked the running version), or when the version on offer changes; `null`: none yet |
+
+**Required updates** (`docs/design/required-update.md`):
+- `getAppInfo` gains `updateRequired: { version: string | null } | null`. It's set from the first moment of a start when an earlier check found the running version revoked (`policy.json`), and after any check that does. It never clears within a process; only a restart into a version that isn't revoked clears it.
+- While it's set:
+  - the download starts at once and checks repeat every 15 minutes;
+  - a version that failed its trial here is never fetched again;
+  - **RU1:** the core signs nothing and syncs nothing. Every command that would sign answers `update-required` (a new `ErrorCode`), with nothing signed. The sync round, re-keys, rotations, re-joins, profile posts and the report outbox don't run, and the node goes quiet (no gossip, pulls, dials or relaying). Local reads still answer.
+- `checkForUpdate` keeps working; it's what the banner's Try again calls.
+- **Residuals, accepted by the SL on #599:**
+  - **Unreadable or missing `policy.json`:** it fails open. The version isn't required until the next accepted check (within minutes), and in that window an outdated core could run one sync round. Fail-closed would lock people out over a corrupt file, and only local file access can cause it. Network-side refusal is the backstop.
+  - **Startup:** the node starts just before the core reads `policy.json` and quiets it, so for a moment it may serve and store records. The core signs and publishes nothing in that window. Follow-up: start the node quiet.
 
 **Rules the core keeps:**
 - The first check runs once the UI is up (the first `markHealthy`, so the

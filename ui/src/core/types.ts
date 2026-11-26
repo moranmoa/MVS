@@ -64,6 +64,11 @@ export interface ServerSummary {
   mentions: number;
   /** Closed by its owner (#261): read-only until it is purged 30 days later. */
   closed?: boolean;
+  /**
+   * #589: a member wrote a record kind this version doesn't know, so they run a
+   * newer MVS and this computer may miss what it adds. The UI asks to update.
+   */
+  updateNeeded?: boolean;
   /** G-51: the server's icon, a still PNG or WebP data URL (at most 128 px, 8 KiB). */
   iconDataUrl?: string;
   /** G-51: plain text, up to 5 lines; shown as is (never Markdown or links). */
@@ -181,7 +186,9 @@ export interface CoreError {
     /** G-48: I already reported this message or member in the last 30 days. */
     | 'already-reported'
     /** G-48: nobody can receive the report (the owner is reported and there are no admins). */
-    | 'no-recipient';
+    | 'no-recipient'
+    /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
+    | 'profile-too-large';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */
   detail?: CoreDownDetail;
   /** 1-based word positions that were not recognised (restore). */

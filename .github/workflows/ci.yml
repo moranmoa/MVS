@@ -45,9 +45,26 @@ jobs:
           workspaces: core
       - run: cargo test --release --locked
         working-directory: core
+      # The shipped code as release.yml builds it: no test targets, so no
+      # dev-dependency features (sync's `test-util`), which `cargo test` turns
+      # on for every crate and so hides code that only compiles with them.
+      # Every workspace binary (mvs-core, mvs-launcher, ...) built, then the
+      # same code linted.
+      - name: build as shipped (no test features)
+        run: |
+          cargo build --release --locked --workspace
+          cargo clippy --workspace --locked -- -D warnings
+        working-directory: core
+      # G-48: the report receiver's tests that need what a modified client
+      # would send (feature `test-hooks`, never in a release build).
+      - name: api test hooks
+        run: cargo test --release --locked -p api --features test-hooks --test reports
+        working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p api --all-targets --locked --features test-hooks -- -D warnings
         working-directory: core
 
   updater-windows:
@@ -349,6 +366,15 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npx playwright test --project=smoke
+      # A flaky failure (e.g. channels.spec rename) needs its trace: keep the
+      # Playwright results (traces, screenshots, page snapshots) when it fails.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: qa-smoke-test-results
+          path: qa/test-results
+          retention-days: 7
+          if-no-files-found: warn
 
   relay-image:
     name: relay image build

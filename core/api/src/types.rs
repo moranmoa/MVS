@@ -397,6 +397,9 @@ pub enum ErrorCode {
     /// trying).
     LockedOut,
     DiskFull,
+    /// A required update is pending (RU1): the core signs nothing and
+    /// sends nothing until it runs a version that isn't revoked.
+    UpdateRequired,
     /// G-48: I already reported this message or member in the last 30 days.
     AlreadyReported,
     /// G-48: nobody can receive the report: the owner is reported and the
@@ -492,6 +495,20 @@ pub struct AppInfo {
     /// through the relay, and calls are off.
     #[serde(default)]
     pub relay_only: bool,
+    /// A required update (`docs/design/required-update.md`): `null` unless
+    /// an accepted signed manifest revoked this version. Then the app is
+    /// local read-only plus update, and the core signs and syncs nothing
+    /// (RU1) for the rest of the process.
+    #[serde(default)]
+    pub update_required: Option<UpdateRequired>,
+}
+
+/// `AppInfo.updateRequired` and `update.required`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRequired {
+    /// The newer version on offer; `null`: none yet ("not available yet").
+    pub version: Option<String>,
 }
 
 /// `getRecoveryChallenge`'s result: 1-based positions.
@@ -604,6 +621,9 @@ pub enum Event {
     MessageAdded(Message),
     #[serde(rename = "update.ready")]
     UpdateReady(UpdateInfo),
+    /// A required update turned on (or the version on offer changed).
+    #[serde(rename = "update.required")]
+    UpdateRequired(UpdateRequired),
     /// Voice: my call changed (join, leave, mute, timeout). After a leave,
     /// or a refusal by a full call, its participants are empty.
     #[serde(rename = "call.state")]
@@ -612,6 +632,11 @@ pub enum Event {
     /// answers come only verified (see `voice`), so the flag is always true.
     #[serde(rename = "call.signal", rename_all = "camelCase")]
     CallSignal { from: Id, kind: SignalKind, payload: String, fingerprint_verified: bool },
+    /// G-81: a voice frame from a participant of my current call, over
+    /// libp2p (#509 §2.3). `callId` 32 hex, `from` the sender's user ID,
+    /// `data` standard base64 of at most 400 bytes (empty: a DTX gap).
+    #[serde(rename = "voice.frame", rename_all = "camelCase")]
+    VoiceFrame { call_id: String, from: Id, seq: u32, ts: u32, data: String },
     /// Voice rooms: a server's live rooms changed (created, gone, join,
     /// leave, mute, timeout, kick, rename, limit), mine or not: the whole
     /// list, oldest first. At most one per server per sync round, only
@@ -734,6 +759,10 @@ pub struct CallState {
     /// with this set ended because relay-only went on.
     #[serde(default)]
     pub relay_only: bool,
+    /// G-81: my current call's ID (32 lowercase hex), opaque, new on every
+    /// join; `voiceFrame`s carry it. Absent with no call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -745,6 +774,21 @@ pub struct CallParticipant {
     /// G-84b: hears no one (only with `muted`; false from cores before 0.6.0).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deafened: bool,
+    /// G-81: how my voice frames reach this peer over libp2p; only for
+    /// peers I send to that way (not on LAN WebRTC), absent for me.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<VoicePathKind>,
+}
+
+/// G-81 `CallParticipant.path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoicePathKind {
+    Lan,
+    Direct,
+    Circuit,
+    MemberCircuit,
+    None,
 }
 
 /// Why `server.removed` fired (server lifecycle).

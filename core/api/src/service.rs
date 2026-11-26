@@ -379,8 +379,15 @@ struct Inner {
     calls: voice::Calls,
     /// G-29: who is typing, what I sent, the replay cache. Never stored.
     typing: typing::Typing,
+    /// A required update (RU1): `Some` once an accepted manifest revoked
+    /// this version, for the rest of the process. Inside, the newer version
+    /// on offer. While set, the core signs nothing and syncs nothing.
+    update_required: Option<Option<String>>,
     /// G-48: delivers report boxes (sync); `None` without a network.
     report_net: Option<Arc<dyn crate::report::ReportNet>>,
+    /// G-48: reports kept per server ([`MAX_STORED_REPORTS`]; lower only in
+    /// tests, feature `test-hooks`).
+    report_store_cap: usize,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -391,6 +398,15 @@ struct Inner {
     /// Who was missing then: a new joiner (someone not in that set) starts
     /// a wait of its own (dev-identity on #517).
     join_key_wait: HashMap<(ServerId, ChannelId), (BTreeSet<PublicKey>, u64)>,
+    /// LM-2: accepted Joins of others this process has applied, and what
+    /// it re-sealed for each ([`Inner::reseal_for_joins`]). No plain text:
+    /// the text is re-read from the log when sealing.
+    reseal: HashMap<(ServerId, RecordId), Reseal>,
+    /// LM-2: Joins whose re-seal window is over (bounded: cleared when
+    /// full; a cleared Join only finds messages it already covers).
+    reseal_done: HashSet<RecordId>,
+    /// LM-2: when my last re-seals went out (ms), for the per-author rate.
+    reseal_sent: std::collections::VecDeque<u64>,
     /// B7-k K2: servers whose `adult-keys-outdated` notice was sent; cleared
     /// once every member posts the cap, so it comes again if it reopens.
     adult_keys_warned: HashSet<ServerId>,
@@ -401,6 +417,32 @@ struct Inner {
 }
 
 /// A message held for its channel key (`Core::send_message`).
+/// LM-2: one accepted Join of someone else, as this core handles it.
+struct Reseal {
+    /// When this core first applied it (ms, my clock).
+    applied_at: u64,
+    /// Who joined.
+    joiner: PublicKey,
+    /// My messages already re-sealed for it.
+    sealed: HashSet<RecordId>,
+    /// Re-seals per channel, against [`RESEAL_PER_CHANNEL`].
+    per_channel: HashMap<ChannelId, usize>,
+}
+
+/// LM-2 (SL and TL): a message is re-sealed for a joiner only if its `ts`
+/// is at most this long before the Join's `ts`: an honest joiner sees
+/// about this much of propagation slack, never older history (D30).
+const RESEAL_BEFORE_JOIN_MS: u64 = 60_000;
+/// LM-2: and only if I sent it at most this long before I applied the
+/// Join: a backdated `Join.ts` exposes at most this much.
+const RESEAL_SENT_WITHIN_MS: u64 = 600_000;
+/// LM-2: at most this many re-seals per channel per Join.
+const RESEAL_PER_CHANNEL: usize = 50;
+/// LM-2: at most this many re-seals a minute, all Joins together.
+const RESEAL_PER_MINUTE: usize = 100;
+/// LM-2: finished Joins remembered before the set starts over.
+const RESEAL_DONE_MAX: usize = 4096;
+
 struct KeyPending {
     /// Provisional, `pending-` + 16 random hex: never a record ID.
     id: String,
@@ -461,6 +503,8 @@ pub struct Core {
     /// The app lock is on (`lock_keys` until `unlock_keys`): a restore
     /// waits, holding no server secrets.
     keys_locked: AtomicBool,
+    /// G-81: the `voiceFrame` fast path's gate (`voice_media`).
+    media: Arc<crate::voice_media::MediaGate>,
     /// G-78: app-lock attempts run one at a time, so the counter can't be
     /// raced past its delay.
     app_lock_gate: Mutex<()>,
@@ -633,9 +677,14 @@ impl Core {
             join_waiting: BTreeSet::new(),
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
+            update_required: None,
             report_net: None,
+            report_store_cap: MAX_STORED_REPORTS,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
+            reseal: HashMap::new(),
+            reseal_done: HashSet::new(),
+            reseal_sent: std::collections::VecDeque::new(),
             adult_keys_warned: HashSet::new(),
             update_needed: BTreeSet::new(),
         };
@@ -681,6 +730,7 @@ impl Core {
             buddies_checked: Mutex::new(None),
             restore: Mutex::new(RestoreProgress::new(restore_state)),
             keys_locked: AtomicBool::new(false),
+            media: Arc::default(),
             app_lock_gate: Mutex::new(()),
         })
     }
@@ -689,6 +739,9 @@ impl Core {
     /// secret and every channel key, and we leave any call. TODO(app lock):
     /// the commands.
     pub fn lock_keys(&self) {
+        // G-81 (SL on #556): the frame gate shuts first, whatever leaving
+        // the call does, and stays shut until unlock.
+        self.media.shut();
         let _ = self.leave_call();
         // Messages held for a key: their text is dropped (zeroized) at lock
         // and sign-out, never kept past them (lost-message P1, SL C3). Each
@@ -756,6 +809,8 @@ impl Core {
                 None => return Err(ErrorCode::BadRequest.into()),
             }
         }
+        // G-81 (SL on #556): the frame gate shuts first, for good.
+        self.media.shut();
         let _ = self.leave_call();
         self.pending_joins.lock().expect("not poisoned").clear();
         let mut inner = self.lock();
@@ -814,6 +869,10 @@ impl Core {
     pub fn unlock_keys(&self) {
         self.keys_locked.store(false, Ordering::SeqCst);
         unlock_cipher(&self.ports, self.lock().me.as_ref());
+        // Never reopened while a required update holds (RU1).
+        if self.lock().update_required.is_none() {
+            self.media.unshut();
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -837,6 +896,11 @@ impl Core {
             let result = f(&mut inner, &self.ports, &mut events);
             // Member relays: anything the command changed is announced.
             inner.check_member_relay(&self.ports, &mut events);
+            // G-81: my call changed: the frame gate and the node follow, the
+            // gate first (SL on #554).
+            if events.iter().any(|e| matches!(e, Event::CallState(_))) {
+                self.media.apply(inner.calls.media_call());
+            }
             result
         };
         self.emit(events);
@@ -1316,6 +1380,8 @@ impl Core {
         age_restriction: AgeRestriction,
     ) -> CoreResult<ServerSummary> {
         self.run(|inner, ports, events| {
+            // RU1: a genesis is signed here, not through `publish_control`.
+            inner.may_sign()?;
             let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
             inner.vault.require_recovery_check(&me.identity).map_err(vault_error)?;
             let name = name.trim();
@@ -2112,7 +2178,20 @@ impl Core {
 
     /// Voice: sync's voice transport (piece A). Without one, `joinCall`
     /// answers `not-implemented`.
+    /// G-81: the sidecar reader's handle for `voiceFrame` (`voice_media`):
+    /// never takes the core's lock.
+    pub fn voice_frames(&self) -> crate::VoiceFrames {
+        crate::VoiceFrames(self.media.clone())
+    }
+
+    /// G-81 `--voice-p2p` (the shell's flag, off by default): calls run over
+    /// libp2p, so relay-only no longer refuses or ends them.
+    pub fn set_voice_p2p(&self, on: bool) {
+        self.lock().calls.set_voice_p2p(on);
+    }
+
     pub fn set_voice(&self, net: Arc<dyn VoiceNet>) {
+        self.media.set_net(net.clone());
         self.lock().calls.set_net(net);
     }
 
@@ -2178,6 +2257,53 @@ impl Core {
     }
 
     /// `leaveCall`: idempotent.
+    /// G-81: a voice frame the node passed (gate, caps, sequence): out as
+    /// `voice.frame`, only while it is still my call (a frame overtaking
+    /// `leaveCall` is a no-op). Never takes the core's lock.
+    pub fn voice_media_frame(&self, from: PublicKey, frame: sync::VoiceFrame) {
+        if self.media.current() != Some(frame.call_id) {
+            return;
+        }
+        use base64::Engine as _;
+        self.ports.events.emit(&Event::VoiceFrame {
+            call_id: hex::encode(frame.call_id),
+            from: model::hex_id(from.as_bytes()),
+            seq: frame.seq,
+            ts: frame.ts,
+            data: base64::engine::general_purpose::STANDARD.encode(&frame.opus),
+        });
+    }
+
+    /// G-81: how my frames reach `peer` changed (`CallParticipant.path`).
+    pub fn voice_media_path(&self, peer: PublicKey, path: sync::VoicePath) {
+        let kind = match path {
+            sync::VoicePath::Lan => VoicePathKind::Lan,
+            sync::VoicePath::Direct => VoicePathKind::Direct,
+            sync::VoicePath::Circuit => VoicePathKind::Circuit,
+            sync::VoicePath::MemberCircuit => VoicePathKind::MemberCircuit,
+            sync::VoicePath::None => VoicePathKind::None,
+        };
+        let _ = self.voice(|calls, ctx, _| {
+            calls.set_path(ctx, peer, kind);
+            Ok(())
+        });
+    }
+
+    /// G-81 `setCallWebrtcPeers({ identities })`: the call peers the UI has a
+    /// live LAN WebRTC connection to. The core sends voice frames over
+    /// libp2p to every other participant; the UI can only exclude, never
+    /// add targets. At most [`MAX_PARTICIPANTS`]; reset on every new call.
+    pub fn set_call_webrtc_peers(&self, identities: &[String]) -> CoreResult<()> {
+        if identities.len() > crate::voice::MAX_PARTICIPANTS {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let peers: HashSet<PublicKey> = identities.iter().map(|id| parse_user(id)).collect::<CoreResult<_>>()?;
+        self.voice(|calls, ctx, _| {
+            calls.set_webrtc_peers(ctx, peers);
+            Ok(())
+        })
+    }
+
     pub fn leave_call(&self) -> CoreResult<()> {
         if !self.in_call() {
             return Ok(());
@@ -2436,6 +2562,8 @@ impl Core {
             return Err(ErrorCode::BadRequest.into());
         }
         let message = self.run(|inner, ports, events| {
+            // RU1: refused before anything else, nothing sealed or signed.
+            inner.may_sign()?;
             let (server, channel) = inner.find_channel(channel_id)?;
             // G-29: a send ends my typing there (`off` once, if `on` went out).
             let stop = inner.typing.stopped(channel);
@@ -2713,6 +2841,11 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        // RU1: no sync at all while a required update is pending: nothing
+        // fetched, nothing published, no re-key, rotation or re-join.
+        if self.lock().update_required.is_some() {
+            return Ok(());
+        }
         self.announce_device_notices();
         // Device link, the new device: its link moves on even before sign-in.
         self.poll_device_link();
@@ -2868,7 +3001,11 @@ impl Core {
             // the round; the next one retries.
             let _ = inner.prune_reports(ports.clock.now_ms());
             // Messages held for their key: sent now if it came.
-            inner.send_key_pending(ports, events)
+            inner.send_key_pending(ports, events)?;
+            // LM-2: my recent messages a new member's Join didn't reach,
+            // re-sealed for them. Never fails the round.
+            inner.reseal_for_joins(ports);
+            Ok(())
         })
     }
 
@@ -3009,12 +3146,16 @@ impl Core {
     pub fn export_diagnostics(&self) -> CoreResult<String> {
         let info = self.get_app_info()?;
         let inner = self.lock();
+        // NC-1 (QA's conditions): testers attach this file to public issues.
+        // Counts and a fixed vocabulary only; times to the minute, storage
+        // to the MiB.
         let report = serde_json::json!({
             "app": info,
-            "exportedAtMs": self.ports.clock.now_ms(),
+            "exportedAtMs": crate::netdiag::rounded_time(self.ports.clock.now_ms()),
             "hasIdentity": inner.me.is_some(),
+            "network": crate::netdiag::network_json(&self.ports.network.net_counters()),
             "servers": inner.db.servers()?.len(),
-            "storageBytes": inner.db.size_bytes()?,
+            "storageBytes": crate::netdiag::rounded_storage(inner.db.size_bytes()?),
         });
         Ok(serde_json::to_string_pretty(&report).expect("json value"))
     }
@@ -3025,7 +3166,9 @@ impl Core {
             _ => UpdateChannel::Stable,
         };
         let relay_only = relay_only_in(&self.lock().db)?;
-        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only })
+        let update_required =
+            self.lock().update_required.clone().map(|version| UpdateRequired { version });
+        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only, update_required })
     }
 
     /// `setRelayOnly(on)` (GAP-6r): stored, then applied to the network. On
@@ -3034,8 +3177,15 @@ impl Core {
     /// `relayOnly` at the next tick. Needs no identity.
     pub fn set_relay_only(&self, on: bool) -> CoreResult<()> {
         if on {
-            self.lock().calls.set_relay_only(true);
-            self.leave_call()?;
+            let mut inner = self.lock();
+            inner.calls.set_relay_only(true);
+            // G-81: with `--voice-p2p` the call goes on, over our relays'
+            // circuits only (the node switches its path).
+            let voice_p2p = inner.calls.voice_p2p();
+            drop(inner);
+            if !voice_p2p {
+                self.leave_call()?;
+            }
         }
         self.run(|inner, ports, _| {
             inner.db.set(KV_RELAY_ONLY, &[u8::from(on)])?;
@@ -3377,6 +3527,9 @@ impl Core {
     /// it the update commands answer `not-implemented` and no check runs.
     pub fn with_updates(mut self, updates: Updates) -> Core {
         self.updates = Some(Arc::new(updates));
+        // A required update survives a restart (`policy.json`): RU1 holds
+        // from the first moment, before any sync round.
+        self.refresh_required();
         self
     }
 
@@ -3398,12 +3551,16 @@ impl Core {
 
     /// `checkForUpdate` (main/core only, A2).
     pub fn check_for_update(&self) -> CoreResult<serde_json::Value> {
-        self.updates()?.check(self.ui_channel()?, self.now_secs())
+        let checked = self.updates()?.check(self.ui_channel()?, self.now_secs());
+        self.refresh_required();
+        checked
     }
 
     /// `downloadUpdate` (main/core only): emits `update.ready` once staged.
     pub fn download_update(&self) -> CoreResult<serde_json::Value> {
-        let outcome = self.updates()?.download(self.ui_channel()?, self.now_secs())?;
+        let outcome = self.updates()?.download(self.ui_channel()?, self.now_secs());
+        self.refresh_required();
+        let outcome = outcome?;
         self.emit_update(outcome.events);
         Ok(outcome.ok)
     }
@@ -3438,6 +3595,7 @@ impl Core {
         loop {
             if let Ok(channel) = self.ui_channel() {
                 self.emit_update(updates.background_round(channel, self.now_secs()));
+                self.refresh_required();
                 // Slice 3b: the owner's signed global switch, fetched with the
                 // check. Kept in kv; only this path writes it.
                 let off = updates.member_relay_off(channel);
@@ -3454,7 +3612,10 @@ impl Core {
                 }
                 self.emit(events);
             }
-            if !updates.wait(crate::update::next_interval()) {
+            // While required: check again every 15 minutes, not hourly.
+            let required = self.lock().update_required.is_some();
+            let wait = if required { REQUIRED_RECHECK } else { crate::update::next_interval() };
+            if !updates.wait(wait) {
                 return;
             }
         }
@@ -3563,6 +3724,8 @@ impl Inner {
     /// turning 18 with the date my claims came from (`birth_date_trusted`:
     /// set at sign-up here) is just a birthday, with no wait.
     fn age_claim(&mut self, ports: &Ports, server: ServerId) -> CoreResult<Option<Record>> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let now = ports.clock.now_ms();
         self.settle_birth_date(now)?;
         let mut trust = false;
@@ -4521,6 +4684,175 @@ impl Inner {
         Ok(())
     }
 
+    /// LM-2 (SL and TL, lan-first-message P1): a message I sealed before
+    /// I applied someone's Join never reaches them: they weren't a reader,
+    /// and no rotation ever gives them that epoch (D30). So, for each
+    /// accepted Join of X, I re-seal my own messages that:
+    /// - don't reach the Join (it isn't in their `auth_deps`' past);
+    /// - have `ts ≥ Join.ts − 60 s`, and I sent them at most 10 min before
+    ///   I applied the Join (a backdated Join gets at most that);
+    /// - are in a channel X reads now (18+: adults), and that I never
+    ///   edited (bar earlier re-seals) or deleted.
+    ///
+    /// Each is a `MessageEdit` with the same text and the original's `ts`,
+    /// sealed for the current readers only once the join re-key covers X,
+    /// never by rotating past a removal. A Join of someone no longer a
+    /// member re-seals nothing. At most 50 per channel per Join and 100 a
+    /// minute. The text is read back from my log; nothing is held, and no
+    /// text or key is logged.
+    fn reseal_for_joins(&mut self, ports: &Ports) {
+        let Some(me) = self.me.as_ref().map(Me::key) else { return };
+        let now = ports.clock.now_ms();
+        let servers = match self.db.servers() {
+            Ok(servers) => servers,
+            Err(_) => return,
+        };
+        for server in servers {
+            if let Err(e) = self.reseal_server(ports, server, me, now) {
+                tracing::debug!(target: "mvs::keys", code = ?e.code, "re-seal for a join skipped this round");
+            }
+        }
+        let over: Vec<(ServerId, RecordId)> = self
+            .reseal
+            .iter()
+            .filter(|(_, r)| now.saturating_sub(r.applied_at) >= RESEAL_SENT_WITHIN_MS)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in over {
+            self.reseal.remove(&key);
+            if self.reseal_done.len() >= RESEAL_DONE_MAX {
+                self.reseal_done.clear();
+            }
+            self.reseal_done.insert(key.1);
+        }
+    }
+
+    fn reseal_server(&mut self, ports: &Ports, server: ServerId, me: PublicKey, now: u64) -> CoreResult<()> {
+        self.load(server)?;
+        let view = self.view(server)?;
+        if !view.state.is_member(me) || view.is_kicked(&me) || view.state.closed.is_some() {
+            return Ok(());
+        }
+        let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+        let joins: Vec<(RecordId, PublicKey, u64)> = log
+            .records
+            .iter()
+            .filter(|r| r.kind() == Kind::Join && r.author() != me && view.state.accepted.contains(&r.id()))
+            .filter(|r| !self.reseal_done.contains(&r.id()))
+            .map(|r| (r.id(), r.author(), r.ts()))
+            .collect();
+        // Every Join first, so one re-seal can count for all it covers.
+        // `applied_at` is this process's first sight: after a restart an
+        // old Join looks freshly applied. That's harmless: a message I sent
+        // after I first applied it reaches it (its `auth_deps` were my heads
+        // then), so `reaches` leaves it out; only messages that truly never
+        // reached the Join qualify, still within `ts ≥ Join.ts − 60 s`.
+        for (join, joiner, _) in &joins {
+            self.reseal.entry((server, *join)).or_insert_with(|| Reseal {
+                applied_at: now,
+                joiner: *joiner,
+                sealed: HashSet::new(),
+                per_channel: HashMap::new(),
+            });
+        }
+        for (join, joiner, join_ts) in joins {
+            let entry = self.reseal.get(&(server, join)).ok_or(ErrorCode::Internal)?;
+            let applied_at = entry.applied_at;
+            let done = entry.sealed.clone();
+            let view = self.view(server)?;
+            // A concurrent removal of the joiner: nothing for them.
+            if !view.state.members.contains(&joiner) {
+                continue;
+            }
+            let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+            // Edited (other than by a re-seal) or deleted: never re-sealed.
+            let mut touched: HashSet<RecordId> = HashSet::new();
+            let mine: HashMap<RecordId, u64> = log
+                .channel
+                .iter()
+                .filter(|r| r.kind() == Kind::Message && r.author() == me)
+                .map(|r| (r.id(), r.ts()))
+                .collect();
+            for r in &log.channel {
+                let Some(of) = chat::target(r) else { continue };
+                let Some(&ts) = mine.get(&of) else { continue };
+                let reseal = r.kind() == Kind::MessageEdit && r.author() == me && r.ts() == ts;
+                if !reseal && matches!(r.kind(), Kind::MessageEdit | Kind::MessageDelete) {
+                    touched.insert(of);
+                }
+            }
+            let mut by_channel: BTreeMap<ChannelId, Vec<(RecordId, u64)>> = BTreeMap::new();
+            for r in &log.channel {
+                let Scope::Channel(channel) = r.scope() else { continue };
+                let fits = r.kind() == Kind::Message
+                    && r.author() == me
+                    && r.ts() >= join_ts.saturating_sub(RESEAL_BEFORE_JOIN_MS)
+                    && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS
+                    && !done.contains(&r.id())
+                    && !touched.contains(&r.id())
+                    && !log.resolver.reaches(join, r.auth_deps());
+                if fits && channel_readers(&view, channel).contains(&joiner) {
+                    by_channel.entry(channel).or_default().push((r.id(), r.ts()));
+                }
+            }
+            for (channel, messages) in by_channel {
+                // Only once the join re-key covers them (#517's wait).
+                if self.waits_for_join_key(ports, server, channel)?
+                    || ports.cipher.missing_readers(server, channel).contains(&joiner)
+                {
+                    continue;
+                }
+                // Who a re-seal now reaches: every reader whose key is in
+                // place. One re-seal covers each such joiner's Join too.
+                let missing: HashSet<PublicKey> = ports.cipher.missing_readers(server, channel).into_iter().collect();
+                let covered: HashSet<PublicKey> =
+                    channel_readers(&self.view(server)?, channel).into_iter().filter(|r| !missing.contains(r)).collect();
+                let shown = self.shown(&*ports.cipher, server, channel)?;
+                for (target, ts) in messages {
+                    let entry = self.reseal.get(&(server, join)).ok_or(ErrorCode::Internal)?;
+                    if entry.per_channel.get(&channel).copied().unwrap_or(0) >= RESEAL_PER_CHANNEL {
+                        break;
+                    }
+                    while self.reseal_sent.front().is_some_and(|at| now.saturating_sub(*at) >= 60_000) {
+                        self.reseal_sent.pop_front();
+                    }
+                    if self.reseal_sent.len() >= RESEAL_PER_MINUTE {
+                        return Ok(());
+                    }
+                    let Some(text) = shown
+                        .iter()
+                        .find(|s| s.record.id() == target && !s.deleted && s.unreadable.is_none())
+                        .map(|s| Zeroizing::new(s.text.clone()))
+                    else {
+                        continue;
+                    };
+                    let sealed = self.seal_with(ports, server, channel, text.as_bytes(), false)?;
+                    let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+                    let seq = chat::channel_seq(log, channel, &me);
+                    let deps = chat::deps_with(log, channel, target);
+                    let auth = auth_deps(&self.view(server)?);
+                    let body = [target.as_bytes().as_slice(), &sealed].concat();
+                    let record = self.sign_channel(server, channel, seq, deps, auth, ts, Kind::MessageEdit, body)?;
+                    let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+                    if !chat::would_accept(log, &record) {
+                        continue;
+                    }
+                    self.store(server, record.clone())?;
+                    ports.network.publish(&record);
+                    self.reseal_sent.push_back(now);
+                    let entry = self.reseal.get_mut(&(server, join)).ok_or(ErrorCode::Internal)?;
+                    *entry.per_channel.entry(channel).or_default() += 1;
+                    for ((at, _), other) in self.reseal.iter_mut() {
+                        if *at == server && covered.contains(&other.joiner) {
+                            other.sealed.insert(target);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a new message in `channel` should wait for a join re-key:
     /// some current members can't read its key yet, for less than
     /// [`JOIN_KEY_WAIT`] so far. Sealed now, the message would never reach
@@ -4718,6 +5050,8 @@ impl Inner {
         members: &BTreeSet<PublicKey>,
         auth_deps: &[RecordId],
     ) -> CoreResult<()> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let cipher = &*ports.cipher;
         let parts = cipher.rotate(server, channel, members).map_err(cipher_error)?;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
@@ -4871,6 +5205,8 @@ impl Inner {
         kind: Kind,
         body: Vec<u8>,
     ) -> CoreResult<Record> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         Draft { server, scope: Scope::Channel(channel), seq, deps, auth_deps, ts, kind, body }
             .sign(me.identity.signing_key())
@@ -5143,6 +5479,8 @@ impl Inner {
         server: ServerId,
         action: &Action,
     ) -> CoreResult<Record> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let view = self.view(server)?;
         // A revoke-invite lists its invite in its deps.
@@ -5580,6 +5918,8 @@ impl Inner {
         fetched: Vec<Record>,
         events: &mut Events,
     ) -> CoreResult<JoinStatus> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let link = link.to_owned();
         let server_hex = model::hex_id(server.as_bytes());
@@ -6268,8 +6608,13 @@ mod device_notice_tests {
 
 /// My reports waiting for each recipient's ack.
 const KV_REPORT_OUTBOX: &str = "report-outbox";
-/// Reports sealed to me, as staff.
+/// Reports sealed to me, as staff: one store per server,
+/// `report-inbox/<server>` (the Tech Lead's #515 follow-up). The bare key is
+/// the first release's single store, moved over on first use.
 const KV_REPORT_INBOX: &str = "report-inbox";
+/// The servers that have a `report-inbox/<server>` store, so pruning finds
+/// them (kv has no prefix scan).
+const KV_REPORT_INBOXES: &str = "report-inboxes";
 /// Report IDs I received, with their reporter, for dedup and the receiver's
 /// per-reporter cap; kept 31 days.
 const KV_REPORT_SEEN: &str = "report-seen";
@@ -6300,6 +6645,10 @@ struct OutRow {
 #[derive(Clone, Serialize, Deserialize)]
 struct InRow {
     server: String,
+    /// The report ID (hex): `find_report` matches on it without opening any
+    /// box. Empty in rows from the first release, filled on first lookup.
+    #[serde(default)]
+    id: String,
     sealed: String,
     at: u64,
     dismissed: bool,
@@ -6431,6 +6780,11 @@ impl Core {
     /// is the reported member, or whose server I left is dropped, and so
     /// are rows older than 30 days. Delivery runs without the lock.
     pub fn report_tick(&self) {
+        // RU1: the network is quiet while a required update is pending; the
+        // rows stay and go out once the newer version runs.
+        if self.lock().update_required.is_some() {
+            return;
+        }
         let Ok((net, due)) = self.run(|inner, ports, _| {
             inner.prune_reports(ports.clock.now_ms())?;
             let outbox: Vec<OutRow> = inner.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
@@ -6532,24 +6886,20 @@ impl Core {
             seen.push(SeenRow { id, reporter, at: now });
             inner.set_kv_json(KV_REPORT_SEEN, &seen)?;
             let server_hex = model::hex_id(server.as_bytes());
-            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut inbox = inner.inbox(server)?;
             inbox.push(InRow {
                 server: server_hex.clone(),
+                id: model::hex_id(&opened.id()),
                 sealed: hex::encode(sealed),
                 at: now,
                 dismissed: false,
             });
-            if inbox.iter().filter(|r| r.server == server_hex).count() > MAX_STORED_REPORTS {
-                // The oldest dismissed one here, else the oldest.
-                let pick = inbox
-                    .iter()
-                    .position(|r| r.server == server_hex && r.dismissed)
-                    .or_else(|| inbox.iter().position(|r| r.server == server_hex));
-                if let Some(i) = pick {
-                    inbox.remove(i);
-                }
+            if inbox.len() > inner.report_store_cap {
+                // The oldest dismissed one, else the oldest.
+                let pick = inbox.iter().position(|r| r.dismissed).unwrap_or(0);
+                inbox.remove(pick);
             }
-            inner.set_kv_json(KV_REPORT_INBOX, &inbox)?;
+            inner.set_inbox(server, &inbox)?;
             let summary = inner.report_summary(server, &opened, now, false)?;
             events.push(Event::ReportReceived { server_id: server_hex, report: summary });
             Ok(())
@@ -6565,10 +6915,9 @@ impl Core {
             inner.load_mine(server)?;
             inner.prune_reports(ports.clock.now_ms())?;
             inner.staff_check(server)?;
-            let server_hex = model::hex_id(server.as_bytes());
-            let inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let inbox = inner.inbox(server)?;
             let mut out = Vec::new();
-            for row in inbox.iter().rev().filter(|r| r.server == server_hex) {
+            for row in inbox.iter().rev() {
                 let Ok(sealed) = hex::decode(&row.sealed) else { continue };
                 let Some((_, opened)) = inner.open_report(&sealed)? else { continue };
                 out.push(inner.report_summary(server, &opened, row.at, row.dismissed)?);
@@ -6582,10 +6931,29 @@ impl Core {
         self.run(|inner, _, _| {
             let (index, server, _) = inner.find_report(report_id)?;
             inner.staff_check(server)?;
-            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut inbox = inner.inbox(server)?;
             inbox[index].dismissed = true;
-            inner.set_kv_json(KV_REPORT_INBOX, &inbox)
+            inner.set_inbox(server, &inbox)
         })
+    }
+
+    /// Tests only (the Tech Lead's #515 follow-up; feature `test-hooks`,
+    /// never in a release build): signs `report` as me, with none of
+    /// `reportContent`'s checks, and seals it to `to`, so a test can hand a
+    /// receiver what a modified client would send. Not a command.
+    #[cfg(feature = "test-hooks")]
+    pub fn sealed_report_for_tests(&self, report: &Report, to: PublicKey) -> CoreResult<Vec<u8>> {
+        let inner = self.lock();
+        let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let signed = report.sign(me.identity.signing_key()).ok_or(ErrorCode::BadRequest)?;
+        groupkeys::seal_box(report.server, &to, &signed, &mut OsRng).map_err(|_| ErrorCode::Internal.into())
+    }
+
+    /// Tests only (feature `test-hooks`): how many reports a server's store
+    /// keeps, so the eviction can be tested without a thousand boxes.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_report_store_cap_for_tests(&self, cap: usize) {
+        self.lock().report_store_cap = cap;
     }
 
     /// G-48 `getReportEvidence(reportId)`: the reported message, on an
@@ -6690,18 +7058,83 @@ impl Inner {
         Ok(found)
     }
 
-    /// My stored report `report_id`: its inbox index, server and contents.
+    /// My stored report `report_id`: its index in its server's inbox, the
+    /// server and its contents. Matched by the stored ID; only the match is
+    /// opened (rows from the first release get their ID filled once).
     fn find_report(&mut self, report_id: &str) -> CoreResult<(usize, ServerId, Report)> {
-        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
-        for (index, row) in inbox.iter().enumerate() {
-            let Ok(sealed) = hex::decode(&row.sealed) else { continue };
-            if let Some((server, opened)) = self.open_report(&sealed)? {
-                if model::hex_id(&opened.id()) == report_id {
+        for server in self.inbox_servers()? {
+            let mut inbox = self.inbox(server)?;
+            let mut filled = false;
+            for row in inbox.iter_mut().filter(|r| r.id.is_empty()) {
+                let opened = hex::decode(&row.sealed).ok().map(|s| self.open_report(&s)).transpose()?.flatten();
+                if let Some((_, opened)) = opened {
+                    row.id = model::hex_id(&opened.id());
+                    filled = true;
+                }
+            }
+            if filled {
+                self.set_inbox(server, &inbox)?;
+            }
+            let Some(index) = inbox.iter().position(|r| r.id == report_id) else { continue };
+            let sealed = hex::decode(&inbox[index].sealed).map_err(|_| ErrorCode::Internal)?;
+            if let Some((found, opened)) = self.open_report(&sealed)? {
+                if found == server && model::hex_id(&opened.id()) == report_id {
                     return Ok((index, server, opened));
                 }
             }
         }
         Err(ErrorCode::NotFound.into())
+    }
+
+    fn inbox_key(server: ServerId) -> String {
+        format!("{KV_REPORT_INBOX}/{}", model::hex_id(server.as_bytes()))
+    }
+
+    /// The servers with an inbox store, after moving the first release's
+    /// single store over (once).
+    fn inbox_servers(&mut self) -> CoreResult<Vec<ServerId>> {
+        if let Some(legacy) = self.kv_json::<Vec<InRow>>(KV_REPORT_INBOX)? {
+            let mut by_server: BTreeMap<String, Vec<InRow>> = BTreeMap::new();
+            for row in legacy {
+                by_server.entry(row.server.clone()).or_default().push(row);
+            }
+            for (hex, rows) in by_server {
+                let Some(server) = model::parse_hex32(&hex).map(ServerId::from_bytes) else { continue };
+                let mut inbox: Vec<InRow> = self.kv_json(&Self::inbox_key(server))?.unwrap_or_default();
+                // A move cut short by a crash may have copied some already.
+                for row in rows {
+                    if !inbox.iter().any(|r| r.sealed == row.sealed) {
+                        inbox.push(row);
+                    }
+                }
+                self.set_inbox(server, &inbox)?;
+            }
+            self.db.delete(KV_REPORT_INBOX)?;
+        }
+        let list: Vec<String> = self.kv_json(KV_REPORT_INBOXES)?.unwrap_or_default();
+        Ok(list.iter().filter_map(|h| model::parse_hex32(h).map(ServerId::from_bytes)).collect())
+    }
+
+    /// One server's stored reports, oldest first.
+    fn inbox(&mut self, server: ServerId) -> CoreResult<Vec<InRow>> {
+        self.inbox_servers()?;
+        Ok(self.kv_json(&Self::inbox_key(server))?.unwrap_or_default())
+    }
+
+    /// Writes one server's reports; an empty list deletes the store.
+    fn set_inbox(&mut self, server: ServerId, rows: &[InRow]) -> CoreResult<()> {
+        let hex = model::hex_id(server.as_bytes());
+        let mut list: Vec<String> = self.kv_json(KV_REPORT_INBOXES)?.unwrap_or_default();
+        if rows.is_empty() {
+            self.db.delete(&Self::inbox_key(server))?;
+            list.retain(|h| *h != hex);
+        } else {
+            self.set_kv_json(&Self::inbox_key(server), &rows)?;
+            if !list.contains(&hex) {
+                list.push(hex);
+            }
+        }
+        self.set_kv_json(KV_REPORT_INBOXES, &list)
     }
 
     fn report_summary(
@@ -6763,14 +7196,13 @@ impl Inner {
             staff.insert(hex, list.iter().map(|k| model::hex_id(k.as_bytes())).collect());
         }
         let me_hex = me.map(|k| model::hex_id(k.as_bytes())).unwrap_or_default();
-        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
-        let kept: Vec<InRow> = inbox
-            .iter()
-            .filter(|r| staff.get(&r.server).is_some_and(|s| s.contains(&me_hex)))
-            .cloned()
-            .collect();
-        if kept.len() != inbox.len() {
-            self.set_kv_json(KV_REPORT_INBOX, &kept)?;
+        // A server's whole store goes when I'm no longer staff there, or no
+        // longer in it at all (left, kicked, purged).
+        for server in self.inbox_servers()? {
+            let hex = model::hex_id(server.as_bytes());
+            if !staff.get(&hex).is_some_and(|s| s.contains(&me_hex)) {
+                self.set_inbox(server, &[])?;
+            }
         }
         let outbox: Vec<OutRow> = self.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
         let kept: Vec<OutRow> = outbox
@@ -6866,5 +7298,54 @@ mod birth_date_tests {
     fn an_old_pending_reads_as_the_restore_form() {
         let old: PendingBirth = serde_json::from_str(r#"{"date":"1990-01-01","effectiveAt":5}"#).unwrap();
         assert!(!old.correction && !old.capped);
+    }
+}
+
+// ---- Required updates (docs/design/required-update.md) ----------------------
+//
+// An accepted signed manifest that revokes this version makes an update
+// required. The core then (RU1, the security lead's condition) signs nothing
+// on its own and syncs nothing, for the rest of the process: every signing
+// path checks `may_sign`, the sync round does nothing, and the network goes
+// quiet. Update checks and downloads (HTTPS, not the P2P network) go on, at
+// once and then every 15 minutes.
+
+/// Between update checks while an update is required ("not available yet"
+/// keeps checking).
+pub const REQUIRED_RECHECK: Duration = Duration::from_secs(15 * 60);
+
+impl Inner {
+    /// RU1: `update-required` while a required update is pending.
+    fn may_sign(&self) -> CoreResult<()> {
+        match self.update_required {
+            Some(_) => Err(ErrorCode::UpdateRequired.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Core {
+    /// Reads the updater's verdict and applies it. Turning on (or a newer
+    /// version on offer) emits `update.required`, quiets the network and
+    /// wakes the update loop so the download starts at once. Never turns
+    /// off within a process: only a restart into a version that isn't
+    /// revoked clears it.
+    fn refresh_required(&self) {
+        let Some(updates) = &self.updates else { return };
+        let Ok(channel) = self.ui_channel() else { return };
+        let Some(now) = updates.required(channel) else { return };
+        let changed = {
+            let mut inner = self.lock();
+            let changed = inner.update_required.as_ref() != Some(&now);
+            inner.update_required = Some(now.clone());
+            changed
+        };
+        if changed {
+            // RU1: no voice frames either (SL on #556).
+            self.media.shut();
+            self.ports.network.set_quiet();
+            updates.wake();
+            self.emit(vec![Event::UpdateRequired(UpdateRequired { version: now })]);
+        }
     }
 }

@@ -251,6 +251,7 @@ export function cleanServer(s: ServerSummary): ServerSummary {
     unread: s.unread === true,
     mentions: count(s.mentions),
     closed: s.closed === true,
+    updateNeeded: s.updateNeeded === true,
     // G-51: only a still PNG or WebP data URL is an icon; anything else is dropped.
     ...(serverIcon(s.iconDataUrl) ? { iconDataUrl: serverIcon(s.iconDataUrl) } : {}),
     ...(serverDescription(s.description) ? { description: serverDescription(s.description) } : {}),

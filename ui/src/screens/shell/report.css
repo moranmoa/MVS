@@ -100,8 +100,8 @@
   inset-inline-end: 0.5rem;
   display: grid;
   place-items: center;
-  width: 1.375rem;
-  height: 1.375rem;
+  width: 1.5rem;
+  height: 1.5rem;
   border-radius: 50%;
   border: 0.1875rem solid var(--bg-rail);
   /* Solid amber with ink (UX on #567): about 3.6:1 against the light rail, white ink 4.8:1. */
@@ -122,4 +122,17 @@
 }
 .settings-count {
   margin-inline-start: 0.5rem;
+}
+.rail-reports .icon {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+/* UX on #605: the actions on a report card are outlined; the filled red is inside the confirmations. */
+.report-actions .secondary.danger-outline {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+}
+.report-actions .secondary.danger-outline:hover {
+  background: var(--danger-soft);
 }

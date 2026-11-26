@@ -348,7 +348,8 @@ struct Inner {
     /// when it differs). `None` until first worked out.
     member_relay: Option<MemberRelay>,
     /// Slice 3a: the shell says the network is metered (`setMetered`). In
-    /// memory only: the shell sets it at every start.
+    /// memory only, and fail-closed (SL on #640): metered from every start
+    /// until the shell first says otherwise.
     metered: bool,
     /// RR2 (SL): the shell says this device runs on battery (`setOnBattery`).
     /// In memory only, and fails closed: on battery from every start until
@@ -696,7 +697,7 @@ impl Core {
             me: None,
             keyring_unavailable: false,
             member_relay: None,
-            metered: false,
+            metered: true,
             on_battery: true,
             device_link: None,
             approvals: HashMap::new(),

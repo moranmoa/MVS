@@ -181,3 +181,13 @@ describe('jitter buffer: no big rewind before playout (TL)', () => {
     expect(j.pull()).toMatchObject({ kind: 'frame', seq: 2 ** 30 + 9 });
   });
 });
+
+describe('jitter buffer: the half-ring boundary (SL nit)', () => {
+  it('a frame exactly 2^31 away is refused, and the depth stays honest', () => {
+    const j = new JitterBuffer({ startMs: 40 });
+    j.push(10, bytes(1));
+    expect(j.push((10 + 0x8000_0000) >>> 0, bytes(1))).toBe('late');
+    expect(j.stats().depthFrames).toBe(1);
+    expect(j.pull()).toMatchObject({ kind: 'frame', seq: 10 });
+  });
+});

@@ -69,6 +69,10 @@ export interface ServerSummary {
    * newer MVS and this computer may miss what it adds. The UI asks to update.
    */
   updateNeeded?: boolean;
+  /** G-51: the server's icon, a still PNG or WebP data URL (at most 128 px, 8 KiB). */
+  iconDataUrl?: string;
+  /** G-51: plain text, up to 5 lines; shown as is (never Markdown or links). */
+  description?: string;
 }
 
 export interface Channel {
@@ -184,7 +188,9 @@ export interface CoreError {
     /** G-48: nobody can receive the report (the owner is reported and there are no admins). */
     | 'no-recipient'
     /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
-    | 'profile-too-large';
+    | 'profile-too-large'
+    /** #577: a required update is pending; main refuses everything that writes or connects. */
+    | 'update-required';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */
   detail?: CoreDownDetail;
   /** 1-based word positions that were not recognised (restore). */
@@ -275,6 +281,18 @@ export interface UpdateInfo {
   version: string;
   /** While in a voice call the update waits until the call ends. */
   waitingForCall: boolean;
+}
+
+/**
+ * Desktop shell (#577, #626): the required-update gate, on every change and on
+ * every page load. `endedCall` stays true once the gate ended a call.
+ */
+export interface UpdateGate {
+  required: boolean;
+  version: string | null;
+  active: boolean;
+  phase: 'none' | 'gated';
+  endedCall: boolean;
 }
 
 export type UpdateChannel = 'stable' | 'beta';
@@ -403,7 +421,15 @@ export interface CallParticipant {
   muted: boolean;
   /** G-84b: hears no one (only with muted; never from cores before 0.6.0). */
   deafened?: boolean;
+  /**
+   * G-81 B (docs/design/g81-p2p-calls.md §2.3, dev-sync 2a): how my core
+   * reaches this participant. Absent for me, and from cores before 2a: unknown.
+   */
+  path?: CallPath;
 }
+
+/** G-81 B: the core's connection to a call participant. */
+export type CallPath = 'lan' | 'direct' | 'circuit' | 'member-circuit' | 'none';
 
 /** My current call. After leaveCall, `participants` is empty. `full` = 5 in. */
 export interface CallState {
@@ -412,6 +438,8 @@ export interface CallState {
   full: boolean;
   /** Relay-only is on (#272): with no participants, my call was ended for it. */
   relayOnly?: boolean;
+  /** G-81 B: this call's id for media frames, 32 lower-case hex; fresh on every join. Absent from cores before 2a. */
+  callId?: string;
 }
 
 /** Someone in a voice room. `userId` is a member id; `joinedAt` (ms) orders the hand-off. */

@@ -42,6 +42,7 @@ mod typing;
 mod voice;
 mod voice_media;
 mod dialback;
+pub mod netstats;
 #[cfg(test)]
 pub(crate) mod testutil;
 

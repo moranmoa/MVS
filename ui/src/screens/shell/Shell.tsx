@@ -7,7 +7,7 @@ import { phoneQuery, useMediaQuery } from '../../app/media';
 import { sortByOrder } from '../../app/serverOrder';
 import { useSettings } from '../../app/settings';
 import { paragraphs, useUiDir } from '../../app/textDir';
-import { useCore, useCoreEvent, type Id, type JoinStatus } from '../../core';
+import { isCoreError, useCore, useCoreEvent, type Id, type JoinStatus } from '../../core';
 import { Dialog } from '../../components/common';
 import { AlertIcon, CloseIcon, RefreshIcon, ShieldIcon } from '../../components/icons';
 import { RecoveryCheck, RecoveryWordsPanel } from '../onboarding/RecoveryWords';
@@ -26,6 +26,7 @@ import { ServerRail } from './ServerRail';
 import { ServerSettings } from './ServerSettings';
 import { LeaveServerDialog } from './ServerLifecycle';
 import { useDesktopNotifications } from './useNotifications';
+import { UpdateRequiredBanner, useUpdateRequired } from './UpdateRequired';
 import { useWindowTitle } from '../../app/TitleBar';
 
 const MEMBERS_KEY = 'mvp.ui.membersOpen';
@@ -41,6 +42,9 @@ export function Shell() {
   const servers = useStore(store, (s) => s.servers);
   const notice = useStore(store, (s) => s.notice);
   const updateNote = useStore(store, (s) => s.updateNote);
+  const callEndedForUpdate = useStore(store, (s) => s.callEndedForUpdate);
+  const updateRequired = useUpdateRequired();
+  const staged = useStore(store, (s) => s.update);
   const flash = useStore(store, (s) => s.flash);
   const settingsRequest = useStore(store, (s) => s.settingsRequest);
   const serverGone = useStore(store, (s) => s.serverGone);
@@ -160,6 +164,13 @@ export function Shell() {
     const t = setTimeout(() => store.clearNotice(), 6000);
     return () => clearTimeout(t);
   }, [notice, store]);
+
+  // #622: "your call ended for the update" shows for 8 s.
+  useEffect(() => {
+    if (!callEndedForUpdate) return;
+    const t = setTimeout(() => store.clearCallEndedForUpdate(), 8000);
+    return () => clearTimeout(t);
+  }, [callEndedForUpdate, store]);
 
   // Update notes stay until closed when there are release notes to read.
   useEffect(() => {
@@ -330,7 +341,9 @@ export function Shell() {
           <FormattedMessage id="a11y.skipToChat" />
         </a>
       )}
-      {!identity.recoveryChecked && (
+      {/* #577: a required update; the recovery check would sign, so its banner waits. */}
+      <UpdateRequiredBanner />
+      {!identity.recoveryChecked && !updateRequired && (
         <div className="banner" role="status">
           <ShieldIcon />
           <span>
@@ -470,6 +483,24 @@ export function Shell() {
       {/* Toasts stack in one column, so two at once never overlap. */}
       <DeviceNotices />
       <div className="toasts">
+        {callEndedForUpdate && (
+          <div className="toast call-ended-update" role="alert" key={callEndedForUpdate}>
+            <AlertIcon />
+            <span>
+              <FormattedMessage id="update.required.callEnded" />
+            </span>
+            {/* Already staged: the same restart as the rail pill and #604's banner button. */}
+            {staged && (
+              <button
+                type="button"
+                className="secondary small"
+                onClick={() => core.restartToUpdate().catch((e) => isCoreError(e) && store.updateRefused(e.code))}
+              >
+                <FormattedMessage id="server.syncUpdateNeeded.restart" />
+              </button>
+            )}
+          </div>
+        )}
         {serverGone && (
           <div className="toast" role="status" key={serverGone.at}>
             <FormattedMessage id={`server.gone.${serverGone.reason}`} values={{ name: serverGone.name }} />

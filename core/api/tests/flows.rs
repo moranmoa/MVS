@@ -8,7 +8,7 @@ use std::sync::Arc;
 use api::*;
 use common::{Peer, World};
 use identity::MemoryStore;
-use records::{Draft, Kind, PublicKey, Scope, ServerId, SigningKey};
+use records::{Draft, Kind, PublicKey, RecordId, Scope, ServerId, SigningKey};
 
 const LEGAL: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
@@ -2053,6 +2053,164 @@ fn a_message_sent_before_a_join_arrived_is_re_sealed_for_the_joiner() {
     advance(&world, 1000);
     owner.core.sync_now().unwrap();
     assert_eq!(edits_in(&world, &server), 1);
+}
+
+/// LM-2 × B7-k (Tech Lead, child safety): an 18+ channel turned plain
+/// re-seals nothing from its 18+ time to a minor who joins just after,
+/// though it is inside the 60 s window; what was written after it turned
+/// plain is re-sealed as usual. Real cipher.
+#[test]
+fn an_adult_channel_turned_plain_re_seals_nothing_from_its_18_time_to_a_minor() {
+    use api::crypto::GroupKeysCipher;
+    let world = World::new();
+    let person = |name: &str, birth_date: &str| {
+        let peer = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+        let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: birth_date.into() };
+        let created = peer.core.create_identity(input).unwrap();
+        let positions = peer.core.get_recovery_challenge().unwrap().positions;
+        let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+        assert!(peer.core.check_recovery_words(answers).unwrap().ok);
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+        peer.core.update_profile(profile).unwrap();
+        peer
+    };
+    let owner = person("Owner", "1990-05-01");
+    let server = owner.core.create_server("Den", AgeRestriction::None).unwrap();
+    let den = owner.core.create_channel(&server.id, "den", true).unwrap().id;
+    owner.core.sync_now().unwrap();
+    owner.core.send_message(&den, "late, 18+ time", None).unwrap();
+    owner.core.update_channel(&den, None, Some(false)).unwrap();
+    owner.core.send_message(&den, "plain now", None).unwrap();
+    advance(&world, 100);
+    // A 17-year-old joins right after; the owner hasn't seen the Join yet.
+    let minor = person("Minor", "2009-06-01");
+    minor.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    let shown: Vec<String> = shown_messages(&minor, &den).into_iter().map(|m| m.body).collect();
+    assert!(shown.iter().any(|b| b == "plain now"), "re-sealed as usual: {shown:?}");
+    assert!(!shown.iter().any(|b| b == "late, 18+ time"), "nothing from the 18+ time: {shown:?}");
+}
+
+/// The same with a modified minor client that backdates its `Join.ts` to
+/// widen LM-2's window to about 10 min (Security Lead): the rule follows
+/// where the message sits in the log, not the clock, so the 18+ time's
+/// message is never re-sealed; one written after the channel turned plain
+/// is.
+#[test]
+fn a_backdated_join_gets_nothing_from_an_18_time_either() {
+    use api::crypto::GroupKeysCipher;
+    let world = World::new();
+    let owner = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "1990-05-01".into() };
+    let created = owner.core.create_identity(input).unwrap();
+    let positions = owner.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(owner.core.check_recovery_words(answers).unwrap().ok);
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+    owner.core.update_profile(profile).unwrap();
+    let server = owner.core.create_server("Den", AgeRestriction::None).unwrap();
+    let id = server_key(&server);
+    let den = owner.core.create_channel(&server.id, "den", true).unwrap().id;
+    owner.core.sync_now().unwrap();
+    let late_at = *world.clock.0.lock().unwrap();
+    owner.core.send_message(&den, "late, 18+ time", None).unwrap();
+    advance(&world, 5 * 60_000);
+    owner.core.update_channel(&den, None, Some(false)).unwrap();
+    owner.core.send_message(&den, "plain now", None).unwrap();
+    let message = |body_ts_after: u64| -> RecordId {
+        world
+            .network
+            .fetch(id)
+            .into_iter()
+            .filter(|r| r.kind() == Kind::Message && r.ts() >= body_ts_after)
+            .min_by_key(|r| r.ts())
+            .unwrap()
+            .id()
+    };
+    let late = message(late_at);
+    // A minor's modified client: no 18+ claim, and a Join dated 4 min
+    // before the 18+ message, so its ts is well inside the window.
+    let minor = records::SigningKey::from_bytes(&[91; 32]);
+    let invite = {
+        let link = server.invite_link.trim_start_matches("mvs://join/");
+        RecordId::from_bytes(hex::decode(link.split('/').nth(1).unwrap()).unwrap().try_into().unwrap())
+    };
+    let mut deps: BTreeSet<RecordId> =
+        world.network.fetch(id).iter().filter(|r| r.scope() == Scope::Control).map(|r| r.id()).collect();
+    deps.insert(invite);
+    let backdated = late_at.saturating_sub(4 * 60_000);
+    let join = authority::sign_control(&minor, id, 1, deps.into_iter().collect(), backdated, &authority::Action::Join { invite })
+        .unwrap();
+    world.network.publish(&join);
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    let resealed: Vec<RecordId> = world
+        .network
+        .fetch(id)
+        .into_iter()
+        .filter(|r| r.kind() == Kind::MessageEdit)
+        .filter_map(|r| r.body().get(..32).map(|t| RecordId::from_bytes(t.try_into().unwrap())))
+        .collect();
+    assert!(!resealed.is_empty(), "the message from after it turned plain is re-sealed");
+    assert!(!resealed.contains(&late), "never the one from the 18+ time");
+}
+
+/// Security Lead: when no single edit back to plain has every other one in
+/// its past (two concurrent ones, here from two of the owner's devices),
+/// which came last can't be told, so a minor joiner gets no re-seal from
+/// that channel at all.
+#[test]
+fn concurrent_edits_to_plain_re_seal_nothing_to_a_minor() {
+    use api::crypto::GroupKeysCipher;
+    let world = World::new();
+    // An adult owner, whose key the test signs with too.
+    let owner = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "1990-05-01".into() };
+    let created = owner.core.create_identity(input).unwrap();
+    let positions = owner.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(owner.core.check_recovery_words(answers).unwrap().ok);
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+    owner.core.update_profile(profile).unwrap();
+    let server = owner.core.create_server("Twice", AgeRestriction::None).unwrap();
+    let id = server_key(&server);
+    let den = owner.core.create_channel(&server.id, "den", true).unwrap().id;
+    let den_id = records::ChannelId::from_bytes(hex::decode(&den).unwrap().try_into().unwrap());
+    owner.core.sync_now().unwrap();
+    // Two edits back to plain on the same heads, signed apart.
+    let key = identity::RecoveryPhrase::parse(&created.words.join(" ")).unwrap().identity();
+    let heads: Vec<RecordId> = {
+        let control: Vec<records::Record> =
+            world.network.fetch(id).into_iter().filter(|r| r.scope() == Scope::Control).collect();
+        let referenced: BTreeSet<RecordId> = control.iter().flat_map(|r| r.deps().to_vec()).collect();
+        let mut heads: Vec<RecordId> = control.iter().map(|r| r.id()).filter(|r| !referenced.contains(r)).collect();
+        heads.sort();
+        heads
+    };
+    for (seq, name) in [(10_000, "den"), (10_001, "lounge")] {
+        let edit = authority::Action::ChannelEdit { channel: den_id, adult: false, name: name.into() };
+        world.network.publish(&authority::sign_control(key.signing_key(), id, seq, heads.clone(), 1, &edit).unwrap());
+    }
+    owner.core.sync_now().unwrap();
+    assert!(!owner.core.list_channels(&server.id).unwrap().iter().find(|c| c.id == den).unwrap().adult);
+    // The owner writes after both, before it sees the minor's Join.
+    owner.core.send_message(&den, "after both", None).unwrap();
+    let minor = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "2009-06-01".into() };
+    let created = minor.core.create_identity(input).unwrap();
+    let positions = minor.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(minor.core.check_recovery_words(answers).unwrap().ok);
+    minor.core.join_server(&server.invite_link).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 0, "fail closed: nothing re-sealed from that channel");
 }
 
 /// LM-2, the D30 bound (SL): an honest Join gets only messages from at

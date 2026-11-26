@@ -182,6 +182,23 @@ describe('path B: locked during a call', () => {
     expect(await screen.findByText('Your mic is still off. Turn it on from the call bar.', {}, T)).toBeTruthy();
   });
 
+  it('LR-1: a path B unlock re-reads the servers (a server removed during the lock is gone; updateNeeded fresh)', async () => {
+    const b = bridge({ enabled: true, locked: false, pending: false, path: null });
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    render(<App core={core} initialSettings={settings} />);
+    await screen.findByRole('button', { name: /^Minecraft IL/ }, T);
+    b.emit({ enabled: true, locked: true, pending: false, path: 'B', inCall: true });
+    await screen.findByRole('dialog', { name: 'MVS is locked' }, T);
+    // While locked, the server goes away on the core's side (a kick, purge or
+    // leave); main drops server events then, and holds none (SL).
+    const minecraft = (await core.listServers()).find((s) => s.name === 'Minecraft IL')!;
+    await core.leaveServer(minecraft.id);
+    b.emit({ enabled: true, locked: false, pending: false, path: null });
+    await screen.findByRole('textbox', { name: /^Message / }, T);
+    // The store re-read the servers (store.init → listServers): it's gone.
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^Minecraft IL/ })).toBeNull(), T);
+  });
+
   it('Tab stays inside the overlay', async () => {
     const b = bridge({ enabled: true, locked: false, pending: false, path: null });
     render(<App core={new MockCore({ demo: true, speed: 0, simulateActivity: false })} initialSettings={settings} />);

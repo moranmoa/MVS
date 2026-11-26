@@ -85,6 +85,8 @@ const NOT_READ_ONLY = Object.freeze(
     'createServer',
     'joinServer',
     'renameServer',
+    'setServerIcon',
+    'setServerDescription',
     'leaveServer',
     'closeServer',
     'createInvite',
@@ -109,6 +111,7 @@ const NOT_READ_ONLY = Object.freeze(
     'setMuted',
     'setDeafened',
     'sendSignal',
+    'setCallWebrtcPeers',
     'setMemberRelay',
     'setMemberRelayCap',
     // G-48: a report is a signed record.

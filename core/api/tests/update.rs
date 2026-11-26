@@ -434,6 +434,11 @@ fn required_release(channel: &str, revoked: &[&str]) -> Release {
 
 /// `core_at`, on a shared `world`, so other peers can reach it.
 fn core_in(world: &World, dir: &std::path::Path, host: &Host, installed: &str) -> Peer {
+    core_with_root(world, dir, host, installed, TrustRoot::single(key(1).verifying_key()).unwrap())
+}
+
+/// `core_in`, trusting `root`.
+fn core_with_root(world: &World, dir: &std::path::Path, host: &Host, installed: &str, root: TrustRoot) -> Peer {
     let dirs = UpdateDirs::new(dir.join("install"), dir.join("state"));
     let h = host.clone();
     let setup = UpdateSetup {
@@ -442,7 +447,7 @@ fn core_in(world: &World, dir: &std::path::Path, host: &Host, installed: &str) -
         platform: PLATFORM.into(),
         installed: v(installed),
         baseline: Baseline::default(),
-        root: Some(TrustRoot::single(key(1).verifying_key()).unwrap()),
+        root: Some(root),
         source: Arc::new(move |channel| {
             Ok(Box::new(Fake { host: h.clone(), channel: channel.into() }) as Box<dyn UpdateSource>)
         }),
@@ -550,5 +555,60 @@ fn a_required_core_signs_and_sends_nothing() {
     // Running the newer version: not required.
     let newer = core_in(&world, &dir, &host, "1.1.0");
     assert_eq!(newer.core.get_app_info().unwrap().update_required, None);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The whole chain as a release makes it (`.github/scripts/e2e-required-update.sh`
+/// builds the inputs with a throwaway key: `updater keygen` and `make-root`,
+/// `manifest-body.mjs --require-from`, `updater sign-manifest`). Ignored
+/// unless that script hands over `MVS_E2E_MANIFEST` and `MVS_E2E_ROOT`.
+#[test]
+#[ignore = "run by .github/scripts/e2e-required-update.sh"]
+fn required_update_end_to_end() {
+    let manifest = fs::read(std::env::var("MVS_E2E_MANIFEST").expect("MVS_E2E_MANIFEST")).unwrap();
+    let root_json = fs::read(std::env::var("MVS_E2E_ROOT").expect("MVS_E2E_ROOT")).unwrap();
+    let root_file: updater::TrustRootFile = serde_json::from_slice(&root_json).unwrap();
+    let root = TrustRoot::from_file(&root_file).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("mvs-api-update-e2e-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("install")).unwrap();
+    fs::write(dir.join("install").join(APP_EXE), b"base").unwrap();
+    fs::create_dir_all(dir.join("data")).unwrap();
+    // The manifest was signed just now: the core's clock is now too.
+    let world = World::new();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    *world.clock.0.lock().unwrap() = now;
+    let host = Host::default();
+    host.publish(Release { manifest, payload: vec![] }, "alpha");
+
+    // 1.0.0, revoked by the signed manifest: required, once.
+    let owner = core_with_root(&world, &dir, &host, "1.0.0", root.clone());
+    signed_up(&owner, "Owner");
+    let server = owner.core.create_server("Old", AgeRestriction::None).unwrap();
+    owner.events.take();
+    call(&owner, "checkForUpdate").unwrap();
+    assert_eq!(required_events(&owner), [Some("1.1.0".to_string())]);
+    let info = owner.core.handle_value("getAppInfo", Value::Null).unwrap();
+    assert_eq!(info["updateRequired"], json!({ "version": "1.1.0" }));
+
+    // RU1: a join arrives; the owner signs and sends nothing.
+    let id = |s: &str| records::ServerId::from_bytes(hex::decode(s).unwrap().try_into().unwrap());
+    let me = owner.core.get_identity().unwrap().unwrap().id;
+    let mine = || world.network.fetch(id(&server.id)).iter().filter(|r| hex::encode(r.author().as_bytes()) == me).count();
+    let before = mine();
+    let guest = world.peer();
+    signed_up(&guest, "Guest");
+    guest.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    assert_eq!(mine(), before, "nothing signed or sent while required");
+    assert_eq!(owner.core.create_server("New", AgeRestriction::None).unwrap_err().code, ErrorCode::UpdateRequired);
+
+    // A restart keeps it; the newer version clears it.
+    drop(owner);
+    let again = core_with_root(&world, &dir, &host, "1.0.0", root.clone());
+    assert!(again.core.get_app_info().unwrap().update_required.is_some());
+    let updated = core_with_root(&world, &dir, &host, "1.1.0", root);
+    assert_eq!(updated.core.get_app_info().unwrap().update_required, None);
     let _ = fs::remove_dir_all(&dir);
 }

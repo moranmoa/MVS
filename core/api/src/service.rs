@@ -414,6 +414,10 @@ struct Inner {
     /// kind this version doesn't know (`ServerSummary.updateNeeded`). In
     /// memory only, so a restart (after an update) clears it.
     update_needed: BTreeSet<ServerId>,
+    /// T17: whether this core writes secret rotations. Off until the release
+    /// that requires updating (Tech Lead on #592): an older core refuses kind 25
+    /// and stalls on the rest of the control log.
+    write_secret_rotation: bool,
 }
 
 /// A message held for its channel key (`Core::send_message`).
@@ -555,6 +559,31 @@ struct PendingJoin {
 /// Events collected while the lock is held, emitted after it is released.
 type Events = Vec<Event>;
 
+/// T17: whether this release writes `SecretRotation` records; reading them
+/// is always on. **It flips only together with** (Tech Lead and Security
+/// Lead on #609, T17-W1):
+/// - S3/S4, sync serving and reading the old secret's frozen prefix from the
+///   kept previous secret; without it, a member offline during a rotation is
+///   stranded on the old secret;
+/// - S5, re-issued invites with the owner notice, and the backup and LAN
+///   beacon key following the rotation;
+/// - the release that requires updating (older cores refuse kind 25).
+///
+/// The const assertion below fails the build until this is revisited.
+const WRITE_SECRET_ROTATION: bool = false;
+// Tech Lead on #609: whoever flips it ships S3/S4 and S5 in the same change
+// and removes this line there.
+const _: () = assert!(!WRITE_SECRET_ROTATION, "S3/S4 and S5 must ship with the flip");
+
+/// T17 (Q2, Security Lead T17-W1): how long the secret a rotation replaced
+/// stays, sealed, for reading the old secret's frozen prefix.
+pub const PREVIOUS_SECRET_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// T17: the rotation whose secret this device moved to, per server.
+fn secret_rotation_key(server: ServerId) -> String {
+    format!("secret-rotation/{}", hex::encode(server.as_bytes()))
+}
+
 fn vault_error(e: VaultError) -> CoreError {
     match e {
         // QA-20: the OS keychain failed (no Secret Service, locked, denied).
@@ -687,6 +716,7 @@ impl Core {
             reseal_sent: std::collections::VecDeque::new(),
             adult_keys_warned: HashSet::new(),
             update_needed: BTreeSet::new(),
+            write_secret_rotation: WRITE_SECRET_ROTATION,
         };
         // GAP-6r: the stored relay-only setting, applied before anything
         // else reaches the network.
@@ -1747,6 +1777,59 @@ impl Core {
         })
     }
 
+    /// G-52 `setAgeRestriction(serverId, 'none' | '16+' | '18+')`
+    /// (`docs/design/server-age-limit.md`): the owner only (`not-allowed`);
+    /// `18+` only while my effective age is 18 or more (`too-young`, PO on
+    /// #512); behind `lv:1` (`update-needed`: an older core would ignore the
+    /// limit and keep keying minors). The current value signs nothing. A
+    /// raise to 18+ re-keys every channel for the adult members at once
+    /// (Security Lead Q2 on #590); a lowering re-keys forward only, so
+    /// nothing written while it was 18+ opens to 16- and 17-year-olds.
+    pub fn set_age_restriction(&self, server_id: &str, limit: AgeRestriction) -> CoreResult<ServerSummary> {
+        let server = parse_server(server_id)?;
+        let _ = self.sync_now();
+        self.run(|inner, ports, events| {
+            inner.load_mine(server)?;
+            inner.lifecycle_role(server, authority::Role::Owner)?;
+            if inner.view(server)?.age_limit() == limit {
+                return inner.counted_summary(&*ports.cipher, server);
+            }
+            let now = ports.clock.now_ms();
+            let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            if limit == AgeRestriction::Eighteen && me.profile.effective_age(now).is_none_or(|age| age < 18) {
+                return Err(ErrorCode::TooYoung.into());
+            }
+            inner.cap_gate(server, model::LEVEL_CAP)?;
+            inner.publish_control(ports, server, &Action::ServerAgeLimit { min: limit.min_age() as u8 })?;
+            // The readers changed: re-key now rather than at the next send.
+            if inner.rekey(ports, server, events).is_err() {
+                events.push(Event::Notice { kind: NoticeKind::RekeyWaiting, server_id: server_id.to_owned() });
+            }
+            let summary = inner.counted_summary(&*ports.cipher, server)?;
+            events.push(Event::ServerUpdated(summary.clone()));
+            Ok(summary)
+        })
+    }
+
+    /// G-52 `countAgeAffected(serverId, ageRestriction)`: how many members
+    /// other than me a change to `ageRestriction` would lock out: for `18+`,
+    /// those without an accepted 18+ claim; 0 otherwise (the app's minimum
+    /// is 16). No names. The owner or an admin (`not-allowed`).
+    pub fn count_age_affected(&self, server_id: &str, limit: AgeRestriction) -> CoreResult<AgeAffected> {
+        let server = parse_server(server_id)?;
+        let mut inner = self.lock();
+        inner.load_mine(server)?;
+        inner.lifecycle_role(server, authority::Role::Admin)?;
+        if limit != AgeRestriction::Eighteen {
+            return Ok(AgeAffected { count: 0 });
+        }
+        let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        let view = inner.view(server)?;
+        let state = view.state;
+        let count = state.members.iter().filter(|m| **m != me && !state.adults.contains(*m)).count();
+        Ok(AgeAffected { count: u32::try_from(count).unwrap_or(u32::MAX) })
+    }
+
     /// `leaveServer`: any member but the owner (`not-allowed`; the owner
     /// deletes instead). The `Leave` goes out, so the others re-key; then
     /// the server leaves this device (`server.removed`, `left`). A leaver
@@ -2168,6 +2251,14 @@ impl Core {
                         kind: NoticeKind::RekeyWaiting,
                         server_id: server_id.to_owned(),
                     });
+                }
+            }
+            // T17 (PO on #557): a kick rotates the server secret at once.
+            // The kick stands even if the rotation fails; the sync round
+            // retries it.
+            if matches!(action, Action::Kick { .. }) {
+                if let Err(e) = inner.apply_secret_rotation(ports, server, events) {
+                    eprintln!("mvs-core: the server secret wasn't rotated after a kick: {:?}", e.code);
                 }
             }
             Ok(record.id())
@@ -2837,6 +2928,14 @@ impl Core {
             .map(|due| due.max(REKEY_WAKE_FLOOR))
     }
 
+    /// T17, tests only (feature `test-hooks`, never in a release build):
+    /// write secret rotations before [`WRITE_SECRET_ROTATION`] turns them on
+    /// for everyone.
+    #[cfg(feature = "test-hooks")]
+    pub fn enable_secret_rotation_writes(&self) {
+        self.lock().write_secret_rotation = true;
+    }
+
     /// Rust addition (`syncNow`): pulls every server's records from the
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
@@ -2928,6 +3027,12 @@ impl Core {
                     inner.close_locally(ports, server, events)?;
                     continue;
                 }
+                // G-52: raised above my age; I leave (never aborts the round).
+                match inner.leave_if_under_limit(ports, server, events) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => eprintln!("mvs-core: an age-limit leave wasn't sent: {:?}", e.code),
+                }
                 let meta_changed = {
                     let view = inner.view(server)?;
                     view.state.server_name != name_before
@@ -2945,6 +3050,12 @@ impl Core {
                 // B7-k K2: owners and admins learn when older members would
                 // key an 18+ channel for minors too.
                 let _ = inner.adult_keys_notice(server, me, events);
+                // T17: move to a newer sync secret sealed for me, and rotate
+                // as a rotator when a removal calls for it. Never aborts the
+                // round; the next one retries.
+                if let Err(e) = inner.apply_secret_rotation(ports, server, events) {
+                    eprintln!("mvs-core: the server secret rotation wasn't applied: {:?}", e.code);
+                }
                 let after = inner.view(server)?;
                 if after.is_kicked(&me) {
                     inner.join_waiting.remove(&server);
@@ -4077,7 +4188,7 @@ impl Inner {
             let server_id = model::hex_id(server.as_bytes());
             let name = view.state.server_name.clone().unwrap_or_else(|| view.genesis.name.clone());
             let owner = view.state.role(key) == authority::Role::Owner;
-            if view.genesis.age_restriction.min_age() > age {
+            if view.age_limit().min_age() > age {
                 let loss = AgeLoss { server_id, name, channel: None };
                 if owner { owned.push(loss) } else { out.push(loss) }
             } else if age < 18 && view.state.adults.contains(&key) {
@@ -4110,7 +4221,7 @@ impl Inner {
                 continue;
             }
             let was_adult = view.state.adults.contains(&key);
-            let leave = view.genesis.age_restriction.min_age() > age && view.state.role(key) != authority::Role::Owner;
+            let leave = view.age_limit().min_age() > age && view.state.role(key) != authority::Role::Owner;
             let adult_channels: Vec<(String, String)> = view
                 .state
                 .channels
@@ -4123,12 +4234,7 @@ impl Inner {
                 ports.network.publish(&claim);
             }
             if leave {
-                let record = self.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
-                self.db.set_leave(server, &record)?;
-                if self.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
-                    ports.network.publish(&record);
-                }
-                self.purge_server(ports, server, RemovedReason::Age, &[], true, events)?;
+                self.leave_for_age(ports, server, events)?;
             } else if was_adult && age < 18 {
                 let server_id = model::hex_id(server.as_bytes());
                 for (channel_id, name) in adult_channels {
@@ -4142,6 +4248,34 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// G-77: I'm under `server`'s age limit and not its owner: the `Leave`
+    /// goes through the leave outbox, and the server leaves this device
+    /// (`server.removed`, reason `age`, with the limit as `required`).
+    fn leave_for_age(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<()> {
+        let record = self.publish_control(ports, server, &Action::Leave { cut: Cut::default() })?;
+        self.db.set_leave(server, &record)?;
+        if self.cap_gate(server, model::SERVER_LIFECYCLE_CAP).is_ok() {
+            ports.network.publish(&record);
+        }
+        self.purge_server(ports, server, RemovedReason::Age, &[], true, events)
+    }
+
+    /// G-52: a raise read by sync left me under the server's limit (spec
+    /// §4, B7): I leave it as for a lowered birth date. Only with a known
+    /// age (a restored device without its birth date keeps the claim the
+    /// server holds), and never as the owner.
+    fn leave_if_under_limit(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<bool> {
+        let Some(me) = self.me.as_ref() else { return Ok(false) };
+        let (key, age) = (me.key(), me.profile.effective_age(ports.clock.now_ms()));
+        let view = self.view(server)?;
+        let under = age.is_some_and(|age| age < view.age_limit().min_age());
+        if !under || !view.state.is_member(key) || view.state.role(key) == authority::Role::Owner {
+            return Ok(false);
+        }
+        self.leave_for_age(ports, server, events)?;
+        Ok(true)
     }
 
     /// B6-p: every full record an accepted delete or edit replaced is pruned
@@ -4173,6 +4307,197 @@ impl Inner {
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let key = *me.identity.storage_key().expose_secret();
         self.db.save_server_secret(&key, server, secret)
+    }
+
+    // ---- T17: server secret rotation (docs/design/server-secret-rotation.md)
+
+    /// The latest complete secret rotation authority accepts, assembled,
+    /// with the record ID of its last part in linear order. Accepted parts
+    /// are grouped by (author, rotation): a part another rotator signs under
+    /// someone else's rotation ID never joins, so it can't spoil that
+    /// rotation (Security Lead and Tech Lead on #609). A group must be
+    /// complete, with every part and no gaps (#592). The group whose last
+    /// part comes latest in linear order and that assembles wins. `None`
+    /// before the first rotation.
+    fn current_secret_rotation(
+        &self,
+        cipher: &dyn GroupCipher,
+        server: ServerId,
+    ) -> CoreResult<Option<(crate::ports::OpenedSecret, RecordId)>> {
+        let log = self.logs.get(&server).ok_or(ErrorCode::Internal)?;
+        let accepted = &log.resolver.state().secret_rotations;
+        if accepted.is_empty() {
+            return Ok(None);
+        }
+        let by_id: HashMap<RecordId, &Record> = log.records.iter().map(|r| (r.id(), r)).collect();
+        // (author, rotation) -> its parts, ordered by where each group's
+        // latest part sits in linear order.
+        let mut groups: Vec<((PublicKey, RecordId), Vec<Record>)> = Vec::new();
+        for id in accepted {
+            let Some(record) = by_id.get(id) else { continue };
+            let Some(Action::SecretRotation { rotation, .. }) = Action::from_record(record) else { continue };
+            let key = (record.author(), rotation);
+            match groups.iter().position(|(k, _)| *k == key) {
+                Some(at) => {
+                    let mut group = groups.remove(at);
+                    group.1.push((*record).clone());
+                    groups.push(group);
+                }
+                None => groups.push((key, vec![(*record).clone()])),
+            }
+        }
+        Ok(groups.iter().rev().find_map(|(_, parts)| {
+            let last = parts.last()?.id();
+            cipher.open_secret(server, parts).ok().map(|opened| (opened, last))
+        }))
+    }
+
+    /// T17: moves this device to `server`'s new sync secret: the one it
+    /// replaces stays, sealed, for [`PREVIOUS_SECRET_FOR_MS`] (Security Lead
+    /// T17-W1: sync reads the old secret's frozen prefix read-only, S3/S4),
+    /// sync reopens on the new one, and `server.updated` (the invite link
+    /// changes). Never logs either secret.
+    fn move_to_secret(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        opened: &crate::ports::OpenedSecret,
+        events: &mut Events,
+    ) -> CoreResult<()> {
+        let Some(secret) = &opened.secret else { return Ok(()) };
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let key = *me.identity.storage_key().expose_secret();
+        if let Some(old) = self.secret(server)?.filter(|old| **old != **secret) {
+            let until = ports.clock.now_ms().saturating_add(PREVIOUS_SECRET_FOR_MS);
+            self.db.save_previous_server_secret(&key, server, &old, until, ports.clock.now_ms())?;
+        }
+        self.save_secret(server, secret)?;
+        self.db.set(&secret_rotation_key(server), opened.rotation.as_bytes())?;
+        // TODO(T17 S3/S4, dev-sync): serve and read the old secret's frozen
+        // prefix from the kept previous secret until it expires.
+        self.open_sync(ports, server)?;
+        // TODO(T17 S5): re-issue open invites, re-key the backup and the
+        // LAN beacon from the new secret.
+        events.push(Event::ServerUpdated(self.counted_summary(&*ports.cipher, server)?));
+        Ok(())
+    }
+
+    /// T17: moves to the server's newest sync secret when a rotation sealed
+    /// one for me: stored sealed, sync reopened on it, `server.updated` (the
+    /// invite link changes). Never logs the secret. Then, as a rotator, makes
+    /// a new rotation when the current secret is held by someone no longer a
+    /// member (S2 `Required`) or misses a member (S2 `Add`): see
+    /// [`Self::secret_rotation_due`].
+    fn apply_secret_rotation(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<()> {
+        let current = self.current_secret_rotation(&*ports.cipher, server)?;
+        if let Some((opened, _)) = &current {
+            let seen = self.db.get(&secret_rotation_key(server))?.is_some_and(|v| v == opened.rotation.as_bytes());
+            if !seen {
+                self.move_to_secret(ports, server, opened, events)?;
+            }
+        }
+        if self.secret_rotation_due(server, current.as_ref())? {
+            self.rotate_secret(ports, server, current.as_ref().map(|(opened, _)| opened), events)?;
+        }
+        Ok(())
+    }
+
+    /// Whether I should rotate `server`'s secret now. Writing is behind
+    /// [`Inner::write_secret_rotation`] (the required-update gate, Tech Lead
+    /// on #592). Only a rotator (moderator or above) does, and to keep
+    /// moderators from all rotating at once: the owner always; anyone else
+    /// only for a removal they signed themselves (their kick).
+    /// - No rotation yet: due once anyone was kicked or left, since everyone
+    ///   who ever had an invite link holds the server's first secret.
+    /// - Otherwise: due when a recipient is no longer a member (S2
+    ///   `Required`), or, for the owner, when a member is missing who joined
+    ///   through an invite from before the rotation (S2 `Add`, Tech Lead and
+    ///   Security Lead on #609): a later invite's link already carries the
+    ///   new secret, so ordinary joins rotate nothing. A join whose invite
+    ///   can't be placed counts as missing.
+    ///
+    /// TODO(T17 step 2c, SL Q1 on #609): with no owner online, an admin
+    /// rotates for a leave once 24 h (plus 0–6 h of jitter) pass with no
+    /// newer rotation, checking again just before signing.
+    fn secret_rotation_due(
+        &self,
+        server: ServerId,
+        current: Option<&(crate::ports::OpenedSecret, RecordId)>,
+    ) -> CoreResult<bool> {
+        if !self.write_secret_rotation {
+            return Ok(false);
+        }
+        let Some(me) = self.me.as_ref().map(Me::key) else { return Ok(false) };
+        let view = self.view(server)?;
+        let state = &view.state;
+        if state.closed.is_some() || !state.is_member(me) || state.role(me) < authority::Role::Moderator {
+            return Ok(false);
+        }
+        let owner = state.role(me) == authority::Role::Owner;
+        let gone: BTreeSet<PublicKey> = match current {
+            Some((opened, _)) => opened.recipients.iter().filter(|k| !state.members.contains(*k)).copied().collect(),
+            None => {
+                let joined = view.records.iter().filter(|r| r.kind() == records::Kind::Join).map(|r| r.author());
+                joined.chain(state.removed.keys().copied()).filter(|k| !state.members.contains(k)).collect()
+            }
+        };
+        let mine = |target: &PublicKey| {
+            state.removed.get(target).and_then(|kick| view.records.iter().find(|r| r.id() == *kick)).is_some_and(|r| r.author() == me)
+        };
+        if !gone.is_empty() && (owner || gone.iter().any(mine)) {
+            return Ok(true);
+        }
+        if !owner {
+            return Ok(false);
+        }
+        let Some((opened, last_part)) = current else { return Ok(false) };
+        let resolver = &self.logs.get(&server).ok_or(ErrorCode::Internal)?.resolver;
+        // The invite each member last joined through.
+        let invite_of = |member: &PublicKey| {
+            view.records.iter().rev().filter(|r| r.author() == *member).find_map(|r| match Action::from_record(r) {
+                Some(Action::Join { invite }) => Some(invite),
+                _ => None,
+            })
+        };
+        let stale = |member: &PublicKey| match invite_of(member) {
+            // An invite signed after the rotation reaches it.
+            Some(invite) => !resolver.reaches(*last_part, &[invite]),
+            None => true,
+        };
+        Ok(state.members.iter().filter(|m| !opened.recipients.contains(*m)).any(stale))
+    }
+
+    /// T17: seals a fresh secret for the members now (S2) and signs every
+    /// part as its own `SecretRotation`, all or none; then moves to it.
+    fn rotate_secret(
+        &mut self,
+        ports: &Ports,
+        server: ServerId,
+        current: Option<&crate::ports::OpenedSecret>,
+        events: &mut Events,
+    ) -> CoreResult<()> {
+        let members = self.view(server)?.state.members.clone();
+        let (epoch, prev) = match current {
+            Some(opened) => (opened.epoch.checked_add(1).ok_or(ErrorCode::Internal)?, Some(opened.rotation)),
+            None => (0, None),
+        };
+        let (bodies, _secret) =
+            ports.cipher.seal_secret(server, epoch, prev, &members).map_err(|_| ErrorCode::Internal)?;
+        let mut actions = Vec::with_capacity(bodies.len());
+        for body in &bodies {
+            let (rotation, rest) = body.split_at_checked(32).ok_or(ErrorCode::Internal)?;
+            let [part, parts, sealed @ ..] = rest else { return Err(ErrorCode::Internal.into()) };
+            let rotation = RecordId::from_bytes(rotation.try_into().map_err(|_| ErrorCode::Internal)?);
+            actions.push(Action::SecretRotation { rotation, part: *part, parts: *parts, sealed: sealed.to_vec() });
+        }
+        for action in &actions {
+            self.publish_control(ports, server, action)?;
+        }
+        // My own box opens like anyone's: one path for the switch.
+        if let Some((opened, _)) = self.current_secret_rotation(&*ports.cipher, server)? {
+            self.move_to_secret(ports, server, &opened, events)?;
+        }
+        Ok(())
     }
 
     /// T8-02: a short link for my new invite. A fresh k (kept sealed, S4),
@@ -4781,6 +5106,63 @@ impl Inner {
                     touched.insert(of);
                 }
             }
+            // B7-k (Tech Lead, child safety): for a joiner who isn't an adult,
+            // a channel that was ever 18+ re-seals only messages whose deps
+            // reach its latest edit back to plain; none without one. Nothing
+            // from its 18+ time ever reaches them.
+            // Each ever-18+ channel's latest edit back to plain, found once per
+            // Join (dev-sync on #635): the one with every other plain edit
+            // for that channel in its past; None (none, or concurrent ones)
+            // fails closed.
+            let latest_plain: HashMap<ChannelId, Option<RecordId>> = if view.state.adults.contains(&joiner) {
+                HashMap::new()
+            } else {
+                let mut plain: HashMap<ChannelId, Vec<RecordId>> = HashMap::new();
+                for e in log.records.iter().filter(|e| view.state.accepted.contains(&e.id())) {
+                    if let Some(Action::ChannelEdit { channel, adult: false, .. }) = Action::from_record(e) {
+                        plain.entry(channel).or_default().push(e.id());
+                    }
+                }
+                view.state
+                    .adult_edits
+                    .keys()
+                    .map(|channel| {
+                        let edits = plain.remove(channel).unwrap_or_default();
+                        let latest =
+                            edits.iter().find(|p| edits.iter().all(|o| o == *p || log.resolver.reaches(*o, &[**p])));
+                        (*channel, latest.copied())
+                    })
+                    .collect()
+            };
+            let after_plain = |r: &Record, channel: ChannelId| match latest_plain.get(&channel) {
+                None => true,
+                Some(Some(edit)) => log.resolver.reaches(*edit, r.auth_deps()),
+                Some(None) => false,
+            };
+            // G-52 (forward-only lowering): for a joiner who isn't an adult,
+            // in a server that was ever 18+, only messages written after the
+            // latest lowering, so their deps reach it; nothing from the 18+
+            // time is ever re-sealed to them.
+            let ever_adult = log.genesis_min >= 18 || view.state.age_raise.is_some();
+            let lowered_at = if ever_adult && !view.state.adults.contains(&joiner) {
+                let lowerings: Vec<RecordId> = log
+                    .records
+                    .iter()
+                    .filter(|r| view.state.accepted.contains(&r.id()))
+                    .filter(|r| matches!(Action::from_record(r), Some(Action::ServerAgeLimit { min }) if min < 18))
+                    .map(|r| r.id())
+                    .collect();
+                // The owner signs them in a chain: the latest reaches the rest.
+                let latest = lowerings.iter().find(|l| lowerings.iter().all(|o| o == *l || log.resolver.reaches(*o, &[**l])));
+                Some(latest.copied())
+            } else {
+                None
+            };
+            let after_lowering = |r: &Record| match lowered_at {
+                None => true,
+                Some(Some(lowering)) => log.resolver.reaches(lowering, r.auth_deps()),
+                Some(None) => false,
+            };
             let mut by_channel: BTreeMap<ChannelId, Vec<(RecordId, u64)>> = BTreeMap::new();
             for r in &log.channel {
                 let Scope::Channel(channel) = r.scope() else { continue };
@@ -4790,7 +5172,9 @@ impl Inner {
                     && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS
                     && !done.contains(&r.id())
                     && !touched.contains(&r.id())
-                    && !log.resolver.reaches(join, r.auth_deps());
+                    && !log.resolver.reaches(join, r.auth_deps())
+                    && after_plain(r, channel)
+                    && after_lowering(r);
                 if fits && channel_readers(&view, channel).contains(&joiner) {
                     by_channel.entry(channel).or_default().push((r.id(), r.ts()));
                 }
@@ -5666,7 +6050,7 @@ impl Inner {
     ) -> CoreResult<()> {
         // G-77: an age removal says which restriction I'm now under.
         let required = (reason == RemovedReason::Age)
-            .then(|| self.view(server).ok().map(|v| v.genesis.age_restriction))
+            .then(|| self.view(server).ok().map(|v| v.age_limit()))
             .flatten();
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
@@ -5862,6 +6246,9 @@ impl Inner {
         let server_id = model::hex_id(view.id.as_bytes());
         let mut out = Vec::new();
         let looks = view.looks();
+        // G-52: the owner and admins see who isn't an adult in an 18+ server.
+        let staff = me.is_some_and(|me| view.state.role(me) >= authority::Role::Admin);
+        let adult_server = view.age_limit() == AgeRestriction::Eighteen;
         // Profile save (#378): my own row shows my saved profile at once,
         // not what my last profile post said (it may still be waiting).
         let mine = self.me.as_ref().map(|me| {
@@ -5902,6 +6289,7 @@ impl Inner {
                 bio: None,
                 avatar_data_url: avatar,
                 color,
+                not_adult: (staff && adult_server && !view.state.adults.contains(&member.key)).then_some(true),
             });
         }
         Ok(out)
@@ -5948,7 +6336,7 @@ impl Inner {
         // new computer): no new join, and nothing that would overwrite what
         // the server already holds about me.
         let member = view.state.is_member(key);
-        let required = view.genesis.age_restriction;
+        let required = view.age_limit();
         // As it counts now: at most 17 while a raise waits its 30 days.
         let age = me.profile.effective_age(ports.clock.now_ms());
         // A member's earlier age claim stands while this device has no birth
@@ -6037,7 +6425,7 @@ impl ServerView<'_> {
             initials: model::initials(&name),
             name,
             color: model::color_for(self.id.as_bytes()),
-            age_restriction: self.genesis.age_restriction,
+            age_restriction: self.age_limit(),
             owner_id: model::hex_id(self.owner.as_bytes()),
             invite_link,
             unread: false,
@@ -6109,7 +6497,8 @@ impl ServerView<'_> {
 /// members, and for an 18+ channel only those with an accepted 18+ claim.
 fn channel_readers(view: &ServerView, channel: ChannelId) -> BTreeSet<PublicKey> {
     let members = view.state.members.iter().copied();
-    if view.state.channels.get(&channel).is_some_and(|c| c.adult) {
+    // G-52: while the server is 18+, every channel is read by its adults only.
+    if view.age_limit() == AgeRestriction::Eighteen || view.state.channels.get(&channel).is_some_and(|c| c.adult) {
         members.filter(|m| view.state.adults.contains(m)).collect()
     } else {
         members.collect()

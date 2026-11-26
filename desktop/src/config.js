@@ -271,6 +271,16 @@ function abuseHost(value) {
   return m ? m[1] : null;
 }
 
+/**
+ * G-81 B: the core's argument for the flag (dev-sync #556, TL): `--voice-p2p` when on,
+ * nothing when off. With it, relay-only calls run on B over our circuits only.
+ * @param {boolean} on
+ * @returns {string[]}
+ */
+function voiceP2pArgs(on) {
+  return on === true ? ['--voice-p2p'] : [];
+}
+
 /** The host of a STUN URL (for the file log to hide), or null. */
 function stunHost(url) {
   const m = typeof url === 'string' && /^stuns?:(?:\[([^\]]+)\]|([^:]+))/i.exec(url);
@@ -306,4 +316,5 @@ module.exports = {
   abuseHost,
   withAbuseAddress,
   voiceP2pFor,
+  voiceP2pArgs,
 };

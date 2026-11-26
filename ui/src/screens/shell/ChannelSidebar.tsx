@@ -18,6 +18,7 @@ import { channelMuteKey, isMutedKey, mutedUntil, MUTE_FOREVER } from '../../app/
 import { useMutedLabel } from './MuteDialog';
 import { NotifyDialog, type NotifyTarget } from './NotifyDialog';
 import { TopicDialog } from './TopicDialog';
+import { useReadOnlyProps } from './UpdateRequired';
 
 const NO_CHANNELS: Channel[] = [];
 
@@ -47,6 +48,7 @@ export function ChannelSidebar({
   const channels = useStore(store, (s) => s.channels[server.id] ?? NO_CHANNELS);
   const identity = useStore(store, (s) => s.identity)!;
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   // A closed server is read-only (#261): no owner controls there.
   const owner = server.ownerId === identity.id && !server.closed;
   const core = useCore();
@@ -205,6 +207,7 @@ export function ChannelSidebar({
               onClick={onCreateChannel}
               aria-label={intl.formatMessage({ id: 'channel.create' })}
               title={intl.formatMessage({ id: 'channel.create' })}
+              {...ro}
             >
               <PlusIcon />
             </button>

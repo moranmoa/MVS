@@ -736,6 +736,8 @@ pub struct Node {
     commands: mpsc::UnboundedSender<Command>,
     /// G-81: frames to send, bounded; full drops the frame (`voice_frame`).
     voice_frames: mpsc::Sender<VoiceFrame>,
+    /// NC-1: success counts by path, read without a round-trip.
+    stats: Arc<crate::netstats::NetStats>,
 }
 
 impl Node {
@@ -834,6 +836,7 @@ impl Node {
         let (voice_frames, voice_frame_rx) = mpsc::channel(VOICE_FRAMES_IN);
         let (voice_in_tx, voice_in_rx) = mpsc::channel(VOICE_READ_QUEUE);
         let link_peers = swarm.behaviour().guard.link_peers.clone();
+        let stats = Arc::new(crate::netstats::NetStats::default());
         let mut task = Task {
             swarm,
             store,
@@ -976,6 +979,8 @@ impl Node {
             member_relay_rest: HashMap::new(),
             fallback_dialed: HashMap::new(),
             fallback_dials: HashSet::new(),
+            stats: stats.clone(),
+            holepunched: HashSet::new(),
         };
         // A relay-only start keeps no member addresses either (Security Lead).
         if task.relay_only {
@@ -985,7 +990,13 @@ impl Node {
             task.open(log, None);
         }
         tokio::spawn(task.run(command_rx, answer_rx, decoded_rx, beacon_rx, voice_frame_rx));
-        Ok((Node { peer_id, commands, voice_frames }, event_rx))
+        Ok((Node { peer_id, commands, voice_frames, stats }, event_rx))
+    }
+
+    /// NC-1: how operations succeeded so far, by path, and how others can
+    /// reach us. A cheap copy (atomics), never a round-trip to the task.
+    pub fn net_stats(&self) -> crate::netstats::NetStatsSnapshot {
+        self.stats.snapshot()
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -1647,6 +1658,10 @@ type Answer = (PeerId, ResponseChannel<SyncResponse>, SyncResponse, usize, Vec<R
 type Decoded = ((PeerId, String), Vec<Incoming>, bool, Vec<RecordId>);
 
 struct Task {
+    /// NC-1: success counts by path (shared with the handle).
+    stats: Arc<crate::netstats::NetStats>,
+    /// NC-1: connections a DCUtR hole punch opened (bounded at 1024).
+    holepunched: HashSet<ConnectionId>,
     swarm: Swarm<Behaviour>,
     store: Store,
     /// Read-only connection used by blocking threads to answer pulls.
@@ -3497,6 +3512,7 @@ impl Task {
             }
             SwarmEvent::ConnectionClosed { connection_id, .. } => {
                 self.voice_conns.remove(connection_id);
+                self.holepunched.remove(connection_id);
                 self.voice_dirty = true;
                 self.inbound_direct.remove(connection_id);
                 self.outbound_direct.remove(connection_id);
@@ -3619,6 +3635,28 @@ impl Task {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 self.note_observed(peer_id, &info.observed_addr);
+                // NC-1: how others reach us, from where they see us.
+                let observed = info.observed_addr.iter().find_map(|p| match p {
+                    Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+                    Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+                    _ => None,
+                });
+                if let Some(observed) = observed.filter(|ip| !ip.is_loopback()) {
+                    let listening: Vec<std::net::IpAddr> = self
+                        .swarm
+                        .listeners()
+                        .filter_map(|a| {
+                            a.iter().find_map(|p| match p {
+                                Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+                                Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+                    if let Some(reach) = crate::netstats::reach_of(observed, &listening) {
+                        self.stats.set_reach(reach);
+                    }
+                }
                 if let Some(i) = self.relays.iter().position(|r| r.peer == peer_id) {
                     // Relay circuit as a fallback for peers that can't reach us
                     // directly (NAT). On a LAN the direct address wins.
@@ -3815,11 +3853,13 @@ impl Task {
                     acceptance,
                 );
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message { peer, message, .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message { peer, connection_id, message })) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => self.on_request(peer, request, channel),
                     request_response::Message::Response { request_id, response } => {
                         if let Some(key) = self.inflight.remove(&request_id) {
+                            // NC-1: a pull answered, on this connection's path.
+                            self.stats.add(crate::netstats::NetPurpose::Sync, self.stat_path(connection_id));
                             self.on_response(key, response);
                             self.pull_next(peer);
                         }
@@ -3889,12 +3929,14 @@ impl Task {
             SwarmEvent::Behaviour(BehaviourEvent::InvitePub(request_response::Event::OutboundFailure {
                 peer, error, ..
             })) => debug!(%peer, %error, "invite publication not delivered"),
-            SwarmEvent::Behaviour(BehaviourEvent::InviteAsk(request_response::Event::Message { peer, message, .. })) => {
+            SwarmEvent::Behaviour(BehaviourEvent::InviteAsk(request_response::Event::Message { peer, connection_id, message })) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => {
                         self.on_invite_ask(peer, request, channel)
                     }
                     request_response::Message::Response { request_id, response } => {
+                        // NC-1: a join's invite fetch answered.
+                        self.stats.add(crate::netstats::NetPurpose::Join, self.stat_path(connection_id));
                         self.on_invite_answer(request_id, Some(response))
                     }
                 }
@@ -4008,9 +4050,13 @@ impl Task {
                 match result {
                     Ok(connection) => {
                         info!(peer = %remote_peer_id, "hole punch succeeded");
-                        // R1: never a dial-back probe (SL on #565).
+                        // R1: never a dial-back probe (SL on #565); NC-1: counts
+                        // as hole-punched. Both bounded.
                         if self.punched.len() < 1024 {
                             self.punched.insert(connection);
+                        }
+                        if self.holepunched.len() < 1024 {
+                            self.holepunched.insert(connection);
                         }
                     }
                     Err(err) => debug!(peer = %remote_peer_id, %err, "hole punch failed: staying relayed"),
@@ -5136,6 +5182,19 @@ impl Task {
         }
     }
 
+    /// NC-1: the path of an open connection, for the counters.
+    fn stat_path(&self, connection: ConnectionId) -> crate::netstats::NetPath {
+        use crate::netstats::NetPath;
+        match self.voice_conns.get(&connection) {
+            Some(VoicePath::Lan) => NetPath::DirectLan,
+            Some(VoicePath::Direct) if self.holepunched.contains(&connection) => NetPath::DirectHolepunch,
+            Some(VoicePath::Direct) => NetPath::DirectPublic,
+            Some(VoicePath::Circuit) => NetPath::OurRelay,
+            Some(VoicePath::MemberCircuit) => NetPath::MemberRelay,
+            Some(VoicePath::None) | None => NetPath::None,
+        }
+    }
+
     /// Whether voice may use `connection` now: it is open, and relay-only
     /// (SL B5) allows only our circuits.
     fn voice_allowed(&self, connection: ConnectionId) -> bool {
@@ -5210,6 +5269,10 @@ impl Task {
             if self.voice_paths.get(&identity) != Some(&path) {
                 self.voice_paths.insert(identity, path);
                 self.emit(NodeEvent::VoicePath { identity, path });
+                // NC-1: a call peer's media on a new path.
+                if let Some((_, conn, _)) = route {
+                    self.stats.add(crate::netstats::NetPurpose::Call, self.stat_path(conn));
+                }
             }
             let current_ok = self
                 .voice_out

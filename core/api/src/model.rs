@@ -198,11 +198,22 @@ pub(crate) const ADULT_KEYS_CAP: &str = "adult-keys-v1";
 /// records. Older cores refuse an unknown kind and stall the control log
 /// behind it, so nobody sets either until every member posts this.
 pub(crate) const SERVER_META_CAP: &str = "server-meta-v1";
+/// The first level (Tech Lead on #590 and #609): this version decodes every
+/// kind up to level 1, which is every code up to 26: `SecretRotation` (25,
+/// T17) and `ServerAgeLimit` (26, G-52). A gate checks `lv >= k`. The next
+/// release that adds a kind posts `lv:2` and adds its row to
+/// [`LEVEL_MAX_KIND`].
+pub(crate) const LEVEL_CAP: &str = "lv:1";
+/// Each level and the highest kind code it promises to decode. The last row
+/// is the level this version posts (`LEVEL_CAP`); a test holds it to what
+/// `records` decodes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LEVEL_MAX_KIND: [(u32, u16); 1] = [(1, 26)];
 /// Every cap this version posts, and the only names `getUpdateNeeded`
 /// takes. Frozen after server-meta-v1: later gates use one `lv:N` cap
 /// (Tech Lead on #555).
-pub(crate) const CAPS: [&str; 5] =
-    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP];
+pub(crate) const CAPS: [&str; 6] =
+    [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP, LEVEL_CAP];
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileBody {
@@ -264,6 +275,9 @@ pub(crate) struct Log {
     pub stubs: HashMap<RecordId, Stub>,
     server: ServerId,
     channel_ids: HashSet<RecordId>,
+    /// G-52: the minimum age the genesis set (0, 16 or 18), once it joined.
+    /// `State::age_limit` overrides it ([`effective_min_age`]).
+    pub genesis_min: u8,
 }
 
 impl Log {
@@ -286,6 +300,7 @@ impl Log {
             stubs: HashMap::new(),
             server,
             channel_ids: HashSet::new(),
+            genesis_min: 0,
         };
         for record in records {
             log.add(record);
@@ -338,6 +353,9 @@ impl Log {
                         if entry.1 == 0 {
                             ready.push(self.pending.remove(&waiter).expect("just seen").0);
                         }
+                    }
+                    if record.kind() == Kind::Genesis && record.server() == self.server {
+                        self.genesis_min = genesis_body(&record).map_or(0, |b| b.age_restriction.min_age() as u8);
                     }
                     self.records.push(record.clone());
                     out.push(record);
@@ -392,6 +410,32 @@ pub(crate) struct MemberInfo {
     pub display_name: String,
 }
 
+/// A genesis record's metadata, after its nonce.
+fn genesis_body(genesis: &Record) -> Option<GenesisBody> {
+    let metadata = genesis.body().get(records::GENESIS_NONCE_LEN..)?;
+    serde_json::from_slice(metadata).ok()
+}
+
+/// G-52: the server's minimum age now: the latest accepted `ServerAgeLimit`,
+/// else the genesis value.
+pub(crate) fn effective_min_age(state: &State, genesis_min: u8) -> u8 {
+    state.age_limit.unwrap_or(genesis_min)
+}
+
+/// G-52: while the server is 18+, the record every channel record's deps
+/// must reach unless its author is an adult now (Security Lead on #590):
+/// `Some(Some(raise))` after an accepted raise to 18, `Some(None)` for a
+/// server made 18+ at its genesis (everything reaches that); `None` when
+/// the server isn't 18+.
+pub(crate) fn server_adult_edit(state: &State, genesis_min: u8) -> Option<Option<RecordId>> {
+    if effective_min_age(state, genesis_min) < 18 {
+        return None;
+    }
+    // Set only while `age_limit` is 18 (Security Lead on #610): a lower
+    // clears what counts, a later raise moves it.
+    Some(state.age_limit.and(state.age_raise))
+}
+
 /// One server, as its [`Log`] resolves it.
 pub(crate) struct ServerView<'a> {
     pub id: ServerId,
@@ -409,8 +453,7 @@ impl<'a> ServerView<'a> {
         let genesis = log.records.iter().find(|r| {
             r.kind() == Kind::Genesis && r.scope() == Scope::Control && r.server() == id
         })?;
-        let metadata = genesis.body().get(records::GENESIS_NONCE_LEN..)?;
-        let body: GenesisBody = serde_json::from_slice(metadata).ok()?;
+        let body = genesis_body(genesis)?;
         let owner = genesis.author();
         (body.v == 1 && state.owner == Some(owner)).then_some(ServerView {
             id,
@@ -423,6 +466,16 @@ impl<'a> ServerView<'a> {
 
     pub fn is_kicked(&self, key: &PublicKey) -> bool {
         self.state.kicked.contains(key)
+    }
+
+    /// G-52: the age limit now: the latest accepted change, else the
+    /// genesis value.
+    pub fn age_limit(&self) -> AgeRestriction {
+        match effective_min_age(self.state, self.genesis.age_restriction.min_age() as u8) {
+            18 => AgeRestriction::Eighteen,
+            16 => AgeRestriction::Sixteen,
+            _ => AgeRestriction::None,
+        }
     }
 
     /// G-91: since when each current member has been in this server: the
@@ -1085,13 +1138,49 @@ mod tests {
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
     }
 
+    /// G-52 (Tech Lead on #616): the raise every channel record must reach
+    /// while the server is 18+, in each case.
+    #[test]
+    fn server_adult_edit_in_each_case() {
+        let raise = RecordId::from_bytes([1; 32]);
+        let state = |limit: Option<u8>, raised: Option<RecordId>| State { age_limit: limit, age_raise: raised, ..State::default() };
+        // Never changed: the genesis decides.
+        assert_eq!(server_adult_edit(&state(None, None), 0), None);
+        assert_eq!(server_adult_edit(&state(None, None), 16), None);
+        assert_eq!(server_adult_edit(&state(None, None), 18), Some(None), "18+ from the genesis");
+        // Raised: the raise, whatever the genesis said.
+        assert_eq!(server_adult_edit(&state(Some(18), Some(raise)), 0), Some(Some(raise)));
+        assert_eq!(server_adult_edit(&state(Some(18), Some(raise)), 18), Some(Some(raise)));
+        // Lowered after a raise: not 18+, even from an 18+ genesis; the old
+        // raise no longer counts (Security Lead on #610).
+        assert_eq!(server_adult_edit(&state(Some(16), Some(raise)), 18), None);
+        assert_eq!(server_adult_edit(&state(Some(0), Some(raise)), 0), None);
+        assert_eq!(effective_min_age(&state(Some(16), None), 18), 16);
+        assert_eq!(effective_min_age(&state(None, None), 18), 18);
+    }
+
+    /// Tech Lead on #609: the posted level promises exactly what this core
+    /// decodes: every kind code up to the level's max decodes, and no code
+    /// above it does.
+    #[test]
+    fn the_posted_level_matches_what_this_core_decodes() {
+        let (level, max) = *LEVEL_MAX_KIND.last().expect("a level");
+        assert_eq!(LEVEL_CAP, format!("lv:{level}"), "LEVEL_CAP is the last row");
+        assert!(LEVEL_MAX_KIND.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        for code in 1..=max {
+            assert!(records::Kind::from_code(code).is_some(), "code {code} is promised by lv:{level}");
+        }
+        let highest = (1..=u16::MAX).filter(|c| records::Kind::from_code(*c).is_some()).max();
+        assert_eq!(highest, Some(max), "a new kind needs a new level");
+    }
+
     /// Every cap is posted once (Tech Lead on #555): a merge that loses a
     /// line of `CAPS`, or doubles one, fails here.
     #[test]
     fn every_cap_is_posted_once() {
         let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();
         assert_eq!(unique.len(), CAPS.len(), "a cap twice");
-        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP] {
+        for cap in [SERVER_LIFECYCLE_CAP, REACTIONS_CAP, TOPIC_CAP, ADULT_KEYS_CAP, SERVER_META_CAP, LEVEL_CAP] {
             assert!(CAPS.contains(&cap), "{cap} missing");
         }
     }

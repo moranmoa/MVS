@@ -69,12 +69,6 @@ const UPDATE = Object.freeze(new Set(['getAppInfo', 'restartToUpdate']));
 const CHECK_EVERY_MS = 30_000;
 
 /**
- * While a required update waits for a call to end (TL): only the call's own
- * commands pass, besides reads and the update. No sends, joins or kicks.
- */
-const CALL = Object.freeze(new Set(['setMuted', 'setDeafened', 'sendSignal', 'leaveCall']));
-
-/**
  * Everything else: writes, signed actions and the network. Listed so the
  * classification is explicit (a test checks the two lists cover commands.js).
  */
@@ -122,9 +116,6 @@ const NOT_READ_ONLY = Object.freeze(
   ]),
 );
 
-/** How long a required update waits for a call to end (SL): 30 min. */
-const CALL_CAP_MS = 30 * 60 * 1000;
-
 /** The core's updateRequired / update.required payload: { version } or null. */
 function cleanRequired(v) {
   if (!v || typeof v !== 'object') return null;
@@ -133,32 +124,29 @@ function cleanRequired(v) {
 }
 
 /**
- * The gate. `inCall()` is the call gate; `endCall()` ends the call when the
- * 30 min cap runs out; `onChange(state)` gets every change of
- * { required, version, active, callEndsAt }.
+ * The gate. A required update applies at once (TL, confirmed by the PO): the
+ * core's RU1 already stops voice and sync, so a call in progress is ended
+ * cleanly right away (`endCall()`: a normal leave), with no grace period.
+ * `onChange(state)` gets every change of { required, version, active, phase,
+ * endedCall }; `endedCall` is true when this gate ended a call (the banner
+ * says so: update.required.callEnded).
  */
-function createRequiredGate({ inCall, endCall, onChange = () => {}, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, capMs = CALL_CAP_MS }) {
+function createRequiredGate({ inCall, endCall, onChange = () => {} }) {
   let required = null; // { version } once set; never cleared in this process
-  let capped = false;
-  let callEndsAt = null;
-  let timer = null;
+  let endedCall = false;
 
-  const active = () => !!required && (capped || !inCall());
-  /** 'none' | 'call' (required, waiting for the call to end) | 'gated'. */
-  const phase = () => (!required ? 'none' : active() ? 'gated' : 'call');
-  const state = () => ({ required: !!required, version: required ? required.version : null, active: active(), phase: phase(), callEndsAt });
+  const active = () => !!required;
+  /** 'none' | 'gated'. */
+  const phase = () => (required ? 'gated' : 'none');
+  const state = () => ({ required: !!required, version: required ? required.version : null, active: active(), phase: phase(), endedCall });
   const changed = () => onChange(state());
 
-  const startCap = () => {
-    if (timer || capped || !required || !inCall()) return;
-    callEndsAt = now() + capMs;
-    timer = setTimer(() => {
-      timer = null;
-      capped = true;
-      callEndsAt = null;
-      endCall();
-      changed();
-    }, capMs);
+  /** A call still running under a required update ends now. True if it ended one. */
+  const endRunningCall = () => {
+    if (!required || !inCall()) return false;
+    endedCall = true;
+    endCall();
+    return true;
   };
 
   return {
@@ -177,35 +165,22 @@ function createRequiredGate({ inCall, endCall, onChange = () => {}, now = Date.n
         return true;
       }
       required = r;
-      startCap();
+      endRunningCall();
       changed();
       return true;
     },
-    /** After any change to the call (main's syncCall). */
+    /** After any change to the call (main's syncCall): no call may run while required. */
     callChanged() {
-      if (!required) return;
-      if (!inCall() && timer) {
-        clearTimer(timer);
-        timer = null;
-        callEndsAt = null;
-        changed(); // the gate is active now
-      } else if (inCall()) {
-        startCap();
-      }
+      // A racing call ended: the page hears it (the banner's "call ended", TL).
+      if (endRunningCall()) changed();
     },
     get active() {
       return active();
     },
-    /**
-     * May the page send this core command now? Not required: anything. While
-     * waiting for a call to end: reads, the update and the call's own
-     * commands. Gated: reads and the update.
-     */
+    /** May the page send this core command now? Not required: anything. Required: reads and the update. */
     allows(cmd) {
-      const p = phase();
-      if (p === 'none') return true;
-      if (READ_ONLY.has(cmd) || UPDATE.has(cmd)) return true;
-      return p === 'call' && CALL.has(cmd);
+      if (!required) return true;
+      return READ_ONLY.has(cmd) || UPDATE.has(cmd);
     },
   };
 }
@@ -235,4 +210,4 @@ function createCheckThrottle({ run, now = Date.now, every = CHECK_EVERY_MS }) {
   };
 }
 
-module.exports = { READ_ONLY, UPDATE, CALL, NOT_READ_ONLY, CALL_CAP_MS, CHECK_EVERY_MS, cleanRequired, createRequiredGate, createCheckThrottle };
+module.exports = { READ_ONLY, UPDATE, NOT_READ_ONLY, CHECK_EVERY_MS, cleanRequired, createRequiredGate, createCheckThrottle };

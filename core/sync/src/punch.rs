@@ -202,6 +202,11 @@ impl MemberPunch {
         true
     }
 
+    /// Whether punching may run at all (off while relay-only, or in tests).
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Relay-only on: close every gate and refuse punch dials. Off: gates
     /// open again only through [`MemberPunch::open`].
     pub(crate) fn set_enabled(&mut self, on: bool) {

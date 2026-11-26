@@ -3993,7 +3993,13 @@ impl Task {
                 self.on_backup_providers(id, providers, step.last);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Punch(libp2p::dcutr::Event { remote_peer_id, result })) => {
-                if self.punch_events.len() < 1024 || self.punch_events.contains_key(&remote_peer_id) {
+                // R1: a punch event, ours or theirs, within 30 s makes a
+                // helper's answer refused (TL on #565). Only while punching
+                // can run at all: with it off no gate opens and no punch dial
+                // goes out, so no connection can come of the event (it is a
+                // refusal), and a peer that just dials us is an ordinary inbound.
+                let may_punch = self.swarm.behaviour().punch.enabled();
+                if may_punch && (self.punch_events.len() < 1024 || self.punch_events.contains_key(&remote_peer_id)) {
                     self.punch_events.insert(remote_peer_id, Instant::now());
                 }
                 // A success shows up as a direct connection: `track_connection`

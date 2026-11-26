@@ -123,14 +123,6 @@ process.stdin.on('data', (chunk) => {
         }
         break;
       }
-      case 'setMuted':
-        // LR-1 path B: <data-dir>/fake-emit-server-updated → main's setMuted on
-        // a lock during a call is followed by a server.updated (updateNeeded).
-        if (fs.existsSync(path.join(dataDir, 'fake-emit-server-updated'))) {
-          out({ type: 'event', event: 'server.updated', payload: { id: 's'.repeat(64), name: 'S', updateNeeded: { cap: 'secret-rotation' } } });
-        }
-        out({ type: 'response', id: m.id, ok: m.args ?? null }); // the default echo, as before
-        break;
       case 'leaveCall':
         out({ type: 'event', event: 'call.state', payload: { channelId: 'c'.repeat(64), participants: [], full: false } });
         out({ type: 'response', id: m.id, ok: null });

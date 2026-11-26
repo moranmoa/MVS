@@ -6,31 +6,63 @@
 //! links or per-event times.
 //!
 //! sync (dev-sync, NC-1 (a)) reports through [`crate::Network::net_counters`]
-//! in its own words: each `(purpose, path, count)` and a reachability label.
-//! Nothing it says is copied: each label is matched exactly against the
-//! vocabulary below, and anything else is dropped (a count under an unknown
-//! label is lost, never shown). The output always has every key, so the
-//! file's shape never depends on the input.
+//! in **typed** labels (dev-sync's request: the compiler checks each one, so
+//! no count can go missing under a misspelt label, and nothing but these
+//! words can reach the file). Each count is the number of successful
+//! operations since start for that (purpose, path): joins completed, sync
+//! pulls answered, calls whose media ran on that path. The output always
+//! has every purpose, so the file's shape never depends on the input.
 
 use serde_json::{json, Map, Value};
 
-/// What a connection was for.
-pub const PURPOSES: [&str; 3] = ["join", "sync", "call"];
-/// How a connection reached the peer.
-pub const PATHS: [&str; 5] = ["direct-lan", "direct-holepunch", "member-relay", "our-relay", "none"];
-/// This device's reachability verdict (RIA-R1).
-pub const REACHABILITY: [&str; 5] = ["public", "port-mapped", "nat", "cgnat-likely", "unknown"];
+macro_rules! vocabulary {
+    ($(#[$doc:meta])* $name:ident, $all:ident: $($variant:ident = $label:literal),+ $(,)?) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum $name { $($variant),+ }
 
-/// What sync reports, in its own labels, before any check.
+        impl $name {
+            pub const ALL: [$name; [$($label),+].len()] = [$($name::$variant),+];
+            /// Its word in the diagnostics file.
+            pub fn label(self) -> &'static str {
+                match self { $($name::$variant => $label),+ }
+            }
+        }
+
+        /// Every word of the vocabulary, in order.
+        pub const $all: [&str; [$($label),+].len()] = [$($label),+];
+    };
+}
+
+vocabulary!(
+    /// What a connection was for.
+    NetPurpose, PURPOSES: Join = "join", Sync = "sync", Call = "call",
+);
+vocabulary!(
+    /// How a connection reached the peer.
+    NetPath, PATHS: DirectLan = "direct-lan", DirectHolepunch = "direct-holepunch",
+    MemberRelay = "member-relay", OurRelay = "our-relay", None = "none",
+);
+vocabulary!(
+    /// This device's reachability verdict (RIA-R1).
+    Reachability, REACHABILITY: Public = "public", PortMapped = "port-mapped", Nat = "nat",
+    CgnatLikely = "cgnat-likely", Unknown = "unknown",
+);
+
+// By hand: the macro has no place for a variant's `#[default]`.
+#[allow(clippy::derivable_impls)]
+impl Default for Reachability {
+    fn default() -> Self {
+        Reachability::Unknown
+    }
+}
+
+/// What sync reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RawCounters {
     /// `(purpose, path, count)`; the same pair may repeat (summed).
-    pub paths: Vec<(String, String, u64)>,
-    pub reachability: String,
-}
-
-fn known<'a>(vocabulary: &[&'a str], label: &str) -> Option<&'a str> {
-    vocabulary.iter().copied().find(|v| *v == label)
+    pub paths: Vec<(NetPurpose, NetPath, u64)>,
+    pub reachability: Reachability,
 }
 
 /// Totals as the file shows them (SL on #620): a bucket, never a count.
@@ -63,13 +95,13 @@ fn share(part: u64, total: u64) -> u64 {
 /// [`SHARES_FROM`].
 pub fn network_json(raw: &RawCounters) -> Value {
     let mut connections = Map::new();
-    for purpose in PURPOSES {
-        let counts: Vec<u64> = PATHS
+    for purpose in NetPurpose::ALL {
+        let counts: Vec<u64> = NetPath::ALL
             .iter()
             .map(|path| {
                 raw.paths
                     .iter()
-                    .filter(|(p, q, _)| known(&PURPOSES, p) == Some(purpose) && known(&PATHS, q) == Some(*path))
+                    .filter(|(p, q, _)| *p == purpose && q == path)
                     .fold(0u64, |sum, (_, _, n)| sum.saturating_add(*n))
             })
             .collect();
@@ -81,9 +113,9 @@ pub fn network_json(raw: &RawCounters) -> Value {
                 PATHS.iter().zip(&counts).map(|(path, n)| ((*path).to_owned(), json!(share(*n, total)))).collect();
             entry.insert("shares".to_owned(), Value::Object(shares));
         }
-        connections.insert(purpose.to_owned(), Value::Object(entry));
+        connections.insert(purpose.label().to_owned(), Value::Object(entry));
     }
-    let reachability = known(&REACHABILITY, &raw.reachability).unwrap_or("unknown");
+    let reachability = raw.reachability.label();
     json!({ "connections": connections, "reachability": reachability })
 }
 
@@ -107,13 +139,13 @@ mod tests {
     fn known_labels_are_counted_and_every_key_is_present() {
         let raw = RawCounters {
             paths: vec![
-                ("sync".into(), "direct-lan".into(), 3),
-                ("sync".into(), "direct-lan".into(), 2),
-                ("call".into(), "our-relay".into(), 1),
-                ("join".into(), "member-relay".into(), u64::MAX),
-                ("join".into(), "member-relay".into(), 9),
+                (NetPurpose::Sync, NetPath::DirectLan, 3),
+                (NetPurpose::Sync, NetPath::DirectLan, 2),
+                (NetPurpose::Call, NetPath::OurRelay, 1),
+                (NetPurpose::Join, NetPath::MemberRelay, u64::MAX),
+                (NetPurpose::Join, NetPath::MemberRelay, 9),
             ],
-            reachability: "cgnat-likely".into(),
+            reachability: Reachability::CgnatLikely,
         };
         let v = network_json(&raw);
         // sync: 5 → a bucket, and too few for shares.
@@ -134,11 +166,11 @@ mod tests {
         // Shares from 6 on, to the nearest 10%.
         let mixed = RawCounters {
             paths: vec![
-                ("call".into(), "direct-lan".into(), 7),
-                ("call".into(), "direct-holepunch".into(), 2),
-                ("call".into(), "our-relay".into(), 1),
+                (NetPurpose::Call, NetPath::DirectLan, 7),
+                (NetPurpose::Call, NetPath::DirectHolepunch, 2),
+                (NetPurpose::Call, NetPath::OurRelay, 1),
             ],
-            reachability: "nat".into(),
+            reachability: Reachability::Nat,
         };
         let v = network_json(&mixed);
         assert_eq!(v["connections"]["call"]["total"], "6-20");
@@ -180,48 +212,15 @@ mod tests {
             self.0 ^= self.0 << 17;
             self.0
         }
-        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
-            items[(self.next() % items.len() as u64) as usize]
-        }
     }
 
-    /// What a careless or hostile reporter might hand over.
-    const HOSTILE: [&str; 24] = [
-        "192.168.1.20",
-        "10.0.0.1:4001",
-        "fe80::1",
-        "[2001:db8::7]:443",
-        "/ip4/203.0.113.9/tcp/4001",
-        "/ip6/::1/udp/4001/quic-v1",
-        "/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc",
-        "12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt",
-        "8c3f1a2b9d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a",
-        "relay.example.org",
-        "mvs://join/0011/2233",
-        "Direct-LAN",
-        "direct-lan ",
-        " direct-lan",
-        "direct_lan",
-        "direct-lan\0",
-        "our-relay\u{202E}",
-        "UNKNOWN",
-        "public;nat",
-        "cgnat",
-        "",
-        "שרת סודי",
-        "<script>alert(1)</script>",
-        "\"},\"x\":{\"",
-    ];
-
-    /// QA's condition: whatever sync reports, nothing outside the
-    /// vocabulary, and no IP, multiaddr, 64-hex or peer ID, reaches the file.
+    /// QA's condition: whatever sync reports (typed: any mix of purposes,
+    /// paths, reachability and counts up to u64::MAX), only the vocabulary,
+    /// buckets and shares reach the file, and no IP, multiaddr, 64-hex or
+    /// peer ID; never an exact count.
     #[test]
-    fn hostile_labels_never_reach_the_file() {
+    fn any_report_gives_only_vocabulary_buckets_and_shares() {
         let mut g = Gen(0x9E37_79B9_7F4A_7C15);
-        let mut labels: Vec<&str> = HOSTILE.to_vec();
-        labels.extend(PURPOSES);
-        labels.extend(PATHS);
-        labels.extend(REACHABILITY);
         let allowed: Vec<&str> = PURPOSES
             .iter()
             .chain(PATHS.iter())
@@ -234,9 +233,19 @@ mod tests {
             let n = (g.next() % 12) as usize;
             let raw = RawCounters {
                 paths: (0..n)
-                    .map(|_| (g.pick(&labels).to_owned(), g.pick(&labels).to_owned(), g.next() % 1_000))
+                    .map(|_| {
+                        let purpose = NetPurpose::ALL[(g.next() % 3) as usize];
+                        let path = NetPath::ALL[(g.next() % 5) as usize];
+                        let count = match g.next() % 4 {
+                            0 => g.next() % 6,
+                            1 => g.next() % 1_000,
+                            2 => g.next(),
+                            _ => u64::MAX,
+                        };
+                        (purpose, path, count)
+                    })
                     .collect(),
-                reachability: g.pick(&labels).to_owned(),
+                reachability: Reachability::ALL[(g.next() % 5) as usize],
             };
             let v = network_json(&raw);
             let text = v.to_string();
@@ -333,6 +342,6 @@ mod tests {
     #[test]
     fn the_grep_helpers_catch_what_they_should() {
         assert!(has_ipv4("x 10.0.0.1 y") && !has_ipv4("1.2.3"));
-        assert!(has_hex_run(HOSTILE[8], 64) && !has_hex_run("abc", 64));
+        assert!(has_hex_run("8c3f1a2b9d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a", 64) && !has_hex_run("abc", 64));
     }
 }

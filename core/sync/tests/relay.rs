@@ -1067,6 +1067,187 @@ async fn a_senders_restart_mid_call_is_heard_at_once() {
     b.shutdown().await.unwrap();
 }
 
+// ---- relay in the app, R1: reachability by dial-back ----------------------
+
+/// Until `cond` holds for `node`'s reachability, within `wait`.
+async fn reachable_within(node: &Node, wait: Duration) -> Option<Multiaddr> {
+    let start = Instant::now();
+    loop {
+        if let Some(addr) = node.relay_reachable().await.unwrap() {
+            return Some(addr);
+        }
+        if start.elapsed() >= wait {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// SL RR1 and TL 4: a node a member can't dial back at a global address
+/// (here: loopback, as behind NAT) never counts as reachable, so it never
+/// offers itself as a member relay, though its relay is on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_not_publicly_reachable_never_offers_itself_as_a_relay() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-nat-a", &relay, 50, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-nat-b", &relay, 51, true, Arc::new(AcceptAll)).await;
+    // A opens the direct connection (so B observes A's address).
+    b.test_no_direct_dials().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(50), voice_id(51), true).await;
+    assert_eq!(reachable_within(&a, Duration::from_secs(5)).await, None, "loopback was taken as public");
+    assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()), "a NAT'd node offered itself");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// R1's working path (on one machine, loopback allowed for the test): a
+/// member dials A back at the address it observed, A is confirmed
+/// reachable there, and only then offers itself, with that address alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_dials_back_and_only_then_the_relay_is_offered() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-ok-a", &relay, 52, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-ok-b", &relay, 53, true, Arc::new(AcceptAll)).await;
+    a.test_no_direct_dials().unwrap();
+    // Not about punching (the forged-answer test is): a recent punch
+    // would hold the answer back 30 s.
+    a.test_no_hole_punch().unwrap();
+    b.test_no_hole_punch().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(52), voice_id(53), true).await;
+    let addr = reachable_within(&a, Duration::from_secs(60)).await.expect("never confirmed");
+    let a_ports: Vec<Multiaddr> = a.listen_addrs().await.unwrap();
+    assert!(
+        a_ports.iter().any(|l| l.iter().nth(1) == addr.iter().nth(1)),
+        "confirmed {addr} isn't one of A's listen ports {a_ports:?}"
+    );
+    let start = Instant::now();
+    while !b.test_relay_offers().await.unwrap().contains(&a.peer_id()) {
+        assert!(start.elapsed() < Duration::from_secs(30), "the confirmed relay was never offered");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL 4: a dial-back is for members only. A helper that doesn't count the
+/// asker as a member declines, untried, so the asker stays unconfirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_member_is_never_dialled_back() {
+    let (relay, _relay) = voice_relay();
+    let gate = Refusing::default();
+    gate.set(voice_id(54), true);
+    let (a, _ea) = bound_node_events("r1-gate-a", &relay, 54, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-gate-b", &relay, 55, true, Arc::new(gate.clone())).await;
+    b.test_no_direct_dials().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    // A sees B as a member, B doesn't see A as one: wait until A is online
+    // for B's peer at least (A's presence of B).
+    let start = Instant::now();
+    loop {
+        let sa = a.presence(test_server().0).await.unwrap();
+        if sa.online.contains(&voice_id(55)) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "never met");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(reachable_within(&a, Duration::from_secs(8)).await, None, "a non-member was dialled back");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// TL and SL on #565: a helper that forges "reached" (it dials nothing) is
+/// never believed: not for a stranger's address, and not even for one of
+/// my own, since no probe of its came in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_dial_back_answer_is_never_believed() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-forge-a", &relay, 56, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-forge-b", &relay, 57, true, Arc::new(AcceptAll)).await;
+    // A dials B: no inbound from B ever reaches A, so a forged answer has
+    // nothing to match. (An ordinary inbound from B on A's port would be
+    // a real reachability proof, not a forgery.)
+    b.test_no_direct_dials().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    // B claims to have reached A at A's own listen address, or at a victim's.
+    let own = a.listen_addrs().await.unwrap().into_iter().find(|l| l.to_string().contains("/tcp/") && !l.to_string().contains("p2p-circuit")).unwrap();
+    b.test_dialback_lie(own).unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(56), voice_id(57), true).await;
+    // While A's ask to B is pending, A punches nothing with B (SL on #565),
+    // so no punched connection can pass for B's probe.
+    let start = Instant::now();
+    while a.test_punch_open(b.peer_id()).await.unwrap() || a.relay_reachable().await.unwrap().is_some() {
+        assert!(start.elapsed() < Duration::from_secs(20), "A kept punching with the helper it asked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(reachable_within(&a, Duration::from_secs(20)).await, None, "a forged answer was believed");
+    assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// SL on #565: a slow helper stays "waited on", punch gate closed, past
+/// 10 s until its answer settles. A new relayed connection to it at 11 s
+/// (here: the same `try_punch` it triggers) opens nothing, and its honest
+/// answer at 12 s is still taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_helper_keeps_the_punch_gate_closed_until_its_answer_settles() {
+    let (relay, _relay) = voice_relay();
+    let (a, _ea) = bound_node_events("r1-slow-a", &relay, 62, true, Arc::new(AcceptAll)).await;
+    let (b, _eb) = bound_node_events("r1-slow-b", &relay, 63, true, Arc::new(AcceptAll)).await;
+    a.test_no_direct_dials().unwrap();
+    a.test_no_hole_punch().unwrap();
+    b.test_no_hole_punch().unwrap();
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    b.test_dialback_delay(Duration::from_secs(12)).unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(62), voice_id(63), true).await;
+    let start = Instant::now();
+    while !a.test_dialback_waiting(b.peer_id()).await.unwrap() {
+        assert!(start.elapsed() < Duration::from_secs(30), "A never asked B");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let asked = Instant::now();
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    a.test_try_punch(b.peer_id()).unwrap();
+    // Still waiting on B, whose answer is due at 12 s: the gate stays shut.
+    while asked.elapsed() < Duration::from_millis(11_800) {
+        assert!(a.test_dialback_waiting(b.peer_id()).await.unwrap(), "A stopped waiting on B before its answer");
+        assert!(!a.test_punch_open(b.peer_id()).await.unwrap(), "A opened the punch gate with the helper it asked");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    reachable_within(&a, Duration::from_secs(30)).await.expect("the slow helper's answer was never taken");
+    assert!(!a.test_dialback_waiting(b.peer_id()).await.unwrap(), "still waiting after the answer settled");
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
+/// RR2: a relay-only node never asks, never serves, and never offers itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_only_node_never_becomes_a_relay() {
+    let (relay, _relay) = voice_relay();
+    let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let (a, _ea) = bound_node_on_events("r1-ro-a", &relay, 58, true, Arc::new(AcceptAll), listen.clone(), vec![], true).await;
+    let (b, _eb) = bound_node_events("r1-ro-b", &relay, 59, true, Arc::new(AcceptAll)).await;
+    a.test_local_dialback().unwrap();
+    b.test_local_dialback().unwrap();
+    a.set_member_relay(true, 1024, true).unwrap();
+    voice_meet(&a, &b, voice_id(58), voice_id(59), false).await;
+    assert_eq!(reachable_within(&a, Duration::from_secs(10)).await, None, "relay-only asked or was confirmed");
+    assert!(!b.test_relay_offers().await.unwrap().contains(&a.peer_id()));
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}
+
 /// Required update (#577 RU1): a quiet node signs, syncs and serves nothing
 /// for the rest of the process. It drops its member peers, closes any new
 /// connection at once (so a reachable quiet node answers nothing), and
@@ -1782,6 +1963,12 @@ async fn a_member_relay_serves_bound_members_only() {
     let (stranger, _) = node_events("mr-stranger", &relay).await;
     let a_direct = direct_addr(&a).await;
     let via_a = a_direct.clone().with(Protocol::P2pCircuit);
+    // R1: A serves only once a member dialled it back (loopback allowed
+    // for this test only).
+    for node in [&a, &b, &c] {
+        node.test_local_dialback().unwrap();
+        node.test_no_hole_punch().unwrap();
+    }
     for node in [&b, &c, &stranger] {
         node.test_dial(a_direct.clone());
     }
@@ -1803,6 +1990,7 @@ async fn a_member_relay_serves_bound_members_only() {
 
     // On: a member reserves (retrying while the gate opens), a stranger never.
     a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB, true).unwrap();
+    reachable_within(&a, Duration::from_secs(60)).await.expect("A was never dialled back");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !reserved_via(&b, &via_a).await {
         assert!(Instant::now() < deadline, "a member never reserved on the member relay");
@@ -1866,8 +2054,12 @@ async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
         node.test_no_hole_punch().unwrap();
     }
     let (d, _) = bound_node_on_events("fb-d", &relay, 34, true, Arc::new(AcceptAll), listen(), vec![], true).await;
+    // R1: A offers itself only once a member dialled it back (loopback is
+    // allowed for this test only).
+    for node in [&a, &b, &c, &d] {
+        node.test_local_dialback().unwrap();
+    }
     a.set_member_relay(true, sync::MEMBER_RELAY_DEFAULT_CAP_MB, true).unwrap();
-    let via_a = direct_addr(&a).await.with(Protocol::P2pCircuit);
 
     // Everyone meets through our relay and binds; A's offer reaches them.
     let deadline = Instant::now() + Duration::from_secs(40);
@@ -1879,6 +2071,9 @@ async fn members_fall_back_to_a_member_relay_when_our_relay_is_down() {
         assert!(Instant::now() < deadline, "the members never met: B sees {sb:?}, C sees {sc:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // A is confirmed reachable, and offers that address.
+    let confirmed = reachable_within(&a, Duration::from_secs(90)).await.expect("A was never dialled back");
+    let via_a = confirmed.with(Protocol::P2p(a.peer_id())).with(Protocol::P2pCircuit);
     // Our relay is up: nobody reserves on the member relay.
     tokio::time::sleep(Duration::from_secs(5)).await;
     for node in [&b, &c, &d] {

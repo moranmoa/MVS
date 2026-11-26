@@ -4090,3 +4090,14 @@ input.switch:disabled {
 .server-meta textarea {
   resize: vertical;
 }
+
+/* G-51: the settings title shows the icon too. */
+.server-settings-icon {
+  overflow: hidden;
+}
+
+.server-settings-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}

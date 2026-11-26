@@ -80,7 +80,7 @@ export function ServerSettings({
       title={
         <span className="server-settings-title" title={server.name}>
           <span className="server-settings-icon" style={{ background: server.color }} aria-hidden="true">
-            <bdi>{server.initials}</bdi>
+            {server.iconDataUrl ? <img src={server.iconDataUrl} alt="" /> : <bdi>{server.initials}</bdi>}
           </span>
           <Name>{server.name}</Name>
         </span>

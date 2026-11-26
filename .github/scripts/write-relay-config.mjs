@@ -132,6 +132,11 @@ if (boot.length) {
 agree(config.relays || (config.relay ? [config.relay] : []), config.bootstrap || []);
 if (process.env.STUN) config.stun = stunUrl(process.env.STUN);
 if (process.env.ABUSE_ADDRESS?.trim()) config.abuseAddress = abuseAddress(process.env.ABUSE_ADDRESS.trim());
+// B24: a release build must carry the abuse-report address. REQUIRE_ABUSE_ADDRESS=1
+// is set by release.yml on tag builds only; PR and dev builds stay optional.
+if (process.env.REQUIRE_ABUSE_ADDRESS === "1" && !config.abuseAddress) {
+  fail("a release build needs the abuse-report address: set the repository variable MVS_ABUSE_ADDRESS");
+}
 writeFileSync(out, JSON.stringify(config));
 console.log(config.relays ? `${config.relays.length} relays configured` : config.relay ? "relay configured" : "::warning::no relay address in this build: the app will run offline");
 console.log(config.bootstrap ? `${config.bootstrap.length} bootstrap address(es) configured` : "no bootstrap address in this build");

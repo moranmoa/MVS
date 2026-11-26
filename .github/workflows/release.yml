@@ -115,6 +115,8 @@ jobs:
           RELAYS_TCP: ${{ vars.MVS_RELAY_TCP_ADDRS }}
           STUN: ${{ vars.MVS_STUN_URL }}
           ABUSE_ADDRESS: ${{ vars.MVS_ABUSE_ADDRESS }}
+          # Checks the variables as a release would use them (B24).
+          REQUIRE_ABUSE_ADDRESS: "1"
         run: node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-vars.json"
 
   ui:
@@ -269,6 +271,15 @@ jobs:
               echo "::error::accepted as an abuse address: $a"; exit 1
             fi
           done
+          # B24: with REQUIRE_ABUSE_ADDRESS=1 (tag builds), a missing or blank
+          # address fails the build; a valid one passes.
+          for a in '' '   '; do
+            if ABUSE_ADDRESS="$a" REQUIRE_ABUSE_ADDRESS=1 node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" 2>/dev/null; then
+              echo "::error::a release build without an abuse address was accepted"; exit 1
+            fi
+          done
+          ABUSE_ADDRESS=abuse@relay.example.invalid REQUIRE_ABUSE_ADDRESS=1 \
+            node .github/scripts/write-relay-config.mjs "$RUNNER_TEMP/relay-selftest.json" >/dev/null
           # Multi-relay (part A): a two-line list wins over RELAY; "relay" is
           # its first entry. Part C: the bootstrap list covers both relays.
           RELAYS=$'/dns4/relay.example.org/tcp/443/wss/p2p/12D3KooWBVzkbuxE3TA4LU7zEeMBM87G4Ns1KQoPdAc4MR8R3GTc\n/dns4/relay2.example.org/tcp/443/wss/p2p/12D3KooWAHoEkEqnKzM5PXFygh2movVBCSX3k8tDsT2cneU68Gyt\n' \
@@ -325,6 +336,8 @@ jobs:
           # G-48: where abuse is reported (an e-mail or https URL); optional.
           # The domain is private: set only as a repo variable, never committed.
           ABUSE_ADDRESS: ${{ github.event_name == 'push' && vars.MVS_ABUSE_ADDRESS || '' }}
+          # B24: a tag build fails without it; other builds stay optional.
+          REQUIRE_ABUSE_ADDRESS: ${{ github.event_name == 'push' && '1' || '' }}
           MSYS2_ENV_CONV_EXCL: RELAY
           MSYS_NO_PATHCONV: "1"
         run: |

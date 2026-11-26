@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { createAppLock, cleanPasscode, cleanWords, predatesLock, START_TIMEOUT_MS } = require('../src/applock');
+const { createAppLock, cleanPasscode, cleanWords, predatesLock, pageQuery, wrongPage, START_TIMEOUT_MS } = require('../src/applock');
 
 function harness({ config = { enabled: true, idleMinutes: 5, lockOnSleep: true }, verify = () => ({ result: 'ok' }), getDelay = 0 } = {}) {
   const calls = [];
@@ -345,4 +345,63 @@ test('forgot: the words clear the lock (core-checked, same counter)', async () =
   assert.deepEqual(h.calls.at(-1), ['clearAppLockWithWords', { words: 'one two three' }]);
   assert.equal(h.lock.state.enabled, false);
   assert.equal(h.lock.lock(), false);
+});
+
+// QA (voice-e2e, dcc1e48): "MVS is locked" with no lock set. A slow core's "off"
+// came after the 10 s fail-closed start, while the first ?locked load was still
+// on its way (getURL() ''), so the change skipped the reload.
+const PENDING = { enabled: true, locked: true, pending: true, path: 'A' };
+const LOCKED_A = { enabled: true, locked: true, pending: false, path: 'A' };
+const LOCKED_B = { enabled: true, locked: true, pending: false, path: 'B' };
+const OPEN = { enabled: false, locked: false, pending: false, path: null };
+const PAGE = 'app://mvs/index.html';
+
+test('pageQuery: pending, path A, open (with the open query)', () => {
+  assert.equal(pageQuery(PENDING), '?locked=pending');
+  assert.equal(pageQuery(LOCKED_A), '?locked');
+  assert.equal(pageQuery(OPEN), '');
+  assert.equal(pageQuery(OPEN, '?demo=x'), '?demo=x');
+  assert.equal(pageQuery(LOCKED_B, '?demo=x'), '?demo=x', 'path B keeps the page');
+});
+
+test('wrongPage: a lock screen once the lock is off must load again, and the reverse', () => {
+  assert.equal(wrongPage(PAGE + '?locked', OPEN), true, 'the QA case: stale ?locked');
+  assert.equal(wrongPage(PAGE + '?locked=pending', OPEN), true);
+  assert.equal(wrongPage(PAGE, LOCKED_A), true, 'locked meanwhile: no content page');
+  assert.equal(wrongPage(PAGE, PENDING), true);
+  assert.equal(wrongPage(PAGE + '?locked', PENDING), true);
+  assert.equal(wrongPage(PAGE, OPEN, '?demo=x'), true, 'demo query expected but missing');
+  // Matching pages stay (no reload loop).
+  assert.equal(wrongPage(PAGE, OPEN), false);
+  assert.equal(wrongPage(PAGE + '?demo=x', OPEN, '?demo=x'), false);
+  assert.equal(wrongPage(PAGE + '?locked', LOCKED_A), false);
+  assert.equal(wrongPage(PAGE + '?locked=pending', PENDING), false);
+});
+
+test('wrongPage: path B never reloads (the call goes on); no URL: nothing to check', () => {
+  assert.equal(wrongPage(PAGE, LOCKED_B), false);
+  assert.equal(wrongPage(PAGE + '?locked', LOCKED_B), false);
+  assert.equal(wrongPage(undefined, OPEN), false);
+  assert.equal(wrongPage(null, LOCKED_A), false);
+});
+
+test('the QA order: fail closed at 10 s, the window loads ?locked, then the late "off" asks for the plain page', async () => {
+  let answer;
+  const timers = [];
+  const lock = createAppLock({
+    request: (cmd) => (cmd === 'getAppLock' ? new Promise((r) => (answer = r)) : Promise.resolve({ error: { code: 'x' } })),
+    inCall: () => false,
+    onChange: () => {},
+    setTimer: (fn) => (timers.push(fn), fn),
+    clearTimer: () => {},
+  });
+  const started = lock.start();
+  timers.shift()(); // the 10 s timeout: fail closed
+  const atCreate = pageQuery(lock.state);
+  assert.equal(atCreate, '?locked', 'the window is created on the lock screen');
+  answer({ ok: { enabled: false, idleMinutes: 5, lockOnSleep: true } });
+  await started;
+  assert.equal(lock.state.locked, false);
+  assert.equal(wrongPage(PAGE + atCreate, lock.state), true, "that first load's did-finish-load loads the plain page");
+  assert.equal(wrongPage(PAGE + pageQuery(lock.state), lock.state), false, 'and stops there');
 });

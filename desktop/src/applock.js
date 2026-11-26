@@ -298,4 +298,27 @@ function cleanSetInput(input) {
   return { ...(current ? { current } : {}), passcode, method: 'passcode', idleMinutes, lockOnSleep };
 }
 
-module.exports = { createAppLock, cleanPasscode, cleanWords, cleanSetInput, predatesLock, START_TIMEOUT_MS };
+/**
+ * The page's query for a lock state: '?locked=pending', '?locked' (path A),
+ * or `open` (unlocked, or path B, which keeps the page it has).
+ */
+function pageQuery(st, open = '') {
+  if (st.pending) return '?locked=pending';
+  if (st.locked && st.path === 'A') return '?locked';
+  return open;
+}
+
+/**
+ * QA (voice-e2e, dcc1e48): an internal page at `url` that shows another lock
+ * state than `st` and must be loaded again. A late lock answer can come while
+ * the first load is still on its way (getURL() is '' then, so the change's
+ * own reload skips it); this is asked again when that load finishes. Path B
+ * never reloads (it would end the call).
+ */
+function wrongPage(url, st, open = '') {
+  if (typeof url !== 'string' || (st.locked && st.path === 'B')) return false;
+  const i = url.indexOf('?');
+  return (i < 0 ? '' : url.slice(i)) !== pageQuery(st, open);
+}
+
+module.exports = { createAppLock, cleanPasscode, cleanWords, cleanSetInput, predatesLock, pageQuery, wrongPage, START_TIMEOUT_MS };

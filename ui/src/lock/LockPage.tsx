@@ -20,5 +20,8 @@ export function LockPage({ pending }: { pending: boolean }) {
     };
   }, [core]);
   if (lock ? lock.pending : pending) return <LockLoading />;
+  // QA (voice-e2e, dcc1e48): main says the lock is open, so this page is
+  // stale and main loads the right one; never ask for a passcode nobody set.
+  if (lock && !lock.locked) return <LockLoading />;
   return <LockScreen lock={lock} version={version} />;
 }

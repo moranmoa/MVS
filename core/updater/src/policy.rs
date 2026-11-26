@@ -125,6 +125,11 @@ impl ClientPolicy {
         Ok(if offered == installed { Decision::UpToDate } else { Decision::Install(offered) })
     }
 
+    /// The version of the newest manifest accepted (or the installed one).
+    pub fn newest(&self) -> Option<Version> {
+        self.newest.map(|(v, _)| v)
+    }
+
     /// True when the running version was revoked; the app should treat the
     /// next update as urgent (it still cannot downgrade).
     pub fn is_revoked(&self, v: Version) -> bool {

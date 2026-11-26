@@ -112,6 +112,8 @@ export interface MockOptions {
   relayOnly?: boolean;
   /** B24 (?abuse=1): the build carries an abuse-report address (a placeholder, never a real one). */
   abuseAddress?: boolean;
+  /** G-48 (?noRecipient=1): every report finds nobody to receive it, for screenshots. */
+  reportNoRecipient?: boolean;
   /** Server lifecycle (#261): two members run an old MVS, so rename and close answer `update-needed` (a leave never does). */
   outdatedMembers?: boolean;
   /** The demo server "Minecraft IL" starts closed by its owner (read-only). */
@@ -1746,7 +1748,7 @@ export class MockCore implements CoreApi {
     const key = `${serverId}|${target.kind === 'message' ? target.messageId : target.userId}`;
     if (this.reported.has(key)) throw err({ code: 'already-reported' });
     // The owner, unless they're the one reported (the mock has no admins).
-    if (reportedId === s.summary.ownerId) throw err({ code: 'no-recipient' });
+    if (reportedId === s.summary.ownerId || this.options.reportNoRecipient) throw err({ code: 'no-recipient' });
     this.reported.add(key);
     const reportId = `r-${++this.reportSeq}`;
     this.emit('report.status', { reportId, delivered: 0, pending: 1 });

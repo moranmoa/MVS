@@ -64,6 +64,11 @@ export interface ServerSummary {
   mentions: number;
   /** Closed by its owner (#261): read-only until it is purged 30 days later. */
   closed?: boolean;
+  /**
+   * #589: a member wrote a record kind this version doesn't know, so they run a
+   * newer MVS and this computer may miss what it adds. The UI asks to update.
+   */
+  updateNeeded?: boolean;
 }
 
 export interface Channel {
@@ -178,6 +183,8 @@ export interface CoreError {
     | 'already-reported'
     /** G-48: nobody can receive the report (the owner is reported and there are no admins). */
     | 'no-recipient'
+    /** #594: the name, small picture and colour together don't fit one profile post; nothing was saved. */
+    | 'profile-too-large'
     /** G-52 (core #590): 18+ chosen by an owner under 18. */
     | 'too-young';
   /** With `core-unavailable` (desktop shell, T8-01): why the core is not answering. */

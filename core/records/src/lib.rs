@@ -225,6 +225,9 @@ pub enum Kind {
     /// `KeyRotation` part's, then what `groupkeys` puts there under its own
     /// box label (`mvs/sync-secret-box/v1`). Control scope.
     SecretRotation = 25,
+    /// The owner changes the server's age limit (G-52). Body: `min u8`: 0,
+    /// 16 or 18. Control scope.
+    ServerAgeLimit = 26,
 }
 
 /// Largest server icon image, in bytes (G-51).
@@ -260,7 +263,7 @@ pub const MAX_ROTATION_PARTS: u8 = 32;
 pub const ROTATION_HEADER_LEN: usize = ID_LEN + 2;
 
 impl Kind {
-    const ALL: [Kind; 25] = [
+    const ALL: [Kind; 26] = [
         Kind::Genesis,
         Kind::Grant,
         Kind::Revoke,
@@ -286,6 +289,7 @@ impl Kind {
         Kind::ServerIcon,
         Kind::ServerDescription,
         Kind::SecretRotation,
+        Kind::ServerAgeLimit,
     ];
 
     const LARGEST_BODY: usize = 16 * 1024;
@@ -313,6 +317,8 @@ impl Kind {
             Kind::Invite | Kind::RevokeInvite | Kind::Join => 128,
             // A channel ID or a key, with room for future fields.
             Kind::ServerClose | Kind::ChannelDelete | Kind::AgeClaim | Kind::Unban => 64,
+            // The minimum age, with room for future fields.
+            Kind::ServerAgeLimit => 64,
             Kind::MessageDelete => 64,
             // Channel ID, history byte, flags and a name.
             Kind::ChannelCreate | Kind::ChannelEdit => 512,
@@ -1211,14 +1217,15 @@ mod tests {
             assert!(!kind.allowed_in(Scope::Channel(ChannelId::from_bytes([1; 32]))));
         }
         assert_eq!(Kind::from_code(25), Some(Kind::SecretRotation));
-        assert_eq!(Kind::from_code(26), None, "older cores still refuse what they don't know");
+        assert_eq!(Kind::from_code(26), Some(Kind::ServerAgeLimit));
+        assert_eq!(Kind::from_code(27), None, "older cores still refuse what they don't know");
     }
 
     #[test]
     fn every_kind_has_one_scope_and_a_body_limit() {
         let channel = Scope::Channel(ChannelId::from_bytes([4; 32]));
         let codes: Vec<u16> = Kind::ALL.iter().map(|kind| kind.code()).collect();
-        assert_eq!(codes, (1..=25).collect::<Vec<u16>>(), "codes are dense and in order");
+        assert_eq!(codes, (1..=26).collect::<Vec<u16>>(), "codes are dense and in order");
         // The genesis has its own tests: its body must carry the nonce.
         for kind in Kind::ALL.into_iter().filter(|kind| *kind != Kind::Genesis) {
             assert_eq!(Kind::from_code(kind.code()), Some(kind));

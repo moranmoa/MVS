@@ -379,8 +379,15 @@ struct Inner {
     calls: voice::Calls,
     /// G-29: who is typing, what I sent, the replay cache. Never stored.
     typing: typing::Typing,
+    /// A required update (RU1): `Some` once an accepted manifest revoked
+    /// this version, for the rest of the process. Inside, the newer version
+    /// on offer. While set, the core signs nothing and syncs nothing.
+    update_required: Option<Option<String>>,
     /// G-48: delivers report boxes (sync); `None` without a network.
     report_net: Option<Arc<dyn crate::report::ReportNet>>,
+    /// G-48: reports kept per server ([`MAX_STORED_REPORTS`]; lower only in
+    /// tests, feature `test-hooks`).
+    report_store_cap: usize,
     /// Messages written before their channel key reached me (a member who
     /// just joined), oldest first: sent by the sync loop when it comes.
     /// In memory only (never the plain text on disk): lost on restart.
@@ -633,7 +640,9 @@ impl Core {
             join_waiting: BTreeSet::new(),
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
+            update_required: None,
             report_net: None,
+            report_store_cap: MAX_STORED_REPORTS,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
             adult_keys_warned: HashSet::new(),
@@ -1316,6 +1325,8 @@ impl Core {
         age_restriction: AgeRestriction,
     ) -> CoreResult<ServerSummary> {
         self.run(|inner, ports, events| {
+            // RU1: a genesis is signed here, not through `publish_control`.
+            inner.may_sign()?;
             let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
             inner.vault.require_recovery_check(&me.identity).map_err(vault_error)?;
             let name = name.trim();
@@ -2436,6 +2447,8 @@ impl Core {
             return Err(ErrorCode::BadRequest.into());
         }
         let message = self.run(|inner, ports, events| {
+            // RU1: refused before anything else, nothing sealed or signed.
+            inner.may_sign()?;
             let (server, channel) = inner.find_channel(channel_id)?;
             // G-29: a send ends my typing there (`off` once, if `on` went out).
             let stop = inner.typing.stopped(channel);
@@ -2713,6 +2726,11 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        // RU1: no sync at all while a required update is pending: nothing
+        // fetched, nothing published, no re-key, rotation or re-join.
+        if self.lock().update_required.is_some() {
+            return Ok(());
+        }
         self.announce_device_notices();
         // Device link, the new device: its link moves on even before sign-in.
         self.poll_device_link();
@@ -3025,7 +3043,9 @@ impl Core {
             _ => UpdateChannel::Stable,
         };
         let relay_only = relay_only_in(&self.lock().db)?;
-        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only })
+        let update_required =
+            self.lock().update_required.clone().map(|version| UpdateRequired { version });
+        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only, update_required })
     }
 
     /// `setRelayOnly(on)` (GAP-6r): stored, then applied to the network. On
@@ -3377,6 +3397,9 @@ impl Core {
     /// it the update commands answer `not-implemented` and no check runs.
     pub fn with_updates(mut self, updates: Updates) -> Core {
         self.updates = Some(Arc::new(updates));
+        // A required update survives a restart (`policy.json`): RU1 holds
+        // from the first moment, before any sync round.
+        self.refresh_required();
         self
     }
 
@@ -3398,12 +3421,16 @@ impl Core {
 
     /// `checkForUpdate` (main/core only, A2).
     pub fn check_for_update(&self) -> CoreResult<serde_json::Value> {
-        self.updates()?.check(self.ui_channel()?, self.now_secs())
+        let checked = self.updates()?.check(self.ui_channel()?, self.now_secs());
+        self.refresh_required();
+        checked
     }
 
     /// `downloadUpdate` (main/core only): emits `update.ready` once staged.
     pub fn download_update(&self) -> CoreResult<serde_json::Value> {
-        let outcome = self.updates()?.download(self.ui_channel()?, self.now_secs())?;
+        let outcome = self.updates()?.download(self.ui_channel()?, self.now_secs());
+        self.refresh_required();
+        let outcome = outcome?;
         self.emit_update(outcome.events);
         Ok(outcome.ok)
     }
@@ -3438,6 +3465,7 @@ impl Core {
         loop {
             if let Ok(channel) = self.ui_channel() {
                 self.emit_update(updates.background_round(channel, self.now_secs()));
+                self.refresh_required();
                 // Slice 3b: the owner's signed global switch, fetched with the
                 // check. Kept in kv; only this path writes it.
                 let off = updates.member_relay_off(channel);
@@ -3454,7 +3482,10 @@ impl Core {
                 }
                 self.emit(events);
             }
-            if !updates.wait(crate::update::next_interval()) {
+            // While required: check again every 15 minutes, not hourly.
+            let required = self.lock().update_required.is_some();
+            let wait = if required { REQUIRED_RECHECK } else { crate::update::next_interval() };
+            if !updates.wait(wait) {
                 return;
             }
         }
@@ -3563,6 +3594,8 @@ impl Inner {
     /// turning 18 with the date my claims came from (`birth_date_trusted`:
     /// set at sign-up here) is just a birthday, with no wait.
     fn age_claim(&mut self, ports: &Ports, server: ServerId) -> CoreResult<Option<Record>> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let now = ports.clock.now_ms();
         self.settle_birth_date(now)?;
         let mut trust = false;
@@ -4718,6 +4751,8 @@ impl Inner {
         members: &BTreeSet<PublicKey>,
         auth_deps: &[RecordId],
     ) -> CoreResult<()> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let cipher = &*ports.cipher;
         let parts = cipher.rotate(server, channel, members).map_err(cipher_error)?;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
@@ -4871,6 +4906,8 @@ impl Inner {
         kind: Kind,
         body: Vec<u8>,
     ) -> CoreResult<Record> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         Draft { server, scope: Scope::Channel(channel), seq, deps, auth_deps, ts, kind, body }
             .sign(me.identity.signing_key())
@@ -5143,6 +5180,8 @@ impl Inner {
         server: ServerId,
         action: &Action,
     ) -> CoreResult<Record> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let view = self.view(server)?;
         // A revoke-invite lists its invite in its deps.
@@ -5580,6 +5619,8 @@ impl Inner {
         fetched: Vec<Record>,
         events: &mut Events,
     ) -> CoreResult<JoinStatus> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let link = link.to_owned();
         let server_hex = model::hex_id(server.as_bytes());
@@ -6268,8 +6309,13 @@ mod device_notice_tests {
 
 /// My reports waiting for each recipient's ack.
 const KV_REPORT_OUTBOX: &str = "report-outbox";
-/// Reports sealed to me, as staff.
+/// Reports sealed to me, as staff: one store per server,
+/// `report-inbox/<server>` (the Tech Lead's #515 follow-up). The bare key is
+/// the first release's single store, moved over on first use.
 const KV_REPORT_INBOX: &str = "report-inbox";
+/// The servers that have a `report-inbox/<server>` store, so pruning finds
+/// them (kv has no prefix scan).
+const KV_REPORT_INBOXES: &str = "report-inboxes";
 /// Report IDs I received, with their reporter, for dedup and the receiver's
 /// per-reporter cap; kept 31 days.
 const KV_REPORT_SEEN: &str = "report-seen";
@@ -6300,6 +6346,10 @@ struct OutRow {
 #[derive(Clone, Serialize, Deserialize)]
 struct InRow {
     server: String,
+    /// The report ID (hex): `find_report` matches on it without opening any
+    /// box. Empty in rows from the first release, filled on first lookup.
+    #[serde(default)]
+    id: String,
     sealed: String,
     at: u64,
     dismissed: bool,
@@ -6431,6 +6481,11 @@ impl Core {
     /// is the reported member, or whose server I left is dropped, and so
     /// are rows older than 30 days. Delivery runs without the lock.
     pub fn report_tick(&self) {
+        // RU1: the network is quiet while a required update is pending; the
+        // rows stay and go out once the newer version runs.
+        if self.lock().update_required.is_some() {
+            return;
+        }
         let Ok((net, due)) = self.run(|inner, ports, _| {
             inner.prune_reports(ports.clock.now_ms())?;
             let outbox: Vec<OutRow> = inner.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
@@ -6532,24 +6587,20 @@ impl Core {
             seen.push(SeenRow { id, reporter, at: now });
             inner.set_kv_json(KV_REPORT_SEEN, &seen)?;
             let server_hex = model::hex_id(server.as_bytes());
-            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut inbox = inner.inbox(server)?;
             inbox.push(InRow {
                 server: server_hex.clone(),
+                id: model::hex_id(&opened.id()),
                 sealed: hex::encode(sealed),
                 at: now,
                 dismissed: false,
             });
-            if inbox.iter().filter(|r| r.server == server_hex).count() > MAX_STORED_REPORTS {
-                // The oldest dismissed one here, else the oldest.
-                let pick = inbox
-                    .iter()
-                    .position(|r| r.server == server_hex && r.dismissed)
-                    .or_else(|| inbox.iter().position(|r| r.server == server_hex));
-                if let Some(i) = pick {
-                    inbox.remove(i);
-                }
+            if inbox.len() > inner.report_store_cap {
+                // The oldest dismissed one, else the oldest.
+                let pick = inbox.iter().position(|r| r.dismissed).unwrap_or(0);
+                inbox.remove(pick);
             }
-            inner.set_kv_json(KV_REPORT_INBOX, &inbox)?;
+            inner.set_inbox(server, &inbox)?;
             let summary = inner.report_summary(server, &opened, now, false)?;
             events.push(Event::ReportReceived { server_id: server_hex, report: summary });
             Ok(())
@@ -6565,10 +6616,9 @@ impl Core {
             inner.load_mine(server)?;
             inner.prune_reports(ports.clock.now_ms())?;
             inner.staff_check(server)?;
-            let server_hex = model::hex_id(server.as_bytes());
-            let inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let inbox = inner.inbox(server)?;
             let mut out = Vec::new();
-            for row in inbox.iter().rev().filter(|r| r.server == server_hex) {
+            for row in inbox.iter().rev() {
                 let Ok(sealed) = hex::decode(&row.sealed) else { continue };
                 let Some((_, opened)) = inner.open_report(&sealed)? else { continue };
                 out.push(inner.report_summary(server, &opened, row.at, row.dismissed)?);
@@ -6582,10 +6632,29 @@ impl Core {
         self.run(|inner, _, _| {
             let (index, server, _) = inner.find_report(report_id)?;
             inner.staff_check(server)?;
-            let mut inbox: Vec<InRow> = inner.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
+            let mut inbox = inner.inbox(server)?;
             inbox[index].dismissed = true;
-            inner.set_kv_json(KV_REPORT_INBOX, &inbox)
+            inner.set_inbox(server, &inbox)
         })
+    }
+
+    /// Tests only (the Tech Lead's #515 follow-up; feature `test-hooks`,
+    /// never in a release build): signs `report` as me, with none of
+    /// `reportContent`'s checks, and seals it to `to`, so a test can hand a
+    /// receiver what a modified client would send. Not a command.
+    #[cfg(feature = "test-hooks")]
+    pub fn sealed_report_for_tests(&self, report: &Report, to: PublicKey) -> CoreResult<Vec<u8>> {
+        let inner = self.lock();
+        let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
+        let signed = report.sign(me.identity.signing_key()).ok_or(ErrorCode::BadRequest)?;
+        groupkeys::seal_box(report.server, &to, &signed, &mut OsRng).map_err(|_| ErrorCode::Internal.into())
+    }
+
+    /// Tests only (feature `test-hooks`): how many reports a server's store
+    /// keeps, so the eviction can be tested without a thousand boxes.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_report_store_cap_for_tests(&self, cap: usize) {
+        self.lock().report_store_cap = cap;
     }
 
     /// G-48 `getReportEvidence(reportId)`: the reported message, on an
@@ -6690,18 +6759,83 @@ impl Inner {
         Ok(found)
     }
 
-    /// My stored report `report_id`: its inbox index, server and contents.
+    /// My stored report `report_id`: its index in its server's inbox, the
+    /// server and its contents. Matched by the stored ID; only the match is
+    /// opened (rows from the first release get their ID filled once).
     fn find_report(&mut self, report_id: &str) -> CoreResult<(usize, ServerId, Report)> {
-        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
-        for (index, row) in inbox.iter().enumerate() {
-            let Ok(sealed) = hex::decode(&row.sealed) else { continue };
-            if let Some((server, opened)) = self.open_report(&sealed)? {
-                if model::hex_id(&opened.id()) == report_id {
+        for server in self.inbox_servers()? {
+            let mut inbox = self.inbox(server)?;
+            let mut filled = false;
+            for row in inbox.iter_mut().filter(|r| r.id.is_empty()) {
+                let opened = hex::decode(&row.sealed).ok().map(|s| self.open_report(&s)).transpose()?.flatten();
+                if let Some((_, opened)) = opened {
+                    row.id = model::hex_id(&opened.id());
+                    filled = true;
+                }
+            }
+            if filled {
+                self.set_inbox(server, &inbox)?;
+            }
+            let Some(index) = inbox.iter().position(|r| r.id == report_id) else { continue };
+            let sealed = hex::decode(&inbox[index].sealed).map_err(|_| ErrorCode::Internal)?;
+            if let Some((found, opened)) = self.open_report(&sealed)? {
+                if found == server && model::hex_id(&opened.id()) == report_id {
                     return Ok((index, server, opened));
                 }
             }
         }
         Err(ErrorCode::NotFound.into())
+    }
+
+    fn inbox_key(server: ServerId) -> String {
+        format!("{KV_REPORT_INBOX}/{}", model::hex_id(server.as_bytes()))
+    }
+
+    /// The servers with an inbox store, after moving the first release's
+    /// single store over (once).
+    fn inbox_servers(&mut self) -> CoreResult<Vec<ServerId>> {
+        if let Some(legacy) = self.kv_json::<Vec<InRow>>(KV_REPORT_INBOX)? {
+            let mut by_server: BTreeMap<String, Vec<InRow>> = BTreeMap::new();
+            for row in legacy {
+                by_server.entry(row.server.clone()).or_default().push(row);
+            }
+            for (hex, rows) in by_server {
+                let Some(server) = model::parse_hex32(&hex).map(ServerId::from_bytes) else { continue };
+                let mut inbox: Vec<InRow> = self.kv_json(&Self::inbox_key(server))?.unwrap_or_default();
+                // A move cut short by a crash may have copied some already.
+                for row in rows {
+                    if !inbox.iter().any(|r| r.sealed == row.sealed) {
+                        inbox.push(row);
+                    }
+                }
+                self.set_inbox(server, &inbox)?;
+            }
+            self.db.delete(KV_REPORT_INBOX)?;
+        }
+        let list: Vec<String> = self.kv_json(KV_REPORT_INBOXES)?.unwrap_or_default();
+        Ok(list.iter().filter_map(|h| model::parse_hex32(h).map(ServerId::from_bytes)).collect())
+    }
+
+    /// One server's stored reports, oldest first.
+    fn inbox(&mut self, server: ServerId) -> CoreResult<Vec<InRow>> {
+        self.inbox_servers()?;
+        Ok(self.kv_json(&Self::inbox_key(server))?.unwrap_or_default())
+    }
+
+    /// Writes one server's reports; an empty list deletes the store.
+    fn set_inbox(&mut self, server: ServerId, rows: &[InRow]) -> CoreResult<()> {
+        let hex = model::hex_id(server.as_bytes());
+        let mut list: Vec<String> = self.kv_json(KV_REPORT_INBOXES)?.unwrap_or_default();
+        if rows.is_empty() {
+            self.db.delete(&Self::inbox_key(server))?;
+            list.retain(|h| *h != hex);
+        } else {
+            self.set_kv_json(&Self::inbox_key(server), &rows)?;
+            if !list.contains(&hex) {
+                list.push(hex);
+            }
+        }
+        self.set_kv_json(KV_REPORT_INBOXES, &list)
     }
 
     fn report_summary(
@@ -6763,14 +6897,13 @@ impl Inner {
             staff.insert(hex, list.iter().map(|k| model::hex_id(k.as_bytes())).collect());
         }
         let me_hex = me.map(|k| model::hex_id(k.as_bytes())).unwrap_or_default();
-        let inbox: Vec<InRow> = self.kv_json(KV_REPORT_INBOX)?.unwrap_or_default();
-        let kept: Vec<InRow> = inbox
-            .iter()
-            .filter(|r| staff.get(&r.server).is_some_and(|s| s.contains(&me_hex)))
-            .cloned()
-            .collect();
-        if kept.len() != inbox.len() {
-            self.set_kv_json(KV_REPORT_INBOX, &kept)?;
+        // A server's whole store goes when I'm no longer staff there, or no
+        // longer in it at all (left, kicked, purged).
+        for server in self.inbox_servers()? {
+            let hex = model::hex_id(server.as_bytes());
+            if !staff.get(&hex).is_some_and(|s| s.contains(&me_hex)) {
+                self.set_inbox(server, &[])?;
+            }
         }
         let outbox: Vec<OutRow> = self.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
         let kept: Vec<OutRow> = outbox
@@ -6866,5 +6999,52 @@ mod birth_date_tests {
     fn an_old_pending_reads_as_the_restore_form() {
         let old: PendingBirth = serde_json::from_str(r#"{"date":"1990-01-01","effectiveAt":5}"#).unwrap();
         assert!(!old.correction && !old.capped);
+    }
+}
+
+// ---- Required updates (docs/design/required-update.md) ----------------------
+//
+// An accepted signed manifest that revokes this version makes an update
+// required. The core then (RU1, the security lead's condition) signs nothing
+// on its own and syncs nothing, for the rest of the process: every signing
+// path checks `may_sign`, the sync round does nothing, and the network goes
+// quiet. Update checks and downloads (HTTPS, not the P2P network) go on, at
+// once and then every 15 minutes.
+
+/// Between update checks while an update is required ("not available yet"
+/// keeps checking).
+pub const REQUIRED_RECHECK: Duration = Duration::from_secs(15 * 60);
+
+impl Inner {
+    /// RU1: `update-required` while a required update is pending.
+    fn may_sign(&self) -> CoreResult<()> {
+        match self.update_required {
+            Some(_) => Err(ErrorCode::UpdateRequired.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Core {
+    /// Reads the updater's verdict and applies it. Turning on (or a newer
+    /// version on offer) emits `update.required`, quiets the network and
+    /// wakes the update loop so the download starts at once. Never turns
+    /// off within a process: only a restart into a version that isn't
+    /// revoked clears it.
+    fn refresh_required(&self) {
+        let Some(updates) = &self.updates else { return };
+        let Ok(channel) = self.ui_channel() else { return };
+        let Some(now) = updates.required(channel) else { return };
+        let changed = {
+            let mut inner = self.lock();
+            let changed = inner.update_required.as_ref() != Some(&now);
+            inner.update_required = Some(now.clone());
+            changed
+        };
+        if changed {
+            self.ports.network.set_quiet();
+            updates.wake();
+            self.emit(vec![Event::UpdateRequired(UpdateRequired { version: now })]);
+        }
     }
 }

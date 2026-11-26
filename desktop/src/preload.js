@@ -9,7 +9,7 @@ const listeners = new Set();
 // Shell events can arrive before the UI has subscribed: `link.open` (an
 // mvs:// invite, e.g. on the first launch) and `core.status` (sent at load).
 // The latest of each is kept for the first subscriber.
-const KEPT = new Set(['link.open', 'link.message', 'core.status']);
+const KEPT = new Set(['link.open', 'link.message', 'core.status', 'update.gate']);
 const pending = new Map();
 
 ipcRenderer.on('core:event', (_e, name, payload) => {
@@ -122,6 +122,16 @@ contextBridge.exposeInMainWorld('mvs', {
   }),
   /** The OS (read-only): 'win32' | 'linux' | 'darwin'. */
   platform: process.platform,
+  /**
+   * Required updates (#577): the gate's state { required, version, active,
+   * phase: 'none'|'call'|'gated', callEndsAt } (also the `update.gate` event).
+   */
+  updateGate: () => ipcRenderer.invoke('update:gate'),
+  /**
+   * The banner's Retry: main checks for an update now (at most every 30 s).
+   * Resolves 'ok' | 'too-soon' | the core's error code ('offline', …).
+   */
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
   /** Opens the shell's logs folder (no words, no message content). Resolves true if it did. */
   openLogsFolder: () => ipcRenderer.invoke('logs:open'),
   onEvent: (callback) => {

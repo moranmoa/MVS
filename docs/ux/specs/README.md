@@ -22,7 +22,7 @@
 | [profile-save.md](profile-save.md) | Profile save: one explicit save, every place updates at once | 0.4.5 |
 | [server-icon-description.md](server-icon-description.md) | Server icon and description editing (G-51) | – |
 | [server-age-limit.md](server-age-limit.md) | Changing a server's age limit, never silently opening to minors (G-52) | – |
-| [update-required.md](update-required.md) | "Update required": local read-only plus an update banner (#577), with the 30-minute call cap | – |
+| [update-required.md](update-required.md) | "Update required": local read-only plus an update banner (#577); a call ends at once | – |
 | [chat-and-voice-extras.md](chat-and-voice-extras.md) | Typing, reactions, emoji picker, voice settings, deafen, per-person volume, push-to-talk | – |
 | [emoji-picker.md](emoji-picker.md) | Full emoji picker: all groups, category tabs, bilingual search (G-27) | – |
 | [app-lock.md](app-lock.md) | App lock screens: lock, in-call overlay, loading, settings (G-78) | – |

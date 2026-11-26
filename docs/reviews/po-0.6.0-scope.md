@@ -67,8 +67,8 @@ G-79 tray (P2, after G-81), G-43 ownership transfer, roles in the UI.
 
 Depends on R1 (#565) and R1b. Owners: dev-sync (core data), dev-ui (header), UX (header spec), SL (privacy review).
 
-- **Visible to: owner decision pending.** The default, per SL condition 1, is owners and admins (the core computes it only for `role ≥ Admin`). The open question is whether other members see nothing or the colour only. Until the owner answers, build to the default.
-- **The count:** the server header shows how many of this server's members can relay right now: member relay on, and reachable as R1 confirmed it. Members behind CGNAT never count, since they can't serve, but they still use relays. It's shown capped at "6+", and refreshed at most every 10 minutes, not on each presence change (SL).
+- **Visible to: owner decision pending.** The default, per SL condition 1, is owners and admins (the core computes it only for `role ≥ Admin`). The open question is whether other members see nothing or the colour only. SL confirms that colour-only meets its condition 1; in that case, the core returns the count only to `role ≥ Admin`, and the colour to every member. Until the owner answers, build to the default.
+- **The count:** the server header shows how many of this server's members can relay right now: member relay on, and reachable as R1 confirmed it. Members behind CGNAT never count, since they can't serve, but they still use relays. It's shown capped at "6+". The count and the colour each refresh at most every 10 minutes, not on each presence change (SL).
 - **Uptime:** each client's relay table tracks each relay's uptime over the last 24 h, as the share of *this client's own observed time* that the relay was reachable. It's kept locally, as rolling buckets only (never per-event timestamps), and deleted when this device leaves the server or the relay stops being a member. It's never published or synced, and never in the diagnostics file (NC-1), `exportDiagnostics`, a report or a backup (SL).
 - **The health colour (owner decision, 95%):**
   - **Red:** 0–2 relays. Shown at once, even while measuring.

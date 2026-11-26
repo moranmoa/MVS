@@ -794,7 +794,7 @@ try {
   // B hears nothing; while A holds T, B hears A. Then A goes back to open.
   const voiceSettings = async (mode) => {
     await page.locator('.me-profile').click();
-    const dlg = page.locator('.settings-dialog');
+    const dlg = page.getByRole('dialog', { name: /^(Settings|הגדרות)$/ });
     await dlg.getByRole('button', { name: /^(Voice|קול)$/ }).click();
     await dlg.getByRole('radio', { name: mode === 'ptt' ? /Push to talk|לחיצה לדיבור/ : /Voice activity|פתוח לדיבור/ }).check();
     if (mode === 'ptt') {

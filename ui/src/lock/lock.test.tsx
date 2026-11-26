@@ -106,6 +106,15 @@ describe('path A: the lock screen', () => {
     expect(listServers).not.toHaveBeenCalled();
   });
 
+  it('QA dcc1e48: a stale ?locked page while main says the lock is off asks for no passcode', async () => {
+    bridge({ enabled: false, locked: false, pending: false, path: null, inCall: false });
+    render(<App core={new MockCore({ speed: 0 })} initialSettings={settings} lockScreen="locked" />);
+    expect(await screen.findByRole('status', {}, T)).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole('status')?.textContent).toBe('Loading…'), T);
+    expect(screen.queryByLabelText('Passcode')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'MVS is locked' })).toBeNull();
+  });
+
   it('wrong: cleared, focused, said; ok leaves it to main', async () => {
     const b = bridge(LOCKED_A);
     render(<App core={new MockCore({ speed: 0 })} initialSettings={settings} lockScreen="locked" />);

@@ -264,7 +264,8 @@ export function ServerRail({
               serverId={s.id}
               menuProps={arranging ? undefined : bind(intl.formatMessage({ id: 'menu.forServer' }, { name: s.name }), () => serverItems(s))}
             >
-              <bdi className="initials">{s.initials}</bdi>
+              {/* G-51: the icon when there is one (alt empty: the button is named), else the initials. */}
+              {s.iconDataUrl ? <img className="server-icon" src={s.iconDataUrl} alt="" /> : <bdi className="initials">{s.initials}</bdi>}
             </RailButton>
             {arranging && (
               <span className="rail-arrange">

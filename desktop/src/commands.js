@@ -33,6 +33,9 @@ const COMMANDS = Object.freeze({
   renameServer: ['serverId', 'name'],
   setAgeRestriction: ['serverId', 'ageRestriction'],
   countAgeAffected: ['serverId', 'ageRestriction'],
+  // G-51 server icon and description
+  setServerIcon: ['serverId', 'dataUrl'],
+  setServerDescription: ['serverId', 'description'],
   leaveServer: ['serverId'],
   closeServer: ['serverId'],
   getUpdateNeeded: ['serverId', 'cap'],
@@ -86,6 +89,8 @@ const COMMANDS = Object.freeze({
   setMuted: ['muted'],
   setDeafened: ['deafened'],
   sendSignal: ['to', 'kind', 'payload'],
+  // G-81 B (#556): the participants with a live LAN WebRTC connection; the core sends B to the rest.
+  setCallWebrtcPeers: ['identities'],
   // App
   getStorageUsage: [],
   setStorageLimit: ['bytes'],

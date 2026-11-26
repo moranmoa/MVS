@@ -4,7 +4,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { COMMANDS } = require('../src/commands');
-const { READ_ONLY, UPDATE, CALL, NOT_READ_ONLY, CALL_CAP_MS, CHECK_EVERY_MS, cleanRequired, createRequiredGate, createCheckThrottle } = require('../src/required');
+const { READ_ONLY, UPDATE, NOT_READ_ONLY, CHECK_EVERY_MS, cleanRequired, createRequiredGate, createCheckThrottle } = require('../src/required');
 
 test('every command in commands.js is classified exactly once', () => {
   const all = Object.keys(COMMANDS);
@@ -78,21 +78,21 @@ test('required: reads and update pass; writes and the network are refused; it ne
   assert.equal(gate.allows('somethingNew'), false, 'unknown: refused');
   assert.equal(gate.set(null), false);
   assert.equal(gate.state.active, true, 'a null payload never clears it');
-  assert.deepEqual(states.at(-1), { required: true, version: '0.6.0', active: true, phase: 'gated', callEndsAt: null });
+  assert.deepEqual(states.at(-1), { required: true, version: '0.6.0', active: true, phase: 'gated', endedCall: false });
 });
 
-test('in a call: only reads, the update and the call itself pass until the call ends (TL)', () => {
-  const { gate, st } = harness({ inCall: true });
+test('in a call: a required update ends it at once, no grace (TL, PO)', () => {
+  const { gate, st, states } = harness({ inCall: true });
   gate.set({ version: '0.6.0' });
-  assert.equal(gate.state.phase, 'call');
-  assert.equal(gate.state.active, false);
-  for (const c of [...CALL, 'getMessages', 'listServers', 'getAppInfo', 'restartToUpdate']) assert.equal(gate.allows(c), true, c);
-  for (const c of ['sendMessage', 'joinServer', 'kickMember', 'createInvite', 'updateProfile', 'joinCall']) assert.equal(gate.allows(c), false, c);
-  st.inCall = false;
-  gate.callChanged();
+  assert.equal(st.ended, 1, 'main ended the call right away');
+  assert.equal(st.inCall, false);
   assert.equal(gate.state.phase, 'gated');
   assert.equal(gate.state.active, true);
-  for (const c of ['sendSignal', 'setMuted', 'setDeafened']) assert.equal(gate.allows(c), false, c);
+  // The banner says the call ended for the update (update.required.callEnded).
+  assert.equal(gate.state.endedCall, true);
+  assert.equal(states.at(-1).endedCall, true);
+  assert.equal(Object.hasOwn(gate.state, 'callEndsAt'), false, 'no countdown');
+  for (const c of ['sendSignal', 'setMuted', 'setDeafened', 'joinCall']) assert.equal(gate.allows(c), false, c);
   assert.equal(gate.allows('leaveCall'), true);
   assert.equal(gate.allows('checkForUpdate'), false, 'Retry goes through main, not core:invoke');
 });
@@ -129,35 +129,29 @@ test('Retry (update:check): main runs the check at most every 30 s; only a code 
 
 test('the state for a page that asks: phase and version, never cleared', () => {
   const { gate } = harness();
-  assert.deepEqual(gate.state, { required: false, version: null, active: false, phase: 'none', callEndsAt: null });
+  assert.deepEqual(gate.state, { required: false, version: null, active: false, phase: 'none', endedCall: false });
   gate.set({ version: '0.6.0' });
-  assert.deepEqual(gate.state, { required: true, version: '0.6.0', active: true, phase: 'gated', callEndsAt: null });
+  assert.deepEqual(gate.state, { required: true, version: '0.6.0', active: true, phase: 'gated', endedCall: false });
 });
 
-test('in a call: at most 30 min, then main ends the call and the gate applies', () => {
-  const { gate, st, advance, states } = harness({ inCall: true });
+test('not in a call: nothing is ended, and the banner gets no "call ended"', () => {
+  const { gate, st } = harness();
   gate.set({ version: '0.6.0' });
-  assert.equal(gate.state.callEndsAt, CALL_CAP_MS);
-  advance(CALL_CAP_MS - 1);
   assert.equal(st.ended, 0);
-  assert.equal(gate.state.active, false);
-  advance(1);
-  assert.equal(st.ended, 1, 'main ended the call');
-  assert.equal(gate.state.active, true);
-  assert.equal(states.at(-1).active, true);
-  // A new call can't lift it.
-  st.inCall = true;
-  gate.callChanged();
-  assert.equal(gate.state.active, true);
+  assert.equal(gate.state.endedCall, false);
 });
 
-test('a call that ends before the cap cancels the timer', () => {
-  const { gate, st, advance, timers } = harness({ inCall: true });
-  gate.set({ version: null });
-  st.inCall = false;
+test('a new call under a required update is ended at once too, and the page hears it', () => {
+  const { gate, st, states } = harness();
+  gate.set({ version: '0.6.0' });
+  const before = states.length;
+  st.inCall = true; // e.g. a join that raced the gate
   gate.callChanged();
-  assert.equal(timers.length, 0);
-  advance(CALL_CAP_MS * 2);
-  assert.equal(st.ended, 0);
+  assert.equal(st.ended, 1);
   assert.equal(gate.state.active, true);
+  assert.equal(states.length, before + 1, 'onChange after ending the racing call (TL)');
+  assert.equal(states.at(-1).endedCall, true);
+  // No call: callChanged() says nothing new.
+  gate.callChanged();
+  assert.equal(states.length, before + 1);
 });

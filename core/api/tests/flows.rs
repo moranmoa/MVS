@@ -8,7 +8,7 @@ use std::sync::Arc;
 use api::*;
 use common::{Peer, World};
 use identity::MemoryStore;
-use records::{Draft, Kind, PublicKey, Scope, ServerId, SigningKey};
+use records::{Draft, Kind, PublicKey, RecordId, Scope, ServerId, SigningKey};
 
 const LEGAL: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
@@ -72,6 +72,7 @@ fn names(events: &[Event]) -> Vec<&'static str> {
             Event::MessageUpdated(_) => "message.updated",
             Event::CallState(_) => "call.state",
             Event::CallSignal { .. } => "call.signal",
+            Event::VoiceFrame { .. } => "voice.frame",
             Event::VoiceRooms { .. } => "voice.rooms",
             Event::Typing { .. } => "typing",
             Event::ReportReceived { .. } => "report.received",
@@ -1915,6 +1916,8 @@ fn join_re_keys_spend_a_token_bucket() {
     let world = World::new();
     let (owner, server, channel) = keyed_server(&world, "Bucket");
     owner.core.send_message(&channel, "before anyone joined", None).unwrap();
+    // Over LM-2's 60 s slack: never re-sealed for a joiner.
+    advance(&world, 61_000);
 
     // A burst of 3: each re-keyed at once, each can write at once.
     let mut first = Vec::new();
@@ -2005,6 +2008,347 @@ fn a_message_sent_while_the_join_re_key_is_in_flight_reaches_the_joiner() {
     let bodies: Vec<String> =
         b.core.get_messages(&channel, 0, 9).unwrap().messages.into_iter().map(|m| m.body).collect();
     assert!(bodies.iter().any(|m| m == "pre a"), "B misses A's message: {bodies:?}");
+}
+
+fn shown_messages(peer: &Peer, channel: &str) -> Vec<Message> {
+    peer.core.sync_now().unwrap();
+    peer.core.get_messages(channel, 0, 200).unwrap().messages
+}
+
+fn edits_in(world: &World, server: &ServerSummary) -> usize {
+    world.network.fetch(server_key(server)).iter().filter(|r| r.kind() == Kind::MessageEdit).count()
+}
+
+/// LM-2 (QA's LAN first-message P1): two join at once and the owner writes
+/// before either Join reached it, so the message is sealed without them,
+/// and no hold (#517) fires. Once the owner applies the Joins, it re-seals
+/// that message for them: same text, the original's `ts`, no "edited",
+/// unread once. One re-seal covers both. The owner sees no change.
+#[test]
+fn a_message_sent_before_a_join_arrived_is_re_sealed_for_the_joiner() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Reseal");
+    owner.core.send_message(&channel, "before anyone joined", None).unwrap();
+    advance(&world, 120_000);
+    let a = joiner(&world, &server, "A");
+    let b = joiner(&world, &server, "B");
+    // The owner writes before it has seen either Join.
+    owner.core.send_message(&channel, "pre o", None).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 1, "one re-seal, for both joiners");
+    for peer in [&a, &b] {
+        let shown = shown_messages(peer, &channel);
+        let pre = shown.iter().find(|m| m.body == "pre o").expect("the joiner never got it");
+        assert_eq!(pre.edited_at, None, "a re-seal shows no \"edited\"");
+        // Pre-join history stays closed (D30).
+        assert!(!shown.iter().any(|m| m.body == "before anyone joined"));
+        let general = peer.core.list_channels(&server.id).unwrap().remove(0);
+        assert_eq!(general.unread_count, Some(1), "unread once");
+    }
+    // The owner sees its own message as before: not "edited".
+    let mine = shown_messages(&owner, &channel);
+    assert_eq!(mine.iter().find(|m| m.body == "pre o").unwrap().edited_at, None);
+    // Nothing more on the next rounds.
+    advance(&world, 1000);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 1);
+}
+
+/// LM-2 × B7-k (Tech Lead, child safety): an 18+ channel turned plain
+/// re-seals nothing from its 18+ time to a minor who joins just after,
+/// though it is inside the 60 s window; what was written after it turned
+/// plain is re-sealed as usual. Real cipher.
+#[test]
+fn an_adult_channel_turned_plain_re_seals_nothing_from_its_18_time_to_a_minor() {
+    use api::crypto::GroupKeysCipher;
+    let world = World::new();
+    let person = |name: &str, birth_date: &str| {
+        let peer = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+        let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: birth_date.into() };
+        let created = peer.core.create_identity(input).unwrap();
+        let positions = peer.core.get_recovery_challenge().unwrap().positions;
+        let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+        assert!(peer.core.check_recovery_words(answers).unwrap().ok);
+        let profile = ProfileInput { display_name: name.into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+        peer.core.update_profile(profile).unwrap();
+        peer
+    };
+    let owner = person("Owner", "1990-05-01");
+    let server = owner.core.create_server("Den", AgeRestriction::None).unwrap();
+    let den = owner.core.create_channel(&server.id, "den", true).unwrap().id;
+    owner.core.sync_now().unwrap();
+    owner.core.send_message(&den, "late, 18+ time", None).unwrap();
+    owner.core.update_channel(&den, None, Some(false)).unwrap();
+    owner.core.send_message(&den, "plain now", None).unwrap();
+    advance(&world, 100);
+    // A 17-year-old joins right after; the owner hasn't seen the Join yet.
+    let minor = person("Minor", "2009-06-01");
+    minor.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    let shown: Vec<String> = shown_messages(&minor, &den).into_iter().map(|m| m.body).collect();
+    assert!(shown.iter().any(|b| b == "plain now"), "re-sealed as usual: {shown:?}");
+    assert!(!shown.iter().any(|b| b == "late, 18+ time"), "nothing from the 18+ time: {shown:?}");
+}
+
+/// The same with a modified minor client that backdates its `Join.ts` to
+/// widen LM-2's window to about 10 min (Security Lead): the rule follows
+/// where the message sits in the log, not the clock, so the 18+ time's
+/// message is never re-sealed; one written after the channel turned plain
+/// is.
+#[test]
+fn a_backdated_join_gets_nothing_from_an_18_time_either() {
+    use api::crypto::GroupKeysCipher;
+    let world = World::new();
+    let owner = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "1990-05-01".into() };
+    let created = owner.core.create_identity(input).unwrap();
+    let positions = owner.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(owner.core.check_recovery_words(answers).unwrap().ok);
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+    owner.core.update_profile(profile).unwrap();
+    let server = owner.core.create_server("Den", AgeRestriction::None).unwrap();
+    let id = server_key(&server);
+    let den = owner.core.create_channel(&server.id, "den", true).unwrap().id;
+    owner.core.sync_now().unwrap();
+    let late_at = *world.clock.0.lock().unwrap();
+    owner.core.send_message(&den, "late, 18+ time", None).unwrap();
+    advance(&world, 5 * 60_000);
+    owner.core.update_channel(&den, None, Some(false)).unwrap();
+    owner.core.send_message(&den, "plain now", None).unwrap();
+    let message = |body_ts_after: u64| -> RecordId {
+        world
+            .network
+            .fetch(id)
+            .into_iter()
+            .filter(|r| r.kind() == Kind::Message && r.ts() >= body_ts_after)
+            .min_by_key(|r| r.ts())
+            .unwrap()
+            .id()
+    };
+    let late = message(late_at);
+    // A minor's modified client: no 18+ claim, and a Join dated 4 min
+    // before the 18+ message, so its ts is well inside the window.
+    let minor = records::SigningKey::from_bytes(&[91; 32]);
+    let invite = {
+        let link = server.invite_link.trim_start_matches("mvs://join/");
+        RecordId::from_bytes(hex::decode(link.split('/').nth(1).unwrap()).unwrap().try_into().unwrap())
+    };
+    let mut deps: BTreeSet<RecordId> =
+        world.network.fetch(id).iter().filter(|r| r.scope() == Scope::Control).map(|r| r.id()).collect();
+    deps.insert(invite);
+    let backdated = late_at.saturating_sub(4 * 60_000);
+    let join = authority::sign_control(&minor, id, 1, deps.into_iter().collect(), backdated, &authority::Action::Join { invite })
+        .unwrap();
+    world.network.publish(&join);
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    let resealed: Vec<RecordId> = world
+        .network
+        .fetch(id)
+        .into_iter()
+        .filter(|r| r.kind() == Kind::MessageEdit)
+        .filter_map(|r| r.body().get(..32).map(|t| RecordId::from_bytes(t.try_into().unwrap())))
+        .collect();
+    assert!(!resealed.is_empty(), "the message from after it turned plain is re-sealed");
+    assert!(!resealed.contains(&late), "never the one from the 18+ time");
+}
+
+/// Security Lead: when no single edit back to plain has every other one in
+/// its past (two concurrent ones, here from two of the owner's devices),
+/// which came last can't be told, so a minor joiner gets no re-seal from
+/// that channel at all.
+#[test]
+fn concurrent_edits_to_plain_re_seal_nothing_to_a_minor() {
+    use api::crypto::GroupKeysCipher;
+    let world = World::new();
+    // An adult owner, whose key the test signs with too.
+    let owner = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "1990-05-01".into() };
+    let created = owner.core.create_identity(input).unwrap();
+    let positions = owner.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(owner.core.check_recovery_words(answers).unwrap().ok);
+    let profile = ProfileInput { display_name: "Owner".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+    owner.core.update_profile(profile).unwrap();
+    let server = owner.core.create_server("Twice", AgeRestriction::None).unwrap();
+    let id = server_key(&server);
+    let den = owner.core.create_channel(&server.id, "den", true).unwrap().id;
+    let den_id = records::ChannelId::from_bytes(hex::decode(&den).unwrap().try_into().unwrap());
+    owner.core.sync_now().unwrap();
+    // Two edits back to plain on the same heads, signed apart.
+    let key = identity::RecoveryPhrase::parse(&created.words.join(" ")).unwrap().identity();
+    let heads: Vec<RecordId> = {
+        let control: Vec<records::Record> =
+            world.network.fetch(id).into_iter().filter(|r| r.scope() == Scope::Control).collect();
+        let referenced: BTreeSet<RecordId> = control.iter().flat_map(|r| r.deps().to_vec()).collect();
+        let mut heads: Vec<RecordId> = control.iter().map(|r| r.id()).filter(|r| !referenced.contains(r)).collect();
+        heads.sort();
+        heads
+    };
+    for (seq, name) in [(10_000, "den"), (10_001, "lounge")] {
+        let edit = authority::Action::ChannelEdit { channel: den_id, adult: false, name: name.into() };
+        world.network.publish(&authority::sign_control(key.signing_key(), id, seq, heads.clone(), 1, &edit).unwrap());
+    }
+    owner.core.sync_now().unwrap();
+    assert!(!owner.core.list_channels(&server.id).unwrap().iter().find(|c| c.id == den).unwrap().adult);
+    // The owner writes after both, before it sees the minor's Join.
+    owner.core.send_message(&den, "after both", None).unwrap();
+    let minor = world.peer_with(Arc::new(MemoryStore::new()), None, Arc::new(GroupKeysCipher::locked()));
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "2009-06-01".into() };
+    let created = minor.core.create_identity(input).unwrap();
+    let positions = minor.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(minor.core.check_recovery_words(answers).unwrap().ok);
+    minor.core.join_server(&server.invite_link).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 0, "fail closed: nothing re-sealed from that channel");
+}
+
+/// LM-2, the D30 bound (SL): an honest Join gets only messages from at
+/// most 60 s before it; older ones, though they don't reach the Join, stay
+/// closed. A message I edited before seeing the Join isn't re-sealed (TL).
+#[test]
+fn only_untouched_messages_from_just_before_a_join_are_re_sealed() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Window");
+    owner.core.send_message(&channel, "61 s before", None).unwrap();
+    advance(&world, 61_000);
+    let edited = owner.core.send_message(&channel, "typo", None).unwrap();
+    owner.core.edit_message(&edited.id, "fixed").unwrap();
+    let a = joiner(&world, &server, "A");
+    owner.core.send_message(&channel, "just after", None).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    let bodies: Vec<String> = shown_messages(&a, &channel).into_iter().map(|m| m.body).collect();
+    assert!(bodies.iter().any(|m| m == "just after"), "{bodies:?}");
+    assert!(!bodies.iter().any(|m| m == "61 s before" || m == "fixed" || m == "typo"), "{bodies:?}");
+    // The real edit, plus one re-seal.
+    assert_eq!(edits_in(&world, &server), 2);
+}
+
+/// LM-2: a backdated `Join.ts` still gets nothing I sent more than 10 min
+/// before I applied the Join (SL).
+#[test]
+fn a_backdated_join_gets_at_most_ten_minutes() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Backdated");
+    let start = *world.clock.0.lock().unwrap();
+    owner.core.send_message(&channel, "eleven minutes ago", None).unwrap();
+    advance(&world, 11 * 60_000);
+    owner.core.send_message(&channel, "recent", None).unwrap();
+    let now = *world.clock.0.lock().unwrap();
+    // The joiner's clock says it joined back then.
+    *world.clock.0.lock().unwrap() = start;
+    let a = joiner(&world, &server, "A");
+    *world.clock.0.lock().unwrap() = now + 100;
+    owner.core.sync_now().unwrap();
+    let bodies: Vec<String> = shown_messages(&a, &channel).into_iter().map(|m| m.body).collect();
+    assert!(bodies.iter().any(|m| m == "recent"), "{bodies:?}");
+    assert!(!bodies.iter().any(|m| m == "eleven minutes ago"), "{bodies:?}");
+}
+
+/// LM-2: a member who could already read the message sees no change from
+/// its re-seal: no "edited", no `message.updated`, no second unread.
+#[test]
+fn a_reader_of_the_original_sees_no_change_from_its_re_seal() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Quiet");
+    let b = joiner(&world, &server, "B");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    b.core.sync_now().unwrap();
+    let a = joiner(&world, &server, "A");
+    owner.core.send_message(&channel, "pre o", None).unwrap();
+    let before = shown_messages(&b, &channel);
+    assert_eq!(before.iter().find(|m| m.body == "pre o").unwrap().edited_at, None);
+    let unread = b.core.list_channels(&server.id).unwrap().remove(0).unread_count;
+    b.events.take();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 1);
+    let after = shown_messages(&b, &channel);
+    assert_eq!(after.iter().find(|m| m.body == "pre o").unwrap().edited_at, None);
+    assert_eq!(b.core.list_channels(&server.id).unwrap().remove(0).unread_count, unread);
+    let updated = b.events.take().into_iter().any(|e| matches!(&e, Event::MessageUpdated(m) if m.body == "pre o"));
+    assert!(!updated, "a re-seal announced a change to a reader of the original");
+    assert!(shown_messages(&a, &channel).iter().any(|m| m.body == "pre o"));
+}
+
+/// LM-2: a joiner who is gone again by the time I apply the Join (here a
+/// leave; a kick is the same) gets nothing re-sealed.
+#[test]
+fn a_joiner_removed_meanwhile_gets_no_re_seal() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Gone");
+    let a = joiner(&world, &server, "A");
+    owner.core.send_message(&channel, "pre o", None).unwrap();
+    a.core.leave_server(&server.id).unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 0);
+}
+
+/// LM-2 caps: at most 50 re-seals per channel per Join.
+#[test]
+fn re_seals_are_capped_per_channel() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Caps");
+    let a = joiner(&world, &server, "A");
+    for i in 0..55 {
+        owner.core.send_message(&channel, &format!("burst {i}"), None).unwrap();
+    }
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    assert_eq!(edits_in(&world, &server), 50);
+    let got = shown_messages(&a, &channel).iter().filter(|m| m.body.starts_with("burst")).count();
+    assert_eq!(got, 50);
+}
+
+/// SL on LM-2: the `ts` marker alone never hides a changed text from a
+/// reader who had the original. An edit by the author that carries the
+/// original's `ts` but other text shows as "edited".
+#[test]
+fn an_edit_with_the_original_ts_and_new_text_is_still_edited() {
+    let world = World::new();
+    let (owner, server, channel) = keyed_server(&world, "Marker");
+    let b = joiner(&world, &server, "B");
+    advance(&world, 100);
+    owner.core.sync_now().unwrap();
+    b.core.sync_now().unwrap();
+    let sent = owner.core.send_message(&channel, "original", None).unwrap();
+    let ts = sent.created_at;
+    // Wind the clock back until an edit is signed at exactly that `ts`.
+    let mut text = None;
+    for back in (0..20u64).rev() {
+        *world.clock.0.lock().unwrap() = ts - 1 - back;
+        let body = format!("rewritten {back}");
+        owner.core.edit_message(&sent.id, &body).unwrap();
+        let exact = world
+            .network
+            .fetch(server_key(&server))
+            .iter()
+            .any(|r| r.kind() == Kind::MessageEdit && r.ts() == ts);
+        if exact {
+            text = Some(body);
+            break;
+        }
+    }
+    let text = text.expect("no edit landed on the original's ts");
+    let shown = shown_messages(&b, &channel);
+    let m = shown.iter().find(|m| m.id == sent.id).unwrap();
+    assert_eq!(m.body, text);
+    assert_eq!(m.edited_at, Some(ts), "a changed text with the original's ts hid \"edited\"");
 }
 
 /// The wait for a join re-key is bounded: with no moderator online, a
@@ -2746,6 +3090,13 @@ fn invites_are_made_listed_and_revoked() {
 struct VoiceHub {
     queue: std::sync::Mutex<Vec<(PublicKey, PublicKey, Vec<u8>)>>,
     relay_only: std::sync::atomic::AtomicBool,
+    /// G-81: the voice frames handed to the node.
+    frames: std::sync::Mutex<Vec<sync::VoiceFrame>>,
+    /// G-81: every call the node was told about (`None`: none).
+    media_calls: std::sync::Mutex<Vec<Option<sync::VoiceCall>>>,
+    /// G-81: a frame tried from inside `set_media_call(None)`, through
+    /// this handle: it must be dropped, since the gate closes first (SL).
+    probe: std::sync::Mutex<Option<(api::VoiceFrames, serde_json::Value)>>,
 }
 
 struct HubPort {
@@ -2761,6 +3112,20 @@ impl VoiceNet for HubPort {
     fn send(&self, to: PublicKey, blob: Vec<u8>) {
         assert!(blob.len() <= 16 * 1024);
         self.hub.queue.lock().unwrap().push((self.me, to, blob));
+    }
+
+    fn media_frame(&self, frame: sync::VoiceFrame) {
+        self.hub.frames.lock().unwrap().push(frame);
+    }
+
+    fn set_media_call(&self, call: Option<sync::VoiceCall>) {
+        if call.is_none() {
+            let probe = self.hub.probe.lock().unwrap().clone();
+            if let Some((frames, args)) = probe {
+                frames.take(Some(&args));
+            }
+        }
+        self.hub.media_calls.lock().unwrap().push(call);
     }
 }
 
@@ -2978,6 +3343,106 @@ fn a_call_between_members() {
     hub.relay_only.store(false, std::sync::atomic::Ordering::SeqCst);
     owner.core.leave_call().unwrap();
     assert!(!owner.core.in_call());
+}
+
+/// G-81 part c (SL on #554): voice frames go out only for the call I'm in.
+/// On leave the gate closes before the node hears of it, so a frame that
+/// overtakes `leaveCall`, or comes after it, sends nothing.
+#[test]
+fn leave_then_frame_sends_nothing() {
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let server = owner.core.create_server("Talk", AgeRestriction::None).unwrap();
+    hub.connect(&owner, &owner_id);
+    let frames = owner.core.voice_frames();
+    let frame = |call: &str| serde_json::json!({ "callId": call, "seq": 1, "ts": 960, "data": "AQID" });
+
+    // Not in a call: dropped.
+    frames.take(Some(&frame(&"0a".repeat(16))));
+    assert!(hub.frames.lock().unwrap().is_empty());
+
+    let state = owner.core.create_voice_room(&server.id).unwrap();
+    let call = state.call_id.clone().expect("a call has an ID");
+    assert_eq!(call.len(), 32);
+    let told = hub.media_calls.lock().unwrap().last().cloned().flatten().expect("the node was told of the call");
+    assert_eq!(hex::encode(told.call_id), call);
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+    assert_eq!(hub.frames.lock().unwrap()[0].opus, [1, 2, 3]);
+    // Another call's ID: dropped.
+    frames.take(Some(&frame(&"0b".repeat(16))));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+
+    // Leave: by the time the node is told, the gate is already shut.
+    *hub.probe.lock().unwrap() = Some((frames.clone(), frame(&call)));
+    owner.core.leave_call().unwrap();
+    assert!(hub.media_calls.lock().unwrap().last().is_some_and(Option::is_none), "the node still has the call");
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1, "a frame went out after leaveCall");
+
+    // A new call has a new ID: the old one's frames still go nowhere.
+    let again = owner.core.create_voice_room(&server.id).unwrap().call_id.unwrap();
+    assert_ne!(again, call);
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+    owner.core.leave_call().unwrap();
+}
+
+/// SL on #556: the app lock shuts the frame gate first, whatever leaving
+/// the call does: a frame of the call is dropped and the node has no call.
+/// Unlocked, a new call opens it again.
+#[test]
+fn the_app_lock_shuts_the_frame_gate() {
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let server = owner.core.create_server("Talk", AgeRestriction::None).unwrap();
+    hub.connect(&owner, &owner_id);
+    let frames = owner.core.voice_frames();
+    let frame = |call: &str| serde_json::json!({ "callId": call, "seq": 1, "ts": 960, "data": "AQID" });
+
+    let call = owner.core.create_voice_room(&server.id).unwrap().call_id.unwrap();
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+    owner.core.lock_keys();
+    assert!(hub.media_calls.lock().unwrap().last().is_some_and(Option::is_none), "the node still has the call");
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1, "a frame went out while locked");
+
+    owner.core.unlock_keys();
+    let again = owner.core.create_voice_room(&server.id).unwrap().call_id.unwrap();
+    frames.take(Some(&frame(&again)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 2);
+    owner.core.leave_call().unwrap();
+}
+
+/// G-81 2a part c (TL): with `--voice-p2p`, a relay-only user can create
+/// and join calls (over our circuits only: the node's call, here); without
+/// it, calls stay refused while relay-only.
+#[test]
+fn relay_only_calls_need_the_voice_p2p_flag() {
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let server = owner.core.create_server("Talk", AgeRestriction::None).unwrap();
+    hub.connect(&owner, &owner_id);
+    hub.relay_only.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(owner.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::RelayOnly);
+
+    owner.core.set_voice_p2p(true);
+    let state = owner.core.create_voice_room(&server.id).unwrap();
+    assert!(owner.core.in_call());
+    let told = hub.media_calls.lock().unwrap().last().cloned().flatten().expect("the node was told of the call");
+    assert_eq!(Some(hex::encode(told.call_id)), state.call_id);
+    owner.core.leave_call().unwrap();
+
+    // Flag off again: refused as before.
+    owner.core.set_voice_p2p(false);
+    assert_eq!(owner.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::RelayOnly);
 }
 
 /// A network that records each relay-only setting it was given.
@@ -6075,6 +6540,8 @@ fn a_message_the_joiner_cant_open_is_a_placeholder_in_place() {
     let world = World::new();
     let (owner, server, channel) = keyed_server(&world, "Placeholder");
     owner.core.send_message(&channel, "before B joined", None).unwrap();
+    // Over LM-2's 60 s slack: never re-sealed for a joiner.
+    advance(&world, 61_000);
     let a = joiner(&world, &server, "A");
     advance(&world, 100);
     owner.core.sync_now().unwrap();
@@ -6149,4 +6616,22 @@ fn an_untrusted_message_is_a_placeholder_without_its_author() {
     let listed = reader.core.list_channels(&server.id).unwrap();
     let ch = listed.iter().find(|c| c.id == channel).unwrap();
     assert_eq!(ch.unread_count, Some(0), "{ch:?}");
+}
+
+/// NC-1 (b): the diagnostics file's network block and rounded fields, as
+/// testers would attach it to a public issue.
+#[test]
+fn diagnostics_carry_only_counts_and_rounded_fields() {
+    let world = World::new();
+    let peer = world.peer();
+    let me = sign_up(&peer, "Tester");
+    let report = peer.core.export_diagnostics().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(v["exportedAtMs"].as_u64().unwrap() % 60_000, 0, "to the minute");
+    assert_eq!(v["storageBytes"].as_u64().unwrap() % (1024 * 1024), 0, "to the MiB");
+    assert_eq!(v["network"]["reachability"], "unknown", "nothing reported yet");
+    for purpose in api::netdiag::PURPOSES {
+        assert_eq!(v["network"]["connections"][purpose], serde_json::json!({ "total": "0" }), "a bucket, no counts");
+    }
+    assert!(!report.contains(&me.id) && !report.contains(&me.short_code) && !report.contains("Tester"), "{report}");
 }

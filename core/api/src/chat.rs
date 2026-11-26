@@ -90,9 +90,10 @@ impl ChannelGraph for Graph<'_> {
 
 /// Whether authority accepts a held stub (a held, accepted delete or newer
 /// edit replaced its record).
-fn stub_accepted(resolver: &Resolver, stub: &Stub, graph: &Graph) -> bool {
+fn stub_accepted(log: &Log, stub: &Stub, graph: &Graph) -> bool {
+    let resolver = &log.resolver;
     check_stub(resolver, stub, graph) == Verdict::Accept
-        && adult_ok(resolver, stub.kind(), stub.scope(), stub.author(), stub.auth_deps())
+        && adult_ok(resolver, log.genesis_min, stub.kind(), stub.scope(), stub.author(), stub.auth_deps())
 }
 
 /// The records of `channel`, in the order they were added.
@@ -100,9 +101,10 @@ pub(crate) fn channel_records(log: &Log, channel: ChannelId) -> Vec<Record> {
     log.channel.iter().filter(|r| r.scope() == Scope::Channel(channel)).cloned().collect()
 }
 
-fn accepted(resolver: &Resolver, record: &Record, graph: &Graph) -> bool {
+fn accepted(log: &Log, record: &Record, graph: &Graph) -> bool {
+    let resolver = &log.resolver;
     check_channel(resolver, record, graph) == Verdict::Accept
-        && adult_ok(resolver, record.kind(), record.scope(), record.author(), record.auth_deps())
+        && adult_ok(resolver, log.genesis_min, record.kind(), record.scope(), record.author(), record.auth_deps())
 }
 
 /// B7-k, the receiver rule (Tech Lead and Security Lead on #544): in a
@@ -120,20 +122,39 @@ fn accepted(resolver: &Resolver, record: &Record, graph: &Graph) -> bool {
 /// (Security Lead): a former adult whose claim was lowered by a modified
 /// client can still post with stale deps pointing at an adult moment after
 /// the edit; the claim is self-attested anyway (GAP-22).
-fn adult_ok(resolver: &Resolver, kind: Kind, scope: Scope, author: PublicKey, auth_deps: &[RecordId]) -> bool {
+///
+/// G-52 (Security Lead on #590): while the server is 18+, every channel is
+/// held to the same rule, and (b) asks the deps to reach the raise too (a
+/// server 18+ from its genesis: everything reaches that). With both a raise
+/// and a channel 18+ edit, the deps must reach each.
+fn adult_ok(
+    resolver: &Resolver,
+    genesis_min: u8,
+    kind: Kind,
+    scope: Scope,
+    author: PublicKey,
+    auth_deps: &[RecordId],
+) -> bool {
     if !matches!(kind, Kind::Message | Kind::MessageEdit | Kind::Reaction) {
         return true;
     }
     let Scope::Channel(channel) = scope else { return true };
     let state = resolver.state();
-    if !state.channels.get(&channel).is_some_and(|c| c.adult) {
+    let channel_adult = state.channels.get(&channel).is_some_and(|c| c.adult);
+    let server_adult = crate::model::server_adult_edit(state, genesis_min);
+    if !channel_adult && server_adult.is_none() {
         return true;
     }
     if resolver.adult_at(author, auth_deps) != Ok(true) {
         return false;
     }
-    let reaches = state.adult_edits.get(&channel).is_some_and(|edit| reaches_cached(resolver, *edit, auth_deps));
-    reaches || state.adults.contains(&author)
+    let channel_reached =
+        !channel_adult || state.adult_edits.get(&channel).is_some_and(|edit| reaches_cached(resolver, *edit, auth_deps));
+    let server_reached = match server_adult {
+        Some(Some(raise)) => reaches_cached(resolver, raise, auth_deps),
+        _ => true,
+    };
+    (channel_reached && server_reached) || state.adults.contains(&author)
 }
 
 thread_local! {
@@ -191,9 +212,14 @@ pub(crate) fn sync_cipher(cipher: &dyn GroupCipher, server: ServerId, log: &Log)
     let state = log.resolver.state();
     let known = known_channels(server, state);
     cipher.set_channels(server, &known);
-    // B7-k: an 18+ channel's key is for the adults among the members only.
-    let adult_channels: BTreeSet<ChannelId> =
-        known.iter().copied().filter(|c| state.channels.get(c).is_some_and(|c| c.adult)).collect();
+    // B7-k: an 18+ channel's key is for the adults among the members only;
+    // G-52: while the server is 18+, every channel's is.
+    let server_adult = crate::model::server_adult_edit(state, log.genesis_min).is_some();
+    let adult_channels: BTreeSet<ChannelId> = known
+        .iter()
+        .copied()
+        .filter(|c| server_adult || state.channels.get(c).is_some_and(|c| c.adult))
+        .collect();
     cipher.set_adults(server, &state.adults, &adult_channels);
     let graph = Graph::new(&log.channel, &log.stubs);
     let rotations: Vec<&Record> = log
@@ -202,7 +228,7 @@ pub(crate) fn sync_cipher(cipher: &dyn GroupCipher, server: ServerId, log: &Log)
         .filter(|r| r.kind() == Kind::KeyRotation && in_known(r, &known))
         .collect();
     let ok: BTreeSet<RecordId> =
-        rotations.iter().filter(|r| accepted(&log.resolver, r, &graph)).map(|r| r.id()).collect();
+        rotations.iter().filter(|r| accepted(log, r, &graph)).map(|r| r.id()).collect();
     cipher.set_accepted(server, &ok);
     for record in rotations {
         // An error is a rotation we can't use; nothing else to do.
@@ -301,7 +327,7 @@ pub(crate) fn reactions(
     for (at, id) in causal_order(&nodes).into_iter().enumerate() {
         let reaction = by_id
             .get(&id)
-            .filter(|r| r.kind() == Kind::Reaction && accepted(&log.resolver, r, &graph));
+            .filter(|r| r.kind() == Kind::Reaction && accepted(log, r, &graph));
         // Every node feeds the effective times; a reaction is counted only
         // within the time and rate rules (`Gate::take`).
         if !folded.gate.take(index[&id], reaction.map(|r| r.author())) {
@@ -375,13 +401,13 @@ pub(crate) fn messages(
     // Full messages, and stubs of messages a delete or edit replaced.
     let full = channel_records(log, channel)
         .into_iter()
-        .filter(|r| r.kind() == Kind::Message && accepted(&log.resolver, r, &graph))
+        .filter(|r| r.kind() == Kind::Message && accepted(log, r, &graph))
         .map(|r| (Meta::of_record(&r), seen_join(r.auth_deps()), Some(r)));
     let pruned = log
         .stubs
         .values()
         .filter(|s| s.scope() == Scope::Channel(channel) && s.kind() == Kind::Message)
-        .filter(|s| stub_accepted(&log.resolver, s, &graph))
+        .filter(|s| stub_accepted(log, s, &graph))
         .map(|s| (Meta::of_stub(s), seen_join(s.auth_deps()), None));
     let mut shown: Vec<Shown> = full
         .chain(pruned)
@@ -402,29 +428,59 @@ pub(crate) fn messages(
             let placeholder =
                 |why: Option<Unreadable>| why.filter(|w| *w != Unreadable::NoKey || seen_join);
             let mut why = None;
+            let original = record
+                .as_ref()
+                .map(|record| try_open(cipher, server, channel, record.author(), record.body()));
             if let Some(edit) = replaced.latest_edit.get(&meta.id) {
-                let opened = edit
-                    .body()
-                    .get(32..)
-                    .ok_or(None)
-                    .and_then(|body| try_open(cipher, server, channel, edit.author(), body));
+                let open_edit = |edit: &Record| {
+                    edit.body()
+                        .get(32..)
+                        .ok_or(None)
+                        .and_then(|body| try_open(cipher, server, channel, edit.author(), body))
+                };
+                let mut opened = open_edit(edit);
+                // LM-2: a re-seal (an edit with the original's own `ts`) is
+                // sealed for the readers of its time, so the latest one may
+                // not open for me while another does.
+                if opened.is_err() && edit.ts() == meta.ts && !matches!(original, Some(Ok(_))) {
+                    let others = replaced.edits.get(&meta.id).into_iter().flatten().filter(|id| **id != edit.id());
+                    for other in others.filter_map(|id| log.channel.iter().find(|r| r.id() == *id)) {
+                        if other.ts() == meta.ts {
+                            if let Ok(text) = open_edit(other) {
+                                opened = Ok(text);
+                                break;
+                            }
+                        }
+                    }
+                }
                 match opened {
                     Ok(text) => {
+                        // "Edited" unless the text is the same (an equal-text
+                        // edit is a re-seal, for anyone who can open both),
+                        // or, for a reader who can't open the original (the
+                        // joiner it was re-sealed for), the edit carries the
+                        // original's `ts`. The `ts` alone never hides a
+                        // changed text from someone who had it (SL).
+                        let edited_at = match &original {
+                            Some(Ok(was)) if *was == text => None,
+                            Some(Ok(_)) => Some(edit.ts()),
+                            _ => (edit.ts() != meta.ts).then_some(edit.ts()),
+                        };
                         return Some(Shown {
                             record: meta,
                             text,
-                            edited_at: Some(edit.ts()),
+                            edited_at,
                             deleted: false,
                             reactions: Vec::new(),
                             unreadable: None,
-                        })
+                        });
                     }
                     // An edit that doesn't open: the original, if it does.
                     Err(e) => why = e,
                 }
             }
-            let opened = match &record {
-                Some(record) => try_open(cipher, server, channel, record.author(), record.body()),
+            let opened = match original {
+                Some(opened) => opened,
                 // Pruned: only its edit had a text, and that didn't open.
                 None => Err(why),
             };
@@ -518,7 +574,7 @@ impl Replaced {
         for record in channel_records(log, channel) {
             let kind = record.kind();
             if !matches!(kind, Kind::MessageDelete | Kind::MessageEdit)
-                || !accepted(&log.resolver, &record, &graph)
+                || !accepted(log, &record, &graph)
             {
                 continue;
             }
@@ -548,6 +604,16 @@ pub(crate) fn prunable(log: &Log, channel: ChannelId) -> Vec<RecordId> {
     let replaced = Replaced::of(log, channel);
     let mut out: Vec<RecordId> = Vec::new();
     for (message, edits) in &replaced.edits {
+        // LM-2: a message whose latest edit carries its own `ts` (re-seals,
+        // so far) keeps its original and those edits: a reader compares
+        // the texts (SL: no silent rewrite), and each joiner may need a
+        // different re-seal. Bounded by the re-seal caps.
+        let ts = log.channel.iter().find(|r| r.id() == *message).map(Record::ts);
+        let resealed = !replaced.deleted.contains(message)
+            && replaced.latest_edit.get(message).is_some_and(|e| Some(e.ts()) == ts);
+        if resealed {
+            continue;
+        }
         out.push(*message);
         let keep = if replaced.deleted.contains(message) {
             None
@@ -591,7 +657,7 @@ pub(crate) fn channel_seq(log: &Log, channel: ChannelId, author: &PublicKey) -> 
 pub(crate) fn would_accept(log: &Log, record: &Record) -> bool {
     let mut records = log.channel.clone();
     records.push(record.clone());
-    accepted(&log.resolver, record, &Graph::new(&records, &log.stubs))
+    accepted(log, record, &Graph::new(&records, &log.stubs))
 }
 
 /// [`channel_deps`] plus `target`, which an edit or delete must list.
@@ -664,7 +730,7 @@ mod adult_rule_tests {
             }
             .sign(&self.keys[n])
             .unwrap();
-            adult_ok(&self.resolver, message.kind(), message.scope(), message.author(), message.auth_deps())
+            adult_ok(&self.resolver, 0, message.kind(), message.scope(), message.author(), message.auth_deps())
         }
     }
 
@@ -719,7 +785,46 @@ mod adult_rule_tests {
         // Unknown deps: never counted (pending).
         assert!(!w.counts(1, NIGHT, RecordId::from_bytes([9; 32])));
         // Key rotations and deletes are never judged by it.
-        let rotation_kind = adult_ok(&w.resolver, Kind::KeyRotation, Scope::Channel(NIGHT), w.key(2), &[before_flip]);
+        let rotation_kind = adult_ok(&w.resolver, 0, Kind::KeyRotation, Scope::Channel(NIGHT), w.key(2), &[before_flip]);
         assert!(rotation_kind);
+    }
+
+    const LOUNGE: ChannelId = ChannelId::from_bytes([8; 32]);
+
+    /// G-52 (Tech Lead on #616): while the server is 18+, plain channels
+    /// are held to the rule, and (b) needs the deps to reach the raise as
+    /// well as a channel's own 18+ edit.
+    #[test]
+    fn an_18_server_holds_every_channel_to_the_rule() {
+        let mut w = World::new();
+        w.control(0, Action::AgeClaim { adult: true });
+        w.control(0, Action::ChannelCreate { channel: LOUNGE, adult: false, name: "lounge".into() });
+        w.control(0, Action::ChannelCreate { channel: NIGHT, adult: true, name: "night".into() });
+        w.control(1, Action::AgeClaim { adult: true });
+        let before_raise = w.head;
+        assert!(w.counts(2, LOUNGE, before_raise), "not 18+ yet: a plain channel has no check");
+        let raise = w.control(0, Action::ServerAgeLimit { min: 18 });
+        let after_raise = w.head;
+        assert_eq!(crate::model::server_adult_edit(w.resolver.state(), 0), Some(Some(raise)));
+
+        // A plain channel now: a minor never counts, stale deps or not.
+        assert!(!w.counts(2, LOUNGE, after_raise));
+        assert!(!w.counts(2, LOUNGE, before_raise));
+        // An adult counts; then lowers their claim.
+        assert!(w.counts(1, LOUNGE, before_raise), "adult now: (b) passes");
+        w.control(1, Action::AgeClaim { adult: false });
+        assert!(w.counts(1, LOUNGE, after_raise), "posted after the raise while adult: it stays");
+        assert!(!w.counts(1, LOUNGE, before_raise), "stale deps, not adult now: dropped");
+        // In the 18+ channel, deps that reach its own 18+ edit (its create)
+        // but not the raise don't do either.
+        assert!(!w.counts(1, NIGHT, before_raise), "reaches the channel's edit, not the raise");
+        assert!(w.counts(1, NIGHT, after_raise), "reaches both");
+
+        // Lowered to 16+: plain channels are free again; the 18+ channel
+        // keeps its own rule.
+        w.control(0, Action::ServerAgeLimit { min: 16 });
+        assert_eq!(crate::model::server_adult_edit(w.resolver.state(), 0), None);
+        assert!(w.counts(2, LOUNGE, w.head));
+        assert!(!w.counts(2, NIGHT, w.head));
     }
 }

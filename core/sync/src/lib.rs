@@ -41,6 +41,7 @@ mod report;
 mod typing;
 mod voice;
 mod voice_media;
+pub mod netstats;
 #[cfg(test)]
 pub(crate) mod testutil;
 

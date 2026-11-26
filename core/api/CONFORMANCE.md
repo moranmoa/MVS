@@ -415,11 +415,25 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - They also go to my own identity, which reaches only my other computers (same recovery words). A hello or bye signed by me counts only when sync bound its sender to me and it has no `to`. It marks me "in a call elsewhere" until its bye or 30 s without a hello, and never appears in a roster. My own envelopes echoed back are replays.
     - A full call's refusal counts only if it comes from someone already in that call, within 10 s of joining.
   - `applyUpdate` answers `not-allowed` during a call.
+  - Voice media over libp2p (G-81 2a part c, #509 §2.3). The core carries Opus frames to the call's peers that the UI has no LAN WebRTC connection with:
+    - `CallState.callId`: 32 lower-case hex. It's random for each call I join, present only while I'm in one, and new on every join.
+    - `CallParticipant.path`: `'lan' | 'direct' | 'circuit' | 'member-circuit' | 'none'`, how my frames reach that participant now, as the node reports it. It's absent until the node reports one, and a change is a `call.state`. It's a display hint; the node picks routes, never the UI.
+    - `setCallWebrtcPeers({ identities: string[] })` returns `null`. It names the participants the UI has a live LAN WebRTC connection with, and the core sends frames to every other participant. The UI can only exclude peers, never add targets.
+      - At most 5 identities; more, or a malformed ID, is `bad-request`.
+      - It resets on every new call. A change is a `call.state`.
+    - `voiceFrame` is a sidecar line `{"cmd":"voiceFrame","args":{"callId","seq","ts","data"}}`. It has no `id` and never gets a reply, even with an `id`.
+      - The sidecar's reader routes it on an exact `cmd` match only (`VoiceFrame` or `voiceFrame ` are ordinary commands, so they get `bad-request`). It never waits for a command, and replies to commands keep their order.
+      - Strict: exactly those four fields. `callId` is 32 lower-case hex, `seq` and `ts` are u32, and `data` is standard base64 of at most 400 bytes (empty means a DTX gap); the length is checked before decoding.
+      - It's sent only while I'm in the call with that `callId`, the keys aren't locked and I'm not signed out. Anything else is dropped silently, counted, and never logged.
+      - The gate closes synchronously on leave and on a relay-only switch without `--voice-p2p`, before the node is told. So a frame that overtakes `leaveCall`, or comes after it, sends nothing.
+      - Lock, sign-out and a required update (RU1) shut it first and unconditionally, whether or not leaving the call succeeds. Until unlock, no frame passes either way and no call reopens it; after sign-out or RU1, not for the rest of the process.
+    - `voice.frame { callId, from, seq, ts, data }`: a frame from a participant of my current call (`data` as above). Frames of any other call are dropped.
+    - `mvs-core --voice-p2p` (no value; the shell's `voiceP2p` flag): while relay-only is on, `createVoiceRoom` and `joinCall` work, and switching relay-only on doesn't end my call. Media then runs over our relay circuits only, never direct or through a member relay. Without the flag, relay-only refuses calls as below.
 - Relay-only (GAP-6r), per device:
   - `setRelayOnly(on: boolean)` returns `null`. It's stored in the core database and needs no identity. On:
     - the network keeps no direct listener, makes no direct dials, and reaches peers only through relay circuits, and direct connections already open are closed (#274);
     - my call ends at once (a bye to the others, then a `call.state` with `participants: []` and `relayOnly: true`);
-    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off.
+    - `createVoiceRoom` and `joinCall` answer `relay-only` until it's off (not with `--voice-p2p`, above).
   - At start, `mvs-core` reads the stored value before the network starts, and the node starts relay-only from the first moment (`NodeConfig.relay_only`: no direct listener, no bootstrap dial, no punching). It fails closed: a database that can't be opened or read, or a value other than off, means on.
   - Shown up front:
     - `AppInfo.relayOnly` from `getAppInfo`;
@@ -535,6 +549,19 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `'untrusted'`: it opens only under a rotation authority doesn't accept (#21). It has **no `authorId`** and no `sendState`, and it's never a reply target.
   - `react`, `editMessage` and `deleteMessage` on a placeholder give `bad-request`.
   - An edit that doesn't open leaves the original text shown (with no `editedAt`); the message is a placeholder only when the original doesn't open either.
+- Re-seals (LM-2, the SL's and the TL's decision): a sender who sealed a message before applying someone's Join re-sends it, so the joiner can read it.
+  - **What gets re-sent:** my own messages that don't reach that Join, with `ts ≥ Join.ts − 60 s`, that I sent at most 10 min before I applied the Join, in a channel the joiner reads now, and that I never edited or deleted.
+  - **The form:** a `MessageEdit` with the same text and the original's `ts`. It's sealed for the current readers once the join re-key covers the joiner.
+  - **Limits:** at most 50 per channel per Join, and 100 a minute.
+  - **Never re-sent:** to a joiner removed meanwhile, or anything from before that window (D30).
+  - **18+ channels turned plain (PO, child safety):** a message written while its channel was 18+ never reaches a joiner who isn't an adult. It stays hidden like pre-join history, with no placeholder.
+    - Where the message sits decides, not its time: for such a joiner, in a channel that was ever 18+ (it has a `State.adult_edits` entry), only messages whose `auth_deps` reach the channel's latest accepted edit back to plain are re-sent. A backdated `Join.ts` (a window of about 10 min) changes nothing.
+    - It fails closed: with no edit back to plain, or concurrent ones none of which has the others in its past, nothing from that channel is re-sent to them.
+  - Display, for every core from this one on:
+    - **A reader who can open both the original and the edit:** `editedAt` is absent when the texts are equal, so there's no "edited" label, no `message.updated` and no second unread. With a different text it's an ordinary edit, even when its `ts` equals the original's.
+    - **A reader who can't open the original (the joiner):** the edit's text shows in the message's place. `editedAt` is absent when the edit's `ts` equals the original's. Unread and mentions count once, as for a new message.
+    - Older cores show a re-seal as an ordinary edit with the same text, perhaps labelled "edited".
+  - A message whose latest edit carries its own `ts` isn't pruned (B6-p), and neither are its same-`ts` edits, so readers can compare the texts.
 - `CoreError.code`: `'bad-request' | 'not-implemented' | 'internal'`, and `'keyring-unavailable'` (QA-20): the OS keychain (Secret Service on Linux) is missing or unusable. The core still starts; `getIdentity` and anything needing the identity reject with it, and the UI shows the keyring cause.
 - `NoticeKind`: `'rekey-waiting'`, sent when removed members still hold a channel key and only a moderator can renew it. Until a moderator does, sending there answers `not-allowed`.
 - Server lifecycle (#229 design, #251 authority; `docs/design/server-rename-leave-delete.md`):
@@ -561,9 +588,21 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - `lv:N` is per release, not per feature (Tech Lead on #590). It means "this core decodes every kind introduced up to level N".
     - The first release that ships a new kind posts the next level, and every kind that release introduces gates on `lv >= N`.
     - The kind codes are fixed: `SecretRotation` (T17) is 25 and `ServerAgeLimit` (G-52) is 26. If both ship in one release, both gate on that release's level.
-- Server age limit (G-52, planned; design `docs/design/server-age-limit.md`, Security Lead on #590):
-  - After a raise to 18+, every channel's readers are members ∩ adults. The receiver rule's `reaches` must cover the later of the server-wide raise and the channel's own 18+ edit.
-  - **Accepted residual:** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata. T17's leave rotation never fires for it. Such members show as not adult to the owner and admins, who can kick them, and the kick rotates the secret.
+- Server age limit (G-52; design `docs/design/server-age-limit.md`, Security Lead and Tech Lead on #590; records and authority #610):
+  - `setAgeRestriction(serverId, 'none' | '16+' | '18+')` returns the updated `ServerSummary` and sends `server.updated`.
+    - The owner only (`not-allowed`); `not-found` for a server I'm not in; `bad-request` for any other value.
+    - `18+` only while my effective age is 18 or more (`too-young`, PO on #512).
+    - Behind `lv:1` (`update-needed` while a member's latest profile lacks it; `getUpdateNeeded(serverId, 'lv:1')` lists who): an older core would ignore the limit and keep keying minors.
+    - The current value signs nothing. The UI confirms raises and lowerings before calling (spec §2, §3); the core takes no "confirmed" flag.
+  - `countAgeAffected(serverId, ageRestriction)` returns `{ count }`: for `18+`, the members other than me without an accepted 18+ claim; 0 otherwise. No names. The owner or an admin (`not-allowed`).
+  - The effective limit (the latest accepted change, else the genesis value) replaces the genesis value everywhere: `ServerSummary.ageRestriction`, the join preview and `AgeBlocked`, birth-date corrections and `server.removed`'s `required`.
+  - **While the server is 18+:**
+    - every channel's readers are members ∩ adults, so the next rotation (at once, in the owner's call) leaves minors out;
+    - the receiver rule applies to every channel: deps that don't reach the raise, and the channel's own 18+ edit where there is one, count only from an adult now. A server 18+ from its genesis counts as raised there;
+    - a member's core under the limit leaves (`server.removed`, reason `age`, `required: '18+'`), unless its age is unknown (a restored device without a birth date) or it is the owner.
+  - **Lowering** re-keys forward only: 16- and 17-year-olds get no key to anything sealed while it was 18+. 18+ channels keep their own readers.
+  - `Member.notAdult?: true`: in an 18+ server, a member without an accepted 18+ claim, shown to the owner and admins only.
+  - **Accepted residual (Security Lead on #590):** a minor's core that refuses to leave keeps the sync secret, so it can read the plaintext control log and metadata, and T17's leave rotation never fires for it. Such members show as `notAdult` to the owner and admins, who can kick them; a kick rotates the secret.
 - 18+ channel keys (B7-k, Security Lead, P1 before the open alpha):
   - An 18+ channel's key rotates to the members with an accepted 18+ claim (`State.adults`) only; every other channel's key goes to all members, as before. The cipher learns the adults and the 18+ channels with the rest of its state (`GroupCipher::set_adults`, from the control log each time it syncs).
   - Someone leaving that set is a removal, as for a kick (#100): an adult whose claim goes "not adult", or a plain channel turned 18+. The next moderator round re-keys the channel for the adults, with `notice: encryption-renewed`, or `rekey-waiting` without a moderator. What's sent after can't be opened by the minor, even with the old key and the record in hand.
@@ -611,6 +650,22 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - `ServerSummary` gains `updateNeeded: boolean` (additive, default false). It turns true when a current member of a server I'm in wrote a validly signed record of a kind this version doesn't know (`records::Record::peek_unknown`): they run a newer version, and mine may miss what it adds. The UI shows an "update to keep up" hint for that server.
   - Sync still refuses that record: it's never stored, forwarded or acked. Anyone else's (a stranger, a kicked member, a broken signature, a server I'm not in) never sets the flag.
   - One `server.updated` when it turns true, then none for further records. In memory only: never cleared by a timer, only by a restart, so it comes back after one only if such a record is seen again.
+- Server secret rotation (T17, `docs/design/server-secret-rotation.md`; step 2b, draft):
+  - **Reading** is always on.
+    - The accepted `SecretRotation` parts are grouped by (author, rotation), so a part signed under someone else's rotation ID never joins theirs (Security Lead and Tech Lead on #609). Only complete groups count: every part, no gaps.
+    - The complete rotation whose last part is latest in linear order wins.
+    - When it sealed a secret for me, I store it (sealed), reopen sync on it, and send `server.updated`: the invite link carries the new secret. Every secret a rotation replaced stays, sealed, for 7 days (`PREVIOUS_SECRET_FOR_MS`), for reading the old secrets' frozen prefixes (Security Lead T17-W1, Tech Lead on #609).
+    - The secret never appears in a log or an event.
+  - **Writing** stays off (`WRITE_SECRET_ROTATION`) until S3/S4 and S5 are merged, in the release that requires updating (Tech Lead on #592 and #609). A unit test keeps it off until then. Then:
+    - a kick rotates at once, from the kicker's core (PO on #557);
+    - the owner's core rotates whenever the current secret is held by someone who is no longer a member (a kick or a leave: S2 `Required`), or misses a member who joined through an invite from before the rotation (S2 `Add`). A join through a newer invite rotates nothing, since its link already carries the new secret.
+    - a moderator rotates only for their own kick, so moderators don't all rotate at once.
+    - A rotation seals a fresh secret for the current members only (S2).
+  - `lv:1` joins the posted caps: this core decodes every kind up to code 26 (`SecretRotation` 25, `ServerAgeLimit` 26; Tech Lead on #609). `LEVEL_MAX_KIND` and a test hold the level to what the core decodes.
+  - Not yet, still to come in T17:
+    - the old secret's read-only frozen prefix (S3/S4, dev-sync);
+    - re-issued invites with the owner notice, the backup and the LAN beacon key following the rotation (S5);
+    - with no owner online, an admin rotating for a leave after 24 h plus 0–6 h of jitter (Security Lead Q1 on #609, step 2c).
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

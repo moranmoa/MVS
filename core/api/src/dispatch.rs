@@ -107,6 +107,14 @@ struct ServerDescriptionArgs {
     description: String,
 }
 
+/// G-52 `setAgeRestriction` and `countAgeAffected`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgeRestrictionArgs {
+    server_id: String,
+    age_restriction: AgeRestriction,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditVoiceRoomArgs {
@@ -290,6 +298,13 @@ struct RevokeInviteArgs {
 #[derive(Deserialize)]
 struct MutedArg {
     muted: bool,
+}
+
+/// G-81 `setCallWebrtcPeers`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebrtcPeersArg {
+    identities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -547,6 +562,14 @@ impl Core {
                 let a: ServerDescriptionArgs = args(raw)?;
                 ok(self.set_server_description(&a.server_id, &a.description))
             }
+            "setAgeRestriction" => {
+                let a: AgeRestrictionArgs = args(raw)?;
+                ok(self.set_age_restriction(&a.server_id, a.age_restriction))
+            }
+            "countAgeAffected" => {
+                let a: AgeRestrictionArgs = args(raw)?;
+                ok(self.count_age_affected(&a.server_id, a.age_restriction))
+            }
             "leaveServer" => ok(self.leave_server(&args::<ServerArg>(raw)?.server_id)),
             "closeServer" => ok(self.close_server(&args::<ServerArg>(raw)?.server_id)),
             "getUpdateNeeded" => {
@@ -646,6 +669,7 @@ impl Core {
             "joinCall" => ok(self.join_call(&args::<ChannelIdArg>(raw)?.channel_id)),
             "leaveCall" => ok(self.leave_call()),
             "setMuted" => ok(self.set_muted(args::<MutedArg>(raw)?.muted)),
+            "setCallWebrtcPeers" => ok(self.set_call_webrtc_peers(&args::<WebrtcPeersArg>(raw)?.identities)),
             "setDeafened" => ok(self.set_deafened(args::<DeafenedArg>(raw)?.deafened)),
             "sendSignal" => {
                 let a: SignalArgs = args(raw)?;

@@ -54,6 +54,12 @@ export class JitterBuffer {
   /** Adds a frame; it is dropped when already played (late), already held, or the buffer is full. */
   push(seq: number, data: Uint8Array): 'ok' | 'late' | 'duplicate' {
     seq >>>= 0;
+    // Exactly half the u32 ring away is neither before nor after: refused, so
+    // no frame can sit stale below `next` (SL nit on #530).
+    if (this.next !== null && ((seq - this.next) >>> 0) === 0x8000_0000) {
+      this.s.late++;
+      return 'late';
+    }
     // Late only once playout has passed its slot; before playout starts, an
     // earlier frame becomes the first one (below).
     if (this.floor !== null && u32Diff(seq, this.floor) < 0) {

@@ -37,6 +37,7 @@ import type {
   ServerSummary,
   StorageUsage,
   UpdateChannel,
+  UpdateGate,
   ReportEvidence,
   ReportReason,
   ReportReceipt,
@@ -70,6 +71,10 @@ export interface MockOptions {
   updateInstalled?: boolean;
   /** Shortly after start: the last update failed and the previous version is back. */
   updateRolledBack?: boolean;
+  /** #577: a required update is pending from the start, in this banner state (screenshots). */
+  updateRequired?: 'downloading' | 'ready' | 'offline' | 'check-clock' | 'not-available' | 'failed';
+  /** #622: this long after joining a call, a required update ends it (as main does). */
+  requiredInCallMs?: number;
   /** Act as if in a voice call: restartToUpdate is refused with not-allowed. */
   inCall?: boolean;
   /** As the desktop shell would: report the core down, for the T8-01 screen. */
@@ -90,6 +95,8 @@ export interface MockOptions {
   signOutKeyring?: boolean;
   /** updateProfile fails (B11e: the save error state). */
   profileError?: boolean;
+  /** G-51: setServerIcon answers rate-limited (screenshots, tests). */
+  serverIconRateLimited?: boolean;
   /** The first demo voice room starts with 5 people in it (full). */
   roomFull?: boolean;
   /** Voice rooms (0.4.3): how many live rooms each demo server starts with (default 1; 0 = none; up to 10). */
@@ -236,6 +243,8 @@ export class MockCore implements CoreApi {
   private storageLimit = 5 * 1024 ** 3;
   private releaseChannel: UpdateChannel = 'stable';
   private pendingJoins = new Map<string, ReturnType<typeof setTimeout>>();
+  /** #622: a required update ended my call (the mock's gate is on from then). */
+  private gateEnded = false;
   private timers: ReturnType<typeof setTimeout | typeof setInterval>[] = [];
   private speed: number;
 
@@ -292,6 +301,10 @@ export class MockCore implements CoreApi {
     }
     if (options.updateRolledBack) {
       this.timers.push(setTimeout(() => this.emit('update.rolledBack', { failed: '0.3.0', running: '0.2.0' }), 800));
+    }
+    if (options.updateRequired === 'ready') {
+      // #577: the required version is already downloaded and staged.
+      this.timers.push(setTimeout(() => this.emit('update.ready', { version: '0.6.0', waitingForCall: false }), 100));
     }
     if (options.updateAfterMs !== undefined) {
       this.timers.push(
@@ -1213,12 +1226,55 @@ export class MockCore implements CoreApi {
     if (this.outdatedOf(s).length) throw err({ code: 'update-needed' });
   }
 
-  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1'): Promise<Id[]> {
+  async getUpdateNeeded(serverId: Id, cap?: 'reactions-v1' | 'server-meta-v1'): Promise<Id[]> {
     const s = this.servers.get(serverId);
     if (!s) throw err({ code: 'not-found' });
     // As the core: only cap names it knows.
     if (cap !== undefined && cap !== 'reactions-v1') throw err({ code: 'bad-request' });
     return this.outdatedOf(s);
+  }
+
+  /** G-51: as the core (owner here; admins too in the core), with its limits. */
+  private lastIconSet = new Map<Id, number>();
+  async setServerIcon(serverId: Id, dataUrl: string | null): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    if (dataUrl !== null) {
+      if (!/^data:image\/(?:png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(dataUrl) || dataUrl.length > 11_000) throw err({ code: 'bad-request' });
+      const last = this.lastIconSet.get(serverId) ?? 0;
+      if (this.options.serverIconRateLimited || Date.now() - last < 10 * 60_000) throw err({ code: 'rate-limited' });
+    }
+    this.lifecycleGate(s);
+    await this.wait(150);
+    if (dataUrl !== null) this.lastIconSet.set(serverId, Date.now());
+    const { iconDataUrl: _old, ...rest } = s.summary;
+    s.summary = dataUrl === null ? rest : { ...rest, iconDataUrl: dataUrl };
+    this.emit('server.updated', s.summary);
+    return s.summary;
+  }
+
+  async setServerDescription(serverId: Id, description: string): Promise<ServerSummary> {
+    const s = this.servers.get(serverId);
+    if (!s) throw err({ code: 'not-found' });
+    if (s.summary.ownerId !== this.identity?.id || s.summary.closed) throw err({ code: 'not-allowed' });
+    const text = description.trim();
+    const lines = text.split('\n');
+    if (
+      [...text].length > 500 ||
+      lines.length > 5 ||
+      /[\r\u2028\u2029]/.test(text) ||
+      lines.some((l) => l !== l.trimEnd()) ||
+      /\n\n\n/.test(text)
+    ) {
+      throw err({ code: 'bad-request' });
+    }
+    this.lifecycleGate(s);
+    await this.wait(150);
+    const { description: _old, ...rest } = s.summary;
+    s.summary = text ? { ...rest, description: text } : rest;
+    this.emit('server.updated', s.summary);
+    return s.summary;
   }
 
   async renameServer(serverId: Id, name: string): Promise<ServerSummary> {
@@ -1574,7 +1630,8 @@ export class MockCore implements CoreApi {
 
   async createVoiceRoom(serverId: Id): Promise<CallState> {
     await this.wait(200);
-    if (this.relayOnly) throw err({ code: 'relay-only' });
+    // Like the core with G-81 2a: relay-only refuses calls unless B (voiceP2p) is on; then they go over our circuits.
+    if (this.relayOnly && !this.options.voiceP2p) throw err({ code: 'relay-only' });
     if (this.options.callError) throw err({ code: this.options.callError });
     if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
     if (this.roomsOf(serverId).length >= 10) throw err({ code: 'room-cap' });
@@ -1597,7 +1654,8 @@ export class MockCore implements CoreApi {
 
   async joinCall(channelId: Id): Promise<CallState> {
     await this.wait(200);
-    if (this.relayOnly) throw err({ code: 'relay-only' });
+    // Like the core with G-81 2a: relay-only refuses calls unless B (voiceP2p) is on; then they go over our circuits.
+    if (this.relayOnly && !this.options.voiceP2p) throw err({ code: 'relay-only' });
     if (this.options.callError) throw err({ code: this.options.callError });
     const found = this.findRoom(channelId);
     // Text channels don't carry calls (voice-room amendment); a room that is gone is not-found.
@@ -1611,6 +1669,16 @@ export class MockCore implements CoreApi {
     this.emitRooms(found.serverId);
     this.call = this.callOf(found.room);
     this.emitCall();
+    if (this.options.requiredInCallMs !== undefined) {
+      // As main does (#626): the gate ends the call, the page hears it, then the leave.
+      this.timers.push(
+        setTimeout(() => {
+          this.gateEnded = true;
+          this.emit('update.gate', { required: true, version: '0.6.0', active: true, phase: 'gated', endedCall: true });
+          void this.leaveCall();
+        }, this.options.requiredInCallMs),
+      );
+    }
     return this.call;
   }
 
@@ -1710,6 +1778,14 @@ export class MockCore implements CoreApi {
 
   async sendSignal(): Promise<null> {
     if (!this.call) throw err({ code: 'not-allowed' });
+    return null;
+  }
+
+  /** G-81 B (#556): the LAN-WebRTC participants; kept so tests can read it. At most 5, or bad-request. */
+  webrtcPeers: Id[] = [];
+  async setCallWebrtcPeers(identities: Id[]): Promise<null> {
+    if (!Array.isArray(identities) || identities.length > 5) throw err({ code: 'bad-request' });
+    this.webrtcPeers = [...identities];
     return null;
   }
 
@@ -1983,6 +2059,18 @@ export class MockCore implements CoreApi {
 
   async setUpdateChannel(channel: UpdateChannel): Promise<void> {
     this.releaseChannel = channel;
+  }
+
+  async getUpdateGate(): Promise<UpdateGate> {
+    const r = this.options.updateRequired ?? (this.gateEnded ? 'downloading' : undefined);
+    if (!r) return { required: false, version: null, active: false, phase: 'none', endedCall: false };
+    return { required: true, version: r === 'not-available' ? null : '0.6.0', active: true, phase: 'gated', endedCall: this.gateEnded };
+  }
+
+  async checkUpdate(): Promise<string> {
+    await this.wait(150);
+    const r = this.options.updateRequired;
+    return r === 'offline' || r === 'check-clock' ? r : r === 'failed' ? 'invalid-update' : 'ok';
   }
 
   async restartToUpdate(): Promise<void> {

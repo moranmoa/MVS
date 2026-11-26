@@ -63,6 +63,16 @@ const attempt = (check) => {
   return until ? { result: 'wrong', retryAfter: 30 } : { result: 'wrong' };
 };
 
+// QA MR.1: <data-dir>/fake-emit-memberrelay → one memberRelay.changed 1.5 s
+// after start (while the app is still locked).
+try {
+  if (fs.existsSync(path.join(dataDir, 'fake-emit-memberrelay'))) {
+    setTimeout(() => out({ type: 'event', event: 'memberRelay.changed', payload: { role: true, setting: 'auto', effective: false, disclosureSeen: false } }), 1500);
+  }
+} catch {
+  // no data dir in some unit tests
+}
+
 process.stdin.on('data', (chunk) => {
   buf += chunk;
   let nl;
@@ -111,6 +121,10 @@ process.stdin.on('data', (chunk) => {
         if (m.args.channelId === 'e'.repeat(64)) {
           setTimeout(() => out({ type: 'event', event: 'call.state', payload: { ...call, participants: [] } }), 300);
         }
+        // Required updates: <data-dir>/fake-required-on-call → the update turns required mid-call.
+        if (fs.existsSync(path.join(dataDir, 'fake-required-on-call'))) {
+          setTimeout(() => out({ type: 'event', event: 'update.required', payload: { version: '9.9.9' } }), 500);
+        }
         break;
       }
       case 'leaveCall':
@@ -122,12 +136,20 @@ process.stdin.on('data', (chunk) => {
         break;
       case 'getAppLock': {
         const cfg = readLock();
-        if (!cfg) {
-          out({ type: 'response', id: m.id, ok: m.args ?? null }); // no lock file: the echo ("off")
-          break;
+        const answer = () => {
+          if (!cfg) return out({ type: 'response', id: m.id, ok: m.args ?? null }); // no lock file: the echo ("off")
+          const wait = waitLeft(cfg);
+          out({ type: 'response', id: m.id, ok: { enabled: !!cfg.enabled, method: 'passcode', idleMinutes: cfg.idleMinutes ?? 5, lockOnSleep: cfg.lockOnSleep !== false, ...(wait ? { retryAfter: wait } : {}) } });
+        };
+        // A slow core at start (QA, fresh profile): <data-dir>/fake-applock-delay holds ms.
+        let delay = 0;
+        try {
+          delay = Number(fs.readFileSync(path.join(dataDir, 'fake-applock-delay'), 'utf8')) || 0;
+        } catch {
+          // no delay
         }
-        const wait = waitLeft(cfg);
-        out({ type: 'response', id: m.id, ok: { enabled: !!cfg.enabled, method: 'passcode', idleMinutes: cfg.idleMinutes ?? 5, lockOnSleep: cfg.lockOnSleep !== false, ...(wait ? { retryAfter: wait } : {}) } });
+        if (delay > 0) setTimeout(answer, delay);
+        else answer();
         break;
       }
       case 'verifyAppLock':

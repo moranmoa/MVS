@@ -241,8 +241,10 @@ function serverDescription(raw: unknown): string | undefined {
 
 export function cleanServer(s: ServerSummary): ServerSummary {
   const name = cleanName(s.name, SERVER_NAME_MAX);
+  // G-51: the raw icon and description never pass through; only their cleaned forms below.
+  const { iconDataUrl: _icon, description: _desc, ...rest } = s;
   return {
-    ...s,
+    ...rest,
     name,
     initials: cleanName(s.initials, 2) || graphemes(name)[0] || '?',
     color: safeColor(s.color),

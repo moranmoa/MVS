@@ -214,6 +214,8 @@ function createCallGate() {
   const shut = () => {
     inCall = false;
     gen += 1;
+    // Joins of older generations can never open it again (TL nit, #641).
+    starting.clear();
   };
   return {
     get inCall() {

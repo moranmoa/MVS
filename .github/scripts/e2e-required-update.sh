@@ -12,6 +12,7 @@ trap 'rm -rf "$work"' EXIT
 updater() { cargo run --quiet --locked --manifest-path core/Cargo.toml -p updater --bin updater -- "$@"; }
 
 # 1. A test root of one throwaway key.
+mkdir -p "$work/keys"
 updater keygen --out "$work/keys" --name e2e >/dev/null
 updater make-root --threshold 1 --pub "$work/keys/e2e.pub" --out "$work/root.json" >/dev/null
 

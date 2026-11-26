@@ -70,10 +70,10 @@ Depends on R1 (#565) and R1b. Owners: dev-sync (core data), dev-ui (header), UX 
 - **The count:** the server header shows how many of this server's members can relay right now: member relay on, and reachable as R1 confirmed it. Members behind CGNAT never count, since they can't serve, but they still use relays.
 - **Uptime:** each client's relay table tracks each relay's uptime over the last 24 h, as the share of *this client's own observed time* that the relay was reachable. It's kept locally and never published or synced.
 - **The health colour (owner decision, 95%):**
-  - **Red:** 0–2 relays.
-  - **Green:** 6 or more relays, each at ≥95% uptime over the last 24 h.
+  - **Red:** 0–2 relays. Shown at once, even while measuring.
+  - **Green:** at least 6 relays at ≥95% uptime over the last 24 h. Other relays may be less steady, so a flaky 7th doesn’t turn a healthy server yellow.
   - **Yellow:** everything else.
-  - **Measuring:** a client with under 24 h of its own observations shows a "measuring" state, at most yellow.
+  - **Measuring:** a client with under 24 h of its own observations shows a "measuring" state. It only blocks green: with 3 or more relays it shows yellow, and with 0–2 it shows red (UX, #638).
 - **Accessibility (UX):** never colour alone. The colour comes with an icon and text, e.g. the count with an ICU plural and the state. The text is neutral Hebrew, isolated with FSI/PDI, and the contrast is AA.
 - **Privacy (SL):** only the count and the colour. Never who relays, or when anyone is online. Nothing about it is published to the network or to non-members. The UI exposes no per-relay list.
 - **Tests:** the thresholds at 2/3, 5/6 and 94/95%, the measuring state, and CGNAT members excluded from the count. A member-relay switch-off lowers the count within the normal presence delay.

@@ -501,13 +501,18 @@ try {
       const dueAfter = ((Date.now() - t0) / 1000).toFixed(1);
       log(`the owner had the member ${seenAfter} s, and relaying was due ${dueAfter} s, after B's "joined" (${JSON.stringify(due)})`);
       log(`events the page got so far: ${JSON.stringify(await page.evaluate(() => (window.__ev ?? []).slice(-40)))}`);
+      // The account was made through the core, not the onboarding screens, so
+      // the page still shows onboarding (Root keeps it until a reload) and the
+      // shell, which holds the disclosure, isn't mounted. Record what's shown,
+      // then reload into the shell as a real user would be after onboarding.
+      await page.screenshot({ path: join(RV, 'a-before-mr1.png') }).catch(() => {});
+      log(`before MR.1 the page shows: ${JSON.stringify(await page.locator('h1, h2').allInnerTexts().catch(() => []))}`);
+      await page.reload();
+      await page.waitForFunction(() => typeof window.mvs?.invoke === 'function');
       const dlg = page.locator('dialog.member-relay-disclosure');
-      // Diagnostic (QA, 2026-11-26): how long after "due" the UI shows it.
-      const tDue = Date.now();
-      await dlg.waitFor({ state: 'visible', timeout: 120_000 });
-      const lag = (Date.now() - tDue) / 1000;
-      log(`the disclosure showed ${lag.toFixed(1)} s after the core said relaying was due`);
-      if (lag > 15) throw new Error(`the disclosure showed ${lag.toFixed(1)} s after the core said relaying was due (UI lag)`);
+      const tShell = Date.now();
+      await dlg.waitFor({ state: 'visible', timeout: 15_000 });
+      log(`the disclosure showed ${((Date.now() - tShell) / 1000).toFixed(1)} s after the shell loaded`);
       await dlg.getByRole('button', { name: /^(OK|הבנתי|אישור)$/ }).click();
       await dlg.waitFor({ state: 'hidden', timeout: 10_000 });
       const mr = await invoke('getMemberRelay').catch(() => null);

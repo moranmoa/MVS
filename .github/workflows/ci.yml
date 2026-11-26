@@ -45,10 +45,15 @@ jobs:
           workspaces: core
       - run: cargo test --release --locked
         working-directory: core
-      # Lints on the shipped code alone: no test targets, so no
-      # dev-dependency features (sync's `test-util`), as release.yml builds it.
-      - name: clippy (no test features)
-        run: cargo clippy --workspace --locked -- -D warnings
+      # The shipped binaries (mvs-core, mvs-launcher, ...) as release.yml
+      # builds them: no test targets, so no dev-dependency features (sync's
+      # `test-util`). An item that exists only under cfg(test)/test-util but
+      # is used in normal code fails here, not in the release build. Then
+      # the same code linted.
+      - name: binaries build without test features
+        run: |
+          cargo check --locked --workspace --bins
+          cargo clippy --workspace --locked -- -D warnings
         working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy

@@ -5106,6 +5106,39 @@ impl Inner {
                     touched.insert(of);
                 }
             }
+            // B7-k (Tech Lead, child safety): for a joiner who isn't an adult,
+            // a channel that was ever 18+ re-seals only messages whose deps
+            // reach its latest edit back to plain; none without one. Nothing
+            // from its 18+ time ever reaches them.
+            // Each ever-18+ channel's latest edit back to plain, found once per
+            // Join (dev-sync on #635): the one with every other plain edit
+            // for that channel in its past; None (none, or concurrent ones)
+            // fails closed.
+            let latest_plain: HashMap<ChannelId, Option<RecordId>> = if view.state.adults.contains(&joiner) {
+                HashMap::new()
+            } else {
+                let mut plain: HashMap<ChannelId, Vec<RecordId>> = HashMap::new();
+                for e in log.records.iter().filter(|e| view.state.accepted.contains(&e.id())) {
+                    if let Some(Action::ChannelEdit { channel, adult: false, .. }) = Action::from_record(e) {
+                        plain.entry(channel).or_default().push(e.id());
+                    }
+                }
+                view.state
+                    .adult_edits
+                    .keys()
+                    .map(|channel| {
+                        let edits = plain.remove(channel).unwrap_or_default();
+                        let latest =
+                            edits.iter().find(|p| edits.iter().all(|o| o == *p || log.resolver.reaches(*o, &[**p])));
+                        (*channel, latest.copied())
+                    })
+                    .collect()
+            };
+            let after_plain = |r: &Record, channel: ChannelId| match latest_plain.get(&channel) {
+                None => true,
+                Some(Some(edit)) => log.resolver.reaches(*edit, r.auth_deps()),
+                Some(None) => false,
+            };
             // G-52 (forward-only lowering): for a joiner who isn't an adult,
             // in a server that was ever 18+, only messages written after the
             // latest lowering, so their deps reach it; nothing from the 18+
@@ -5134,13 +5167,14 @@ impl Inner {
             for r in &log.channel {
                 let Scope::Channel(channel) = r.scope() else { continue };
                 let fits = r.kind() == Kind::Message
-                    && after_lowering(r)
                     && r.author() == me
                     && r.ts() >= join_ts.saturating_sub(RESEAL_BEFORE_JOIN_MS)
                     && applied_at.saturating_sub(r.ts()) <= RESEAL_SENT_WITHIN_MS
                     && !done.contains(&r.id())
                     && !touched.contains(&r.id())
-                    && !log.resolver.reaches(join, r.auth_deps());
+                    && !log.resolver.reaches(join, r.auth_deps())
+                    && after_plain(r, channel)
+                    && after_lowering(r);
                 if fits && channel_readers(&view, channel).contains(&joiner) {
                     by_channel.entry(channel).or_default().push((r.id(), r.ts()));
                 }

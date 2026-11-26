@@ -4,7 +4,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
-const { MAX_PAYLOAD, FRAMES_PER_SEC, BURST, cleanOutgoing, cleanIncoming, createVoiceFrames, payloadBytes } = require('../src/voiceframe');
+const { MAX_PAYLOAD, FRAMES_PER_SEC, BURST, cleanOutgoing, cleanIncoming, createVoiceFrames, payloadBytes, sendAllowed } = require('../src/voiceframe');
+const { createRequiredGate } = require('../src/required');
 const { Sidecar } = require('../src/sidecar');
 const { COMMANDS, toRequest } = require('../src/commands');
 
@@ -132,6 +133,32 @@ test('Sidecar.send: one { cmd, args } line, no id; dropped when down, too long o
   stdin.writableLength = 70 * 1024;
   assert.equal(sc.send('voiceFrame', frame()), false, 'backed up');
   assert.equal(lines.length, 1);
+});
+
+test('sendAllowed: a call, unlocked, and the required-update gate allowing call traffic (#586, SL)', () => {
+  let inCall = true;
+  let timer = null;
+  const gate = createRequiredGate({
+    inCall: () => inCall,
+    endCall: () => {},
+    setTimer: (fn) => (timer = fn),
+    clearTimer: () => (timer = null),
+  });
+  // No required update: the call and the lock decide.
+  assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: gate }), true);
+  assert.equal(sendAllowed({ inCall: false, unlocked: true, requiredGate: gate }), false);
+  assert.equal(sendAllowed({ inCall: true, unlocked: false, requiredGate: gate }), false, 'G-78 lock');
+  // Required, waiting for the call to end: the call's own traffic still goes.
+  gate.set({ version: '0.6.0' });
+  assert.equal(gate.state.phase, 'call');
+  assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: gate }), true);
+  // Gated (the 30 min cap ran out), with a call forced on anyway: dropped.
+  timer();
+  assert.equal(gate.state.phase, 'gated');
+  inCall = true;
+  assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: gate }), false, 'gated + forced inCall');
+  // Fails closed on a missing gate.
+  assert.equal(sendAllowed({ inCall: true, unlocked: true, requiredGate: null }), false);
 });
 
 test('voiceFrame never goes through core:invoke', () => {

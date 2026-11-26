@@ -579,9 +579,22 @@ const _: () = assert!(!WRITE_SECRET_ROTATION, "S3/S4 and S5 must ship with the f
 /// stays, sealed, for reading the old secret's frozen prefix.
 pub const PREVIOUS_SECRET_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// T17 (Security Lead Q1 on #609): how old a leave must be before an admin,
+/// not only the owner, rotates for it.
+pub const ADMIN_LEAVE_ROTATE_MS: u64 = 24 * 60 * 60 * 1000;
+/// T17: the most an admin waits on top, from a hash of its key and the
+/// server, so several admins rarely rotate at once.
+pub const ADMIN_LEAVE_JITTER_MS: u64 = 6 * 60 * 60 * 1000;
+
 /// T17: the rotation whose secret this device moved to, per server.
 fn secret_rotation_key(server: ServerId) -> String {
     format!("secret-rotation/{}", hex::encode(server.as_bytes()))
+}
+
+/// T17: when this core first saw an accepted `Leave` (core clock, ms), for
+/// the admin leave rotation: never the record's own `ts` (Tech Lead on #630).
+fn leave_seen_key(server: ServerId, leave: RecordId) -> String {
+    format!("leave-seen/{}/{}", hex::encode(server.as_bytes()), hex::encode(leave.as_bytes()))
 }
 
 fn vault_error(e: VaultError) -> CoreError {
@@ -4361,7 +4374,7 @@ impl Inner {
         &mut self,
         ports: &Ports,
         server: ServerId,
-        opened: &crate::ports::OpenedSecret,
+        (opened, replaced_by): (&crate::ports::OpenedSecret, RecordId),
         events: &mut Events,
     ) -> CoreResult<()> {
         let Some(secret) = &opened.secret else { return Ok(()) };
@@ -4369,16 +4382,58 @@ impl Inner {
         let key = *me.identity.storage_key().expose_secret();
         if let Some(old) = self.secret(server)?.filter(|old| **old != **secret) {
             let until = ports.clock.now_ms().saturating_add(PREVIOUS_SECRET_FOR_MS);
-            self.db.save_previous_server_secret(&key, server, &old, until, ports.clock.now_ms())?;
+            self.db.save_previous_server_secret(&key, server, &old, replaced_by, until, ports.clock.now_ms())?;
         }
         self.save_secret(server, secret)?;
         self.db.set(&secret_rotation_key(server), opened.rotation.as_bytes())?;
-        // TODO(T17 S3/S4, dev-sync): serve and read the old secret's frozen
-        // prefix from the kept previous secret until it expires.
+        // S3/S4 and the beacon (S5): sync moves to the new secret and keeps
+        // reading the old ones' frozen prefixes (`set_previous_secrets`).
         self.open_sync(ports, server)?;
-        // TODO(T17 S5): re-issue open invites, re-key the backup and the
-        // LAN beacon from the new secret.
+        // S5: the backup follows by itself (its fingerprint covers the
+        // secret, so the next round writes it). Invites: see below.
+        self.reissue_invites(ports, server, secret)?;
+        // A leaver this rotation left out needs no timer any more.
+        let recipients = opened.recipients.clone();
+        self.forget_leaves_seen(server, |leaver| !recipients.contains(leaver))?;
         events.push(Event::ServerUpdated(self.counted_summary(&*ports.cipher, server)?));
+        let me = self.me.as_ref().map(Me::key);
+        if me.is_some_and(|me| self.view(server).is_ok_and(|v| v.state.role(me) >= authority::Role::Admin)) {
+            events.push(Event::Notice { kind: NoticeKind::InvitesReissued, server_id: model::hex_id(server.as_bytes()) });
+        }
+        Ok(())
+    }
+
+    /// T17: drops the leave-seen time of each accepted Leave in `server`
+    /// whose author `forget` picks (no longer a recipient, or everyone on a
+    /// purge), so the rows don't outlive their use.
+    fn forget_leaves_seen(&self, server: ServerId, forget: impl Fn(&PublicKey) -> bool) -> CoreResult<()> {
+        let Some(log) = self.logs.get(&server) else { return Ok(()) };
+        for leave in log.records.iter().filter(|r| r.kind() == records::Kind::Leave && forget(&r.author())) {
+            self.db.delete(&leave_seen_key(server, leave.id()))?;
+        }
+        Ok(())
+    }
+
+    /// T17 S5 (Q3): every short link sealed the old secret, so they all stop:
+    /// the publications I hold or serve for `server` are dropped, and each
+    /// live invite of mine gets a new one under the new secret (a new short
+    /// link; the full link already carries the new secret). Other members'
+    /// invites are re-published by their authors when they move.
+    fn reissue_invites(&mut self, ports: &Ports, server: ServerId, secret: &[u8; 32]) -> CoreResult<()> {
+        ports.network.drop_server_invites(server);
+        let held = self.db.invite_publications(server)?;
+        for (invite, _) in &held {
+            self.db.delete_invite(server, *invite)?;
+        }
+        let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
+        let now = ports.clock.now_ms();
+        let mine: Vec<RecordId> = {
+            let view = self.view(server)?;
+            view.state.invites.keys().copied().filter(|id| view.live_invite_author(*id, now) == Some(me)).collect()
+        };
+        for invite in mine {
+            self.publish_invite(ports, server, invite, secret)?;
+        }
         Ok(())
     }
 
@@ -4390,10 +4445,10 @@ impl Inner {
     /// [`Self::secret_rotation_due`].
     fn apply_secret_rotation(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<()> {
         let current = self.current_secret_rotation(&*ports.cipher, server)?;
-        if let Some((opened, _)) = &current {
+        if let Some((opened, last_part)) = &current {
             let seen = self.db.get(&secret_rotation_key(server))?.is_some_and(|v| v == opened.rotation.as_bytes());
             if !seen {
-                self.move_to_secret(ports, server, opened, events)?;
+                self.move_to_secret(ports, server, (opened, *last_part), events)?;
             }
         }
         if self.secret_rotation_due(server, current.as_ref())? {
@@ -4416,9 +4471,9 @@ impl Inner {
     ///   new secret, so ordinary joins rotate nothing. A join whose invite
     ///   can't be placed counts as missing.
     ///
-    /// TODO(T17 step 2c, SL Q1 on #609): with no owner online, an admin
-    /// rotates for a leave once 24 h (plus 0–6 h of jitter) pass with no
-    /// newer rotation, checking again just before signing.
+    /// - An admin (SL Q1 on #609) rotates for a leave once it is
+    ///   [`ADMIN_LEAVE_ROTATE_MS`] old plus a jitter of its own up to
+    ///   [`ADMIN_LEAVE_JITTER_MS`], with no newer rotation: the owner may be away.
     fn secret_rotation_due(
         &self,
         server: ServerId,
@@ -4446,6 +4501,41 @@ impl Inner {
         };
         if !gone.is_empty() && (owner || gone.iter().any(mine)) {
             return Ok(true);
+        }
+        // SL Q1 on #609: with the owner away, an admin rotates for a leave
+        // once it is ADMIN_LEAVE_ROTATE_MS old, plus a jitter of up to
+        // ADMIN_LEAVE_JITTER_MS of its own, so admins don't all rotate at once.
+        // Checked against this round's view, under the lock that signs.
+        if state.role(me) >= authority::Role::Admin {
+            let now = self.clock.now_ms();
+            let jitter = {
+                let seed = blake3::derive_key("mvs/t17-admin-jitter/v1", &[me.as_bytes().as_slice(), server.as_bytes()].concat());
+                u64::from_le_bytes(seed[..8].try_into().expect("8 bytes")) % ADMIN_LEAVE_JITTER_MS
+            };
+            // When this core first saw each accepted Leave, kept in kv: the
+            // record's own `ts` is the leaver's to set, and a future one
+            // would keep every admin waiting for good (Tech Lead on #630).
+            // It is first written on a round with writing on, so after the
+            // write flip the day counts from then: later, never sooner.
+            let first_seen = |leave: RecordId| -> CoreResult<u64> {
+                let key = leave_seen_key(server, leave);
+                if let Some(at) = self.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes) {
+                    return Ok(at);
+                }
+                self.db.set(&key, &now.to_le_bytes())?;
+                Ok(now)
+            };
+            for member in &gone {
+                let leaves = view
+                    .records
+                    .iter()
+                    .filter(|r| r.author() == *member && r.kind() == records::Kind::Leave && state.accepted.contains(&r.id()));
+                for leave in leaves {
+                    if now.saturating_sub(first_seen(leave.id())?) >= ADMIN_LEAVE_ROTATE_MS + jitter {
+                        return Ok(true);
+                    }
+                }
+            }
         }
         if !owner {
             return Ok(false);
@@ -4494,8 +4584,8 @@ impl Inner {
             self.publish_control(ports, server, action)?;
         }
         // My own box opens like anyone's: one path for the switch.
-        if let Some((opened, _)) = self.current_secret_rotation(&*ports.cipher, server)? {
-            self.move_to_secret(ports, server, &opened, events)?;
+        if let Some((opened, last_part)) = self.current_secret_rotation(&*ports.cipher, server)? {
+            self.move_to_secret(ports, server, (&opened, last_part), events)?;
         }
         Ok(())
     }
@@ -4744,6 +4834,13 @@ impl Inner {
     fn open_sync(&self, ports: &Ports, server: ServerId) -> CoreResult<()> {
         if let Some(secret) = self.secret(server)? {
             ports.network.open_server(server, &secret, &self.known(server)?);
+            // T17 S3/S4: the secrets rotations replaced, still in their keep.
+            let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
+            let key = *me.identity.storage_key().expose_secret();
+            let now = ports.clock.now_ms();
+            let mut previous = self.db.load_previous_server_secrets(&key, server)?;
+            previous.retain(|p| p.until_ms > now);
+            ports.network.set_previous_secrets(server, &previous);
         }
         Ok(())
     }
@@ -6018,6 +6115,8 @@ impl Inner {
         let required = (reason == RemovedReason::Age)
             .then(|| self.view(server).ok().map(|v| v.age_limit()))
             .flatten();
+        // T17: the leave-seen times go with the server (TL and SL on #630).
+        self.forget_leaves_seen(server, |_| true)?;
         self.stop_using(ports, server, !leaving, events);
         self.db.purge_server(server, keep, leaving)?;
         // Held text goes with the server (lost-message P1, SL C3).

@@ -659,10 +659,12 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
     - a moderator rotates only for their own kick, so moderators don't all rotate at once.
     - A rotation seals a fresh secret for the current members only (S2).
   - `lv:1` joins the posted caps: this core decodes every kind up to code 26 (`SecretRotation` 25, `ServerAgeLimit` 26; Tech Lead on #609). `LEVEL_MAX_KIND` and a test hold the level to what the core decodes.
-  - Not yet, still to come in T17:
-    - the old secret's read-only frozen prefix (S3/S4, dev-sync);
-    - re-issued invites with the owner notice, the backup and the LAN beacon key following the rotation (S5);
-    - with no owner online, an admin rotating for a leave after 24 h plus 0–6 h of jitter (Security Lead Q1 on #609, step 2c).
+  - Step 2c (draft):
+    - **Invites (S5, Q3):** a move to a new secret drops every short link held for the server (they sealed the old secret) and gives each of my live invites a new one. The full link already carries the new secret. The owner and admins get `notice: invites-reissued` (new `NoticeKind`; the UI string is the PO's and UX's) to re-share links; other members don't. Another member's invites are re-published only by that member's own core when it moves to the new secret: while they are offline, their short links stay dead, though the full link (which carries the new secret) works for anyone who can see it.
+    - **Backup (S5):** it follows by itself. Its fingerprint covers the secret, so the next round writes the new one.
+    - **Sync (S3/S4, beacon):** `open_server` is called again with the new secret, and `Network::set_previous_secrets` gets every replaced secret still within its 7 days (`PreviousSecret`: the secret, the rotation record `R` that replaced it, until when), each round. Sync freezes each old secret at `R`'s causal past plus `R` (dev-sync). The sync side (dev-sync) moves topics, handles and the LAN beacon key to the new secret and reads the old ones' frozen prefixes, read-only.
+    - **An admin, with the owner away (Security Lead Q1 on #609):** rotates for a leave once it is `ADMIN_LEAVE_ROTATE_MS` (24 h) old, plus a jitter of up to `ADMIN_LEAVE_JITTER_MS` (6 h) from its key and the server. The age counts from when this core first saw the Leave (kept in its database), never the leaver's own `ts`, which a modified client could date years ahead (Tech Lead on #630).
+    - Still the sync side: S3/S4 in sync (dev-sync). Writing stays off until it lands.
 - `syncNow()`: test-only until `sync` drives updates. It shouldn't ship in
   the UI.
 

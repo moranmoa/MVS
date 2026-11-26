@@ -227,3 +227,147 @@ fn only_a_join_through_an_older_invite_rotates() {
     dave.core.sync_now().unwrap();
     assert_eq!(link(&dave, &server), link(&owner, &server));
 }
+
+/// T17 S5 and S3/S4 (step 2c): after a rotation, the old short links stop,
+/// the owner and admins are told to re-share, a plain member isn't, and
+/// sync gets the replaced secret to read the old frozen prefix with.
+#[test]
+fn a_rotation_reissues_invites_and_hands_sync_the_old_secret() {
+    let world = World::new();
+    let [(owner, _, _), (alice, _, _), (bob, _, bob_id)] = team(&world);
+    let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
+    alice.core.join_server(&server.invite_link).unwrap();
+    bob.core.join_server(&server.invite_link).unwrap();
+    for peer in [&owner, &alice, &bob] {
+        peer.core.sync_now().unwrap();
+    }
+    let short = owner.core.create_invite(&server.id, None, None).unwrap().short_link;
+    let handle = match api::invite_link::parse(&short).unwrap() {
+        api::invite_link::InviteLink::V1 { key, .. } => api::crypto::invite::handle(&key),
+        _ => panic!("a short link"),
+    };
+    assert!(!world.network.fetch_invite(handle).is_empty(), "served before");
+    let old_link = link(&owner, &server);
+    assert!(world.network.previous_secrets(server_key(&server)).is_empty());
+
+    owner.events.take();
+    alice.events.take();
+    owner.core.kick_member(&server.id, &bob_id).unwrap();
+    assert!(world.network.fetch_invite(handle).is_empty(), "the old short link stopped");
+    let told = |peer: &Peer| peer.events.take().iter().any(|e| matches!(e, Event::Notice { kind: NoticeKind::InvitesReissued, .. }));
+    assert!(told(&owner), "the owner re-shares");
+    // The old full link carried the old secret: sync keeps it to read with.
+    let old_secret: [u8; 32] = hex::decode(old_link.rsplit('/').next().unwrap()).unwrap().try_into().unwrap();
+    assert_eq!(world.network.previous_secrets(server_key(&server)), [old_secret]);
+    alice.core.sync_now().unwrap();
+    assert!(!told(&alice), "a plain member isn't asked to");
+}
+
+/// SL Q1 on #609: with the owner away, an admin rotates for a leave once
+/// it is a day old (plus its own jitter of up to 6 h), not before.
+#[test]
+fn an_admin_rotates_for_a_leave_after_a_day() {
+    let world = World::new();
+    let [(owner, _, _), (alice, _, alice_id), (bob, _, _)] = team(&world);
+    let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
+    alice.core.join_server(&server.invite_link).unwrap();
+    bob.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    owner.core.grant_role(&server.id, &alice_id, Role::Admin).unwrap();
+    // A first rotation, so the leave is measured against it.
+    let (carol, _, carol_id) = person(&world, "Carol");
+    carol.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    owner.core.kick_member(&server.id, &carol_id).unwrap();
+    assert_eq!(rotations(&world, &server).len(), 1);
+    alice.core.sync_now().unwrap();
+    bob.core.sync_now().unwrap();
+
+    // The owner goes away; Bob leaves.
+    bob.core.leave_server(&server.id).unwrap();
+    alice.core.sync_now().unwrap();
+    assert_eq!(rotations(&world, &server).len(), 1, "not at once");
+    *world.clock.0.lock().unwrap() += api::ADMIN_LEAVE_ROTATE_MS - 60_000;
+    alice.core.sync_now().unwrap();
+    assert_eq!(rotations(&world, &server).len(), 1, "not before a day");
+    *world.clock.0.lock().unwrap() += 60_000 + api::ADMIN_LEAVE_JITTER_MS;
+    alice.core.sync_now().unwrap();
+    let all = rotations(&world, &server);
+    assert_eq!(all.len(), 2);
+    assert_eq!(hex::encode(all.iter().max_by_key(|r| r.ts()).unwrap().author().as_bytes()), alice_id);
+}
+
+/// Tech Lead and Security Lead on #630: the admin's day counts from when
+/// its core first saw the Leave, kept across a restart, never from the
+/// leaver's own `ts`: a Leave dated years ahead still gets the rotation a
+/// day after it arrived.
+#[test]
+fn a_future_dated_leave_still_rotates_a_day_after_it_arrives() {
+    let world = World::new();
+    let [(owner, _, _), _, _] = team(&world);
+    // The admin keeps its database on disk, to restart in between.
+    let dir = std::env::temp_dir().join(format!("mvs-api-leave-seen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("core.db");
+    let _ = std::fs::remove_file(&db);
+    let secrets = Arc::new(MemoryStore::new());
+    let open = |world: &World| {
+        let peer = world.peer_with(secrets.clone(), Some(db.clone()), Arc::new(GroupKeysCipher::locked()));
+        peer.core.enable_secret_rotation_writes();
+        peer
+    };
+    let alice = open(&world);
+    let input = NewIdentityInput { locale: Locale::He, country: "IL".into(), birth_date: "1990-05-01".into() };
+    let created = alice.core.create_identity(input).unwrap();
+    let positions = alice.core.get_recovery_challenge().unwrap().positions;
+    let answers = positions.iter().map(|p| (*p, created.words[p - 1].clone())).collect();
+    assert!(alice.core.check_recovery_words(answers).unwrap().ok);
+    let profile = ProfileInput { display_name: "Alice".into(), bio: None, avatar_data_url: None, avatar_small: None, color: None };
+    let alice_id = alice.core.update_profile(profile).unwrap().id;
+    let server = owner.core.create_server("Team", AgeRestriction::None).unwrap();
+    let id = server_key(&server);
+    alice.core.join_server(&server.invite_link).unwrap();
+    // Mallory, on a modified client.
+    let mallory = records::SigningKey::from_bytes(&[67; 32]);
+    let invite = {
+        let link = server.invite_link.trim_start_matches("mvs://join/");
+        records::RecordId::from_bytes(hex::decode(link.split('/').nth(1).unwrap()).unwrap().try_into().unwrap())
+    };
+    let control = |world: &World| -> Vec<records::RecordId> {
+        let ids: std::collections::BTreeSet<_> =
+            world.network.fetch(id).iter().filter(|r| r.scope() == records::Scope::Control).map(Record::id).collect();
+        ids.into_iter().collect()
+    };
+    let mut deps = control(&world);
+    deps.push(invite);
+    deps.sort();
+    deps.dedup();
+    world.network.publish(&authority::sign_control(&mallory, id, 1, deps, 1, &authority::Action::Join { invite }).unwrap());
+    owner.core.sync_now().unwrap();
+    owner.core.grant_role(&server.id, &alice_id, Role::Admin).unwrap();
+    // A first rotation, sealed for Mallory too.
+    let (carol, _, carol_id) = person(&world, "Carol");
+    carol.core.join_server(&server.invite_link).unwrap();
+    owner.core.sync_now().unwrap();
+    owner.core.kick_member(&server.id, &carol_id).unwrap();
+    assert_eq!(rotations(&world, &server).len(), 1);
+    alice.core.sync_now().unwrap();
+
+    // Mallory leaves with a Leave dated a year ahead.
+    let year = 365 * 24 * 3600 * 1000;
+    let future = *world.clock.0.lock().unwrap() + year;
+    let leave = authority::Action::Leave { cut: authority::Cut::default() };
+    world.network.publish(&authority::sign_control(&mallory, id, 2, control(&world), future, &leave).unwrap());
+    alice.core.sync_now().unwrap();
+    assert_eq!(rotations(&world, &server).len(), 1, "not at once");
+
+    // Alice's core restarts; when it first saw the Leave stays.
+    drop(alice);
+    *world.clock.0.lock().unwrap() += api::ADMIN_LEAVE_ROTATE_MS / 2;
+    let alice = open(&world);
+    alice.core.sync_now().unwrap();
+    assert_eq!(rotations(&world, &server).len(), 1, "half a day: not yet");
+    *world.clock.0.lock().unwrap() += api::ADMIN_LEAVE_ROTATE_MS / 2 + api::ADMIN_LEAVE_JITTER_MS;
+    alice.core.sync_now().unwrap();
+    assert_eq!(rotations(&world, &server).len(), 2, "a day after it arrived, whatever it says");
+}

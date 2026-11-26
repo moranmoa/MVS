@@ -60,6 +60,11 @@ jobs:
       - name: api test hooks
         run: cargo test --release --locked -p api --features test-hooks --test reports
         working-directory: core
+      # The required-update chain end to end, with a throwaway test key:
+      # keygen -> manifest-body --require-from -> sign -> the core goes
+      # required and quiet; the newer version clears it.
+      - name: required update end to end
+        run: bash .github/scripts/e2e-required-update.sh
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy
         run: |

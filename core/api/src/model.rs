@@ -1138,6 +1138,27 @@ mod tests {
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
     }
 
+    /// G-52 (Tech Lead on #616): the raise every channel record must reach
+    /// while the server is 18+, in each case.
+    #[test]
+    fn server_adult_edit_in_each_case() {
+        let raise = RecordId::from_bytes([1; 32]);
+        let state = |limit: Option<u8>, raised: Option<RecordId>| State { age_limit: limit, age_raise: raised, ..State::default() };
+        // Never changed: the genesis decides.
+        assert_eq!(server_adult_edit(&state(None, None), 0), None);
+        assert_eq!(server_adult_edit(&state(None, None), 16), None);
+        assert_eq!(server_adult_edit(&state(None, None), 18), Some(None), "18+ from the genesis");
+        // Raised: the raise, whatever the genesis said.
+        assert_eq!(server_adult_edit(&state(Some(18), Some(raise)), 0), Some(Some(raise)));
+        assert_eq!(server_adult_edit(&state(Some(18), Some(raise)), 18), Some(Some(raise)));
+        // Lowered after a raise: not 18+, even from an 18+ genesis; the old
+        // raise no longer counts (Security Lead on #610).
+        assert_eq!(server_adult_edit(&state(Some(16), Some(raise)), 18), None);
+        assert_eq!(server_adult_edit(&state(Some(0), Some(raise)), 0), None);
+        assert_eq!(effective_min_age(&state(Some(16), None), 18), 16);
+        assert_eq!(effective_min_age(&state(None, None), 18), 18);
+    }
+
     /// Tech Lead on #609: the posted level promises exactly what this core
     /// decodes: every kind code up to the level's max decodes, and no code
     /// above it does.

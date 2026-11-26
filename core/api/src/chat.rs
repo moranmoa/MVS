@@ -748,4 +748,43 @@ mod adult_rule_tests {
         let rotation_kind = adult_ok(&w.resolver, 0, Kind::KeyRotation, Scope::Channel(NIGHT), w.key(2), &[before_flip]);
         assert!(rotation_kind);
     }
+
+    const LOUNGE: ChannelId = ChannelId::from_bytes([8; 32]);
+
+    /// G-52 (Tech Lead on #616): while the server is 18+, plain channels
+    /// are held to the rule, and (b) needs the deps to reach the raise as
+    /// well as a channel's own 18+ edit.
+    #[test]
+    fn an_18_server_holds_every_channel_to_the_rule() {
+        let mut w = World::new();
+        w.control(0, Action::AgeClaim { adult: true });
+        w.control(0, Action::ChannelCreate { channel: LOUNGE, adult: false, name: "lounge".into() });
+        w.control(0, Action::ChannelCreate { channel: NIGHT, adult: true, name: "night".into() });
+        w.control(1, Action::AgeClaim { adult: true });
+        let before_raise = w.head;
+        assert!(w.counts(2, LOUNGE, before_raise), "not 18+ yet: a plain channel has no check");
+        let raise = w.control(0, Action::ServerAgeLimit { min: 18 });
+        let after_raise = w.head;
+        assert_eq!(crate::model::server_adult_edit(w.resolver.state(), 0), Some(Some(raise)));
+
+        // A plain channel now: a minor never counts, stale deps or not.
+        assert!(!w.counts(2, LOUNGE, after_raise));
+        assert!(!w.counts(2, LOUNGE, before_raise));
+        // An adult counts; then lowers their claim.
+        assert!(w.counts(1, LOUNGE, before_raise), "adult now: (b) passes");
+        w.control(1, Action::AgeClaim { adult: false });
+        assert!(w.counts(1, LOUNGE, after_raise), "posted after the raise while adult: it stays");
+        assert!(!w.counts(1, LOUNGE, before_raise), "stale deps, not adult now: dropped");
+        // In the 18+ channel, deps that reach its own 18+ edit (its create)
+        // but not the raise don't do either.
+        assert!(!w.counts(1, NIGHT, before_raise), "reaches the channel's edit, not the raise");
+        assert!(w.counts(1, NIGHT, after_raise), "reaches both");
+
+        // Lowered to 16+: plain channels are free again; the 18+ channel
+        // keeps its own rule.
+        w.control(0, Action::ServerAgeLimit { min: 16 });
+        assert_eq!(crate::model::server_adult_edit(w.resolver.state(), 0), None);
+        assert!(w.counts(2, LOUNGE, w.head));
+        assert!(!w.counts(2, NIGHT, w.head));
+    }
 }

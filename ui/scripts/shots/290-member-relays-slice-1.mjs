@@ -6,6 +6,7 @@ export default async function run() {
     ['lang=he&theme=light', '410-member-relay-on-he', 'privacy'],
     ['lang=he&theme=light&memberRelay=minor', '411-member-relay-minor-he', 'privacy'],
     ['lang=he&theme=light&relayOnly=1', '412-member-relay-relay-only-he', 'privacy'],
+    ['lang=he&theme=light&memberRelay=on-battery', '415-member-relay-paused-he', 'privacy'],
     ['lang=he&theme=light&memberRelayUnseen=1', '413-member-relay-disclosure-he', 'disclosure'],
     ['lang=en&theme=dark&memberRelayUnseen=1', '414-member-relay-disclosure-en-dark', 'disclosure'],
   ]) {

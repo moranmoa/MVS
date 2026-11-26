@@ -76,7 +76,7 @@ export function createCore(search = typeof location !== 'undefined' ? location.s
     messageGapMs: params.has('gapHours') ? Math.max(0.01, Number(params.get('gapHours')) || 1) * 3_600_000 : undefined,
     deviceLinked: params.has('deviceLinked') ? (params.get('deviceLinked') ?? '') : undefined,
     deviceLink: (['confirm', 'expired', 'failed'] as const).find((s) => s === params.get('deviceLink')),
-    memberRelayReason: (['minor', 'metered', 'global-off'] as const).find((r) => r === params.get('memberRelay')),
+    memberRelayReason: (['minor', 'metered', 'on-battery', 'global-off'] as const).find((r) => r === params.get('memberRelay')),
     memberRelayUnseen: params.has('memberRelayUnseen'),
     outdatedMembers: params.has('outdated'),
     closedServer: params.has('closed'),

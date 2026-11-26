@@ -10,6 +10,24 @@ New sections must not contain a `---` line: the release scripts still read
 it as the old Hebrew/English split.
 Never put the relay domain or any IP address here.
 
+## [0.6.0] - TBD
+
+### New
+- **Required updates:** when an update is required, MVS keeps showing what's on your computer but switches to read-only. A banner you can't dismiss explains why, with Update and Try again buttons. Until you update, nothing is sent and nothing connects. A call in progress ends at once.
+- **Report to the owners:** report a message or a member to the server's owner and admins. Only they see the report, and they also see that you sent it. Reports about a minor or sexual content are shown only after a click, and never to staff under 18.
+- **Server icon and description:** server owners can give a server an icon and a short description.
+- **Changing a server's age limit:** server owners can change the age limit after creating the server. TBD: confirm the settings screen is in this release.
+- **Member relays:** a member with an open connection can help others in a server reach each other. TBD: only if #565 (R1) is merged before release.
+
+### Fixed
+- On the same network, a member's very first message could fail to reach the others. Fixed.
+- When a member leaves or is removed, the server's sync secret now changes too, so their copy stops working. TBD: confirm the wording with the security lead.
+- The diagnostics file (for bug reports) now shows only rounded sizes and times, and network counts as ranges and shares. It never shows an address, an ID or a name.
+
+### Known
+- Calls across the internet without a server are built but still switched off while they're tested. Calls work between people on the same network.
+- With someone's volume above 100%, you may hear some echo.
+
 ## [0.5.0] - 2026-11-24
 
 ### New

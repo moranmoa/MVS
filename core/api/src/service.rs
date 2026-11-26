@@ -4153,7 +4153,7 @@ impl Inner {
         let key = *me.identity.storage_key().expose_secret();
         if let Some(old) = self.secret(server)?.filter(|old| **old != **secret) {
             let until = ports.clock.now_ms().saturating_add(PREVIOUS_SECRET_FOR_MS);
-            self.db.save_previous_server_secret(&key, server, &old, until)?;
+            self.db.save_previous_server_secret(&key, server, &old, until, ports.clock.now_ms())?;
         }
         self.save_secret(server, secret)?;
         self.db.set(&secret_rotation_key(server), opened.rotation.as_bytes())?;

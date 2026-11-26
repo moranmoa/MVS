@@ -198,10 +198,17 @@ pub(crate) const ADULT_KEYS_CAP: &str = "adult-keys-v1";
 /// records. Older cores refuse an unknown kind and stall the control log
 /// behind it, so nobody sets either until every member posts this.
 pub(crate) const SERVER_META_CAP: &str = "server-meta-v1";
-/// T17: the first level (Tech Lead on #590): this version decodes every
-/// kind up to level 1, `SecretRotation` (25) included. A gate checks
-/// `lv >= k`; the next release that adds a kind posts `lv:2`.
+/// The first level (Tech Lead on #590 and #609): this version decodes every
+/// kind up to level 1, which is every code up to 26: `SecretRotation` (25,
+/// T17) and `ServerAgeLimit` (26, G-52). A gate checks `lv >= k`. The next
+/// release that adds a kind posts `lv:2` and adds its row to
+/// [`LEVEL_MAX_KIND`].
 pub(crate) const LEVEL_CAP: &str = "lv:1";
+/// Each level and the highest kind code it promises to decode. The last row
+/// is the level this version posts (`LEVEL_CAP`); a test holds it to what
+/// `records` decodes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LEVEL_MAX_KIND: [(u32, u16); 1] = [(1, 26)];
 /// Every cap this version posts, and the only names `getUpdateNeeded`
 /// takes. Frozen after server-meta-v1: later gates use one `lv:N` cap
 /// (Tech Lead on #555).
@@ -1091,6 +1098,21 @@ mod tests {
 
     /// Every cap is posted once (Tech Lead on #555): a merge that loses a
     /// line of `CAPS`, or doubles one, fails here.
+    /// Tech Lead on #609: the posted level promises exactly what this core
+    /// decodes: every kind code up to the level's max decodes, and no code
+    /// above it does.
+    #[test]
+    fn the_posted_level_matches_what_this_core_decodes() {
+        let (level, max) = *LEVEL_MAX_KIND.last().expect("a level");
+        assert_eq!(LEVEL_CAP, format!("lv:{level}"), "LEVEL_CAP is the last row");
+        assert!(LEVEL_MAX_KIND.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        for code in 1..=max {
+            assert!(records::Kind::from_code(code).is_some(), "code {code} is promised by lv:{level}");
+        }
+        let highest = (1..=u16::MAX).filter(|c| records::Kind::from_code(*c).is_some()).max();
+        assert_eq!(highest, Some(max), "a new kind needs a new level");
+    }
+
     #[test]
     fn every_cap_is_posted_once() {
         let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();

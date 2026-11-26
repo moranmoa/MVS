@@ -615,14 +615,14 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
   - **Reading** is always on.
     - The accepted `SecretRotation` parts are grouped by (author, rotation), so a part signed under someone else's rotation ID never joins theirs (Security Lead and Tech Lead on #609). Only complete groups count: every part, no gaps.
     - The complete rotation whose last part is latest in linear order wins.
-    - When it sealed a secret for me, I store it (sealed), reopen sync on it, and send `server.updated`: the invite link carries the new secret. The secret it replaces stays, sealed, for 7 days (`PREVIOUS_SECRET_FOR_MS`), for reading the old secret's frozen prefix (Security Lead T17-W1).
+    - When it sealed a secret for me, I store it (sealed), reopen sync on it, and send `server.updated`: the invite link carries the new secret. Every secret a rotation replaced stays, sealed, for 7 days (`PREVIOUS_SECRET_FOR_MS`), for reading the old secrets' frozen prefixes (Security Lead T17-W1, Tech Lead on #609).
     - The secret never appears in a log or an event.
   - **Writing** stays off (`WRITE_SECRET_ROTATION`) until S3/S4 and S5 are merged, in the release that requires updating (Tech Lead on #592 and #609). A unit test keeps it off until then. Then:
     - a kick rotates at once, from the kicker's core (PO on #557);
     - the owner's core rotates whenever the current secret is held by someone who is no longer a member (a kick or a leave: S2 `Required`), or misses a member who joined through an invite from before the rotation (S2 `Add`). A join through a newer invite rotates nothing, since its link already carries the new secret.
     - a moderator rotates only for their own kick, so moderators don't all rotate at once.
     - A rotation seals a fresh secret for the current members only (S2).
-  - `lv:1` joins the posted caps: this core decodes every kind up to level 1.
+  - `lv:1` joins the posted caps: this core decodes every kind up to code 26 (`SecretRotation` 25, `ServerAgeLimit` 26; Tech Lead on #609). `LEVEL_MAX_KIND` and a test hold the level to what the core decodes.
   - Not yet, still to come in T17:
     - the old secret's read-only frozen prefix (S3/S4, dev-sync);
     - re-issued invites with the owner notice, the backup and the LAN beacon key following the rotation (S5);

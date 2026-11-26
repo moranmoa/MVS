@@ -17,6 +17,7 @@ import { Dialog } from '../../components/common';
 import { isCoreError, useCore, type AgeRestriction, type ServerSummary } from '../../core';
 import { failureOf, FailureNote, type Failure } from './ServerLifecycle';
 import './ageLimit.css';
+import { useReadOnlyProps } from './UpdateRequired';
 
 const OPTIONS: AgeRestriction[] = ['none', '16+', '18+'];
 const key = (a: AgeRestriction) => (a === 'none' ? 'none' : a.slice(0, 2));
@@ -32,6 +33,7 @@ export function ageChangeKind(from: AgeRestriction, to: AgeRestriction): 'none' 
 export function AgeLimitSetting({ server }: { server: ServerSummary }) {
   const core = useCore();
   const intl = useIntl();
+  const ro = useReadOnlyProps();
   const store = useAppStore();
   const birthDate = useStore(store, (s) => s.identity?.birthDate);
   const ownerMinor = !!birthDate && ageOn(birthDate) < 18;
@@ -135,7 +137,7 @@ export function AgeLimitSetting({ server }: { server: ServerSummary }) {
         )}
       </fieldset>
       <div className="actions">
-        <button type="button" className="primary" disabled={busy || age === server.ageRestriction} onClick={onSave}>
+        <button type="button" className="primary" disabled={busy || age === server.ageRestriction} onClick={onSave} {...ro}>
           <FormattedMessage id="server.age.save" />
         </button>
         {saved && (

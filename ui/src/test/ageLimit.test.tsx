@@ -54,6 +54,18 @@ describe("G-52: the server's age limit", () => {
     expect(await within(dialog).findByText('Age limit saved')).toBeTruthy();
   });
 
+  it('while an update is required (#577): Save is off with the reason, and nothing saves', async () => {
+    const { dialog, set } = await openGeneral(async (core, id) => {
+      await core.setAgeRestriction(id, 'none');
+    }, { updateRequired: 'downloading' });
+    await click(radio(dialog, '16 and over'));
+    const save = saveButton(dialog);
+    expect(save.getAttribute('aria-disabled')).toBe('true');
+    expect(save.getAttribute('title')).toBe('Update MVS to do this.');
+    await click(save);
+    expect(set).not.toHaveBeenCalled();
+  });
+
   it('to 18+: the raise dialog; Cancel saves nothing and goes back (§6.2)', async () => {
     const { dialog, set } = await openGeneral(async (core, id) => {
       await core.setAgeRestriction(id, '16+');

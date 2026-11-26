@@ -1,4 +1,4 @@
-// G-52: the server's age limit (shots 550-552; 553 has no demo option).
+// G-52: the server's age limit (shots 550-552, 554-555; 553 has no demo option).
 import { chat, shot } from './lib.mjs';
 
 export default async function run() {
@@ -38,6 +38,29 @@ async function ageSettings(query, opts) {
   await d.getByRole('checkbox').check();
   await p.waitForTimeout(200);
   await shot(p, '552-age-lower-dialog-checked-en-dark');
+  await p.close();
+}
+{
+  // 554: after raising to 18+, the owner sees who has no 18+ claim in the member list.
+  const p = await ageSettings('lang=he&theme=light');
+  await p.locator('.age-limit input[value="18+"]').check();
+  await p.locator('.age-limit .actions .primary').click();
+  await p.getByRole('button', { name: 'הגבלה ל-18+' }).click();
+  await p.locator('.age-limit .success').waitFor();
+  await p.keyboard.press('Escape');
+  await p.getByText('ללא אישור 18+').first().waitFor();
+  await p.mouse.move(0, 0);
+  await p.waitForTimeout(200);
+  await shot(p, '554-age-not-adult-tag-he');
+  await p.close();
+}
+{
+  // 555: a minor's server was raised to 18+: the toast says why it's gone.
+  const p = await chat('?demo=1&still=1&update=999999&lang=he&theme=light&ageRemoved=1', 'x');
+  await p.getByText('מוגבל עכשיו לגיל 18 ומעלה').waitFor();
+  await p.mouse.move(0, 0);
+  await p.waitForTimeout(200);
+  await shot(p, '555-age-removed-toast-he');
   await p.close();
 }
 }

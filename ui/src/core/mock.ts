@@ -71,6 +71,8 @@ export interface MockOptions {
   updateInstalled?: boolean;
   /** Shortly after start: the last update failed and the previous version is back. */
   updateRolledBack?: boolean;
+  /** G-52: shortly after start, a server I'm in is removed for its new 18+ limit (screenshots). */
+  ageRemoved?: boolean;
   /** #577: a required update is pending from the start, in this banner state (screenshots). */
   updateRequired?: 'downloading' | 'ready' | 'offline' | 'check-clock' | 'not-available' | 'failed';
   /** #622: this long after joining a call, a required update ends it (as main does). */
@@ -301,6 +303,18 @@ export class MockCore implements CoreApi {
     }
     if (options.updateRolledBack) {
       this.timers.push(setTimeout(() => this.emit('update.rolledBack', { failed: '0.3.0', running: '0.2.0' }), 800));
+    }
+    if (options.ageRemoved) {
+      // G-52: a server I'm a member of (not mine) was raised to 18+ and I'm under 18.
+      this.timers.push(
+        setTimeout(() => {
+          const s = [...this.servers.values()].find((x) => x.summary.ownerId !== this.identity?.id);
+          if (!s) return;
+          this.servers.delete(s.summary.id);
+          for (const c of s.channels) this.channelIndex.delete(c.channel.id);
+          this.emit('server.removed', { serverId: s.summary.id, reason: 'age' });
+        }, 600),
+      );
     }
     if (options.updateRequired === 'ready') {
       // #577: the required version is already downloaded and staged.

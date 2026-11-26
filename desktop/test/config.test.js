@@ -282,3 +282,9 @@ test('voiceP2p: packaged only with "voiceP2p": true; a checkout only with MVS_VO
   assert.equal(voiceP2pFor({ packaged: false, env: { MVS_VOICE_P2P: '1' } }), true);
   for (const v of [undefined, '', '0', 'true', 'yes']) assert.equal(voiceP2pFor({ packaged: false, env: { MVS_VOICE_P2P: v } }), false, String(v));
 });
+
+test('voiceP2p: the core gets --voice-p2p only when the flag is on', () => {
+  const { voiceP2pArgs } = require('../src/config');
+  assert.deepEqual(voiceP2pArgs(true), ['--voice-p2p']);
+  for (const v of [false, undefined, null, 'true', 1]) assert.deepEqual(voiceP2pArgs(v), [], String(v));
+});

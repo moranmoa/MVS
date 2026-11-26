@@ -1542,7 +1542,8 @@ export class MockCore implements CoreApi {
 
   async createVoiceRoom(serverId: Id): Promise<CallState> {
     await this.wait(200);
-    if (this.relayOnly) throw err({ code: 'relay-only' });
+    // Like the core with G-81 2a: relay-only refuses calls unless B (voiceP2p) is on; then they go over our circuits.
+    if (this.relayOnly && !this.options.voiceP2p) throw err({ code: 'relay-only' });
     if (this.options.callError) throw err({ code: this.options.callError });
     if (!this.servers.has(serverId)) throw err({ code: 'not-found' });
     if (this.roomsOf(serverId).length >= 10) throw err({ code: 'room-cap' });
@@ -1565,7 +1566,8 @@ export class MockCore implements CoreApi {
 
   async joinCall(channelId: Id): Promise<CallState> {
     await this.wait(200);
-    if (this.relayOnly) throw err({ code: 'relay-only' });
+    // Like the core with G-81 2a: relay-only refuses calls unless B (voiceP2p) is on; then they go over our circuits.
+    if (this.relayOnly && !this.options.voiceP2p) throw err({ code: 'relay-only' });
     if (this.options.callError) throw err({ code: this.options.callError });
     const found = this.findRoom(channelId);
     // Text channels don't carry calls (voice-room amendment); a room that is gone is not-found.
@@ -1687,6 +1689,14 @@ export class MockCore implements CoreApi {
 
   async sendSignal(): Promise<null> {
     if (!this.call) throw err({ code: 'not-allowed' });
+    return null;
+  }
+
+  /** G-81 B (#556): the LAN-WebRTC participants; kept so tests can read it. At most 5, or bad-request. */
+  webrtcPeers: Id[] = [];
+  async setCallWebrtcPeers(identities: Id[]): Promise<null> {
+    if (!Array.isArray(identities) || identities.length > 5) throw err({ code: 'bad-request' });
+    this.webrtcPeers = [...identities];
     return null;
   }
 

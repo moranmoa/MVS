@@ -55,10 +55,10 @@ jobs:
           cargo build --release --locked --workspace
           cargo clippy --workspace --locked -- -D warnings
         working-directory: core
-      # G-48: the report receiver's tests that need what a modified client
-      # would send (feature `test-hooks`, never in a release build).
+      # Tests that need a test-only hook (feature `test-hooks`, never in a
+      # release build): G-48 report receiver, T17 secret rotation.
       - name: api test hooks
-        run: cargo test --release --locked -p api --features test-hooks --test reports
+        run: cargo test --release --locked -p api --features test-hooks --test reports --test secret_rotation
         working-directory: core
       # Lints, warnings as errors, over every crate and target (tests too).
       - name: clippy

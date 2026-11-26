@@ -54,8 +54,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-# Test-only hooks (G-48 receiver tests): never in a release build. CI runs
-# `cargo test -p api --features test-hooks --test reports`.
+# Test-only hooks: never in a release build. CI runs the tests that need them
+# with `--features test-hooks` (G-48 reports, T17 secret rotation).
 test-hooks = []
 
 [dev-dependencies]

@@ -13,11 +13,12 @@ const C = 'c'.repeat(64);
 
 const diag = (over: Partial<Diagnostics> = {}): Diagnostics => ({
   stun: true,
+  playout: 'loopback',
   stunAnswered: true,
   gatherWindowS: 3,
   peers: {
-    [B]: { state: 'connected', ice: 'connected', gathered: { host: 1, srflx: 1, prflx: 0, relay: 0 }, pair: { local: 'srflx', remote: 'srflx' }, gatherMs: 412.4, setupMs: 1834.6 },
-    [C]: { state: 'connecting', ice: 'checking', gathered: null, pair: null, gatherMs: null, setupMs: null },
+    [B]: { state: 'connected', ice: 'connected', gathered: { host: 1, srflx: 1, prflx: 0, relay: 0 }, pair: { local: 'srflx', remote: 'srflx' }, gatherMs: 412.4, setupMs: 1834.6, route: 'lan-webrtc' },
+    [C]: { state: 'connecting', ice: 'checking', gathered: null, pair: null, gatherMs: null, setupMs: null, route: 'circuit' },
   },
   ...over,
 });
@@ -54,8 +55,8 @@ describe('voice diagnostics panel (G-81)', () => {
     expect(c.querySelector('.diag-stun')!.textContent).toBe('STUN server: answered (public address found).');
     const rows = [...c.querySelectorAll('tbody tr')].map((tr) => [...tr.children].map((x) => x.textContent));
     expect(rows).toEqual([
-      ['Dana', 'connected / connected', 'srflx → srflx', 'host 1 · srflx 1', '1800 ms'],
-      ['Omer', 'connecting / checking', '—', '—', '—'],
+      ['Dana', 'connected / connected', 'lan-webrtc', 'srflx → srflx', 'host 1 · srflx 1', '1800 ms'],
+      ['Omer', 'connecting / checking', 'circuit', '—', '—', '—'],
     ]);
   });
 

@@ -222,6 +222,9 @@ pub enum Error {
     UnsupportedVersion(u8),
     /// The rotation names a different channel than the one being read.
     WrongChannel,
+    /// T17: a channel key rotation used as a secret rotation, or the other
+    /// way round.
+    WrongDomain,
     /// Epoch 0 must have no `prev`, every later epoch must have one.
     BadEpochLink,
     EpochOverflow,
@@ -271,6 +274,7 @@ impl fmt::Display for Error {
             Error::TrailingBytes => write!(f, "trailing bytes"),
             Error::UnsupportedVersion(ver) => write!(f, "unsupported version {ver}"),
             Error::WrongChannel => write!(f, "rotation is for another channel"),
+            Error::WrongDomain => write!(f, "rotation carries another kind of key"),
             Error::BadEpochLink => write!(f, "epoch and prev don't match"),
             Error::EpochOverflow => write!(f, "epoch counter overflow"),
             Error::NotCanonical => write!(f, "recipients are not strictly ascending"),
@@ -855,19 +859,19 @@ impl Rotation {
     }
 
     /// Opens the epoch key wrapped for `member`. A secret rotation's box is
-    /// refused here (`WrongChannel`): it never serves as a channel key.
+    /// refused here (`WrongDomain`): it never serves as a channel key.
     pub fn unwrap_key(&self, member: &MemberSecret) -> Result<EpochKey, Error> {
         if self.domain != Domain::ChannelKey {
-            return Err(Error::WrongChannel);
+            return Err(Error::WrongDomain);
         }
         self.open(member).map(EpochKey)
     }
 
     /// T17: opens the sync secret sealed for `member`. A channel rotation
-    /// is refused here (`WrongChannel`).
+    /// is refused here (`WrongDomain`).
     pub fn unwrap_secret(&self, member: &MemberSecret) -> Result<SyncSecret, Error> {
         if self.domain != Domain::SyncSecret {
-            return Err(Error::WrongChannel);
+            return Err(Error::WrongDomain);
         }
         self.open(member).map(SyncSecret)
     }

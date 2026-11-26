@@ -43,6 +43,9 @@ function Body({ read, names }: { read: () => Promise<Diagnostics | null>; names:
       <p className={`diag-stun ${d.stun && d.stunAnswered === false ? 'error' : ''}`}>
         <FormattedMessage id={stun} values={{ s: d.gatherWindowS }} />
       </p>
+      <p className="diag-playout">
+        <FormattedMessage id="diag.playout" values={{ type: <bdi dir="ltr">{d.playout}</bdi> }} />
+      </p>
       {ids.length === 0 ? (
         <p className="hint">
           <FormattedMessage id="diag.nobody" />
@@ -56,6 +59,9 @@ function Body({ read, names }: { read: () => Promise<Diagnostics | null>; names:
               </th>
               <th scope="col">
                 <FormattedMessage id="diag.state" />
+              </th>
+              <th scope="col">
+                <FormattedMessage id="diag.route" />
               </th>
               <th scope="col">
                 <FormattedMessage id="diag.path" />
@@ -78,6 +84,9 @@ function Body({ read, names }: { read: () => Promise<Diagnostics | null>; names:
                   </th>
                   <td>
                     <bdi dir="ltr">{`${p.state} / ${p.ice}`}</bdi>
+                  </td>
+                  <td>
+                    <bdi dir="ltr">{p.route}</bdi>
                   </td>
                   <td>
                     <bdi dir="ltr">{p.pair ? `${p.pair.local} → ${p.pair.remote}` : '—'}</bdi>

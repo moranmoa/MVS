@@ -30,7 +30,7 @@ fn every_recipient_opens_the_same_secret_and_nobody_else_does() {
     }
     assert_eq!(rotation.unwrap_secret(&secret(9)).unwrap_err(), Error::NoKey);
     // Never a channel key.
-    assert!(matches!(rotation.unwrap_key(&secret(1)), Err(Error::WrongChannel)));
+    assert!(matches!(rotation.unwrap_key(&secret(1)), Err(Error::WrongDomain)));
     // Never printed.
     assert_eq!(format!("{sent:?}"), "SyncSecret(..)");
 
@@ -73,7 +73,7 @@ fn a_box_never_crosses_domains() {
     // secret call.
     let channel = Rotation::decode(SERVER, pk(1), &channel_bodies[0]).unwrap();
     assert!(!channel.is_secret());
-    assert!(matches!(channel.unwrap_secret(&secret(1)), Err(Error::WrongChannel)));
+    assert!(matches!(channel.unwrap_secret(&secret(1)), Err(Error::WrongDomain)));
 }
 
 /// SL on #592: parts are grouped as for key rotations: same rotator and

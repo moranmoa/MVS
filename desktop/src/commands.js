@@ -84,6 +84,8 @@ const COMMANDS = Object.freeze({
   setMuted: ['muted'],
   setDeafened: ['deafened'],
   sendSignal: ['to', 'kind', 'payload'],
+  // G-81 B (#556): the participants with a live LAN WebRTC connection; the core sends B to the rest.
+  setCallWebrtcPeers: ['identities'],
   // App
   getStorageUsage: [],
   setStorageLimit: ['bytes'],

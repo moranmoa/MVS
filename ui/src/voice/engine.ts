@@ -1239,6 +1239,8 @@ export function createVoiceEngine(core: VoiceCore, options: VoiceEngineOptions =
         stopB();
       }
       for (const id of [...bPeers.keys()]) if (!members.has(id)) leaveB(id);
+      // A path that turns up after the connect timeout: the peer is reachable after all (TL, #550).
+      for (const id of [...bFailed]) if (usableB(id)) bFailed.delete(id);
     }
     for (const p of [...peers.values()]) if (!members.has(p.id)) dropPeer(p);
     for (const id of members) {

@@ -2109,6 +2109,19 @@ describe('voice engine: G-81 C2 (LAN WebRTC, else media over the P2P network)', 
     ey.dispose();
   });
 
+  it('a path that turns up after the connect timeout clears the failure: the peer shows connected again', async () => {
+    const { cx, ex, ey, errors, parts } = await call('none');
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(yB(parts)).toBe('failed');
+    cx.paths[B] = 'circuit';
+    cx.emitState(cx.state());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(yB(parts)).toBe('connected');
+    expect(errors).toEqual([{ code: 'peer-failed', peer: B }]); // reported once, not again
+    ex.dispose();
+    ey.dispose();
+  });
+
   it('muted: nothing goes out over B', async () => {
     const { hy, ex, ey, mx } = await call('circuit');
     ex.setMicMuted(true);

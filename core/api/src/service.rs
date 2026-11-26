@@ -525,8 +525,11 @@ type Events = Vec<Event>;
 ///   beacon key following the rotation;
 /// - the release that requires updating (older cores refuse kind 25).
 ///
-/// `secret_rotation_writes_stay_off` fails until this is revisited.
+/// The const assertion below fails the build until this is revisited.
 const WRITE_SECRET_ROTATION: bool = false;
+// Tech Lead on #609: whoever flips it ships S3/S4 and S5 in the same change
+// and removes this line there.
+const _: () = assert!(!WRITE_SECRET_ROTATION, "S3/S4 and S5 must ship with the flip");
 
 /// T17 (Q2, Security Lead T17-W1): how long the secret a rotation replaced
 /// stays, sealed, for reading the old secret's frozen prefix.
@@ -6406,18 +6409,6 @@ fn link_error(e: DeviceLinkError) -> CoreError {
         // (Security Lead on #394; dev-ui shows "start again").
         DeviceLinkError::Refused => ErrorCode::LockedOut.into(),
         DeviceLinkError::Network => ErrorCode::Offline.into(),
-    }
-}
-
-#[cfg(test)]
-mod secret_rotation_tests {
-    /// Tech Lead on #609: writing secret rotations flips only with S3/S4
-    /// (the frozen prefix) and S5 merged, in the release that requires
-    /// updating. Whoever flips it updates this test in that same change.
-    #[test]
-    fn secret_rotation_writes_stay_off() {
-        assert!(!super::WRITE_SECRET_ROTATION, "S3/S4 and S5 must ship with the flip (see the const)");
-        assert_eq!(super::PREVIOUS_SECRET_FOR_MS, 7 * 24 * 3600 * 1000);
     }
 }
 

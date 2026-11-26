@@ -617,7 +617,7 @@ pub trait GroupCipher: Send + Sync {
         epoch: u64,
         prev: Option<records::RecordId>,
         recipients: &BTreeSet<PublicKey>,
-    ) -> Result<(Vec<Vec<u8>>, Zeroizing<[u8; 32]>), CipherError> {
+    ) -> Result<SealedSecret, CipherError> {
         let _ = (server, epoch, prev, recipients);
         Err(CipherError::Unavailable)
     }
@@ -698,6 +698,10 @@ pub struct Opened {
     /// untrusted, never as a normal message.
     pub accepted: bool,
 }
+
+/// T17: a sealed secret rotation: the part bodies, in order, and the new
+/// secret (zeroized on drop).
+pub type SealedSecret = (Vec<Vec<u8>>, Zeroizing<[u8; 32]>);
 
 /// T17: one assembled secret rotation.
 pub struct OpenedSecret {

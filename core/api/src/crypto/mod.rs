@@ -263,7 +263,7 @@ impl GroupCipher for GroupKeysCipher {
         epoch: u64,
         prev: Option<RecordId>,
         recipients: &BTreeSet<PublicKey>,
-    ) -> Result<(Vec<Vec<u8>>, Zeroizing<[u8; 32]>), CipherError> {
+    ) -> Result<crate::ports::SealedSecret, CipherError> {
         let me = self.state().secret.as_ref().ok_or(CipherError::Unavailable)?.public();
         let (parts, secret) =
             Rotation::create_secret(server, me, epoch, prev, recipients, &mut OsRng).map_err(cipher_error)?;

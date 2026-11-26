@@ -591,6 +591,12 @@ fn secret_rotation_key(server: ServerId) -> String {
     format!("secret-rotation/{}", hex::encode(server.as_bytes()))
 }
 
+/// T17: when this core first saw an accepted `Leave` (core clock, ms), for
+/// the admin leave rotation: never the record's own `ts` (Tech Lead on #630).
+fn leave_seen_key(server: ServerId, leave: RecordId) -> String {
+    format!("leave-seen/{}/{}", hex::encode(server.as_bytes()), hex::encode(leave.as_bytes()))
+}
+
 fn vault_error(e: VaultError) -> CoreError {
     match e {
         // QA-20: the OS keychain failed (no Secret Service, locked, denied).
@@ -4410,16 +4416,27 @@ impl Inner {
                 let seed = blake3::derive_key("mvs/t17-admin-jitter/v1", &[me.as_bytes().as_slice(), server.as_bytes()].concat());
                 u64::from_le_bytes(seed[..8].try_into().expect("8 bytes")) % ADMIN_LEAVE_JITTER_MS
             };
-            let left_long_ago = |member: &PublicKey| {
-                view.records
-                    .iter()
-                    .filter(|r| r.author() == *member && r.kind() == records::Kind::Leave && state.accepted.contains(&r.id()))
-                    .map(|r| r.ts())
-                    .max()
-                    .is_some_and(|at| now.saturating_sub(at) >= ADMIN_LEAVE_ROTATE_MS + jitter)
+            // When this core first saw each accepted Leave, kept in kv: the
+            // record's own `ts` is the leaver's to set, and a future one
+            // would keep every admin waiting for good (Tech Lead on #630).
+            let first_seen = |leave: RecordId| -> CoreResult<u64> {
+                let key = leave_seen_key(server, leave);
+                if let Some(at) = self.db.get(&key)?.and_then(|v| v.try_into().ok()).map(u64::from_le_bytes) {
+                    return Ok(at);
+                }
+                self.db.set(&key, &now.to_le_bytes())?;
+                Ok(now)
             };
-            if gone.iter().any(left_long_ago) {
-                return Ok(true);
+            for member in &gone {
+                let leaves = view
+                    .records
+                    .iter()
+                    .filter(|r| r.author() == *member && r.kind() == records::Kind::Leave && state.accepted.contains(&r.id()));
+                for leave in leaves {
+                    if now.saturating_sub(first_seen(leave.id())?) >= ADMIN_LEAVE_ROTATE_MS + jitter {
+                        return Ok(true);
+                    }
+                }
             }
         }
         if !owner {

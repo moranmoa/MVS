@@ -1138,8 +1138,6 @@ mod tests {
         assert!(heads.windows(2).all(|w| w[0] < w[1]), "sorted, as records requires");
     }
 
-    /// Every cap is posted once (Tech Lead on #555): a merge that loses a
-    /// line of `CAPS`, or doubles one, fails here.
     /// Tech Lead on #609: the posted level promises exactly what this core
     /// decodes: every kind code up to the level's max decodes, and no code
     /// above it does.
@@ -1155,6 +1153,8 @@ mod tests {
         assert_eq!(highest, Some(max), "a new kind needs a new level");
     }
 
+    /// Every cap is posted once (Tech Lead on #555): a merge that loses a
+    /// line of `CAPS`, or doubles one, fails here.
     #[test]
     fn every_cap_is_posted_once() {
         let unique: std::collections::BTreeSet<&str> = CAPS.iter().copied().collect();

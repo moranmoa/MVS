@@ -246,7 +246,7 @@ function toPages(name, payload) {
  * call's audio keeps playing). Never core:invoke, never logged.
  */
 const voiceFrames = voiceframe.createVoiceFrames({
-  canSend: () => callGate.inCall && lockOpen(),
+  canSend: () => voiceframe.sendAllowed({ inCall: callGate.inCall, unlocked: lockOpen(), requiredGate }),
   canReceive: () => callGate.inCall && (lockOpen() || (appLock.state.locked && appLock.state.path === 'B')),
   send: (frame) => (core ? core.send('voiceFrame', frame) : false),
   deliver: (frame) => {

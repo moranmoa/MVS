@@ -637,6 +637,11 @@ pub enum Event {
     /// answers come only verified (see `voice`), so the flag is always true.
     #[serde(rename = "call.signal", rename_all = "camelCase")]
     CallSignal { from: Id, kind: SignalKind, payload: String, fingerprint_verified: bool },
+    /// G-81: a voice frame from a participant of my current call, over
+    /// libp2p (#509 §2.3). `callId` 32 hex, `from` the sender's user ID,
+    /// `data` standard base64 of at most 400 bytes (empty: a DTX gap).
+    #[serde(rename = "voice.frame", rename_all = "camelCase")]
+    VoiceFrame { call_id: String, from: Id, seq: u32, ts: u32, data: String },
     /// Voice rooms: a server's live rooms changed (created, gone, join,
     /// leave, mute, timeout, kick, rename, limit), mine or not: the whole
     /// list, oldest first. At most one per server per sync round, only
@@ -759,6 +764,10 @@ pub struct CallState {
     /// with this set ended because relay-only went on.
     #[serde(default)]
     pub relay_only: bool,
+    /// G-81: my current call's ID (32 lowercase hex), opaque, new on every
+    /// join; `voiceFrame`s carry it. Absent with no call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,6 +779,21 @@ pub struct CallParticipant {
     /// G-84b: hears no one (only with `muted`; false from cores before 0.6.0).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deafened: bool,
+    /// G-81: how my voice frames reach this peer over libp2p; only for
+    /// peers I send to that way (not on LAN WebRTC), absent for me.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<VoicePathKind>,
+}
+
+/// G-81 `CallParticipant.path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoicePathKind {
+    Lan,
+    Direct,
+    Circuit,
+    MemberCircuit,
+    None,
 }
 
 /// Why `server.removed` fired (server lifecycle).

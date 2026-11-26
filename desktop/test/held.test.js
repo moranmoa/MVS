@@ -20,6 +20,18 @@ test('only state events are kept, the latest of each, in arrival order', () => {
   assert.deepEqual(h.take(), [], 'taken once');
 });
 
-test('the list is the reviewed one', () => {
-  assert.deepEqual([...STATE_EVENTS].sort(), ['memberRelay.changed', 'update.ready', 'update.required']);
+test('server.updated (T17-pre updateNeeded, #604) is kept per server, the latest of each', () => {
+  const h = createHeldEvents();
+  assert.equal(h.hold('server.updated', { id: 's1', updateNeeded: null }), true);
+  assert.equal(h.hold('server.updated', { id: 's2', updateNeeded: null }), true);
+  assert.equal(h.hold('server.updated', { id: 's1', updateNeeded: { cap: 'x' } }), true);
+  assert.equal(h.hold('server.updated', { name: 'no id' }), false);
+  assert.deepEqual(h.take(), [
+    ['server.updated', { id: 's2', updateNeeded: null }],
+    ['server.updated', { id: 's1', updateNeeded: { cap: 'x' } }],
+  ]);
+});
+
+test('the list is the reviewed one (SL, LR-1)', () => {
+  assert.deepEqual([...STATE_EVENTS].sort(), ['memberRelay.changed', 'server.updated', 'update.ready', 'update.required']);
 });

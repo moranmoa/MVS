@@ -15,22 +15,37 @@ const STATE_EVENTS = Object.freeze(
     'memberRelay.changed', // { role, setting, effective, disclosureSeen, … }
     'update.ready', // the staged update
     'update.required', // also read again at core start (#577)
+    // A server's summary, incl. T17-pre's updateNeeded (#604): per server,
+    // the latest of each (SL, LR-1: stale after a path B unlock otherwise).
+    'server.updated',
   ]),
 );
 
+/** Events kept per item rather than once: the key inside the payload. */
+const KEYED = Object.freeze({ 'server.updated': (p) => (p && typeof p.id === 'string' && p.id.length <= 128 ? p.id : null) });
+/** At most this many held per keyed event (servers), so a flood can't grow it. */
+const MAX_KEYED = 256;
+
 function createHeldEvents({ names = STATE_EVENTS } = {}) {
-  const held = new Map();
+  const held = new Map(); // key -> [name, payload]
   return {
     /** A core event main didn't forward (locked): keep it if it's a state event. True if kept. */
     hold(name, payload) {
       if (!names.has(name)) return false;
-      held.delete(name); // keep the arrival order of the latest values
-      held.set(name, payload);
+      let key = name;
+      if (KEYED[name]) {
+        const id = KEYED[name](payload);
+        if (!id) return false;
+        key = `${name}\u0000${id}`;
+        if (!held.has(key) && [...held.keys()].filter((k) => k.startsWith(`${name}\u0000`)).length >= MAX_KEYED) return false;
+      }
+      held.delete(key); // keep the arrival order of the latest values
+      held.set(key, [name, payload]);
       return true;
     },
     /** Everything kept, oldest first, and forget it. */
     take() {
-      const out = [...held.entries()];
+      const out = [...held.values()];
       held.clear();
       return out;
     },

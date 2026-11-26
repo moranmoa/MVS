@@ -58,3 +58,21 @@ test('memberRelay.changed sent while locked reaches the page once it is unlocked
     'memberRelay.changed delivered to the unlocked page',
   );
 });
+
+test('path B (locked during a call, no reload): server.updated (updateNeeded, #604) reaches the page on unlock', async () => {
+  // Same app, now unlocked: the next lock is during a call.
+  writeFileSync(join(CORE_DIR, 'fake-emit-server-updated'), '');
+  const page = await app.firstWindow();
+  const key = (keyCode, modifiers = []) =>
+    app.evaluate(({ BrowserWindow }, [k, m]) => BrowserWindow.getAllWindows()[0].webContents.sendInputEvent({ type: 'keyDown', keyCode: k, modifiers: m }), [keyCode, modifiers]);
+  assert.ok((await page.evaluate(() => window.mvs.invoke('joinCall', ['c'.repeat(64)]))).ok);
+  await app.evaluate(() => (globalThis.__sent = []));
+  await key('L', ['control']);
+  assert.ok(await until(async () => (await page.evaluate(() => window.mvs.lock.state())).path === 'B'), 'path B');
+  // Main muted me in the core; the fake core answered with server.updated, which is held.
+  await new Promise((r) => setTimeout(r, 1500));
+  assert.equal((await app.evaluate(() => globalThis.__sent)).some((s) => s.name === 'server.updated'), false, 'not shown behind the lock');
+  await page.evaluate(() => window.mvs.lock.unlock({ passcode: '2468' }));
+  assert.ok(await until(async () => (await page.evaluate(() => window.mvs.lock.state())).locked === false), 'unlocked (no reload)');
+  assert.ok(await until(async () => (await app.evaluate(() => globalThis.__sent)).some((s) => s.name === 'server.updated')), 'server.updated delivered after the path B unlock');
+});

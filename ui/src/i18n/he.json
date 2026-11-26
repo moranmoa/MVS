@@ -659,7 +659,7 @@
   "memberRelay.capDefault": "\u2068{size}\u2069 (ברירת מחדל)",
   "memberRelay.capCustom": "אחר…",
   "memberRelay.capCustomLabel": "מגבלה יומית ב-GB",
-  "memberRelay.capRange": "מ-⁦0.25 GB⁩ עד ⁦50 GB⁩.",
+  "memberRelay.capRange": "מ-<ltr>0.25 GB</ltr> עד <ltr>50 GB</ltr>.",
   "memberRelay.reason.minor": "כבוי: זמין רק מגיל 18.",
   "memberRelay.reason.relayOnly": "כבוי במצב \"ממסר בלבד\".",
   "memberRelay.reason.metered": "כבוי בחיבור עם מגבלת נתונים.",

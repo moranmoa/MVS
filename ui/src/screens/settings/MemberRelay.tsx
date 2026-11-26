@@ -234,7 +234,8 @@ function DailyCap({ relay }: { relay: MemberRelay }) {
         </label>
       )}
       <p id="member-relay-cap-range" className={failed ? 'error small' : 'muted small'} role={failed ? 'alert' : undefined}>
-        <FormattedMessage id="memberRelay.capRange" />
+        {/* UX: each value isolated LTR; "מ-" and "עד" stay outside (en's string has no tags). */}
+        <FormattedMessage id="memberRelay.capRange" values={{ ltr: (c) => <bdi dir="ltr">{c}</bdi> }} />
       </p>
     </div>
   );

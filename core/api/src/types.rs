@@ -320,6 +320,11 @@ pub struct Member {
     /// #354: their chosen colour (`#rrggbb`); `avatarColor` is the derived one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// G-52 (Security Lead residual on #590): in an 18+ server, a member
+    /// without an accepted 18+ claim, shown to the owner and admins only
+    /// (they can kick, which rotates the server secret). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_adult: Option<bool>,
 }
 
 /// Every command rejects with this shape.
@@ -703,6 +708,13 @@ pub struct BlockedUser {
     pub short_code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// G-52 `countAgeAffected`: how many members a change would lock out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeAffected {
+    pub count: u32,
 }
 
 /// Rust addition (`createInvite`, #208): the new invite and its link.

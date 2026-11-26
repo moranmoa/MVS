@@ -5,7 +5,7 @@
 // zone (close the server, #261). Changing the age limit and removed accounts
 // wait for their core commands.
 
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { useAppStore } from '../../app/App';
 import { useStore } from '../../app/store';
@@ -16,6 +16,7 @@ import { displayName, ProfileCard } from './MemberList';
 import { ClosePanel, RenameForm } from './ServerLifecycle';
 import { AgeLimitSetting } from './AgeLimit';
 import { ServerMetaForm } from './ServerMeta';
+import type { SectionHandle, SectionState } from './generalDraft';
 import { RemovedAccounts } from './RemovedAccounts';
 import { ReportsPage } from './Reports';
 import { useOpenReports } from './reportsState';
@@ -66,6 +67,18 @@ export function ServerSettings({
     setPage(p);
   };
 
+  // G-51n: a draft on General is asked about before leaving it (as profile save, B11e).
+  const general = useRef<GeneralHandle>(null);
+  const [generalDirty, setGeneralDirty] = useState(false);
+  const [leaving, setLeaving] = useState<(() => void) | null>(null);
+  const guard = (action: () => void) => (generalDirty && page === 'general' ? setLeaving(() => action) : action());
+  const leave = () => {
+    const go = leaving;
+    setLeaving(null);
+    setGeneralDirty(false);
+    go?.();
+  };
+
   const onNavKey = (e: KeyboardEvent) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
     e.preventDefault();
@@ -77,7 +90,7 @@ export function ServerSettings({
   return (
     <Dialog
       open={open}
-      onClose={onClose}
+      onClose={() => guard(onClose)}
       className="settings-dialog server-settings"
       title={
         <span className="server-settings-title" title={server.name}>
@@ -108,9 +121,12 @@ export function ServerSettings({
                   aria-controls="server-settings-panel"
                   tabIndex={page === p ? 0 : -1}
                   className={[page === p ? 'active' : '', p === 'danger' ? 'danger-tab' : ''].filter(Boolean).join(' ')}
-                  onClick={() => choose(p)}
+                  onClick={() => p !== page && guard(() => choose(p))}
                 >
                   <FormattedMessage id={`server.settings.nav.${p}`} />
+                  {p === 'general' && generalDirty && (
+                    <span className="nav-dirty" role="img" aria-label={intl.formatMessage({ id: 'profile.edit.unsaved' })} />
+                  )}
                   {p === 'reports' && openReports > 0 && (
                     // The tab keeps its name; the rail button's label says the count in words.
                     <span className="badge settings-count" aria-hidden="true">
@@ -126,7 +142,7 @@ export function ServerSettings({
           <h3 ref={headingRef} tabIndex={-1}>
             <FormattedMessage id={`server.settings.nav.${page}`} />
           </h3>
-          {page === 'general' && <GeneralPage server={server} />}
+          {page === 'general' && <GeneralPage ref={general} server={server} onDirtyChange={setGeneralDirty} />}
           {page === 'channels' && <ChannelsPage server={server} onCreate={onCreateChannel} onEdit={onEditChannel} />}
           {page === 'invite' && <InvitePage server={server} onOpenRemoved={() => choose('removed')} />}
           {page === 'members' && <MembersPage server={server} />}
@@ -135,21 +151,118 @@ export function ServerSettings({
           {page === 'danger' && <ClosePanel server={server} />}
         </section>
       </div>
+      <Dialog open={!!leaving} onClose={() => setLeaving(null)} title={intl.formatMessage({ id: 'server.settings.unsavedTitle' })}>
+        <div className="actions">
+          <button
+            type="button"
+            className="primary"
+            autoFocus
+            onClick={async () => {
+              if (await general.current?.save()) leave();
+              else setLeaving(null); // the reason shows on the page
+            }}
+          >
+            <FormattedMessage id="server.settings.save" />
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => {
+              general.current?.discard();
+              leave();
+            }}
+          >
+            <FormattedMessage id="profile.edit.unsavedDiscard" />
+          </button>
+          <button type="button" className="link" onClick={() => setLeaving(null)}>
+            <FormattedMessage id="profile.edit.unsavedBack" />
+          </button>
+        </div>
+      </Dialog>
     </Dialog>
   );
 }
 
-function GeneralPage({ server }: { server: ServerSummary }) {
+type GeneralHandle = { save(): Promise<boolean>; discard(): void };
+type Section = 'name' | 'meta' | 'age';
+const CLEAN: SectionState = { dirty: false, invalid: false };
+
+/**
+ * G-51n (server-icon-description.md §1): one "Save" for General. Every change
+ * is a draft until then; the save bar is sticky while there's one. The age
+ * limit's confirmation comes first, and cancelling it saves nothing.
+ */
+const GeneralPage = forwardRef<GeneralHandle, { server: ServerSummary; onDirtyChange: (dirty: boolean) => void }>(function GeneralPage(
+  { server, onDirtyChange },
+  ref,
+) {
+  const ro = useReadOnlyProps();
+  const name = useRef<SectionHandle>(null);
+  const meta = useRef<SectionHandle>(null);
+  const age = useRef<SectionHandle>(null);
+  const [states, setStates] = useState<Record<Section, SectionState>>({ name: CLEAN, meta: CLEAN, age: CLEAN });
+  const track = (k: Section) => (st: SectionState) =>
+    setStates((prev) => (prev[k].dirty === st.dirty && prev[k].invalid === st.invalid ? prev : { ...prev, [k]: st }));
+  const onName = useCallback(track('name'), []);
+  const onMeta = useCallback(track('meta'), []);
+  const onAge = useCallback(track('age'), []);
+  const dirty = states.name.dirty || states.meta.dirty || states.age.dirty;
+  const invalid = states.name.invalid || states.meta.invalid;
+  useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  useEffect(() => {
+    if (dirty) setSaved(false);
+  }, [dirty]);
+
+  const save = async (): Promise<boolean> => {
+    if (busy || invalid) return false;
+    if (!(await (age.current?.confirm?.() ?? Promise.resolve(true)))) return false;
+    setBusy(true);
+    // Each section saves and shows its own error; one failing doesn't stop the others.
+    const results = [];
+    for (const s of [name, meta, age]) results.push(await (s.current?.save() ?? Promise.resolve(true)));
+    setBusy(false);
+    const ok = results.every(Boolean);
+    if (ok) setSaved(true);
+    return ok;
+  };
+  const discard = () => [name, meta, age].forEach((s) => s.current?.discard());
+  useImperativeHandle(ref, () => ({ save, discard }));
+
   return (
-    <div className="stack">
-      <RenameForm server={server} />
-      {/* G-51: icon and description (its own save until the page-wide save, after G-52). */}
-      <ServerMetaForm server={server} />
-      {/* G-52: editable, with its own confirmations (AgeLimit.tsx). */}
-      <AgeLimitSetting server={server} />
-    </div>
+    <form
+      className="stack"
+      noValidate
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (dirty) void save();
+      }}
+    >
+      <RenameForm ref={name} server={server} onState={onName} />
+      <ServerMetaForm ref={meta} server={server} onState={onMeta} />
+      <AgeLimitSetting ref={age} server={server} onState={onAge} />
+      <div className={`profile-actions general-actions ${dirty ? 'dirty' : ''}`}>
+        <div className="actions">
+          {saved && !dirty && (
+            <span className="success small" role="status">
+              <FormattedMessage id="server.settings.saved" />
+            </span>
+          )}
+          <span className="spacer" />
+          {dirty && (
+            <button type="button" className="secondary" disabled={busy} onClick={discard}>
+              <FormattedMessage id="server.settings.discard" />
+            </button>
+          )}
+          <button type="submit" className="primary" disabled={!dirty || busy || invalid} {...ro}>
+            <FormattedMessage id={busy ? 'server.settings.saving' : 'server.settings.save'} />
+          </button>
+        </div>
+      </div>
+    </form>
   );
-}
+});
 
 function ChannelsPage({ server, onCreate, onEdit }: { server: ServerSummary; onCreate: () => void; onEdit: (c: Channel) => void }) {
   const store = useAppStore();

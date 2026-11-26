@@ -261,7 +261,10 @@ pub(crate) fn socket(port: u16) -> io::Result<tokio::net::UdpSocket> {
 
 /// Reads beacons into `to` (dropped when the node is busy); ends with the
 /// node.
-pub(crate) fn spawn_reader(socket: std::sync::Arc<tokio::net::UdpSocket>, to: tokio::sync::mpsc::Sender<(IpAddr, Vec<u8>)>) {
+pub(crate) fn spawn_reader(
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
+    to: tokio::sync::mpsc::Sender<(IpAddr, Vec<u8>)>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0; PACKET_LEN + 1];
         loop {
@@ -283,7 +286,7 @@ pub(crate) fn spawn_reader(socket: std::sync::Arc<tokio::net::UdpSocket>, to: to
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

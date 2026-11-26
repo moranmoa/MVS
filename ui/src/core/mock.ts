@@ -104,7 +104,7 @@ export interface MockOptions {
   /** Voice rooms (0.4.3): how many live rooms each demo server starts with (default 1; 0 = none; up to 10). */
   voiceRooms?: number;
   /** Member relays: forced off for this reason (under 18, metered, turned off for everyone). */
-  memberRelayReason?: 'minor' | 'metered' | 'global-off';
+  memberRelayReason?: 'minor' | 'metered' | 'on-battery' | 'global-off';
   /** Member relays: the one-time disclosure not seen yet (shows at start for an owner). */
   memberRelayUnseen?: boolean;
   /** Shortly after start: "a new device was added to your account" (label; '' = none). */

@@ -857,6 +857,37 @@ async fn call_participants_exchange_voice_frames_relayed_and_on_a_lan() {
     }
 }
 
+/// QA V3.5: relay-only promises no direct listener, so the LAN beacon's UDP
+/// socket isn't bound at all while it's on (not just silent): asked for
+/// while relay-only, nothing is bound and the port is free; relay-only off
+/// binds it; on again unbinds it and frees the port.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_only_binds_no_lan_beacon_socket() {
+    let relay_key = identity::Keypair::generate_ed25519();
+    let port = free_port();
+    let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", PeerId::from(relay_key.public())).parse().unwrap();
+    let _relay = start_relay(relay_key, port);
+    let (a, _) = node_lan("beacon-ro", &relay, true).await;
+    a.set_relay_only(true).unwrap();
+    let udp = free_udp_port();
+    assert!(a.start_lan_beacon(udp).await.unwrap());
+    assert!(!a.test_beacon_bound().await.unwrap(), "bound while relay-only");
+    let free = || std::net::UdpSocket::bind(("0.0.0.0", udp)).is_ok();
+    assert!(free(), "the beacon port is taken while relay-only");
+
+    a.set_relay_only(false).unwrap();
+    assert!(a.test_beacon_bound().await.unwrap(), "not bound again once relay-only is off");
+
+    a.set_relay_only(true).unwrap();
+    assert!(!a.test_beacon_bound().await.unwrap());
+    let start = Instant::now();
+    while !free() {
+        assert!(start.elapsed() < Duration::from_secs(5), "relay-only on left the beacon port bound");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    a.shutdown().await.unwrap();
+}
+
 /// Relay-only (SL B5): voice stays on our relay's circuit, never direct,
 /// even on one LAN.
 #[tokio::test(flavor = "multi_thread")]

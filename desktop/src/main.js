@@ -180,10 +180,9 @@ function lockPayload() {
 }
 
 /** What the page should be showing for this lock state. */
+const OPEN_QUERY = DEMO ? `?demo=${encodeURIComponent(DEMO)}` : '';
 function pageQuery(st) {
-  if (st.pending) return '?locked=pending';
-  if (st.locked && st.path === 'A') return '?locked';
-  return DEMO ? `?demo=${encodeURIComponent(DEMO)}` : '';
+  return applock.pageQuery(st, OPEN_QUERY);
 }
 
 /** State events the core sent while locked (held.js), latest value each. */
@@ -210,13 +209,12 @@ function onLockChange(st) {
   }
   let reloading = false;
   for (const win of BrowserWindow.getAllWindows()) {
-    const want = pageQuery(st);
     const url = win.webContents.getURL();
-    const has = url.includes('?') ? url.slice(url.indexOf('?')) : '';
     // Path B never reloads (it would end the call); everything else loads
-    // the page for its state, which drops whatever it held in memory.
-    if (!(st.locked && st.path === 'B') && sec.isInternalUrl(url) && has !== want) {
-      win.loadURL(`${sec.ORIGIN}/index.html${want}`);
+    // the page for its state, which drops whatever it held in memory. A first
+    // load still on its way (url '') is checked when it finishes.
+    if (sec.isInternalUrl(url) && applock.wrongPage(url, st, OPEN_QUERY)) {
+      win.loadURL(`${sec.ORIGIN}/index.html${pageQuery(st)}`);
       reloading = true;
     } else if (sec.isInternalUrl(url)) {
       win.webContents.send('core:event', 'lock.state', lockPayload());
@@ -794,6 +792,14 @@ function createWindow() {
   });
   // Every load (a reload too) gets the current core status.
   win.webContents.on('did-finish-load', () => {
+    // QA (voice-e2e, dcc1e48): the lock changed while this load was on its
+    // way (e.g. a slow core's "off" right after the 10 s fail-closed start):
+    // load the page for the lock as it is now, never a stale lock screen.
+    const loaded = win.webContents.getURL();
+    if (sec.isInternalUrl(loaded) && applock.wrongPage(loaded, appLock.state, OPEN_QUERY)) {
+      win.loadURL(`${sec.ORIGIN}/index.html${pageQuery(appLock.state)}`);
+      return;
+    }
     flushLink();
     // The page may have missed earlier changes; the preload keeps this for the UI.
     if (sec.isInternalUrl(win.webContents.getURL())) win.webContents.send('core:event', 'core.status', statusForPage(coreStatus));

@@ -646,7 +646,7 @@ export function cleanMemberRelay(r: unknown): MemberRelay | null {
   if (typeof dailyCapMb !== 'number' || !Number.isInteger(dailyCapMb) || dailyCapMb < MEMBER_RELAY_CAP_MIN_MB || dailyCapMb > MEMBER_RELAY_CAP_MAX_MB) return null;
   if (setting !== 'auto' && setting !== 'on' && setting !== 'off') return null;
   if (typeof effective !== 'boolean' || typeof role !== 'boolean' || typeof disclosureSeen !== 'boolean') return null;
-  const REASONS = ['global-off', 'minor', 'relay-only', 'metered'] as const;
+  const REASONS = ['global-off', 'minor', 'relay-only', 'metered', 'on-battery'] as const;
   const why = REASONS.find((x) => x === reason);
   if (reason !== undefined && reason !== null && !why) return null;
   // A reason means off, whatever the setting.

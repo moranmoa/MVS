@@ -359,6 +359,7 @@ one).
 | ID | Pri | Gate | Steps | Expected | How |
 | --- | --- | --- | --- | --- | --- |
 | VC-ECHO-01 | 1 | 0.5 release gate: per-person volume vs echo (#440) | Two people on **two machines, both on speakers** (no headsets), in one voice room, in separate rooms of the house. Each talks for 30 s at 100%. Then on machine 1 raise person 2's volume to **200%**; person 2 talks and stays silent in turns for 60 s. Repeat the other way. | At the far end (person 2) there is no echo of their own voice and no feedback howl at 200%, and no worse echo than at 100%. Echo cancellation still works with the Web Audio gain in the path. Record: OS, speakers, what was heard. | Manual, two people. Not automatable (needs real speakers and microphones). |
+| LOCK-EV-01 | 1 | 0.6.0 pass: LR-1 path B (fix #624) | In a voice call, **lock the app** (path B: the call keeps going, mic muted). While it's locked, change state that the page shows: e.g. the owner **kicks** this account, or a member's version makes #604's "update needed" line appear. Then **unlock**. | Right after unlocking, **without a page reload**, the page shows the new state: the #604 line, or the kicked server's notice. No stale view until a restart. | Manual, two machines (owner + member). The path-A side (no call) is covered by qa/voice-e2e MR.1: the member-relay disclosure must show within 15 s of the core saying it's due. |
 
 ## מה כבר אוטומטי ואיך מריצים
 

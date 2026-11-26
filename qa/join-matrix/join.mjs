@@ -98,7 +98,11 @@ try {
         await call('sendMessage', { channelId: channel, body: 'hello from the owner' });
         // The words cross only through the run's private rendezvous folder.
         put(`ready-${r}`, { link: s.inviteLink, words, ownerId: (await call('getIdentity')).id });
-        const done = await take(`done-${r}`, JOIN_TIMEOUT + 60_000).catch((e) => ({ error: e.message }));
+        // Sent once the joiner is in: this one it must get (the one above
+        // predates its join, so it can't open it: GAP-8, by design).
+        const joined = await take(`joined-${r}`, JOIN_TIMEOUT + 30_000).catch(() => null);
+        if (joined) await call('sendMessage', { channelId: channel, body: 'hello after the join' });
+        const done = await take(`done-${r}`, JOIN_TIMEOUT + 150_000).catch((e) => ({ error: e.message }));
         log(`round ${r}: joiner reports:`, JSON.stringify(done));
         if (r === ROUNDS) log('members now:', JSON.stringify((await call('listMembers', { serverId: s.id })).map((m) => m.displayName || m.id.slice(0, 8))));
       }
@@ -128,17 +132,26 @@ try {
     if (server) {
       const s = ((Date.now() - started) / 1000).toFixed(1);
       const channel = (await call('listChannels', { serverId: server.id }))[0].id;
-      let history = [];
-      for (let i = 0; i < 20 && !history.length; i++) {
-        const n = await call('getMessageCount', { channelId: channel });
-        history = n ? (await call('getMessages', { channelId: channel, start: 0, end: n })).messages.map((m) => m.body) : [];
-        if (!history.length) await sleep(500);
-      }
+      put(`joined-${r}`);
       const sent = await call('sendMessage', { channelId: channel, body: 'hello from the joiner' }).then(
         () => 'ok',
         (e) => e.message,
       );
-      result = `round ${r}: JOINED in ${s} s; owner's message ${history.includes('hello from the owner') ? 'received' : 'NOT received'}; send ${sent}`;
+      // The owner's message from before the invite stays unreadable to a
+      // joiner (GAP-8, by design); the one sent after the join must arrive.
+      const bodies = async () => {
+        const n = await call('getMessageCount', { channelId: channel }).catch(() => 0);
+        return n ? (await call('getMessages', { channelId: channel, start: 0, end: n })).messages.map((m) => m.body) : [];
+      };
+      const from = Date.now();
+      let got = await bodies();
+      while (!got.includes('hello after the join') && Date.now() - from < 120_000) {
+        await sleep(1000);
+        got = await bodies();
+      }
+      const after = got.includes('hello after the join') ? `received (${((Date.now() - from) / 1000).toFixed(1)} s)` : 'NOT received in 120 s';
+      const before = got.includes('hello from the owner') ? 'shown (unexpected: GAP-8 says it cannot be opened)' : 'not shown (as designed)';
+      result = `round ${r}: JOINED in ${s} s; owner's message after the join ${after}; from before the invite ${before}; send ${sent}`;
     } else {
       await call('cancelJoin', { link }).catch(() => {});
       result = `round ${r}: HANG: not joined after ${JOIN_TIMEOUT / 1000} s`;

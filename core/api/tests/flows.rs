@@ -6473,9 +6473,7 @@ fn diagnostics_carry_only_counts_and_rounded_fields() {
     assert_eq!(v["storageBytes"].as_u64().unwrap() % (1024 * 1024), 0, "to the MiB");
     assert_eq!(v["network"]["reachability"], "unknown", "nothing reported yet");
     for purpose in api::netdiag::PURPOSES {
-        for path in api::netdiag::PATHS {
-            assert_eq!(v["network"]["connections"][purpose][path], 0);
-        }
+        assert_eq!(v["network"]["connections"][purpose], serde_json::json!({ "total": "0" }), "a bucket, no counts");
     }
     assert!(!report.contains(&me.id) && !report.contains(&me.short_code) && !report.contains("Tester"), "{report}");
 }

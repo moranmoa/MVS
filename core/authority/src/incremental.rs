@@ -151,6 +151,8 @@ pub struct Resolver {
     /// A record couldn't be applied incrementally; re-resolve once the
     /// current arrival and the records it unblocked have joined.
     stale: Option<Fallback>,
+    /// G-52: any `ServerAgeLimit` joined; age claims then re-resolve.
+    age_limit_seen: bool,
     stats: Stats,
 }
 
@@ -193,6 +195,7 @@ impl Resolver {
             unsettled: HashMap::new(),
             owner_unsettled: false,
             stale: None,
+            age_limit_seen: false,
             stats: Stats::default(),
         }
     }
@@ -336,6 +339,7 @@ impl Resolver {
             let edits = &mut self.server_edits;
             edits.insert(edits.partition_point(|other| pos[other] < at), id);
         }
+        self.age_limit_seen |= matches!(action, Some(Action::ServerAgeLimit { .. }));
         self.actions.insert(id, action);
 
         self.stats.joined += 1;
@@ -453,6 +457,10 @@ impl Resolver {
                 self.refresh_server_name();
                 return Ok(());
             }
+            // G-52: an 18+ limit counts only from an adult owner, and a later
+            // age claim can land before it in linear order: re-resolve both.
+            Action::ServerAgeLimit { .. } => return Err(Fallback::Other),
+            Action::AgeClaim { .. } if self.age_limit_seen => return Err(Fallback::Other),
             Action::AgeClaim { .. } => {
                 // Changes no roles; whether it counts depends on the author's
                 // membership, which must be the same in every pass.
@@ -950,6 +958,10 @@ impl Resolver {
                     self.refresh_channel(channel);
                 }
                 // The author's membership changed under it.
+                // G-52: whether an age limit counts depends on the owner's age
+                // claims at its position: re-resolve.
+                Action::ServerAgeLimit { .. } => return Err(Fallback::Other),
+                Action::AgeClaim { .. } if self.age_limit_seen => return Err(Fallback::Other),
                 Action::AgeClaim { .. } => {
                     if now {
                         self.state.accepted.insert(id);
@@ -1228,6 +1240,22 @@ impl View for AtPosition<'_> {
 
     fn has_channels(&self) -> bool {
         self.resolver.first_create(self.at).is_some()
+    }
+
+    /// The actor's latest accepted age claim before this position.
+    fn is_adult(&self, actor: Actor) -> bool {
+        let r = self.resolver;
+        let latest = r.touch.get(&actor).into_iter().flatten().rev().find_map(|id| {
+            let before = r.pos.get(id).is_some_and(|pos| *pos < self.at);
+            if !before || r.known[id].author() != actor || !r.state.accepted.contains(id) {
+                return None;
+            }
+            match r.actions[id] {
+                Some(Action::AgeClaim { adult }) => Some(adult),
+                _ => None,
+            }
+        });
+        latest == Some(true)
     }
 
     fn owner(&self) -> Option<Actor> {

@@ -379,6 +379,10 @@ struct Inner {
     calls: voice::Calls,
     /// G-29: who is typing, what I sent, the replay cache. Never stored.
     typing: typing::Typing,
+    /// A required update (RU1): `Some` once an accepted manifest revoked
+    /// this version, for the rest of the process. Inside, the newer version
+    /// on offer. While set, the core signs nothing and syncs nothing.
+    update_required: Option<Option<String>>,
     /// G-48: delivers report boxes (sync); `None` without a network.
     report_net: Option<Arc<dyn crate::report::ReportNet>>,
     /// Messages written before their channel key reached me (a member who
@@ -662,6 +666,7 @@ impl Core {
             join_waiting: BTreeSet::new(),
             calls: voice::Calls::default(),
             typing: typing::Typing::default(),
+            update_required: None,
             report_net: None,
             key_pending: Vec::new(),
             join_key_wait: HashMap::new(),
@@ -1346,6 +1351,8 @@ impl Core {
         age_restriction: AgeRestriction,
     ) -> CoreResult<ServerSummary> {
         self.run(|inner, ports, events| {
+            // RU1: a genesis is signed here, not through `publish_control`.
+            inner.may_sign()?;
             let me = inner.me.as_ref().ok_or(ErrorCode::NotFound)?;
             inner.vault.require_recovery_check(&me.identity).map_err(vault_error)?;
             let name = name.trim();
@@ -2474,6 +2481,8 @@ impl Core {
             return Err(ErrorCode::BadRequest.into());
         }
         let message = self.run(|inner, ports, events| {
+            // RU1: refused before anything else, nothing sealed or signed.
+            inner.may_sign()?;
             let (server, channel) = inner.find_channel(channel_id)?;
             // G-29: a send ends my typing there (`off` once, if `on` went out).
             let stop = inner.typing.stopped(channel);
@@ -2759,6 +2768,11 @@ impl Core {
     /// network and reports what changed. TODO(sync): driven by the sync
     /// crate's push and pull instead of a command.
     pub fn sync_now(&self) -> CoreResult<()> {
+        // RU1: no sync at all while a required update is pending: nothing
+        // fetched, nothing published, no re-key, rotation or re-join.
+        if self.lock().update_required.is_some() {
+            return Ok(());
+        }
         self.announce_device_notices();
         // Device link, the new device: its link moves on even before sign-in.
         self.poll_device_link();
@@ -3077,7 +3091,9 @@ impl Core {
             _ => UpdateChannel::Stable,
         };
         let relay_only = relay_only_in(&self.lock().db)?;
-        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only })
+        let update_required =
+            self.lock().update_required.clone().map(|version| UpdateRequired { version });
+        Ok(AppInfo { version: self.app_version.clone(), update_channel: channel, relay_only, update_required })
     }
 
     /// `setRelayOnly(on)` (GAP-6r): stored, then applied to the network. On
@@ -3429,6 +3445,9 @@ impl Core {
     /// it the update commands answer `not-implemented` and no check runs.
     pub fn with_updates(mut self, updates: Updates) -> Core {
         self.updates = Some(Arc::new(updates));
+        // A required update survives a restart (`policy.json`): RU1 holds
+        // from the first moment, before any sync round.
+        self.refresh_required();
         self
     }
 
@@ -3450,12 +3469,16 @@ impl Core {
 
     /// `checkForUpdate` (main/core only, A2).
     pub fn check_for_update(&self) -> CoreResult<serde_json::Value> {
-        self.updates()?.check(self.ui_channel()?, self.now_secs())
+        let checked = self.updates()?.check(self.ui_channel()?, self.now_secs());
+        self.refresh_required();
+        checked
     }
 
     /// `downloadUpdate` (main/core only): emits `update.ready` once staged.
     pub fn download_update(&self) -> CoreResult<serde_json::Value> {
-        let outcome = self.updates()?.download(self.ui_channel()?, self.now_secs())?;
+        let outcome = self.updates()?.download(self.ui_channel()?, self.now_secs());
+        self.refresh_required();
+        let outcome = outcome?;
         self.emit_update(outcome.events);
         Ok(outcome.ok)
     }
@@ -3490,6 +3513,7 @@ impl Core {
         loop {
             if let Ok(channel) = self.ui_channel() {
                 self.emit_update(updates.background_round(channel, self.now_secs()));
+                self.refresh_required();
                 // Slice 3b: the owner's signed global switch, fetched with the
                 // check. Kept in kv; only this path writes it.
                 let off = updates.member_relay_off(channel);
@@ -3506,7 +3530,10 @@ impl Core {
                 }
                 self.emit(events);
             }
-            if !updates.wait(crate::update::next_interval()) {
+            // While required: check again every 15 minutes, not hourly.
+            let required = self.lock().update_required.is_some();
+            let wait = if required { REQUIRED_RECHECK } else { crate::update::next_interval() };
+            if !updates.wait(wait) {
                 return;
             }
         }
@@ -3615,6 +3642,8 @@ impl Inner {
     /// turning 18 with the date my claims came from (`birth_date_trusted`:
     /// set at sign-up here) is just a birthday, with no wait.
     fn age_claim(&mut self, ports: &Ports, server: ServerId) -> CoreResult<Option<Record>> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let now = ports.clock.now_ms();
         self.settle_birth_date(now)?;
         let mut trust = false;
@@ -4961,6 +4990,8 @@ impl Inner {
         members: &BTreeSet<PublicKey>,
         auth_deps: &[RecordId],
     ) -> CoreResult<()> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let cipher = &*ports.cipher;
         let parts = cipher.rotate(server, channel, members).map_err(cipher_error)?;
         let key = self.me.as_ref().ok_or(ErrorCode::NotFound)?.key();
@@ -5114,6 +5145,8 @@ impl Inner {
         kind: Kind,
         body: Vec<u8>,
     ) -> CoreResult<Record> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         Draft { server, scope: Scope::Channel(channel), seq, deps, auth_deps, ts, kind, body }
             .sign(me.identity.signing_key())
@@ -5386,6 +5419,8 @@ impl Inner {
         server: ServerId,
         action: &Action,
     ) -> CoreResult<Record> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let view = self.view(server)?;
         // A revoke-invite lists its invite in its deps.
@@ -5823,6 +5858,8 @@ impl Inner {
         fetched: Vec<Record>,
         events: &mut Events,
     ) -> CoreResult<JoinStatus> {
+        // RU1: nothing signed while a required update is pending.
+        self.may_sign()?;
         let me = self.me.as_ref().ok_or(ErrorCode::NotFound)?;
         let link = link.to_owned();
         let server_hex = model::hex_id(server.as_bytes());
@@ -6674,6 +6711,11 @@ impl Core {
     /// is the reported member, or whose server I left is dropped, and so
     /// are rows older than 30 days. Delivery runs without the lock.
     pub fn report_tick(&self) {
+        // RU1: the network is quiet while a required update is pending; the
+        // rows stay and go out once the newer version runs.
+        if self.lock().update_required.is_some() {
+            return;
+        }
         let Ok((net, due)) = self.run(|inner, ports, _| {
             inner.prune_reports(ports.clock.now_ms())?;
             let outbox: Vec<OutRow> = inner.kv_json(KV_REPORT_OUTBOX)?.unwrap_or_default();
@@ -7109,5 +7151,52 @@ mod birth_date_tests {
     fn an_old_pending_reads_as_the_restore_form() {
         let old: PendingBirth = serde_json::from_str(r#"{"date":"1990-01-01","effectiveAt":5}"#).unwrap();
         assert!(!old.correction && !old.capped);
+    }
+}
+
+// ---- Required updates (docs/design/required-update.md) ----------------------
+//
+// An accepted signed manifest that revokes this version makes an update
+// required. The core then (RU1, the security lead's condition) signs nothing
+// on its own and syncs nothing, for the rest of the process: every signing
+// path checks `may_sign`, the sync round does nothing, and the network goes
+// quiet. Update checks and downloads (HTTPS, not the P2P network) go on, at
+// once and then every 15 minutes.
+
+/// Between update checks while an update is required ("not available yet"
+/// keeps checking).
+pub const REQUIRED_RECHECK: Duration = Duration::from_secs(15 * 60);
+
+impl Inner {
+    /// RU1: `update-required` while a required update is pending.
+    fn may_sign(&self) -> CoreResult<()> {
+        match self.update_required {
+            Some(_) => Err(ErrorCode::UpdateRequired.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Core {
+    /// Reads the updater's verdict and applies it. Turning on (or a newer
+    /// version on offer) emits `update.required`, quiets the network and
+    /// wakes the update loop so the download starts at once. Never turns
+    /// off within a process: only a restart into a version that isn't
+    /// revoked clears it.
+    fn refresh_required(&self) {
+        let Some(updates) = &self.updates else { return };
+        let Ok(channel) = self.ui_channel() else { return };
+        let Some(now) = updates.required(channel) else { return };
+        let changed = {
+            let mut inner = self.lock();
+            let changed = inner.update_required.as_ref() != Some(&now);
+            inner.update_required = Some(now.clone());
+            changed
+        };
+        if changed {
+            self.ports.network.set_quiet();
+            updates.wake();
+            self.emit(vec![Event::UpdateRequired(UpdateRequired { version: now })]);
+        }
     }
 }

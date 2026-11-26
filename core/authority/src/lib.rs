@@ -206,6 +206,14 @@ pub enum Action {
         parts: u8,
         sealed: Vec<u8>,
     },
+    /// G-52: the owner changes the server's age limit. Body: `min u8`, one
+    /// of 0, 16 and 18; anything else doesn't parse. 18 only from an owner
+    /// whose latest accepted age claim at the record says 18+ (PO on #512).
+    /// Privileged. `State::age_limit` is the latest accepted in linear
+    /// order; `State::age_raise` the latest that raised it to 18.
+    ServerAgeLimit {
+        min: u8,
+    },
     /// A member other than the owner leaves the server. It ends their role
     /// and membership; unlike a kick, they may join again. Body: a cut.
     Leave {
@@ -247,6 +255,7 @@ impl Action {
             Action::ServerIcon { .. } => Kind::ServerIcon,
             Action::ServerDescription { .. } => Kind::ServerDescription,
             Action::SecretRotation { .. } => Kind::SecretRotation,
+            Action::ServerAgeLimit { .. } => Kind::ServerAgeLimit,
             Action::Leave { .. } => Kind::Leave,
             Action::ServerClose => Kind::ServerClose,
         }
@@ -297,6 +306,7 @@ impl Action {
             Action::SecretRotation { rotation, part, parts, sealed } => {
                 [rotation.as_bytes().as_slice(), &[*part, *parts], sealed].concat()
             }
+            Action::ServerAgeLimit { min } => vec![*min],
             Action::Leave { cut } => {
                 let mut body = Vec::new();
                 cut.encode(&mut body);
@@ -424,6 +434,10 @@ impl Action {
                     sealed: sealed.to_vec(),
                 })
             }
+            Kind::ServerAgeLimit => match body {
+                [min @ (0 | 16 | 18)] => Some(Action::ServerAgeLimit { min: *min }),
+                _ => None,
+            },
             Kind::Leave => Some(Action::Leave { cut: Cut::parse(body)? }),
             Kind::ServerClose => body.is_empty().then_some(Action::ServerClose),
             // Channel kinds are judged by the channel checks (B4-4).
@@ -456,6 +470,7 @@ impl Action {
             | Action::ServerIcon { .. }
             | Action::ServerDescription { .. }
             | Action::SecretRotation { .. }
+            | Action::ServerAgeLimit { .. }
             | Action::Leave { .. }
             | Action::ServerClose => None,
         }
@@ -504,6 +519,7 @@ impl Action {
                     | Action::ServerIcon { .. }
                     | Action::ServerDescription { .. }
                     | Action::SecretRotation { .. }
+                    | Action::ServerAgeLimit { .. }
                     | Action::ServerClose
             )
     }
@@ -946,6 +962,14 @@ pub struct State {
     pub server_description: Option<String>,
     /// T17: accepted `SecretRotation` parts, in linear order.
     pub secret_rotations: Vec<RecordId>,
+    /// G-52: the latest accepted age limit in linear order (0, 16 or 18);
+    /// `None` keeps the genesis value.
+    pub age_limit: Option<u8>,
+    /// G-52: the latest accepted change that raised the limit to 18 from
+    /// anything else (the genesis value counts as not 18 here). `core/api`
+    /// requires an 18+ server's channel records to reach the later of this
+    /// and the channel's own 18+ edit (Security Lead on #590).
+    pub age_raise: Option<RecordId>,
     /// The latest accepted rename in linear order; `None` keeps the genesis
     /// name.
     pub server_name: Option<String>,
@@ -1006,6 +1030,8 @@ trait View {
     /// Whether any channel has been created at this point. A server without
     /// channel records (made before #113) keeps a derived #general.
     fn has_channels(&self) -> bool;
+    /// G-52: the actor's latest accepted age claim at this point says 18+.
+    fn is_adult(&self, actor: Actor) -> bool;
 
     fn role_of(&self, actor: Actor) -> Role {
         if self.owner() == Some(actor) {
@@ -1051,6 +1077,10 @@ impl View for State {
 
     fn has_channels(&self) -> bool {
         !self.channels.is_empty() || !self.deleted_channels.is_empty()
+    }
+
+    fn is_adult(&self, actor: Actor) -> bool {
+        self.adults.contains(&actor)
     }
 }
 
@@ -1143,6 +1173,8 @@ fn permitted(view: &impl View, record: &Record, action: &Action) -> bool {
         }
         // T17: who may rotate a channel key may rotate the server secret.
         Action::SecretRotation { .. } => author_role >= Role::Moderator && view.is_member(author),
+        // G-52: the owner alone; 18+ only from an adult owner (PO on #512).
+        Action::ServerAgeLimit { min } => author_role == Role::Owner && (*min < 18 || view.is_adult(author)),
         // A member leaves, but the owner can't (no ownership transfer in v1),
         // and a kicked key can't (refused above), so a ban survives.
         Action::Leave { .. } => view.is_member(author) && author_role != Role::Owner,
@@ -1219,6 +1251,7 @@ fn apply(state: &mut State, record: &Record, action: &Action) -> Option<(Actor, 
         | Action::ServerIcon { .. }
         | Action::ServerDescription { .. }
         | Action::SecretRotation { .. }
+        | Action::ServerAgeLimit { .. }
         | Action::ServerClose => None,
     }
 }
@@ -1234,6 +1267,12 @@ fn apply_server(state: &mut State, record: &Record, action: &Action) {
         }
         Action::ServerClose => state.closed = Some(record.id()),
         Action::SecretRotation { .. } => state.secret_rotations.push(record.id()),
+        Action::ServerAgeLimit { min } => {
+            if *min == 18 && state.age_limit != Some(18) {
+                state.age_raise = Some(record.id());
+            }
+            state.age_limit = Some(*min);
+        }
         _ => {}
     }
 }
@@ -1618,6 +1657,7 @@ impl<'a> Graph<'a> {
                 | Action::ServerIcon { .. }
                 | Action::ServerDescription { .. }
                 | Action::SecretRotation { .. }
+                | Action::ServerAgeLimit { .. }
                 | Action::ServerClose => continue,
                 Action::RevokeInvite { invite } => {
                     pass.voided.extend(self.voids_of(i));

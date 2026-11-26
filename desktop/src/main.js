@@ -30,6 +30,7 @@ const badge = require('./badge');
 const applock = require('./applock');
 const demo = require('./demo');
 const voiceframe = require('./voiceframe');
+const held = require('./held');
 
 /** T8-04: the mock demo (MVS_DEMO), checkout only; null otherwise. */
 const DEMO = demo.demoFor({ packaged: app.isPackaged, env: process.env });
@@ -183,6 +184,14 @@ function pageQuery(st) {
   return DEMO ? `?demo=${encodeURIComponent(DEMO)}` : '';
 }
 
+/** State events the core sent while locked (held.js), latest value each. */
+const heldEvents = held.createHeldEvents();
+/** Hands them to the page, once it is open. */
+function deliverHeld() {
+  if (!lockOpen()) return;
+  for (const [name, payload] of heldEvents.take()) toPages(name, payload);
+}
+
 function onLockChange(st) {
   const prev = lastLock;
   lastLock = st;
@@ -197,6 +206,7 @@ function onLockChange(st) {
       core?.request('setMuted', { muted: true }).catch(() => {});
     }
   }
+  let reloading = false;
   for (const win of BrowserWindow.getAllWindows()) {
     const want = pageQuery(st);
     const url = win.webContents.getURL();
@@ -205,11 +215,15 @@ function onLockChange(st) {
     // the page for its state, which drops whatever it held in memory.
     if (!(st.locked && st.path === 'B') && sec.isInternalUrl(url) && has !== want) {
       win.loadURL(`${sec.ORIGIN}/index.html${want}`);
+      reloading = true;
     } else if (sec.isInternalUrl(url)) {
       win.webContents.send('core:event', 'lock.state', lockPayload());
     }
   }
   if (lockOpen()) {
+    // QA MR.1: state events kept while locked. Path A's reload delivers them
+    // on did-finish-load; path B (no reload) now.
+    if (!reloading) deliverHeld();
     syncCall();
     // Path B unlock has no reload: hand over a held invite now (path A's
     // reload does it on did-finish-load).
@@ -328,6 +342,8 @@ function startCore() {
       callGate.onEvent(name, payload);
       syncCall();
       if (appLock.forwards(name)) toPages(name, payload);
+      // Locked: keep the latest value of a state event for after unlock (QA MR.1).
+      else heldEvents.hold(name, payload);
     },
     onStatus: setCoreStatus,
     // stderr only (counts and error kinds); stdout is never logged.
@@ -777,6 +793,8 @@ function createWindow() {
     // Required updates (#577, TL): every load (cold start, reload, the lock's
     // reload) gets the gate's state, so the banner never goes missing.
     if (sec.isInternalUrl(win.webContents.getURL()) && requiredGate.state.required) win.webContents.send('core:event', 'update.gate', requiredGate.state);
+    // QA MR.1: state events held while locked, now that an open page is loaded.
+    deliverHeld();
     // Commit this version once the UI is up and the core answers (main only, once).
     if (!healthReported) {
       healthReported = true;

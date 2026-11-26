@@ -72,6 +72,23 @@ describe('ipc core', () => {
     expect(invites).toEqual([{ link: 'mvs://join/x' }]);
   });
 
+  it('QA MR.1: gives the latest memberRelay.changed to a listener that comes late', async () => {
+    const { bridge, emit } = fakeBridge(() => ({ ok: null }));
+    const core = createIpcCore(bridge);
+    emit('memberRelay.changed', { effective: false });
+    emit('memberRelay.changed', { effective: true });
+    const seen: unknown[] = [];
+    core.on('memberRelay.changed' as never, (p: unknown) => seen.push(p));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seen).toEqual([{ effective: true }]);
+    // Content events are not replayed.
+    emit('message.new', { id: 'm1' });
+    const late: unknown[] = [];
+    core.on('message.new' as never, (p: unknown) => late.push(p));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(late).toEqual([]);
+  });
+
   it('gives the latest core.status to every listener, also ones that come late (T8-01)', async () => {
     const { bridge, emit } = fakeBridge(() => ({ ok: null }));
     const core = createIpcCore(bridge);

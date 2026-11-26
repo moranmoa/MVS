@@ -108,7 +108,7 @@ export type UpdateNote =
 export interface StoreState {
   identity: Identity | null;
   /** A server left this device (left, closed and purged, or a kick): its name, for a toast. */
-  serverGone: { name: string; reason: 'left' | 'closed' | 'kicked'; at: number } | null;
+  serverGone: { name: string; reason: 'left' | 'closed' | 'kicked' | 'age'; at: number } | null;
   /** Muted servers and channels on this device (G-03, G-17), by mute key; see app/mute.ts. */
   mutes: Mutes;
   servers: ServerSummary[];

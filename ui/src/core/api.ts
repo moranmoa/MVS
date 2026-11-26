@@ -296,7 +296,7 @@ export interface CoreEvents {
   'server.added': ServerSummary;
   'server.updated': ServerSummary;
   /** `reason` is absent for a kick. */
-  'server.removed': { serverId: Id; reason?: 'left' | 'closed' };
+  'server.removed': { serverId: Id; reason?: 'left' | 'closed' | 'age' };
   /** The owner closed it: it stays listed, read-only (`ServerSummary.closed`). */
   'server.closed': { serverId: Id };
   'channel.updated': Channel;

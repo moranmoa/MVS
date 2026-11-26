@@ -144,3 +144,36 @@ describe('G-52: the affected count (core #590)', () => {
     await expect(core.countAgeAffected(other.id, '18+')).rejects.toMatchObject({ code: 'not-allowed' });
   });
 });
+
+describe('G-52 (core #616): staff see who has no 18+ claim; a minor is told', () => {
+  it('after raising to 18+, members without a claim are tagged for the owner, in the row name too', async () => {
+    const { core, server } = await openGeneral();
+    await act(async () => {
+      await core.setAgeRestriction(server.id, '18+');
+    });
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    const list = screen.getByRole('complementary', { name: 'Server members' });
+    const tagged = await within(list).findAllByRole('button', { name: /No 18\+ confirmation/ });
+    expect(tagged.length).toBeGreaterThan(0);
+    expect(within(tagged[0]!).getByText('No 18+ confirmation').getAttribute('title')).toBe(
+      'This account has no 18+ age confirmation. In an 18+ server you can remove it.',
+    );
+  });
+
+  it('the sanitizer keeps notAdult only when it is exactly true', async () => {
+    const { cleanMember } = await import('../core/sanitize');
+    const base = { id: 'u', serverId: 's', displayName: 'A', shortCode: 'AAAA-BBBB', avatarColor: '#445566', presence: 'offline' as const, isOwner: false };
+    expect(cleanMember({ ...base, notAdult: true })).toHaveProperty('notAdult', true);
+    expect(cleanMember({ ...base, notAdult: 'yes' } as never)).not.toHaveProperty('notAdult');
+  });
+
+  it("a minor removed by a raise is told why (server.removed reason 'age')", async () => {
+    const core = new MockCore({ demo: true, speed: 0, simulateActivity: false });
+    render(<App core={core} initialSettings={en} />);
+    await screen.findByRole('textbox', { name: /^Message / });
+    await act(async () => {});
+    const server = (await core.listServers())[1]!;
+    await act(async () => (core as unknown as { emit: (e: string, p: unknown) => void }).emit('server.removed', { serverId: server.id, reason: 'age' }));
+    expect(await screen.findByText(`\u2068${server.name}\u2069 is now limited to 18 and over, so it's no longer available to you.`)).toBeTruthy();
+  });
+});

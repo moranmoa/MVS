@@ -39,6 +39,16 @@ export function lookalikeIds(members: Member[]): Set<string> {
   return out;
 }
 
+/** G-52 (UX): staff only (the core sends notAdult only to the owner and admins). */
+export function NotAdultTag() {
+  const intl = useIntl();
+  return (
+    <span className="lookalike-tag" title={intl.formatMessage({ id: 'members.notAdultHint' })}>
+      <FormattedMessage id="members.notAdult" />
+    </span>
+  );
+}
+
 export function LookalikeTag() {
   const intl = useIntl();
   return (
@@ -158,6 +168,7 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
                 aria-label={[
                   intl.formatMessage({ id: 'members.open' }, { name: displayName(m) }),
                   m.connection ? intl.formatMessage({ id: `connection.${m.connection}` }) : null,
+                  m.notAdult ? intl.formatMessage({ id: 'members.notAdult' }) : null,
                 ]
                   .filter(Boolean)
                   .join(', ')}
@@ -171,6 +182,7 @@ export function MemberList({ server, onClose }: { server: ServerSummary; onClose
                   </span>
                 )}
                 {flagged.has(m.id) && <LookalikeTag />}
+                {m.notAdult && <NotAdultTag />}
                 {m.isOwner && (
                   <span className="owner-tag" title={intl.formatMessage({ id: 'members.owner' })}>
                     <FormattedMessage id="members.owner" />

@@ -1249,6 +1249,15 @@ export class MockCore implements CoreApi {
     this.lifecycleGate(s);
     await this.wait(150);
     s.summary = { ...s.summary, ageRestriction };
+    // G-52: at 18+ the owner sees who has no 18+ claim (every third other member, as countAgeAffected).
+    const me = this.identity?.id;
+    let i = 0;
+    s.members = s.members.map((m) => {
+      const { notAdult: _, ...rest } = m;
+      if (m.id === me || ageRestriction !== '18+') return rest;
+      return i++ % 3 === 0 ? { ...rest, notAdult: true as const } : rest;
+    });
+    this.emit('members.changed', { serverId, members: s.members });
     this.emit('server.updated', s.summary);
     return s.summary;
   }

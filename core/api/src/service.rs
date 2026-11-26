@@ -701,6 +701,9 @@ impl Core {
     /// secret and every channel key, and we leave any call. TODO(app lock):
     /// the commands.
     pub fn lock_keys(&self) {
+        // G-81 (SL on #556): the frame gate shuts first, whatever leaving
+        // the call does, and stays shut until unlock.
+        self.media.shut();
         let _ = self.leave_call();
         // Messages held for a key: their text is dropped (zeroized) at lock
         // and sign-out, never kept past them (lost-message P1, SL C3). Each
@@ -768,6 +771,8 @@ impl Core {
                 None => return Err(ErrorCode::BadRequest.into()),
             }
         }
+        // G-81 (SL on #556): the frame gate shuts first, for good.
+        self.media.shut();
         let _ = self.leave_call();
         self.pending_joins.lock().expect("not poisoned").clear();
         let mut inner = self.lock();
@@ -826,6 +831,10 @@ impl Core {
     pub fn unlock_keys(&self) {
         self.keys_locked.store(false, Ordering::SeqCst);
         unlock_cipher(&self.ports, self.lock().me.as_ref());
+        // Never reopened while a required update holds (RU1).
+        if self.lock().update_required.is_none() {
+            self.media.unshut();
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -7117,6 +7126,8 @@ impl Core {
             changed
         };
         if changed {
+            // RU1: no voice frames either (SL on #556).
+            self.media.shut();
             self.ports.network.set_quiet();
             updates.wake();
             self.emit(vec![Event::UpdateRequired(UpdateRequired { version: now })]);

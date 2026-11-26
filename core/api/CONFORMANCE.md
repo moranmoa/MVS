@@ -425,7 +425,8 @@ Each difference keeps a scenario Rust-only. Fix the mock, then add `"mock"`.
       - The sidecar's reader routes it on an exact `cmd` match only (`VoiceFrame` or `voiceFrame ` are ordinary commands, so they get `bad-request`). It never waits for a command, and replies to commands keep their order.
       - Strict: exactly those four fields. `callId` is 32 lower-case hex, `seq` and `ts` are u32, and `data` is standard base64 of at most 400 bytes (empty means a DTX gap); the length is checked before decoding.
       - It's sent only while I'm in the call with that `callId`, the keys aren't locked and I'm not signed out. Anything else is dropped silently, counted, and never logged.
-      - The gate closes synchronously on leave, lock, a relay-only switch and sign-out, before the node is told. So a frame that overtakes `leaveCall`, or comes after it, sends nothing.
+      - The gate closes synchronously on leave and on a relay-only switch without `--voice-p2p`, before the node is told. So a frame that overtakes `leaveCall`, or comes after it, sends nothing.
+      - Lock, sign-out and a required update (RU1) shut it first and unconditionally, whether or not leaving the call succeeds. Until unlock, no frame passes either way and no call reopens it; after sign-out or RU1, not for the rest of the process.
     - `voice.frame { callId, from, seq, ts, data }`: a frame from a participant of my current call (`data` as above). Frames of any other call are dropped.
     - `mvs-core --voice-p2p` (no value; the shell's `voiceP2p` flag): while relay-only is on, `createVoiceRoom` and `joinCall` work, and switching relay-only on doesn't end my call. Media then runs over our relay circuits only, never direct or through a member relay. Without the flag, relay-only refuses calls as below.
 - Relay-only (GAP-6r), per device:

@@ -3047,6 +3047,35 @@ fn leave_then_frame_sends_nothing() {
     owner.core.leave_call().unwrap();
 }
 
+/// SL on #556: the app lock shuts the frame gate first, whatever leaving
+/// the call does: a frame of the call is dropped and the node has no call.
+/// Unlocked, a new call opens it again.
+#[test]
+fn the_app_lock_shuts_the_frame_gate() {
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let server = owner.core.create_server("Talk", AgeRestriction::None).unwrap();
+    hub.connect(&owner, &owner_id);
+    let frames = owner.core.voice_frames();
+    let frame = |call: &str| serde_json::json!({ "callId": call, "seq": 1, "ts": 960, "data": "AQID" });
+
+    let call = owner.core.create_voice_room(&server.id).unwrap().call_id.unwrap();
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+    owner.core.lock_keys();
+    assert!(hub.media_calls.lock().unwrap().last().is_some_and(Option::is_none), "the node still has the call");
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1, "a frame went out while locked");
+
+    owner.core.unlock_keys();
+    let again = owner.core.create_voice_room(&server.id).unwrap().call_id.unwrap();
+    frames.take(Some(&frame(&again)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 2);
+    owner.core.leave_call().unwrap();
+}
+
 /// G-81 2a part c (TL): with `--voice-p2p`, a relay-only user can create
 /// and join calls (over our circuits only: the node's call, here); without
 /// it, calls stay refused while relay-only.

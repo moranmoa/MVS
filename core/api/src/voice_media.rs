@@ -33,9 +33,26 @@ pub(crate) struct MediaGate {
     call: Mutex<Option<[u8; 16]>>,
     net: Mutex<Option<Arc<dyn VoiceNet>>>,
     dropped: AtomicU64,
+    /// Locked, signed out or a required update (SL on #556): no frame
+    /// passes and no call reopens the gate, whatever `apply` is given,
+    /// until [`Self::unshut`] (unlock).
+    shut: std::sync::atomic::AtomicBool,
 }
 
 impl MediaGate {
+    /// Lock, sign-out, RU1: closes the gate first and for good (until
+    /// unlock), and tells the node there's no call. Unconditional: it
+    /// doesn't depend on leaving the call succeeding.
+    pub fn shut(&self) {
+        self.shut.store(true, Ordering::SeqCst);
+        self.apply(None);
+    }
+
+    /// Unlocked: calls may open the gate again.
+    pub fn unshut(&self) {
+        self.shut.store(false, Ordering::SeqCst);
+    }
+
     pub fn set_net(&self, net: Arc<dyn VoiceNet>) {
         *self.net.lock().expect("not poisoned") = Some(net);
     }
@@ -49,6 +66,7 @@ impl MediaGate {
     /// the gate first, synchronously, so no queued frame of a call I left
     /// goes out (SL on #554); then the node.
     pub fn apply(&self, call: Option<sync::VoiceCall>) {
+        let call = call.filter(|_| !self.shut.load(Ordering::SeqCst));
         self.set_call(call.as_ref().map(|c| c.call_id));
         let net = self.net.lock().expect("not poisoned").clone();
         if let Some(net) = net {
@@ -58,7 +76,7 @@ impl MediaGate {
 
     /// The call frames may go to and come from now.
     pub fn current(&self) -> Option<[u8; 16]> {
-        *self.call.lock().expect("not poisoned")
+        (*self.call.lock().expect("not poisoned")).filter(|_| !self.shut.load(Ordering::SeqCst))
     }
 
     /// Frames dropped by the fast path (malformed, or the gate closed).
@@ -83,7 +101,7 @@ impl VoiceFrames {
     pub fn take(&self, args: Option<&Value>) {
         let gate = &self.0;
         let frame = args.and_then(parse);
-        let open = *gate.call.lock().expect("not poisoned");
+        let open = (*gate.call.lock().expect("not poisoned")).filter(|_| !gate.shut.load(Ordering::SeqCst));
         match frame {
             Some(frame) if open == Some(frame.call_id) => {
                 let net = gate.net.lock().expect("not poisoned").clone();

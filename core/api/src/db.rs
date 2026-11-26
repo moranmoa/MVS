@@ -53,9 +53,11 @@ fn previous_secret_key(server: ServerId) -> String {
 }
 
 const PREVIOUS_SECRET_AD: &[u8] = b"mvs/api/server-secret-previous/v1";
+/// One kept entry: until (8) ‖ R (32) ‖ secret (32).
+const KEPT_LEN: usize = 8 + 32 + 32;
 
 /// T17: a replaced sync secret, kept until a time (ms).
-pub(crate) type KeptSecret = (Zeroizing<[u8; 32]>, u64);
+pub(crate) use crate::ports::PreviousSecret as KeptSecret;
 
 /// T8-02: a short link's invite key k, per invite (S4: sealed like the
 /// server secret).
@@ -198,22 +200,25 @@ impl Db {
     /// rotation replaced that is still within its keep, for reading the old
     /// secrets' frozen prefixes. Adds `secret` until `until_ms`, drops the
     /// entries whose time has passed at `now_ms`, and seals the list as one,
-    /// bound to the server by the AD. Entry: `until u64 LE` ‖ secret.
+    /// bound to the server by the AD. Entry: `until u64 LE` ‖ the rotation
+    /// record that replaced it (`R`, for sync's frozen prefix) ‖ secret.
     pub fn save_previous_server_secret(
         &self,
         key: &[u8; 32],
         server: ServerId,
         secret: &[u8; 32],
+        replaced_by: RecordId,
         until_ms: u64,
         now_ms: u64,
     ) -> Result<(), CoreError> {
         let mut kept = self.load_previous_server_secrets(key, server)?;
-        kept.retain(|(_, until)| *until > now_ms);
-        kept.push((Zeroizing::new(*secret), until_ms));
-        let mut plain = Zeroizing::new(Vec::with_capacity(kept.len() * 40));
-        for (secret, until) in &kept {
-            plain.extend_from_slice(&until.to_le_bytes());
-            plain.extend_from_slice(secret.as_ref());
+        kept.retain(|p| p.until_ms > now_ms);
+        kept.push(KeptSecret { secret: Zeroizing::new(*secret), replaced_by, until_ms });
+        let mut plain = Zeroizing::new(Vec::with_capacity(kept.len() * KEPT_LEN));
+        for p in &kept {
+            plain.extend_from_slice(&p.until_ms.to_le_bytes());
+            plain.extend_from_slice(p.replaced_by.as_bytes());
+            plain.extend_from_slice(p.secret.as_ref());
         }
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
@@ -243,15 +248,19 @@ impl Db {
                 .decrypt(XNonce::from_slice(nonce), Payload { msg: sealed, aad: &aad })
                 .map_err(internal)?,
         );
-        if plain.len() % 40 != 0 {
+        if plain.len() % KEPT_LEN != 0 {
             return Err(internal("previous secrets size"));
         }
         Ok(plain
-            .chunks_exact(40)
+            .chunks_exact(KEPT_LEN)
             .map(|entry| {
-                let (until, secret) = entry.split_at(8);
-                let until = u64::from_le_bytes(until.try_into().expect("8 bytes"));
-                (Zeroizing::new(secret.try_into().expect("32 bytes")), until)
+                let (until, rest) = entry.split_at(8);
+                let (replaced_by, secret) = rest.split_at(32);
+                KeptSecret {
+                    until_ms: u64::from_le_bytes(until.try_into().expect("8 bytes")),
+                    replaced_by: RecordId::from_bytes(replaced_by.try_into().expect("32 bytes")),
+                    secret: Zeroizing::new(secret.try_into().expect("32 bytes")),
+                }
             })
             .collect())
     }
@@ -679,13 +688,18 @@ mod tests {
         let db = Db::open(None).unwrap();
         let (key, server, other) = ([1; 32], ServerId::from_bytes([2; 32]), ServerId::from_bytes([3; 32]));
         assert!(db.load_previous_server_secrets(&key, server).unwrap().is_empty());
-        db.save_previous_server_secret(&key, server, &[9; 32], 1_000, 0).unwrap();
-        db.save_previous_server_secret(&key, server, &[8; 32], 2_000, 500).unwrap();
-        let kept: Vec<([u8; 32], u64)> =
-            db.load_previous_server_secrets(&key, server).unwrap().into_iter().map(|(s, u)| (*s, u)).collect();
-        assert_eq!(kept, [([9; 32], 1_000), ([8; 32], 2_000)], "both within their keep");
-        db.save_previous_server_secret(&key, server, &[7; 32], 3_000, 1_500).unwrap();
-        let kept: Vec<u64> = db.load_previous_server_secrets(&key, server).unwrap().into_iter().map(|(_, u)| u).collect();
+        let (r1, r2, r3) = (RecordId::from_bytes([1; 32]), RecordId::from_bytes([2; 32]), RecordId::from_bytes([3; 32]));
+        db.save_previous_server_secret(&key, server, &[9; 32], r1, 1_000, 0).unwrap();
+        db.save_previous_server_secret(&key, server, &[8; 32], r2, 2_000, 500).unwrap();
+        let kept: Vec<([u8; 32], RecordId, u64)> = db
+            .load_previous_server_secrets(&key, server)
+            .unwrap()
+            .into_iter()
+            .map(|p| (*p.secret, p.replaced_by, p.until_ms))
+            .collect();
+        assert_eq!(kept, [([9; 32], r1, 1_000), ([8; 32], r2, 2_000)], "both within their keep");
+        db.save_previous_server_secret(&key, server, &[7; 32], r3, 3_000, 1_500).unwrap();
+        let kept: Vec<u64> = db.load_previous_server_secrets(&key, server).unwrap().into_iter().map(|p| p.until_ms).collect();
         assert_eq!(kept, [2_000, 3_000], "the first one's time passed");
         assert!(db.load_previous_server_secrets(&key, other).unwrap().is_empty());
         let mut blob = db.get(&previous_secret_key(server)).unwrap().unwrap();

@@ -4286,7 +4286,7 @@ impl Inner {
         &mut self,
         ports: &Ports,
         server: ServerId,
-        opened: &crate::ports::OpenedSecret,
+        (opened, replaced_by): (&crate::ports::OpenedSecret, RecordId),
         events: &mut Events,
     ) -> CoreResult<()> {
         let Some(secret) = &opened.secret else { return Ok(()) };
@@ -4294,7 +4294,7 @@ impl Inner {
         let key = *me.identity.storage_key().expose_secret();
         if let Some(old) = self.secret(server)?.filter(|old| **old != **secret) {
             let until = ports.clock.now_ms().saturating_add(PREVIOUS_SECRET_FOR_MS);
-            self.db.save_previous_server_secret(&key, server, &old, until, ports.clock.now_ms())?;
+            self.db.save_previous_server_secret(&key, server, &old, replaced_by, until, ports.clock.now_ms())?;
         }
         self.save_secret(server, secret)?;
         self.db.set(&secret_rotation_key(server), opened.rotation.as_bytes())?;
@@ -4343,10 +4343,10 @@ impl Inner {
     /// [`Self::secret_rotation_due`].
     fn apply_secret_rotation(&mut self, ports: &Ports, server: ServerId, events: &mut Events) -> CoreResult<()> {
         let current = self.current_secret_rotation(&*ports.cipher, server)?;
-        if let Some((opened, _)) = &current {
+        if let Some((opened, last_part)) = &current {
             let seen = self.db.get(&secret_rotation_key(server))?.is_some_and(|v| v == opened.rotation.as_bytes());
             if !seen {
-                self.move_to_secret(ports, server, opened, events)?;
+                self.move_to_secret(ports, server, (opened, *last_part), events)?;
             }
         }
         if self.secret_rotation_due(server, current.as_ref())? {
@@ -4469,8 +4469,8 @@ impl Inner {
             self.publish_control(ports, server, action)?;
         }
         // My own box opens like anyone's: one path for the switch.
-        if let Some((opened, _)) = self.current_secret_rotation(&*ports.cipher, server)? {
-            self.move_to_secret(ports, server, &opened, events)?;
+        if let Some((opened, last_part)) = self.current_secret_rotation(&*ports.cipher, server)? {
+            self.move_to_secret(ports, server, (&opened, last_part), events)?;
         }
         Ok(())
     }
@@ -4724,7 +4724,7 @@ impl Inner {
             let key = *me.identity.storage_key().expose_secret();
             let now = ports.clock.now_ms();
             let mut previous = self.db.load_previous_server_secrets(&key, server)?;
-            previous.retain(|(_, until)| *until > now);
+            previous.retain(|p| p.until_ms > now);
             ports.network.set_previous_secrets(server, &previous);
         }
         Ok(())

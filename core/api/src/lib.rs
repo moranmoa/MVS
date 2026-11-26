@@ -48,7 +48,7 @@ pub use dispatch::NOT_YET;
 pub use gate::MemberGate;
 pub use ports::{
     CipherError, CipherOutcome, Clock, CollectingSink, EventSink, FixedClock, GroupCipher,
-    LoopbackNetwork, Network, Opened, OpenedSecret, PendingGroupKeys, Ports, Reach, SharedSecrets,
+    LoopbackNetwork, Network, Opened, OpenedSecret, PendingGroupKeys, PreviousSecret, Ports, Reach, SharedSecrets,
     SystemClock,
 };
 pub use rekey::{JOIN_REKEY_BURST, JOIN_REKEY_REFILL_MS};

@@ -190,14 +190,14 @@ pub trait Network: Send + Sync {
     }
 
     /// T17 (S3/S4, the sync side is dev-sync's): the secrets `server`'s
-    /// rotations replaced, each with the time (core clock, ms) until it is
-    /// kept, oldest first; expired ones are already left out. Called every
+    /// rotations replaced, each with the rotation record `R` that replaced it
+    /// and the time (core clock, ms) until it is kept, oldest first; expired ones are already left out. Called every
     /// round after [`Self::open_server`]. With them, sync reads (never
     /// writes: S4) each old secret's frozen prefix, the rotation record's
     /// causal past plus the record, control log only (S3), so a member who
     /// was offline during a rotation still finds the record sealed to them.
     /// Empty: nothing to keep.
-    fn set_previous_secrets(&self, server: ServerId, previous: &[(Zeroizing<[u8; 32]>, u64)]) {
+    fn set_previous_secrets(&self, server: ServerId, previous: &[PreviousSecret]) {
         let _ = (server, previous);
     }
 
@@ -426,8 +426,8 @@ impl Network for LoopbackNetwork {
         std::mem::take(&mut *self.unknown.lock().expect("not poisoned"))
     }
 
-    fn set_previous_secrets(&self, server: ServerId, previous: &[(Zeroizing<[u8; 32]>, u64)]) {
-        let kept = previous.iter().map(|(secret, _)| **secret).collect();
+    fn set_previous_secrets(&self, server: ServerId, previous: &[PreviousSecret]) {
+        let kept = previous.iter().map(|p| *p.secret).collect();
         self.previous.lock().expect("not poisoned").insert(server, kept);
     }
 
@@ -737,6 +737,17 @@ pub struct Opened {
     /// False: sealed under a rotation authority doesn't accept; show it as
     /// untrusted, never as a normal message.
     pub accepted: bool,
+}
+
+/// T17 (S3/S4): a secret a rotation replaced, kept for reading its frozen
+/// prefix: `R`'s causal past plus `R`, control log only, read-only. Never
+/// logged.
+pub struct PreviousSecret {
+    pub secret: Zeroizing<[u8; 32]>,
+    /// The rotation's last part record (its causal past holds every part).
+    pub replaced_by: records::RecordId,
+    /// Kept until then (core clock, ms).
+    pub until_ms: u64,
 }
 
 /// T17: a sealed secret rotation: the part bodies, in order, and the new

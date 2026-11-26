@@ -73,6 +73,12 @@ impl MediaGate {
 pub struct VoiceFrames(pub(crate) Arc<MediaGate>);
 
 impl VoiceFrames {
+    /// Frames dropped so far (malformed, or the gate closed): a count only,
+    /// for diagnostics and tests; never what they held.
+    pub fn dropped(&self) -> u64 {
+        self.0.dropped()
+    }
+
     /// One `voiceFrame`'s `args`: handed to the network, or dropped.
     pub fn take(&self, args: Option<&Value>) {
         let gate = &self.0;

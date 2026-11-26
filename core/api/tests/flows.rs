@@ -2747,6 +2747,13 @@ fn invites_are_made_listed_and_revoked() {
 struct VoiceHub {
     queue: std::sync::Mutex<Vec<(PublicKey, PublicKey, Vec<u8>)>>,
     relay_only: std::sync::atomic::AtomicBool,
+    /// G-81: the voice frames handed to the node.
+    frames: std::sync::Mutex<Vec<sync::VoiceFrame>>,
+    /// G-81: every call the node was told about (`None`: none).
+    media_calls: std::sync::Mutex<Vec<Option<sync::VoiceCall>>>,
+    /// G-81: a frame tried from inside `set_media_call(None)`, through
+    /// this handle: it must be dropped, since the gate closes first (SL).
+    probe: std::sync::Mutex<Option<(api::VoiceFrames, serde_json::Value)>>,
 }
 
 struct HubPort {
@@ -2762,6 +2769,20 @@ impl VoiceNet for HubPort {
     fn send(&self, to: PublicKey, blob: Vec<u8>) {
         assert!(blob.len() <= 16 * 1024);
         self.hub.queue.lock().unwrap().push((self.me, to, blob));
+    }
+
+    fn media_frame(&self, frame: sync::VoiceFrame) {
+        self.hub.frames.lock().unwrap().push(frame);
+    }
+
+    fn set_media_call(&self, call: Option<sync::VoiceCall>) {
+        if call.is_none() {
+            let probe = self.hub.probe.lock().unwrap().clone();
+            if let Some((frames, args)) = probe {
+                frames.take(Some(&args));
+            }
+        }
+        self.hub.media_calls.lock().unwrap().push(call);
     }
 }
 
@@ -2979,6 +3000,77 @@ fn a_call_between_members() {
     hub.relay_only.store(false, std::sync::atomic::Ordering::SeqCst);
     owner.core.leave_call().unwrap();
     assert!(!owner.core.in_call());
+}
+
+/// G-81 part c (SL on #554): voice frames go out only for the call I'm in.
+/// On leave the gate closes before the node hears of it, so a frame that
+/// overtakes `leaveCall`, or comes after it, sends nothing.
+#[test]
+fn leave_then_frame_sends_nothing() {
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let server = owner.core.create_server("Talk", AgeRestriction::None).unwrap();
+    hub.connect(&owner, &owner_id);
+    let frames = owner.core.voice_frames();
+    let frame = |call: &str| serde_json::json!({ "callId": call, "seq": 1, "ts": 960, "data": "AQID" });
+
+    // Not in a call: dropped.
+    frames.take(Some(&frame(&"0a".repeat(16))));
+    assert!(hub.frames.lock().unwrap().is_empty());
+
+    let state = owner.core.create_voice_room(&server.id).unwrap();
+    let call = state.call_id.clone().expect("a call has an ID");
+    assert_eq!(call.len(), 32);
+    let told = hub.media_calls.lock().unwrap().last().cloned().flatten().expect("the node was told of the call");
+    assert_eq!(hex::encode(told.call_id), call);
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+    assert_eq!(hub.frames.lock().unwrap()[0].opus, [1, 2, 3]);
+    // Another call's ID: dropped.
+    frames.take(Some(&frame(&"0b".repeat(16))));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+
+    // Leave: by the time the node is told, the gate is already shut.
+    *hub.probe.lock().unwrap() = Some((frames.clone(), frame(&call)));
+    owner.core.leave_call().unwrap();
+    assert!(hub.media_calls.lock().unwrap().last().is_some_and(Option::is_none), "the node still has the call");
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1, "a frame went out after leaveCall");
+
+    // A new call has a new ID: the old one's frames still go nowhere.
+    let again = owner.core.create_voice_room(&server.id).unwrap().call_id.unwrap();
+    assert_ne!(again, call);
+    frames.take(Some(&frame(&call)));
+    assert_eq!(hub.frames.lock().unwrap().len(), 1);
+    owner.core.leave_call().unwrap();
+}
+
+/// G-81 2a part c (TL): with `--voice-p2p`, a relay-only user can create
+/// and join calls (over our circuits only: the node's call, here); without
+/// it, calls stay refused while relay-only.
+#[test]
+fn relay_only_calls_need_the_voice_p2p_flag() {
+    let world = World::new();
+    let hub = Arc::new(VoiceHub::default());
+    let owner = world.peer();
+    let owner_id = sign_up(&owner, "Owner").id;
+    let server = owner.core.create_server("Talk", AgeRestriction::None).unwrap();
+    hub.connect(&owner, &owner_id);
+    hub.relay_only.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(owner.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::RelayOnly);
+
+    owner.core.set_voice_p2p(true);
+    let state = owner.core.create_voice_room(&server.id).unwrap();
+    assert!(owner.core.in_call());
+    let told = hub.media_calls.lock().unwrap().last().cloned().flatten().expect("the node was told of the call");
+    assert_eq!(Some(hex::encode(told.call_id)), state.call_id);
+    owner.core.leave_call().unwrap();
+
+    // Flag off again: refused as before.
+    owner.core.set_voice_p2p(false);
+    assert_eq!(owner.core.create_voice_room(&server.id).unwrap_err().code, ErrorCode::RelayOnly);
 }
 
 /// A network that records each relay-only setting it was given.

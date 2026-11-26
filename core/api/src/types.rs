@@ -949,6 +949,9 @@ pub enum MemberRelayReason {
     RelayOnly,
     /// A metered network, as the desktop shell reports it (`setMetered`).
     Metered,
+    /// On battery, as the desktop shell reports it (`setOnBattery`); also
+    /// until the shell first says, at every start (fails closed).
+    OnBattery,
 }
 
 /// Where bringing my servers back after a restore stands (G-91).

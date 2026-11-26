@@ -431,6 +431,13 @@ mod optional_secret {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OnBatteryArg {
+    #[serde(rename = "onBattery")]
+    on_battery: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MeteredArg {
     metered: bool,
 }
@@ -639,6 +646,7 @@ impl Core {
             "markMemberRelayDisclosureSeen" => ok(self.mark_member_relay_disclosure_seen()),
             // The desktop shell only (not in the page's allow-list).
             "setMetered" => ok(self.set_metered(args::<MeteredArg>(raw)?.metered)),
+            "setOnBattery" => ok(self.set_on_battery(args::<OnBatteryArg>(raw)?.on_battery)),
             "startDeviceLink" => ok(self.start_device_link()),
             "cancelDeviceLink" => ok(self.cancel_device_link()),
             "beginDeviceApproval" => ok(self.begin_device_approval(&args::<QrOrCodeArg>(raw)?.qr_or_code)),
